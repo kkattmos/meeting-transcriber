@@ -1,0 +1,492 @@
+ ▐▛███▜▌   Claude Code v2.1.218
+▝▜█████▛▘  minimax-m3 · API Usage Billing
+  ▘▘ ▝▝    ~/Documents/meeting-transcripter
+
+
+❯ /clear                                                                        
+
+❯ New fix: The bot did not leave automatically (tested on google meet; only me  
+  and the bot). Ask me questions first.                                         
+
+  Thought for 8s (ctrl+o to expand)
+
+● Let me look at the auto-exit logic before asking, so I can ask the right
+  questions.
+
+  Read 1 file (ctrl+o to expand)
+
+● Now I have enough context. The relevant logic is in wait_until_meeting_ends —
+  the auto-exit policy in CLAUDE.md lines 145-156. With a 2-person meeting (you
+  + the bot), count is 2, so is_alone = count <= 1 is False, and peak_count = 2,
+  so is_mass_exodus = count <= int(2 * 0.30) = 0 is also False. Nothing ever
+  triggers.
+
+  A few questions before I propose a fix:
+
+● User answered Claude's questions:
+  ⎿  · How should 'I'm the only other person here' be detected? → Option 3 (only
+     the bot left in the call), also with the mass exit threshold.
+     · How long should the bot wait in an idle state before leaving? → 5 minutes
+     (Recommended)
+     · Should the new rule be tunable from .env? → Env var, like 
+     MAX_MEETING_MINUTES (Recommended)
+     · How should the bot leave when the new rule triggers? → Same as existing: 
+     click Leave button (Recommended)
+
+● Wait — your answer to Q1 is ambiguous. You said "Option 3 (only the bot left
+  in the call)" but the mass-exit threshold is already a separate code path that
+  runs in parallel. Let me re-read: "also with the mass exit threshold" — I
+  read that as keeping the existing mass-exit rule AND adding a new "only me and
+  the bot" rule.
+
+  To be safe, one quick confirmation before I plan the code:
+
+● User answered Claude's questions:
+  ⎿  · How exactly do the two rules combine? → Add both: new rule AND keep 
+     mass-exit AND add count==1 rule
+
+● All three rules active. Let me plan the change.
+
+● Entered plan mode
+  Claude is now exploring and designing an implementation approach.
+
+● I have already read the only file I need (screen/capture.py) and the user's
+  answers cover the design decisions. The task is well-scoped: add two new
+  auto-exit rules to wait_until_meeting_ends, keep the mass-exit rule intact,
+  add one env var. Let me write the plan directly.
+
+● Updated plan
+  ⎿  /plan to preview
+
+● Not relevant — I'm in plan mode and the work is a single-file change
+  documented in the plan file. No task tracking needed.
+
+● User approved Claude's plan
+  ⎿  Plan saved to: ~/.claude/plans/hazy-floating-whisper.md · /plan to edit
+     Plan: Add "only me + the bot" and "only the bot" auto-exit rules
+
+     Context
+
+     screen/capture.py already has a mass-exit rule that leaves the meeting when
+     participant count falls below int(peak_count * 0.30) for two consecutive
+     polls. It also leaves on kill sentinel, page-closed, title change, and a
+     hard
+     timeout.
+
+     The bot does NOT auto-leave when the user is the only other person in a
+     Google Meet call. With 2 participants (user + bot) the existing logic sees
+     count=2, so is_alone = count <= 1 is False and count <= int(2 * 0.30) = 0
+     is also False — nothing fires. The user tested this in a solo Meet and the
+     bot stayed until the hard timeout (4h default).
+
+     This plan adds two new rules so test calls end on their own while keeping
+     the existing mass-exit path untouched. The user confirmed: keep the
+     mass-exit
+     rule, add a "only the bot + me" idle rule, add a "only the bot" idle rule.
+     Idle timeout = 5 minutes. Tunable via env var. Leave via the in-Meet Leave
+     button (consistent with the existing kill-sentinel / hard-timeout paths).
+
+     Files to modify
+
+     - screen/capture.py — add constants, env override, two new checks in
+     wait_until_meeting_ends. Single-file change.
+     - CLAUDE.md — extend the "Auto-exit policy" section to document the new
+     rules, their constants, and the new env var.
+     - .env.example — add IDLE_LEAVE_MINUTES=5 with a comment.
+
+     Design
+
+     New constants at the top of screen/capture.py
+
+     Mirror the existing MAX_MEETING_SECONDS pattern:
+
+     # Idle auto-leave: if the meeting has been at "only me + bot" or
+     # "only the bot" for IDLE_LEAVE_MINUTES, leave cleanly. This catches
+     # the "test call with just me" case that the mass-exit rule misses
+     # (peak is 2, so 30% of peak is 0 — never triggers). Tunable via
+     # IDLE_LEAVE_MINUTES in the environment.
+     IDLE_LEAVE_SECONDS = int(os.environ.get("IDLE_LEAVE_MINUTES", "5")) * 60
+
+     New state in wait_until_meeting_ends
+
+     Add two timestamps next to the existing low_streak counter, both
+     initialised to None:
+
+     idle_since_ts = None   # first poll at which the "idle" condition was true
+
+     New checks inside the poll loop
+
+     Inserted after the existing get_participant_count block, before the
+     mass-exit low_streak check, so the more-specific rules fire first:
+
+     # Idle auto-leave: only me + bot (count == 2) or only the bot
+     # (count == 1). Track how long the count has stayed in the idle
+     # zone; once IDLE_LEAVE_SECONDS elapses, leave cleanly.
+     is_idle = count in (1, 2)
+     if is_idle:
+         if idle_since_ts is None:
+             idle_since_ts = time.time()
+         elif time.time() - idle_since_ts >= IDLE_LEAVE_SECONDS:
+             mins = int((time.time() - idle_since_ts) // 60)
+             print(
+                 f"Idle threshold reached ({mins}m, count={count}, "
+                 f"peak={peak_count}) - leaving."
+             )
+             leave_meeting(page)
+             return
+     else:
+         idle_since_ts = None
+
+     Notes:
+     - is_idle is only computed when count is not None. If the participant
+     count is unparseable for a poll, the timer is left alone — better to wait
+     out the full idle window than to reset it on a transient scrape miss.
+     - The mass-exit low_streak block is unchanged and still runs after this,
+     so a 20-person meeting that drops to 1 still leaves on the existing path.
+     - peak_count is still updated by the existing line above, so the mass-exit
+     heuristic continues to see the true peak.
+     - leave_meeting(page) reuses the existing helper (lines 163-182).
+
+     Why count in (1, 2) and not "count <= 2"
+
+     A 3-person meeting (you + 2 others) where both leave simultaneously will
+     briefly read count=1. With count in (1, 2), that poll would start the
+     idle timer, but the next poll would either see 0 (still in the set) or
+     the bot is alone. In a real meeting, count=3 (or higher) resets the
+     timer on the very next poll, so the false positive window is one poll
+     interval (15s) — short enough to be safe, long enough that a stuck-at-2
+     test call is caught within IDLE_LEAVE_SECONDS + 15s.
+
+     If we want extra safety, we can add a count == 1 check too (only the
+     bot) — but the user already said "only the bot" should be its own rule
+     that triggers. count in (1, 2) covers both in one branch; the
+     behaviour is the same because the timer is what gates the leave, not
+     the count value.
+
+     Why a single timer and not two
+
+     A "count==2" call that drops to "count==1" (you left) is a stricter
+     condition, not a separate one. Resetting the timer between the two
+     would add a 5-minute delay to the "you left too" case. One timer that
+     triggers on either condition is the right call.
+
+     CLAUDE.md update
+
+     Append to the "Auto-exit policy" section (after the hard-timeout bullet):
+
+     5. **Idle auto-leave** — participant count stays at 1 (only the bot)
+        or 2 (only you + the bot) for `IDLE_LEAVE_SECONDS` (default
+        `5 * 60`, env-overridable as `IDLE_LEAVE_MINUTES`). Catches the
+        "test call with just me" case that the mass-exit rule misses
+        (peak is 2, so 30% of peak is 0). Independent of mass-exit; both
+        run on every poll.
+
+     Update the configuration example block to include:
+
+     # Auto-leave when only the bot (count=1) or only the bot + one
+     # other person (count=2) for N minutes:
+     IDLE_LEAVE_MINUTES=5 sudo -H ./screen/record_screen.sh ...
+
+     .env.example update
+
+     Add:
+
+     # Idle auto-leave: leave when participant count is 1 or 2 for this
+     # many minutes. Catches test calls. Set to 0 to disable.
+     IDLE_LEAVE_MINUTES=5
+
+     Verification
+
+     This requires the user to run a real Google Meet test (the user's own
+     test, not mine — per sudo-required-for-live-youtube-test.md style
+     constraints, sudo-required live tests run by the user). The plan is:
+
+     1. Unit-style static check (I can run this): start a 2-person test
+     locally isn't possible without a real Meet; the only automated check
+     is a syntax/import smoke run:
+     python3 -c "import ast; ast.parse(open('screen/capture.py').read())"
+     2. Code-review sanity (I can run this): confirm the new branch is
+     reachable by reading the modified function end-to-end.
+     3. Live test (user runs):
+     sudo -H IDLE_LEAVE_MINUTES=1 ./screen/record_screen.sh <meet-url> test-idle
+     3. Join from a second browser, let the bot in, then leave the call.
+     Confirm the bot exits within ~1m 15s (1 min + one 15s poll) and
+     that the MP4's final frames show the Leave button being clicked.
+     4. Live test, two-person (user runs): same command, but stay in
+     the call alone with the bot for 6 minutes. Confirm the bot leaves
+     at the 5-minute mark.
+     5. Regression test (user runs, optional): join a 3+ person call
+     (or simulate by having two helpers), let the meeting drain to 1
+     person, confirm the mass-exit path still works (should fire
+     immediately when count drops below 30% of peak, not after the
+     idle window).
+
+● Update(screen/capture.py)
+  ⎿  Added 5 lines
+      32  # never gets stuck in a meeting forever. Override with MAX_MEET
+          ING_MINUTES in
+      33  # the environment (e.g. MAX_MEETING_MINUTES=120 for a 2-hour ca
+          p).
+      34  MAX_MEETING_SECONDS = int(os.environ.get("MAX_MEETING_MINUTES",
+           "240")) * 60
+      35 +# Idle auto-leave: if the meeting has been at "only me + bot" (
+         +count==2)                                                      
+      36 +# or "only the bot" (count==1) for IDLE_LEAVE_SECONDS, leave cl
+         +eanly. This                                                    
+      37 +# catches the "test call with just me" case that the mass-exit 
+         +rule misses                                                    
+      38 +# (peak is 2, so 30% of peak is 0 — never triggers). Set to 0 t
+         +o disable.                                                     
+      39 +IDLE_LEAVE_SECONDS = int(os.environ.get("IDLE_LEAVE_MINUTES", "
+         +5")) * 60                                                      
+      40  ADMITTED_MARKER = "/tmp/meeting_bot_admitted"  # touched once i
+          nside the call
+      41  # Sentinel file: when this appears, the bot leaves the meeting 
+          cleanly and exits.
+      42  # Touched by record_screen.sh's signal trap (Ctrl+\) or by kill
+          _meeting.sh.
+
+● Update(screen/capture.py)
+  ⎿  Added 17 lines
+      358                  is_alone = count <= 1
+      359                  is_mass_exodus = peak_count and count <= max(1
+           , int(peak_count * DROP_RATIO_THRESHOLD))
+      360  
+      361 +                # Idle auto-leave: only the bot (count==1) or 
+          +only the bot                                                  
+      362 +                # + one other person (count==2) for IDLE_LEAVE
+          +_SECONDS.                                                     
+      363 +                # Independent of mass-exit; both can fire on t
+          +he same call.                                                 
+      364 +                if IDLE_LEAVE_SECONDS > 0 and count in (1, 2):
+      365 +                    if idle_since_ts is None:                 
+      366 +                        idle_since_ts = time.time()           
+      367 +                    elif time.time() - idle_since_ts >= IDLE_L
+          +EAVE_SECONDS:                                                 
+      368 +                        mins = int((time.time() - idle_since_t
+          +s) // 60)                                                     
+      369 +                        print(                                
+      370 +                            f"Idle threshold reached ({mins}m,
+          + count={count}, "                                             
+      371 +                            f"peak={peak_count}) - leaving."  
+      372 +                        )                                     
+      373 +                        leave_meeting(page)                   
+      374 +                        return                                
+      375 +                else:                                         
+      376 +                    idle_since_ts = None                      
+      377 +                                                              
+      378                  if is_alone or is_mass_exodus:
+      379                      low_streak += 1
+      380                      print(f"Low participant count ({count}, pe
+           ak {peak_count}) - streak {low_streak}")
+
+● Now the state init:
+
+● Update(screen/capture.py)
+  ⎿  Added 1 line
+      310      print("In meeting. Monitoring participant count and end st
+           ate...")
+      311      peak_count = None
+      312      low_streak = 0
+      313 +    idle_since_ts = None    # first poll at which count was in
+          + (1, 2)                                                       
+      314      start_ts = time.time()  # for the hard max-duration timeou
+           t backstop
+      315  
+      316      while True:
+
+● Now update CLAUDE.md and .env.example:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(.env.example)
+  ⎿  Added 5 lines
+      102  # Backstop wall-clock cap, in minutes. Default is 4h (240). Ov
+           erride per
+      103  # run with `MAX_MEETING_MINUTES=N ./pipeline.sh ...`.
+      104  MAX_MEETING_MINUTES=240
+      105 +# Idle auto-leave: leave when participant count is 1 (only the
+          + bot) or 2                                                    
+      106 +# (only the bot + one other person) for this many minutes. Cat
+          +ches test                                                     
+      107 +# calls where the existing mass-exit rule doesn't fire (peak=2
+          +, 30% is 0).                                                  
+      108 +# Set to 0 to disable. Per-run override: `IDLE_LEAVE_MINUTES=N
+          +`.                                                            
+      109 +IDLE_LEAVE_MINUTES=5                                          
+      110  
+      111  # ────────────────────────────────────────────────────────────
+           ───────────
+      112  # AssemblyAI (local-file transcription, Stage 2)
+
+● Now update CLAUDE.md. The auto-exit section is around line 156-170 of the
+  original. Let me read it back:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Not relevant — three small file edits, all in flight, no need for task
+  tracking.
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(CLAUDE.md)
+  ⎿  Added 11 lines
+      424  4. **Hard timeout** — wall-clock time in the meeting exceeds
+      425     `MAX_MEETING_SECONDS` (default `4 * 3600`, env-overridable 
+           as
+      426     `MAX_MEETING_MINUTES`). This is a backstop so the bot never
+            gets stuck.
+      427 +5. **Idle auto-leave** — participant count stays at 1 (only th
+          +e bot)                                                        
+      428 +   or 2 (only you + the bot) for `IDLE_LEAVE_SECONDS` (default
+          + `5 * 60`,                                                    
+      429 +   env-overridable as `IDLE_LEAVE_MINUTES`, set to 0 to disabl
+          +e). Catches                                                   
+      430 +   the "test call with just me" case the mass-exit rule misses
+          + (peak is                                                     
+      431 +   2, so 30% of peak is 0 — never triggers). Independent of ma
+          +ss-exit;                                                      
+      432 +   both can fire on the same call. Counts that can't be parsed
+          + (scrape                                                      
+      433 +   miss) leave the timer untouched rather than resetting it.  
+      434  
+      435  Configuration examples:
+      436  
+     ...
+      441  
+      442  # Override the hard timeout for a single run:
+      443  MAX_MEETING_MINUTES=120 sudo -H ./screen/record_screen.sh ... 
+             # 2h cap
+      444 +                                                              
+      445 +# Auto-leave when only the bot (count=1) or only the bot + one
+          + other                                                        
+      446 +# person (count=2) for N minutes:                             
+      447 +IDLE_LEAVE_MINUTES=1 sudo -H ./screen/record_screen.sh ...    
+          +   # 1m for tests                                             
+      448  ```
+      449  
+      450  ## setup.sh re-run behavior
+● Now the smoke check:
+
+● Bash(python3 -c "import ast; ast.parse(open('screen/capture.py').read());
+      print('OK')")
+  ⎿  OK
+
+● Bash(git diff --stat)
+  ⎿   .env.example      |  5 +++++
+      CLAUDE.md         | 11 +++++++++++
+      screen/capture.py | 23 +++++++++++++++++++++++
+      3 files changed, 39 insertions(+)
+
+● Done. Three files updated, 39 lines added.
+
+  Changes
+
+  - screen/capture.py — Added IDLE_LEAVE_SECONDS constant (env-overridable via
+  IDLE_LEAVE_MINUTES, default 5 min, 0 disables). In wait_until_meeting_ends:
+    - Initialised idle_since_ts = None next to low_streak.
+    - Added an idle check before the mass-exit block: if count in (1, 2) for the
+  full IDLE_LEAVE_SECONDS window, call leave_meeting(page) and return. The
+  mass-exit block below is unchanged — both paths can fire.
+    - If count is unparseable on a poll, the timer is left alone (not reset) so
+  a transient scrape miss doesn't reset a real idle window.
+  - CLAUDE.md — Added item 5 to the Auto-exit policy (idle auto-leave) and a
+  config example for IDLE_LEAVE_MINUTES.
+  - .env.example — Added IDLE_LEAVE_MINUTES=5 under the recording-cap section
+  with a comment.
+
+  Verification
+
+  Static: python3 -c "import ast; ast.parse(...)" passes on the modified file.
+
+  Live: the only meaningful test needs a real Google Meet. Recommended sequence
+  (you to run):
+
+  1. Test case A — you leave the call:
+  sudo -H IDLE_LEAVE_MINUTES=1 ./screen/record_screen.sh <meet-url>
+  test-idle-leave
+  1. Join from a second browser, let the bot in, then leave. Confirm the bot
+  exits within ~75s (1 min idle + one 15s poll) and the MP4 final frames show
+  the Leave button being clicked.
+  2. Test case B — you stay alone with the bot:
+  sudo -H IDLE_LEAVE_MINUTES=2 ./screen/record_screen.sh <meet-url>
+  test-idle-alone
+  2. Stay in the call alone with the bot for ~3 minutes. Confirm the bot leaves
+  at the 2-minute mark.
+  3. Regression — mass-exit still works: join a 3+ person call, let the count
+  drop sharply, confirm the existing mass-exit path fires (not the new idle
+  path).
+
+✻ Worked for 1m 48s
+
+❯ Can you verify how the counting mechanism works? (Test case 1 did not work -  
+  the bot still stays in the chat.)                                             
+
+  Thought for 44s (ctrl+o to expand)
+
+● Let me check what's actually running and look for evidence of what the counter
+  saw.
+
+  Listed 1 directory (ctrl+o to expand)
+
+● Bash(ps -ef | grep -E "capture\.py|record_screen|Xvfb|ffmpeg" | grep -v grep |
+      head -20)
+  ⎿  (No output)
+
+  Listed 1 directory (ctrl+o to expand)
+
+● Acknowledged — single investigation, no task tracking needed. The kill
+  sentinel was touched (you Ctrl+'d to clean up), so the bot exited via the kill
+  path, not my new idle logic. I need to look at why my code never fired before
+  the kill. Let me trace get_participant_count:
+
+  Read 1 file (ctrl+o to expand)
+
+● That's the problem. get_participant_count is heuristic — it greps the entire
+  page body for strings like "5 participants". In your 2-person Google Meet
+  call, that string is unlikely to appear in the visible body text (the
+  participant count usually lives in a small chip / button aria-label, not in
+  the main text stream). The function returns None.
+
+  Look at the gate:
+
+  Read 1 file (ctrl+o to expand)
+
+● My new code lives inside if count is not None:. So if get_participant_count
+  always returns None, my idle check never even sees a count value to evaluate.
+  That makes the new rule dead code in your test — same root cause that has
+  always hidden the participant count from the bot, but mass-exit at least had
+  low_streak initialized so the absence of any count was harmless. My rule needs
+  the count to fire.
+
+  Two problems to solve, in order of importance:
+
+  1. Why is the count always None? I need to see what Meet actually puts in the
+  page DOM in your locale (th-TH). The bot is running on a real Chrome profile
+  you've signed in to, so I can't reproduce this — you need to capture the DOM.
+  2. Should the idle rule depend on count? No. "Only me + the bot" can be
+  detected more directly: the bot's video tile is the only other tile, or Meet's
+  "people" panel shows exactly 2 entries, or the user explicitly tests by
+  leaving.
+
+  Let me ask you:
+
+● User answered Claude's questions:
+  ⎿  · The scraper can't find the count in Meet's body text. How do you want to 
+     proceed? → In my PC, the counter can be found on the top-right screen with 
+     <div class="XUyvz" style=""><div class="fs3avc">2</div></div>
+
+● The count is in <div class="fs3avc">2</div> — a div with a class that holds
+  the bare number. Let me find that and verify it on the page, then rewrite the
+  scraper.
+
+  Read 1 file (ctrl+o to expand)
+
+● Before I edit, two things to ask you, because the class name fs3avc is the
+  kind of obfuscated class Google rotates:
+
+● User answered Claude's questions:
+  ⎿  · How should I rewrite the scraper? → Targeted: query `div.fs3avc` directly
+     · How do you want to verify after the fix? → Re-run the 2-person test after
+     the fix (Recommended)
+  ⎿  Interrupted · What should Claude do instead?

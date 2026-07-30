@@ -1,0 +1,3071 @@
+╭─── Claude Code v2.1.218 ─────────────────────────────────────────────────────╮
+│                                      │ Tips for getting started              │
+│             Welcome back!            │ Run /init to create a CLAUDE.md file… │
+│                                      │ ───────────────────────────────────── │
+│                ▐▛███▜▌               │ What's new                            │
+│               ▝▜█████▛▘              │ Changed `/code-review` to run as a b… │
+│                 ▘▘ ▝▝                │ Added screen-reader announcements of… │
+│                                      │ Fixed Windows paths with `\u`-prefix… │
+│    minimax-m3 · API Usage Billing    │ /release-notes for more               │
+│   ~/Documents/meeting-transcripter   │                                       │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ Read the MDs in the working directory first to understand the overview of the 
+  project, then modify so that there are 3 options for using this project:      
+  Screen recording a meeting, transcribe (voice to text) a meeting into MD, and 
+  use AI agent to summarize the meeting (from shared screen visuals and         
+  transcripted voice. You can have 3 directory for eacnh of the options. After  
+  that, have a docs/ folder and export your plan here. Ask me questions first.  
+
+  Thought for 4s (ctrl+o to expand)
+
+● I'll start by reading the MD files in the working directory to understand the
+  project.
+
+  Read 2 files, listed 1 directory (ctrl+o to expand)
+
+● Now I have a clear picture. Let me check a few key project files to understand
+  the existing patterns and infrastructure.
+
+  Read 4 files (ctrl+o to expand)
+
+● Now I have a complete understanding. Before I plan the new structure, I have
+  some important questions to clarify.
+
+  The current project is a single flow: join a meeting → record audio → 
+  transcribe. You're asking me to break it apart into 3 independent, composable
+  options:
+
+  1. Screen recording (record the meeting — likely video/screen capture, not
+  just audio)
+  2. Transcribe (voice-to-text — feed an existing audio file into whisper)
+  3. AI agent to summarize (use the transcript + screen visuals to produce a
+  summary)
+
+  Let me ask before I plan:
+
+● User answered Claude's questions:
+  ⎿  · For Option 1 (Screen recording), what should be captured? → Screen video 
+     of the meeting browser (Recommended)
+     · For Option 2 (Transcribe), what is the audio source? → Reuse audio from 
+     the recording option (Recommended)
+     · For Option 3 (AI summary), what should the agent consume? → Transcript + 
+     extracted screen frames (Recommended)
+     · For the AI agent, which backend should it use? → FCC claude from 
+     https://github.com/Alishahryar1/free-claude-code (with my configured API 
+     key.) If too complex, use Ollama / llama.cpp 
+
+  Thought for 8s (ctrl+o to expand)
+
+● Got it. A few more questions before I plan, because "FCC claude" implies a
+  custom endpoint and there are still some architecture choices to make.
+
+● User answered Claude's questions:
+  ⎿  · How should the three options be exposed at the command line? → Three 
+     separate scripts + a dispatcher (Recommended)
+     · For the AI backend, how should the FCC Claude endpoint be configured? → 
+     Pluggable — env vars, no code change for either (Recommended)
+     · Should the three options be runnable individually, in any combination? → 
+     Both individually and in chain of all 3.
+     · For screen video, how should frames be sampled for the AI summary? → 
+     Option 2 (but does it work when a user share screens a video?)
+
+● Got it — and good catch on the user-shares-a-video concern. Scene-change
+  detection handles that case naturally (a video stream is just lots of
+  changes), but periodic sampling would miss frames inside the video. Let me ask
+  one more focused round before planning:
+
+● User answered Claude's questions:
+  ⎿  · For the AI summary's frame sampling, the right answer to your "user 
+     shares a video" concern is to combine scene-change detection with periodic 
+     sampling. Is that acceptable? → Option 1, also show me how to configure it.
+     · How should the "all 3 in chain" mode work? → Pipeline script that chains 
+     all three, plus three standalone options
+     · What video container/codec should the screen recorder produce? → MP4 
+     (H.264 + AAC) (Recommended)
+
+● All answers captured. I have enough to write the plan. Let me enter plan mode
+  so you can review before any code changes.
+
+● Entered plan mode
+  Claude is now exploring and designing an implementation approach.
+
+● Plan mode is active. I've already done the exploration (read all the MDs, the
+  bash scripts, the Python join script, the trigger server, and the setup). Now
+  I'll write the plan to the plan file.
+
+● Updated plan
+  ⎿  /plan to preview
+  ⎿  User rejected Claude's plan:
+     ╭─────────────────────────────────────────────────────────────────────────╮
+     │ Plan: Split meeting-transcripter into 3 composable options              │
+     │                                                                         │
+     │ Context                                                                 │
+     │                                                                         │
+     │ The current project is one monolithic pipeline:                         │
+     │ record_and_transcribe.sh <url> <name> [display_name] [lang] joins a     │
+     │ meeting, records audio into a virtual sink, and runs whisper.cpp on the │
+     │ WAV. It cannot:                                                         │
+     │                                                                         │
+     │ - Record the screen (only audio is captured).                           │
+     │ - Process an existing audio file (it always joins a fresh meeting).     │
+     │ - Produce an AI summary that combines what was said with what was       │
+     │ shown.                                                                  │
+     │                                                                         │
+     │ The user wants three self-contained, composable options that can be run │
+     │ individually or chained together:                                       │
+     │                                                                         │
+     │ 1. Screen recording — capture the meeting browser window to MP4 (video  │
+     │ + audio).                                                               │
+     │ 2. Transcribe — voice-to-text, accepting a recording produced by option │
+     │ 1 or any audio file.                                                    │
+     │ 3. AI agent summary — feed a transcript + keyframes from the video into │
+     │ a vision-capable LLM via the FCC Claude endpoint, and produce a         │
+     │ summary.                                                                │
+     │                                                                         │
+     │ The existing code (login flow, Xvfb + PulseAudio + Playwright, kill     │
+     │ switch, Thai button labels, trigger server) is the foundation for       │
+     │ option 1's meeting-join step. The new work is mostly additive: extract  │
+     │ the existing audio-only recording path into a shared library, add a     │
+     │ video recording path, add a standalone transcription entry point, and   │
+     │ add the AI summarizer.                                                  │
+     │                                                                         │
+     │ Target structure                                                        │
+     │                                                                         │
+     │ meeting-transcripter/                                                   │
+     │ ├── README.md                         # updated to describe the three   │
+     │ options                                                                 │
+     │ ├── docs/                             # NEW: each option has its own    │
+     │ doc                                                                     │
+     │ │   ├── 01-screen-recording.md                                          │
+     │ │   ├── 02-transcribe.md                                                │
+     │ │   └── 03-ai-summary.md                                                │
+     │ ├── screen/                           # NEW: option 1                   │
+     │ │   ├── README.md                                                       │
+     │ │   ├── record_screen.sh              # main entry: <meeting_url>       │
+     │ <name> [display_name]                                                   │
+     │ │   ├── capture.py                    # Playwright + Xvfb +             │
+     │ ffmpeg-x11grab (the screen recorder)                                    │
+     │ │   └── extract_frames.py             # scene-change + periodic frame   │
+     │ extraction from MP4                                                     │
+     │ ├── transcribe/                       # NEW: option 2                   │
+     │ │   ├── README.md                                                       │
+     │ │   └── transcribe.sh                 # main entry: <audio_file> <name> │
+     │ [language]                                                              │
+     │ ├── summarize/                        # NEW: option 3                   │
+     │ │   ├── README.md                                                       │
+     │ │   ├── summarize.py                  # main entry: <video_path>        │
+     │ <transcript_path> [<output_path>]                                       │
+     │ │   ├── llm_client.py                 # FCC / Anthropic / Ollama        │
+     │ swappable backend                                                       │
+     │ │   └── prompts/                                                        │
+     │ │       └── summarize.md              # the system + user prompt        │
+     │ template                                                                │
+     │ ├── pipeline.sh                       # NEW: chains all three when      │
+     │ given a meeting URL                                                     │
+     │ ├── setup.sh                          # UNCHANGED: still installs       │
+     │ everything                                                              │
+     │ ├── audio-setup.sh                    # UNCHANGED: still creates the    │
+     │ virtual sink                                                            │
+     │ ├── first_time_login.sh               # UNCHANGED: still the one-time   │
+     │ interactive login                                                       │
+     │ ├── kill_meeting.sh                   # kept at root, works for both    │
+     │ record_screen & the pipeline                                            │
+     │ ├── meeting-bot-trigger.service       # UNCHANGED                       │
+     │ └── trigger_server.py                 # UNCHANGED: still launches the   │
+     │ pipeline script                                                         │
+     │                                                                         │
+     │ The single existing record_and_transcribe.sh and join_meeting.py are    │
+     │ moved/renamed into screen/ (the audio-only path becomes a side-effect   │
+     │ of the screen capture, since meeting_sink.monitor is already routed).   │
+     │ The shared infrastructure (Xvfb, PulseAudio, login profile, kill        │
+     │ sentinel) stays where it is because all three options eventually want   │
+     │ to launch a meeting.                                                    │
+     │                                                                         │
+     │ Critical files to be created / modified                                 │
+     │                                                                         │
+     │ Created (new)                                                           │
+     │                                                                         │
+     │ - screen/record_screen.sh — Main entry for option 1. Caller-facing      │
+     │ usage:                                                                  │
+     │ sudo -H ./screen/record_screen.sh                                       │
+     │ "https://meet.google.com/abc-defg-hij" "Weekly Standup"                 │
+     │ - Internals: start Xvfb :99 (with pre-cleanup of any leftover), run     │
+     │ audio-setup.sh, open the meeting via capture.py, then start ffmpeg to   │
+     │ capture:                                                                │
+     │   - Video from DISPLAY=:99 with ffmpeg -f x11grab -video_size 1280x800  │
+     │ -framerate 15 -i :99 (the meeting browser window lives on the virtual   │
+     │ display; capturing the whole display is simpler than window-scraping    │
+     │ and matches what the user sees).                                        │
+     │   - Audio from meeting_sink.monitor (same sink as today).               │
+     │   - Mux both into a single MP4 (H.264 + AAC, -c:v libx264 -preset       │
+     │ ultrafast -crf 28 -c:a aac -b:a 128k).                                  │
+     │   - Output: /opt/meeting-bot/recordings/<name>_<timestamp>.mp4.         │
+     │   - Reuses the existing kill-sentinel mechanism (/tmp/meeting_bot_kill) │
+     │ and kill-switch signal trap. kill_meeting.sh keeps working unchanged.   │
+     │ - screen/capture.py — Playwright driver for option 1. Replaces today's  │
+     │ join_meeting.py (which is moved here as the foundation). Adds:          │
+     │   - Locale-agnostic button labels (carry over the Thai labels already   │
+     │ added).                                                                 │
+     │   - Same kill-sentinel handling.                                        │
+     │   - Same waiting-room / admission / auto-leave logic.                   │
+     │   - One new responsibility: when the meeting ends, the script returns   │
+     │ so the parent shell can stop ffmpeg and mux the MP4. This is the same   │
+     │ flow as today.                                                          │
+     │ - screen/extract_frames.py — Frame extractor for option 3. Accepts the  │
+     │ MP4 from option 1 and produces:                                         │
+     │   - /opt/meeting-bot/frames/<name>_<timestamp>/frame_<NNNN>.jpg — JPEG  │
+     │ keyframes.                                                              │
+     │   - /opt/meeting-bot/frames/<name>_<timestamp>/manifest.json — list of  │
+     │ {path, timestamp_s, kind: "scene_change"|"periodic"} so the LLM knows   │
+     │ when each frame was taken.                                              │
+     │   - Algorithm:                                                          │
+     │       i. ffmpeg select='gt(scene,0.3)',showinfo extracts frames where   │
+     │ the scene-change score crosses a threshold (default 0.3 —               │
+     │ configurable). Reasonable for slide transitions and shared-video cuts.  │
+     │     ii. After scene-change extraction, a second pass adds periodic      │
+     │ frames every FRAME_PERIOD_SECONDS (default 30s) if not already covered  │
+     │ by a scene-change within ±period/2 of that timestamp. This is the       │
+     │ safety net for "user shares a video" (scene-change catches it but only  │
+     │ emits the I-frame; periodic makes sure we don't miss the in-between if  │
+     │ the scene-score dips) and for "static slide for 5 minutes" (periodic    │
+     │ still returns at least one frame for that window).                      │
+     │     iii. ffmpeg -vsync vfr -frame_pts true keeps timestamps accurate.   │
+     │   - Configurable via env vars: SCENE_THRESHOLD (default 0.3),           │
+     │ FRAME_PERIOD_SECONDS (default 30), FRAME_OUTPUT_DIR (default            │
+     │ /opt/meeting-bot/frames).                                               │
+     │ - transcribe/transcribe.sh — Main entry for option 2. Usage:            │
+     │ sudo -H ./transcribe/transcribe.sh                                      │
+     │ /opt/meeting-bot/recordings/<name>_<timestamp>.wav "<name>" [language]  │
+     │ - Or, given an MP4 from option 1:                                       │
+     │ sudo -H ./transcribe/transcribe.sh                                      │
+     │ /opt/meeting-bot/recordings/<name>_<timestamp>.mp4 "<name>"             │
+     │ - Internals: if input is .mp4, ffmpeg extracts the AAC audio track to a │
+     │ 16kHz mono WAV first (reuses today's -ar 16000 -ac 1 settings). Then    │
+     │ run whisper-cli exactly the same way record_and_transcribe.sh does      │
+     │ today. Output:                                                          │
+     │ /opt/meeting-bot/transcripts/<name>_<timestamp>.{txt,srt}. Same         │
+     │ WHISPER_MODEL and language conventions.                                 │
+     │ - summarize/llm_client.py — Pluggable LLM client. Reads from env:       │
+     │   - ANTHROPIC_BASE_URL (default https://api.anthropic.com, set to the   │
+     │ FCC endpoint for the free proxy)                                        │
+     │   - ANTHROPIC_API_KEY (required)                                        │
+     │   - SUMMARY_MODEL (default claude-sonnet-4-5, override for the FCC      │
+     │ model name)                                                             │
+     │   - SUMMARY_BACKEND = anthropic (default) | ollama (fallback)           │
+     │   - Uses the anthropic Python SDK (already installable via pip install  │
+     │ anthropic). The SDK honors ANTHROPIC_BASE_URL, so the FCC endpoint      │
+     │ works without code changes. The Ollama path is a separate function that │
+     │ hits http://localhost:11434/api/chat — only wired in if                 │
+     │ SUMMARY_BACKEND=ollama.                                                 │
+     │   - Public API: summarize(frames: list[FrameMeta], transcript: str,     │
+     │ prompt_template: str) -> str. Frames are sent as image blocks in the    │
+     │ user message; the transcript is appended as text.                       │
+     │ - summarize/summarize.py — Main entry for option 3. Usage:              │
+     │ python3 summarize/summarize.py <video_path> <transcript_path>           │
+     │ [<output_md_path>]                                                      │
+     │ - Internals:                                                            │
+     │   a. Call extract_frames.py to produce the frame manifest + JPEGs.      │
+     │   b. Read the transcript text.                                          │
+     │   c. Build the prompt from summarize/prompts/summarize.md (system +     │
+     │ user template). The prompt instructs the model to: produce a Markdown   │
+     │ summary with sections "Key decisions", "Action items (with owners)",    │
+     │ "Topics discussed", "Slides / visuals referenced", and cite which       │
+     │ timestamps each point came from.                                        │
+     │   d. Send frames + transcript to the LLM.                               │
+     │   e. Write the returned Markdown to the output path (default:           │
+     │ /opt/meeting-bot/summaries/<name>_<timestamp>.md).                      │
+     │   f. Print a short preview to stdout.                                   │
+     │ - summarize/prompts/summarize.md — The prompt template. Holds the       │
+     │ system prompt, the user-prompt skeleton ({transcript} and               │
+     │ {frame_manifest} placeholders), and a JSON schema for the summary       │
+     │ output the model should follow. Keep this in a separate file so the     │
+     │ user can tune it without touching code.                                 │
+     │ - pipeline.sh — Top-level convenience script:                           │
+     │ sudo -H ./pipeline.sh "https://meet.google.com/abc-defg-hij" "Weekly    │
+     │ Standup"                                                                │
+     │ - Runs: screen/record_screen.sh → transcribe/transcribe.sh (on the      │
+     │ produced MP4) → summarize/summarize.py (on the MP4 + transcript).       │
+     │ Prints the final paths. Bails on any stage failure with a clear         │
+     │ message. This is what trigger_server.py keeps pointing at (it just      │
+     │ changes the script path).                                               │
+     │ - docs/01-screen-recording.md, docs/02-transcribe.md,                   │
+     │ docs/03-ai-summary.md — Per-option docs. Each has:                      │
+     │   - What it does (1 paragraph).                                         │
+     │   - Prerequisites (linking back to setup.sh).                           │
+     │   - Usage (CLI invocation + output paths).                              │
+     │   - Configurable knobs (env vars + their defaults).                     │
+     │   - Common pitfalls + debugging tips.                                   │
+     │                                                                         │
+     │ Modified                                                                │
+     │                                                                         │
+     │ - README.md — Top-level overview now leads with the three options and   │
+     │ links each to its doc. The "Day-to-day usage" section is rewritten to   │
+     │ show the three standalone invocations plus the pipeline.sh shortcut.    │
+     │ The Files table is updated with the new directory layout. The "VM       │
+     │ sizing" / "Architecture" / "Thai language" sections move into the docs  │
+     │ where appropriate.                                                      │
+     │ - setup.sh — Add the anthropic Python package to the venv (pip install  │
+     │ anthropic) and create the new output directories:                       │
+     │ mkdir -p /opt/meeting-bot/{recordings,transcripts,summaries,frames}     │
+     │ - Also install libx264-dev if not already present (already provided by  │
+     │ build-essential + ffmpeg on Ubuntu, but make it explicit). No new       │
+     │ OS-level deps needed beyond ffmpeg's existing -codecs.                  │
+     │ - trigger_server.py — One-line change: MEETING_BOT_SCRIPT default       │
+     │ becomes /opt/meeting-bot/pipeline.sh instead of the old record-only     │
+     │ script. The trigger endpoint keeps the same JSON contract — pipeline.sh │
+     │ accepts the same <url> <name> arguments.                                │
+     │ - kill_meeting.sh — Update the pgrep patterns to match the new script   │
+     │ names (pipeline.sh, screen/record_screen.sh, summarize/summarize.py,    │
+     │ transcribe/transcribe.sh). Already-route through the kill sentinel, so  │
+     │ the Python-level clean-leave logic carries over.                        │
+     │                                                                         │
+     │ Unchanged                                                               │
+     │                                                                         │
+     │ - audio-setup.sh — still creates meeting_sink; consumed by both         │
+     │ screen/record_screen.sh and the older audio-only path.                  │
+     │ - first_time_login.sh — still the one-time interactive login.           │
+     │ - meeting-bot-trigger.service — still references trigger_server.py, no  │
+     │ change.                                                                 │
+     │ - The Thai button labels and kill-sentinel logic from the prior session │
+     │ are preserved verbatim in screen/capture.py.                            │
+     │                                                                         │
+     │ Frame-sampling configuration (option 3)                                 │
+     │                                                                         │
+     │ User asked to be shown how to configure the scene-change + periodic     │
+     │ sampling. From summarize/summarize.py:                                  │
+     │                                                                         │
+     │ # Skip the periodic safety net entirely (scene-change only):            │
+     │ FRAME_PERIOD_SECONDS=0 python3 summarize/summarize.py video.mp4         │
+     │ transcript.txt                                                          │
+     │                                                                         │
+     │ # Aggressive sampling (every 10s + any scene change):                   │
+     │ FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2 python3                     │
+     │ summarize/summarize.py ...                                              │
+     │                                                                         │
+     │ # Very conservative (every 5 minutes, only major slides):               │
+     │ FRAME_PERIOD_SECONDS=300 SCENE_THRESHOLD=0.6 python3                    │
+     │ summarize/summarize.py ...                                              │
+     │                                                                         │
+     │ Defaults that work for most meetings: SCENE_THRESHOLD=0.3,              │
+     │ FRAME_PERIOD_SECONDS=30. The safety net is the answer to the "user      │
+     │ shares a video" concern — a shared video has continuous scene changes,  │
+     │ so we still get coverage; the periodic pass additionally guarantees at  │
+     │ least one frame per 30s window when nothing is changing.                │
+     │                                                                         │
+     │ AI backend configuration (option 3)                                     │
+     │                                                                         │
+     │ The Anthropic Python SDK honors ANTHROPIC_BASE_URL, so the FCC endpoint │
+     │ is just env vars — no code change:                                      │
+     │                                                                         │
+     │ # FCC free proxy:                                                       │
+     │ export ANTHROPIC_BASE_URL="https://<your-fcc-host>"                     │
+     │ export ANTHROPIC_API_KEY="<your-fcc-key>"                               │
+     │ export SUMMARY_MODEL="<the model FCC exposes, e.g. claude-sonnet-4-5>"  │
+     │                                                                         │
+     │ # Or direct Anthropic API:                                              │
+     │ export ANTHROPIC_BASE_URL="https://api.anthropic.com"                   │
+     │ export ANTHROPIC_API_KEY="sk-ant-..."                                   │
+     │ export SUMMARY_MODEL="claude-sonnet-4-5"                                │
+     │                                                                         │
+     │ # Or Ollama fallback (no SDK needed):                                   │
+     │ export SUMMARY_BACKEND="ollama"                                         │
+     │ export OLLAMA_HOST="http://localhost:11434"                             │
+     │ export OLLAMA_MODEL="llava:13b"   # vision-capable local model          │
+     │                                                                         │
+     │ These are documented in docs/03-ai-summary.md.                          │
+     │                                                                         │
+     │ Reused existing code                                                    │
+     │                                                                         │
+     │ - first_time_login.sh — login flows (no change).                        │
+     │ - audio-setup.sh — virtual sink (no change).                            │
+     │ - The Thai-localization + kill-sentinel + waiting-room handling from    │
+     │ recent join_meeting.py edits → carried into screen/capture.py.          │
+     │ - trigger_server.py — kept; only the default script path changes.       │
+     │ - whisper.cpp binary + model — transcribe/transcribe.sh shells out to   │
+     │ the same /opt/whisper.cpp/build/bin/whisper-cli that                    │
+     │ record_and_transcribe.sh already uses.                                  │
+     │ - The mkdir -p /opt/meeting-bot/... pattern from setup.sh is extended,  │
+     │ not replaced.                                                           │
+     │                                                                         │
+     │ Verification                                                            │
+     │                                                                         │
+     │ 1. screen/record_screen.sh — sudo -H ./screen/record_screen.sh          │
+     │ "https://meet.google.com/<test>" "test-screen". Expect: join succeeds   │
+     │ via Thai labels, MP4 produced at                                        │
+     │ /opt/meeting-bot/recordings/test-screen_<ts>.mp4. Play the MP4 with     │
+     │ ffplay and confirm both video and audio are present. Confirm time       │
+     │ matches the meeting duration.                                           │
+     │ 2. kill_meeting.sh still works — start a recording, run sudo            │
+     │ ./kill_meeting.sh from another terminal. Expect: bot clicks Leave in    │
+     │ Meet, MP4 finalizes, summary isn't run (no chain).                      │
+     │ 3. transcribe/transcribe.sh — sudo -H ./transcribe/transcribe.sh        │
+     │ /opt/meeting-bot/recordings/test-screen_<ts>.mp4 "test-screen". Expect: │
+     │ TXT + SRT produced at                                                   │
+     │ /opt/meeting-bot/transcripts/test-screen_<ts>.{txt,srt}. Spot-check the │
+     │ transcript against the audio.                                           │
+     │ 4. summarize/summarize.py — python3 summarize/summarize.py              │
+     │ /opt/meeting-bot/recordings/test-screen_<ts>.mp4                        │
+     │ /opt/meeting-bot/transcripts/test-screen_<ts>.txt. Expect: frame        │
+     │ manifest at /opt/meeting-bot/frames/test-screen_<ts>/manifest.json,     │
+     │ summary at /opt/meeting-bot/summaries/test-screen_<ts>.md. Confirm the  │
+     │ summary has the expected sections and cites timestamps.                 │
+     │ 5. pipeline.sh — sudo -H ./pipeline.sh "https://meet.google.com/<test>" │
+     │ "all-three". Expect: all three stages run in order, summary produced    │
+     │ at the end.                                                             │
+     │ 6. Trigger server — curl -X POST http://localhost:8765/trigger -H       │
+     │ "Authorization: Bearer $TOKEN" -d '{"url":"...","name":"phone"}'.       │
+     │ Expect: 202, recording runs in background, MP4 + transcript + summary   │
+     │ all produced.                                                           │
+     │ 7. Frame sampling knobs — FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2   │
+     │ python3 summarize/summarize.py .... Expect: roughly 6× more frames in   │
+     │ the manifest than with defaults.                                        │
+     │ 8. FCC endpoint — point ANTHROPIC_BASE_URL at the FCC host, run step 4. │
+     │ Expect: a returned Markdown summary (not a connection error). The       │
+     │ exact model name goes in SUMMARY_MODEL.                                 │
+     │                                                                         │
+     │ Out of scope                                                            │
+     │                                                                         │
+     │ - Replacing the existing record_and_transcribe.sh callers (none exist   │
+     │ outside the project — the README is the only consumer). The user can    │
+     │ keep the old script as a shim if they want a no-video fast path; if     │
+     │ not, it gets deleted.                                                   │
+     │ - Auto-uploading summaries to a notes platform (Notion, Slack, etc.) —  │
+     │ easy to add later as a post-step.                                       │
+     │ - Real-time summaries during the meeting — the current pipeline is      │
+     │ post-meeting only.                                                      │
+     │ - Whisper speaker diarization — out of scope; the AI summary asks the   │
+     │ model to attribute action items by name from the transcript context,    │
+     │ which is a reasonable approximation.                                    │
+     ╰─────────────────────────────────────────────────────────────────────────╯
+
+● Understood — switching from a docs/ folder to a CLAUDE.md file at the project
+  root that holds the plan for future sessions. Let me update the plan file to
+  reflect this change, then exit plan mode.
+
+● Updated plan
+  ⎿  /plan to preview
+
+● Updated plan
+  ⎿  /plan to preview
+
+● Updated plan
+  ⎿  /plan to preview
+  ⎿  User rejected Claude's plan:
+     ╭─────────────────────────────────────────────────────────────────────────╮
+     │ Plan: Split meeting-transcripter into 3 composable options              │
+     │                                                                         │
+     │ Context                                                                 │
+     │                                                                         │
+     │ The current project is one monolithic pipeline:                         │
+     │ record_and_transcribe.sh <url> <name> [display_name] [lang] joins a     │
+     │ meeting, records audio into a virtual sink, and runs whisper.cpp on the │
+     │ WAV. It cannot:                                                         │
+     │                                                                         │
+     │ - Record the screen (only audio is captured).                           │
+     │ - Process an existing audio file (it always joins a fresh meeting).     │
+     │ - Produce an AI summary that combines what was said with what was       │
+     │ shown.                                                                  │
+     │                                                                         │
+     │ The user wants three self-contained, composable options that can be run │
+     │ individually or chained together:                                       │
+     │                                                                         │
+     │ 1. Screen recording — capture the meeting browser window to MP4 (video  │
+     │ + audio).                                                               │
+     │ 2. Transcribe — voice-to-text, accepting a recording produced by option │
+     │ 1 or any audio file.                                                    │
+     │ 3. AI agent summary — feed a transcript + keyframes from the video into │
+     │ a vision-capable LLM via the FCC Claude endpoint, and produce a         │
+     │ summary.                                                                │
+     │                                                                         │
+     │ The existing code (login flow, Xvfb + PulseAudio + Playwright, kill     │
+     │ switch, Thai button labels, trigger server) is the foundation for       │
+     │ option 1's meeting-join step. The new work is mostly additive: extract  │
+     │ the existing audio-only recording path into a shared library, add a     │
+     │ video recording path, add a standalone transcription entry point, and   │
+     │ add the AI summarizer.                                                  │
+     │                                                                         │
+     │ Target structure                                                        │
+     │                                                                         │
+     │ meeting-transcripter/                                                   │
+     │ ├── README.md                         # updated to describe the three   │
+     │ options                                                                 │
+     │ ├── CLAUDE.md                         # NEW: persistent project-context │
+     │ file for future                                                         │
+     │ │                                      # Claude sessions (replaces the  │
+     │ docs/ folder).                                                          │
+     │ │                                      # Contains the same per-option   │
+     │ content that 01/02/03                                                   │
+     │ │                                      # would have held, plus the      │
+     │ architectural reasoning                                                 │
+     │ │                                      # and conventions future Claude  │
+     │ sessions need.                                                          │
+     │ ├── screen/                           # NEW: option 1                   │
+     │ │   ├── README.md                                                       │
+     │ │   ├── record_screen.sh              # main entry: <meeting_url>       │
+     │ <name> [display_name]                                                   │
+     │ │   ├── capture.py                    # Playwright + Xvfb +             │
+     │ ffmpeg-x11grab (the screen recorder)                                    │
+     │ │   └── extract_frames.py             # scene-change + periodic frame   │
+     │ extraction from MP4                                                     │
+     │ ├── transcribe/                       # NEW: option 2                   │
+     │ │   ├── README.md                                                       │
+     │ │   └── transcribe.sh                 # main entry: <audio_file> <name> │
+     │ [language]                                                              │
+     │ ├── summarize/                        # NEW: option 3                   │
+     │ │   ├── README.md                                                       │
+     │ │   ├── summarize.py                  # main entry: <video_path>        │
+     │ <transcript_path> [<output_path>]                                       │
+     │ │   ├── llm_client.py                 # FCC / Anthropic / Ollama        │
+     │ swappable backend                                                       │
+     │ │   └── prompts/                                                        │
+     │ │       └── summarize.md              # the system + user prompt        │
+     │ template                                                                │
+     │ ├── pipeline.sh                       # NEW: chains all three when      │
+     │ given a meeting URL                                                     │
+     │ ├── setup.sh                          # UNCHANGED: still installs       │
+     │ everything                                                              │
+     │ ├── audio-setup.sh                    # UNCHANGED: still creates the    │
+     │ virtual sink                                                            │
+     │ ├── first_time_login.sh               # UNCHANGED: still the one-time   │
+     │ interactive login                                                       │
+     │ ├── kill_meeting.sh                   # kept at root, works for both    │
+     │ record_screen & the pipeline                                            │
+     │ ├── meeting-bot-trigger.service       # UNCHANGED                       │
+     │ └── trigger_server.py                 # UNCHANGED: still launches the   │
+     │ pipeline script                                                         │
+     │                                                                         │
+     │ The single existing record_and_transcribe.sh and join_meeting.py are    │
+     │ moved/renamed into screen/ (the audio-only path becomes a side-effect   │
+     │ of the screen capture, since meeting_sink.monitor is already routed).   │
+     │ The shared infrastructure (Xvfb, PulseAudio, login profile, kill        │
+     │ sentinel) stays where it is because all three options eventually want   │
+     │ to launch a meeting.                                                    │
+     │                                                                         │
+     │ Critical files to be created / modified                                 │
+     │                                                                         │
+     │ Created (new)                                                           │
+     │                                                                         │
+     │ - screen/record_screen.sh — Main entry for option 1. Caller-facing      │
+     │ usage:                                                                  │
+     │ sudo -H ./screen/record_screen.sh                                       │
+     │ "https://meet.google.com/abc-defg-hij" "Weekly Standup"                 │
+     │ - Internals: start Xvfb :99 (with pre-cleanup of any leftover), run     │
+     │ audio-setup.sh, open the meeting via capture.py, then start ffmpeg to   │
+     │ capture:                                                                │
+     │   - Video from DISPLAY=:99 with ffmpeg -f x11grab -video_size 1280x800  │
+     │ -framerate 15 -i :99 (the meeting browser window lives on the virtual   │
+     │ display; capturing the whole display is simpler than window-scraping    │
+     │ and matches what the user sees).                                        │
+     │   - Audio from meeting_sink.monitor (same sink as today).               │
+     │   - Mux both into a single MP4 (H.264 + AAC, -c:v libx264 -preset       │
+     │ ultrafast -crf 28 -c:a aac -b:a 128k).                                  │
+     │   - Output: /opt/meeting-bot/recordings/<name>_<timestamp>.mp4.         │
+     │   - Reuses the existing kill-sentinel mechanism (/tmp/meeting_bot_kill) │
+     │ and kill-switch signal trap. kill_meeting.sh keeps working unchanged.   │
+     │ - screen/capture.py — Playwright driver for option 1. Replaces today's  │
+     │ join_meeting.py (which is moved here as the foundation). Adds:          │
+     │   - Locale-agnostic button labels (carry over the Thai labels already   │
+     │ added).                                                                 │
+     │   - Same kill-sentinel handling.                                        │
+     │   - Same waiting-room / admission / auto-leave logic.                   │
+     │   - One new responsibility: when the meeting ends, the script returns   │
+     │ so the parent shell can stop ffmpeg and mux the MP4. This is the same   │
+     │ flow as today.                                                          │
+     │ - screen/extract_frames.py — Frame extractor for option 3. Accepts the  │
+     │ MP4 from option 1 and produces:                                         │
+     │   - /opt/meeting-bot/frames/<name>_<timestamp>/frame_<NNNN>.jpg — JPEG  │
+     │ keyframes.                                                              │
+     │   - /opt/meeting-bot/frames/<name>_<timestamp>/manifest.json — list of  │
+     │ {path, timestamp_s, kind: "scene_change"|"periodic"} so the LLM knows   │
+     │ when each frame was taken.                                              │
+     │   - Algorithm:                                                          │
+     │       i. ffmpeg select='gt(scene,0.3)',showinfo extracts frames where   │
+     │ the scene-change score crosses a threshold (default 0.3 —               │
+     │ configurable). Reasonable for slide transitions and shared-video cuts.  │
+     │     ii. After scene-change extraction, a second pass adds periodic      │
+     │ frames every FRAME_PERIOD_SECONDS (default 30s) if not already covered  │
+     │ by a scene-change within ±period/2 of that timestamp. This is the       │
+     │ safety net for "user shares a video" (scene-change catches it but only  │
+     │ emits the I-frame; periodic makes sure we don't miss the in-between if  │
+     │ the scene-score dips) and for "static slide for 5 minutes" (periodic    │
+     │ still returns at least one frame for that window).                      │
+     │     iii. ffmpeg -vsync vfr -frame_pts true keeps timestamps accurate.   │
+     │   - Configurable via env vars: SCENE_THRESHOLD (default 0.3),           │
+     │ FRAME_PERIOD_SECONDS (default 30), FRAME_OUTPUT_DIR (default            │
+     │ /opt/meeting-bot/frames).                                               │
+     │ - transcribe/transcribe.sh — Main entry for option 2. Usage:            │
+     │ sudo -H ./transcribe/transcribe.sh                                      │
+     │ /opt/meeting-bot/recordings/<name>_<timestamp>.wav "<name>" [language]  │
+     │ - Or, given an MP4 from option 1:                                       │
+     │ sudo -H ./transcribe/transcribe.sh                                      │
+     │ /opt/meeting-bot/recordings/<name>_<timestamp>.mp4 "<name>"             │
+     │ - Internals: if input is .mp4, ffmpeg extracts the AAC audio track to a │
+     │ 16kHz mono WAV first (reuses today's -ar 16000 -ac 1 settings). Then    │
+     │ run whisper-cli exactly the same way record_and_transcribe.sh does      │
+     │ today. Output:                                                          │
+     │ /opt/meeting-bot/transcripts/<name>_<timestamp>.{txt,srt}. Same         │
+     │ WHISPER_MODEL and language conventions.                                 │
+     │ - summarize/llm_client.py — Pluggable LLM client. Reads from env:       │
+     │   - ANTHROPIC_BASE_URL (default https://api.anthropic.com, set to the   │
+     │ FCC endpoint for the free proxy)                                        │
+     │   - ANTHROPIC_API_KEY (required)                                        │
+     │   - SUMMARY_MODEL (default claude-sonnet-4-5, override for the FCC      │
+     │ model name)                                                             │
+     │   - SUMMARY_BACKEND = anthropic (default) | ollama (fallback)           │
+     │   - Uses the anthropic Python SDK (already installable via pip install  │
+     │ anthropic). The SDK honors ANTHROPIC_BASE_URL, so the FCC endpoint      │
+     │ works without code changes. The Ollama path is a separate function that │
+     │ hits http://localhost:11434/api/chat — only wired in if                 │
+     │ SUMMARY_BACKEND=ollama.                                                 │
+     │   - Public API: summarize(frames: list[FrameMeta], transcript: str,     │
+     │ prompt_template: str) -> str. Frames are sent as image blocks in the    │
+     │ user message; the transcript is appended as text.                       │
+     │ - summarize/summarize.py — Main entry for option 3. Usage:              │
+     │ python3 summarize/summarize.py <video_path> <transcript_path>           │
+     │ [<output_md_path>]                                                      │
+     │ - Internals:                                                            │
+     │   a. Call extract_frames.py to produce the frame manifest + JPEGs.      │
+     │   b. Read the transcript text.                                          │
+     │   c. Build the prompt from summarize/prompts/summarize.md (system +     │
+     │ user template). The prompt instructs the model to: produce a Markdown   │
+     │ summary with sections "Key decisions", "Action items (with owners)",    │
+     │ "Topics discussed", "Slides / visuals referenced", and cite which       │
+     │ timestamps each point came from.                                        │
+     │   d. Send frames + transcript to the LLM.                               │
+     │   e. Write the returned Markdown to the output path (default:           │
+     │ /opt/meeting-bot/summaries/<name>_<timestamp>.md).                      │
+     │   f. Print a short preview to stdout.                                   │
+     │ - summarize/prompts/summarize.md — The prompt template. Holds the       │
+     │ system prompt, the user-prompt skeleton ({transcript} and               │
+     │ {frame_manifest} placeholders), and a JSON schema for the summary       │
+     │ output the model should follow. Keep this in a separate file so the     │
+     │ user can tune it without touching code.                                 │
+     │ - pipeline.sh — Top-level convenience script:                           │
+     │ sudo -H ./pipeline.sh "https://meet.google.com/abc-defg-hij" "Weekly    │
+     │ Standup"                                                                │
+     │ - Runs: screen/record_screen.sh → transcribe/transcribe.sh (on the      │
+     │ produced MP4) → summarize/summarize.py (on the MP4 + transcript).       │
+     │ Prints the final paths. Bails on any stage failure with a clear         │
+     │ message. This is what trigger_server.py keeps pointing at (it just      │
+     │ changes the script path).                                               │
+     │ - CLAUDE.md — Persistent project-context file at the project root.      │
+     │ Replaces the originally-planned docs/ folder. Holds content future      │
+     │ Claude sessions need to be productive without re-reading source files,  │
+     │ including:                                                              │
+     │   - One-paragraph "what this project is" summary.                       │
+     │   - The three options at a glance (purpose, entry script, output        │
+     │ paths).                                                                 │
+     │   - Per-option content that 01/02/03 would have held: usage, env vars,  │
+     │ defaults, common pitfalls.                                              │
+     │   - The frame-sampling knobs and how they answer the "user shares a     │
+     │ video" concern.                                                         │
+     │   - The AI-backend env-var configuration (FCC + Anthropic + Ollama).    │
+     │   - Architectural conventions (sudo -H, /opt/meeting-bot paths, kill    │
+     │ sentinel, working-directory requirements).                              │
+     │   - "What NOT to do" notes (e.g. don't bring back --enable-automation   │
+     │ Playwright flags, don't replace meeting_sink audio capture with browser │
+     │ audio capture, etc.).                                                   │
+     │   - The pile of context-free facts that don't deserve to be memory      │
+     │ entries but are non-obvious from the code alone (e.g. why the Thai      │
+     │ labels exist, why --no-sandbox is required, why the kill sentinel       │
+     │ routes through the in-Meet Leave button).                               │
+     │                                                                         │
+     │ Modified                                                                │
+     │                                                                         │
+     │ - README.md — Top-level overview now leads with the three options and   │
+     │ points future readers to CLAUDE.md for the full per-option reference.   │
+     │ The "Day-to-day usage" section is rewritten to show the three           │
+     │ standalone invocations plus the pipeline.sh shortcut. The Files table   │
+     │ is updated with the new directory layout. The "VM sizing" /             │
+     │ "Architecture" / "Thai language" sections stay in the README (they're   │
+     │ user-facing) and a note at the top explains that CLAUDE.md is the       │
+     │ canonical reference for architectural decisions and per-option details. │
+     │ - setup.sh — Add the anthropic Python package to the venv (pip install  │
+     │ anthropic) and create the new output directories:                       │
+     │ mkdir -p /opt/meeting-bot/{recordings,transcripts,summaries,frames}     │
+     │ - Also install libx264-dev if not already present (already provided by  │
+     │ build-essential + ffmpeg on Ubuntu, but make it explicit). No new       │
+     │ OS-level deps needed beyond ffmpeg's existing -codecs.                  │
+     │ - trigger_server.py — One-line change: MEETING_BOT_SCRIPT default       │
+     │ becomes /opt/meeting-bot/pipeline.sh instead of the old record-only     │
+     │ script. The trigger endpoint keeps the same JSON contract — pipeline.sh │
+     │ accepts the same <url> <name> arguments.                                │
+     │ - kill_meeting.sh — Update the pgrep patterns to match the new script   │
+     │ names (pipeline.sh, screen/record_screen.sh, summarize/summarize.py,    │
+     │ transcribe/transcribe.sh). Already-route through the kill sentinel, so  │
+     │ the Python-level clean-leave logic carries over.                        │
+     │                                                                         │
+     │ Unchanged                                                               │
+     │                                                                         │
+     │ - audio-setup.sh — still creates meeting_sink; consumed by both         │
+     │ screen/record_screen.sh and the older audio-only path.                  │
+     │ - first_time_login.sh — still the one-time interactive login.           │
+     │ - meeting-bot-trigger.service — still references trigger_server.py, no  │
+     │ change.                                                                 │
+     │ - The Thai button labels and kill-sentinel logic from the prior session │
+     │ are preserved verbatim in screen/capture.py.                            │
+     │                                                                         │
+     │ Frame-sampling configuration (option 3)                                 │
+     │                                                                         │
+     │ User asked to be shown how to configure the scene-change + periodic     │
+     │ sampling. From summarize/summarize.py:                                  │
+     │                                                                         │
+     │ # Skip the periodic safety net entirely (scene-change only):            │
+     │ FRAME_PERIOD_SECONDS=0 python3 summarize/summarize.py video.mp4         │
+     │ transcript.txt                                                          │
+     │                                                                         │
+     │ # Aggressive sampling (every 10s + any scene change):                   │
+     │ FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2 python3                     │
+     │ summarize/summarize.py ...                                              │
+     │                                                                         │
+     │ # Very conservative (every 5 minutes, only major slides):               │
+     │ FRAME_PERIOD_SECONDS=300 SCENE_THRESHOLD=0.6 python3                    │
+     │ summarize/summarize.py ...                                              │
+     │                                                                         │
+     │ Defaults that work for most meetings: SCENE_THRESHOLD=0.3,              │
+     │ FRAME_PERIOD_SECONDS=30. The safety net is the answer to the "user      │
+     │ shares a video" concern — a shared video has continuous scene changes,  │
+     │ so we still get coverage; the periodic pass additionally guarantees at  │
+     │ least one frame per 30s window when nothing is changing.                │
+     │                                                                         │
+     │ AI backend configuration (option 3)                                     │
+     │                                                                         │
+     │ The Anthropic Python SDK honors ANTHROPIC_BASE_URL, so the FCC endpoint │
+     │ is just env vars — no code change:                                      │
+     │                                                                         │
+     │ # FCC free proxy:                                                       │
+     │ export ANTHROPIC_BASE_URL="https://<your-fcc-host>"                     │
+     │ export ANTHROPIC_API_KEY="<your-fcc-key>"                               │
+     │ export SUMMARY_MODEL="<the model FCC exposes, e.g. claude-sonnet-4-5>"  │
+     │                                                                         │
+     │ # Or direct Anthropic API:                                              │
+     │ export ANTHROPIC_BASE_URL="https://api.anthropic.com"                   │
+     │ export ANTHROPIC_API_KEY="sk-ant-..."                                   │
+     │ export SUMMARY_MODEL="claude-sonnet-4-5"                                │
+     │                                                                         │
+     │ # Or Ollama fallback (no SDK needed):                                   │
+     │ export SUMMARY_BACKEND="ollama"                                         │
+     │ export OLLAMA_HOST="http://localhost:11434"                             │
+     │ export OLLAMA_MODEL="llava:13b"   # vision-capable local model          │
+     │                                                                         │
+     │ These are documented in docs/03-ai-summary.md.                          │
+     │                                                                         │
+     │ Reused existing code                                                    │
+     │                                                                         │
+     │ - first_time_login.sh — login flows (no change).                        │
+     │ - audio-setup.sh — virtual sink (no change).                            │
+     │ - The Thai-localization + kill-sentinel + waiting-room handling from    │
+     │ recent join_meeting.py edits → carried into screen/capture.py.          │
+     │ - trigger_server.py — kept; only the default script path changes.       │
+     │ - whisper.cpp binary + model — transcribe/transcribe.sh shells out to   │
+     │ the same /opt/whisper.cpp/build/bin/whisper-cli that                    │
+     │ record_and_transcribe.sh already uses.                                  │
+     │ - The mkdir -p /opt/meeting-bot/... pattern from setup.sh is extended,  │
+     │ not replaced.                                                           │
+     │                                                                         │
+     │ Verification                                                            │
+     │                                                                         │
+     │ 1. screen/record_screen.sh — sudo -H ./screen/record_screen.sh          │
+     │ "https://meet.google.com/<test>" "test-screen". Expect: join succeeds   │
+     │ via Thai labels, MP4 produced at                                        │
+     │ /opt/meeting-bot/recordings/test-screen_<ts>.mp4. Play the MP4 with     │
+     │ ffplay and confirm both video and audio are present. Confirm time       │
+     │ matches the meeting duration.                                           │
+     │ 2. kill_meeting.sh still works — start a recording, run sudo            │
+     │ ./kill_meeting.sh from another terminal. Expect: bot clicks Leave in    │
+     │ Meet, MP4 finalizes, summary isn't run (no chain).                      │
+     │ 3. transcribe/transcribe.sh — sudo -H ./transcribe/transcribe.sh        │
+     │ /opt/meeting-bot/recordings/test-screen_<ts>.mp4 "test-screen". Expect: │
+     │ TXT + SRT produced at                                                   │
+     │ /opt/meeting-bot/transcripts/test-screen_<ts>.{txt,srt}. Spot-check the │
+     │ transcript against the audio.                                           │
+     │ 4. summarize/summarize.py — python3 summarize/summarize.py              │
+     │ /opt/meeting-bot/recordings/test-screen_<ts>.mp4                        │
+     │ /opt/meeting-bot/transcripts/test-screen_<ts>.txt. Expect: frame        │
+     │ manifest at /opt/meeting-bot/frames/test-screen_<ts>/manifest.json,     │
+     │ summary at /opt/meeting-bot/summaries/test-screen_<ts>.md. Confirm the  │
+     │ summary has the expected sections and cites timestamps.                 │
+     │ 5. pipeline.sh — sudo -H ./pipeline.sh "https://meet.google.com/<test>" │
+     │ "all-three". Expect: all three stages run in order, summary produced    │
+     │ at the end.                                                             │
+     │ 6. Trigger server — curl -X POST http://localhost:8765/trigger -H       │
+     │ "Authorization: Bearer $TOKEN" -d '{"url":"...","name":"phone"}'.       │
+     │ Expect: 202, recording runs in background, MP4 + transcript + summary   │
+     │ all produced.                                                           │
+     │ 7. Frame sampling knobs — FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2   │
+     │ python3 summarize/summarize.py .... Expect: roughly 6× more frames in   │
+     │ the manifest than with defaults.                                        │
+     │ 8. FCC endpoint — point ANTHROPIC_BASE_URL at the FCC host, run step 4. │
+     │ Expect: a returned Markdown summary (not a connection error). The       │
+     │ exact model name goes in SUMMARY_MODEL.                                 │
+     │                                                                         │
+     │ Out of scope                                                            │
+     │                                                                         │
+     │ - Replacing the existing record_and_transcribe.sh callers (none exist   │
+     │ outside the project — the README is the only consumer). The user can    │
+     │ keep the old script as a shim if they want a no-video fast path; if     │
+     │ not, it gets deleted.                                                   │
+     │ - Auto-uploading summaries to a notes platform (Notion, Slack, etc.) —  │
+     │ easy to add later as a post-step.                                       │
+     │ - Real-time summaries during the meeting — the current pipeline is      │
+     │ post-meeting only.                                                      │
+     │ - Whisper speaker diarization — out of scope; the AI summary asks the   │
+     │ model to attribute action items by name from the transcript context,    │
+     │ which is a reasonable approximation.                                    │
+     ╰─────────────────────────────────────────────────────────────────────────╯
+
+● Good point — I need to verify the unchanged scripts still work with the new
+  architecture. Let me explore them to confirm before updating the plan.
+
+  Read 3 files (ctrl+o to expand)
+
+● Good — I now have the full picture of all the unchanged scripts. Let me
+  analyze each against the new architecture:
+
+  audio-setup.sh — Inert. Just creates meeting_sink. Consumed by
+  screen/record_screen.sh the same way record_and_transcribe.sh consumed it. ✅
+  Works as-is.
+
+  first_time_login.sh — Inert. Same browser profile
+  (~/.meeting-bot/chrome-profile), same Xvfb on :99. The new
+  screen/record_screen.sh will use the same profile via Playwright's
+  channel="chrome". ✅ Works as-is.
+
+  meeting-bot-trigger.service — Runs trigger_server.py, no script paths inside.
+  ✅ Works as-is.
+
+  trigger_server.py — Only change needed: default MEETING_BOT_SCRIPT flips to
+  pipeline.sh. The existing JSON contract (url, name) matches pipeline.sh's CLI.
+  ✅ Works with one-line edit.
+
+  kill_meeting.sh — This one is the problem. It hardcodes pgrep -f 
+  "record_and_transcribe\.sh" and pgrep -f "join_meeting\.py". With the new
+  architecture:
+  - pipeline.sh is the new orchestrator (a different script name).
+  - screen/record_screen.sh is the new recorder (replaces
+  record_and_transcribe.sh).
+  - screen/capture.py is the new join driver (replaces join_meeting.py).
+  - It also needs to handle summarize/summarize.py (which is a one-shot script,
+  but might be running while a kill happens).
+
+  So kill_meeting.sh needs to be updated to match the new script names. Let me
+  update the plan to acknowledge this and add the relevant verification.
+
+● Updated plan
+  ⎿  Error editing file
+● Let me re-read the plan file to get the exact current state:
+
+  Read 1 file (ctrl+o to expand)
+
+● Good, I can see the structure. Now I'll make the targeted edits:
+
+● Updated plan
+  ⎿  /plan to preview
+
+● Now let me also add a verification step that explicitly tests kill_meeting.sh
+  against the new script names — that was the specific concern you raised:
+
+● Updated plan
+  ⎿  /plan to preview
+
+● The plan is now updated with explicit verification of every unchanged script
+  and the corrected kill_meeting.sh scope. Let me exit plan mode for your
+  review.
+
+● User approved Claude's plan
+  ⎿  Plan saved to: ~/.claude/plans/twinkly-growing-eagle.md · /plan to edit
+     Plan: Split meeting-transcripter into 3 composable options
+
+     Context
+
+     The current project is one monolithic pipeline: record_and_transcribe.sh 
+     <url> <name> [display_name] [lang] joins a meeting, records audio into a
+     virtual sink, and runs whisper.cpp on the WAV. It cannot:
+
+     - Record the screen (only audio is captured).
+     - Process an existing audio file (it always joins a fresh meeting).
+     - Produce an AI summary that combines what was said with what was shown.
+
+     The user wants three self-contained, composable options that can be run
+     individually or chained together:
+
+     1. Screen recording — capture the meeting browser window to MP4 (video +
+     audio).
+     2. Transcribe — voice-to-text, accepting a recording produced by option 1
+     or any audio file.
+     3. AI agent summary — feed a transcript + keyframes from the video into a
+     vision-capable LLM via the FCC Claude endpoint, and produce a summary.
+
+     The existing code (login flow, Xvfb + PulseAudio + Playwright, kill switch,
+     Thai button labels, trigger server) is the foundation for option 1's
+     meeting-join step. The new work is mostly additive: extract the existing
+     audio-only recording path into a shared library, add a video recording
+     path, add a standalone transcription entry point, and add the AI
+     summarizer.
+
+     Target structure
+
+     meeting-transcripter/
+     ├── README.md                         # updated to describe the three
+     options
+     ├── CLAUDE.md                         # NEW: persistent project-context
+     file for future
+     │                                      # Claude sessions (replaces the
+     docs/ folder).
+     │                                      # Contains the same per-option
+     content that 01/02/03
+     │                                      # would have held, plus the
+     architectural reasoning
+     │                                      # and conventions future Claude
+     sessions need.
+     ├── screen/                           # NEW: option 1
+     │   ├── README.md
+     │   ├── record_screen.sh              # main entry: <meeting_url> <name>
+     [display_name]
+     │   ├── capture.py                    # Playwright + Xvfb + ffmpeg-x11grab
+     (the screen recorder)
+     │   └── extract_frames.py             # scene-change + periodic frame
+     extraction from MP4
+     ├── transcribe/                       # NEW: option 2
+     │   ├── README.md
+     │   └── transcribe.sh                 # main entry: <audio_file> <name>
+     [language]
+     ├── summarize/                        # NEW: option 3
+     │   ├── README.md
+     │   ├── summarize.py                  # main entry: <video_path>
+     <transcript_path> [<output_path>]
+     │   ├── llm_client.py                 # FCC / Anthropic / Ollama swappable
+     backend
+     │   └── prompts/
+     │       └── summarize.md              # the system + user prompt template
+     ├── pipeline.sh                       # NEW: chains all three when given a
+     meeting URL
+     ├── setup.sh                          # UNCHANGED: still installs
+     everything
+     ├── audio-setup.sh                    # UNCHANGED: still creates the
+     virtual sink
+     ├── first_time_login.sh               # UNCHANGED: still the one-time
+     interactive login
+     ├── kill_meeting.sh                   # kept at root, works for both
+     record_screen & the pipeline
+     ├── meeting-bot-trigger.service       # UNCHANGED
+     └── trigger_server.py                 # UNCHANGED: still launches the
+     pipeline script
+
+     The single existing record_and_transcribe.sh and join_meeting.py are
+     moved/renamed into screen/ (the audio-only path becomes a side-effect of
+     the screen capture, since meeting_sink.monitor is already routed). The
+     shared infrastructure (Xvfb, PulseAudio, login profile, kill sentinel)
+     stays where it is because all three options eventually want to launch a
+     meeting.
+
+     Critical files to be created / modified
+
+     Created (new)
+
+     - screen/record_screen.sh — Main entry for option 1. Caller-facing usage:
+     sudo -H ./screen/record_screen.sh "https://meet.google.com/abc-defg-hij"
+     "Weekly Standup"
+     - Internals: start Xvfb :99 (with pre-cleanup of any leftover), run
+     audio-setup.sh, open the meeting via capture.py, then start ffmpeg to
+     capture:
+       - Video from DISPLAY=:99 with ffmpeg -f x11grab -video_size 1280x800 
+     -framerate 15 -i :99 (the meeting browser window lives on the virtual
+     display; capturing the whole display is simpler than window-scraping and
+     matches what the user sees).
+       - Audio from meeting_sink.monitor (same sink as today).
+       - Mux both into a single MP4 (H.264 + AAC, -c:v libx264 -preset ultrafast
+     -crf 28 -c:a aac -b:a 128k).
+       - Output: /opt/meeting-bot/recordings/<name>_<timestamp>.mp4.
+       - Reuses the existing kill-sentinel mechanism (/tmp/meeting_bot_kill) and
+     kill-switch signal trap. kill_meeting.sh keeps working unchanged.
+     - screen/capture.py — Playwright driver for option 1. Replaces today's
+     join_meeting.py (which is moved here as the foundation). Adds:
+       - Locale-agnostic button labels (carry over the Thai labels already
+     added).
+       - Same kill-sentinel handling.
+       - Same waiting-room / admission / auto-leave logic.
+       - One new responsibility: when the meeting ends, the script returns so
+     the parent shell can stop ffmpeg and mux the MP4. This is the same flow as
+     today.
+     - screen/extract_frames.py — Frame extractor for option 3. Accepts the MP4
+     from option 1 and produces:
+       - /opt/meeting-bot/frames/<name>_<timestamp>/frame_<NNNN>.jpg — JPEG
+     keyframes.
+       - /opt/meeting-bot/frames/<name>_<timestamp>/manifest.json — list of
+     {path, timestamp_s, kind: "scene_change"|"periodic"} so the LLM knows when
+     each frame was taken.
+       - Algorithm:
+           i. ffmpeg select='gt(scene,0.3)',showinfo extracts frames where the
+     scene-change score crosses a threshold (default 0.3 — configurable).
+     Reasonable for slide transitions and shared-video cuts.
+         ii. After scene-change extraction, a second pass adds periodic frames
+     every FRAME_PERIOD_SECONDS (default 30s) if not already covered by a
+     scene-change within ±period/2 of that timestamp. This is the safety net for
+     "user shares a video" (scene-change catches it but only emits the I-frame;
+     periodic makes sure we don't miss the in-between if the scene-score dips)
+     and for "static slide for 5 minutes" (periodic still returns at least one
+     frame for that window).
+         iii. ffmpeg -vsync vfr -frame_pts true keeps timestamps accurate.
+       - Configurable via env vars: SCENE_THRESHOLD (default 0.3),
+     FRAME_PERIOD_SECONDS (default 30), FRAME_OUTPUT_DIR (default
+     /opt/meeting-bot/frames).
+     - transcribe/transcribe.sh — Main entry for option 2. Usage:
+     sudo -H ./transcribe/transcribe.sh
+     /opt/meeting-bot/recordings/<name>_<timestamp>.wav "<name>" [language]
+     - Or, given an MP4 from option 1:
+     sudo -H ./transcribe/transcribe.sh
+     /opt/meeting-bot/recordings/<name>_<timestamp>.mp4 "<name>"
+     - Internals: if input is .mp4, ffmpeg extracts the AAC audio track to a
+     16kHz mono WAV first (reuses today's -ar 16000 -ac 1 settings). Then run
+     whisper-cli exactly the same way record_and_transcribe.sh does today.
+     Output: /opt/meeting-bot/transcripts/<name>_<timestamp>.{txt,srt}. Same
+     WHISPER_MODEL and language conventions.
+     - summarize/llm_client.py — Pluggable LLM client. Reads from env:
+       - ANTHROPIC_BASE_URL (default https://api.anthropic.com, set to the FCC
+     endpoint for the free proxy)
+       - ANTHROPIC_API_KEY (required)
+       - SUMMARY_MODEL (default claude-sonnet-4-5, override for the FCC model
+     name)
+       - SUMMARY_BACKEND = anthropic (default) | ollama (fallback)
+       - Uses the anthropic Python SDK (already installable via pip install 
+     anthropic). The SDK honors ANTHROPIC_BASE_URL, so the FCC endpoint works
+     without code changes. The Ollama path is a separate function that hits
+     http://localhost:11434/api/chat — only wired in if SUMMARY_BACKEND=ollama.
+       - Public API: summarize(frames: list[FrameMeta], transcript: str, 
+     prompt_template: str) -> str. Frames are sent as image blocks in the user
+     message; the transcript is appended as text.
+     - summarize/summarize.py — Main entry for option 3. Usage:
+     python3 summarize/summarize.py <video_path> <transcript_path>
+     [<output_md_path>]
+     - Internals:
+       a. Call extract_frames.py to produce the frame manifest + JPEGs.
+       b. Read the transcript text.
+       c. Build the prompt from summarize/prompts/summarize.md (system + user
+     template). The prompt instructs the model to: produce a Markdown summary
+     with sections "Key decisions", "Action items (with owners)", "Topics
+     discussed", "Slides / visuals referenced", and cite which timestamps each
+     point came from.
+       d. Send frames + transcript to the LLM.
+       e. Write the returned Markdown to the output path (default:
+     /opt/meeting-bot/summaries/<name>_<timestamp>.md).
+       f. Print a short preview to stdout.
+     - summarize/prompts/summarize.md — The prompt template. Holds the system
+     prompt, the user-prompt skeleton ({transcript} and {frame_manifest}
+     placeholders), and a JSON schema for the summary output the model should
+     follow. Keep this in a separate file so the user can tune it without
+     touching code.
+     - pipeline.sh — Top-level convenience script:
+     sudo -H ./pipeline.sh "https://meet.google.com/abc-defg-hij" "Weekly
+     Standup"
+     - Runs: screen/record_screen.sh → transcribe/transcribe.sh (on the produced
+     MP4) → summarize/summarize.py (on the MP4 + transcript). Prints the final
+     paths. Bails on any stage failure with a clear message. This is what
+     trigger_server.py keeps pointing at (it just changes the script path).
+     - CLAUDE.md — Persistent project-context file at the project root. Replaces
+     the originally-planned docs/ folder. Holds content future Claude sessions
+     need to be productive without re-reading source files, including:
+       - One-paragraph "what this project is" summary.
+       - The three options at a glance (purpose, entry script, output paths).
+       - Per-option content that 01/02/03 would have held: usage, env vars,
+     defaults, common pitfalls.
+       - The frame-sampling knobs and how they answer the "user shares a video"
+     concern.
+       - The AI-backend env-var configuration (FCC + Anthropic + Ollama).
+       - Architectural conventions (sudo -H, /opt/meeting-bot paths, kill
+     sentinel, working-directory requirements).
+       - "What NOT to do" notes (e.g. don't bring back --enable-automation
+     Playwright flags, don't replace meeting_sink audio capture with browser
+     audio capture, etc.).
+       - The pile of context-free facts that don't deserve to be memory entries
+     but are non-obvious from the code alone (e.g. why the Thai labels exist,
+     why --no-sandbox is required, why the kill sentinel routes through the
+     in-Meet Leave button).
+
+     Modified
+
+     - README.md — Top-level overview now leads with the three options and
+     points future readers to CLAUDE.md for the full per-option reference. The
+     "Day-to-day usage" section is rewritten to show the three standalone
+     invocations plus the pipeline.sh shortcut. The Files table is updated with
+     the new directory layout. The "VM sizing" / "Architecture" / "Thai
+     language" sections stay in the README (they're user-facing) and a note at
+     the top explains that CLAUDE.md is the canonical reference for
+     architectural decisions and per-option details.
+     - setup.sh — Add the anthropic Python package to the venv (pip install 
+     anthropic) and create the new output directories:
+     mkdir -p /opt/meeting-bot/{recordings,transcripts,summaries,frames}
+     - Also install libx264-dev if not already present (already provided by
+     build-essential + ffmpeg on Ubuntu, but make it explicit). No new OS-level
+     deps needed beyond ffmpeg's existing -codecs.
+     - trigger_server.py — One-line change: MEETING_BOT_SCRIPT default becomes
+     /opt/meeting-bot/pipeline.sh instead of the old record-only script. The
+     trigger endpoint keeps the same JSON contract — pipeline.sh accepts the
+     same <url> <name> arguments.
+     - kill_meeting.sh — Update needed (not purely cosmetic). Current script
+     hardcodes two pgrep patterns:
+       - pgrep -f "record_and_transcribe\.sh" — this name no longer exists in
+     the new layout.
+       - pgrep -f "join_meeting\.py" — this name also no longer exists.
+     Replacement patterns must match the new layout:
+       - Orchestrators: pipeline.sh and screen/record_screen.sh (the chain vs.
+     the standalone recorder).
+       - Python join driver: screen/capture.py (the only Python that polls the
+     kill sentinel; carries the in-Meet clean-leave logic).
+       - Optional soft matches for summarize/summarize.py and
+     transcribe/transcribe.sh if the user kills mid-summary / mid-transcription
+     (no special handling needed beyond SIGTERM).
+       - The path KILL_SENTINEL="/tmp/meeting_bot_kill" is unchanged — the new
+     files import the same constant. Sentinel-touch + SIGTERM + 10s wait +
+     SIGKILL-escalate-on-Python-only policy all carry over.
+       - Comments in the file (which currently mention the old names) get
+     rewritten so the next person doesn't grep for the wrong strings.
+
+     Unchanged (verified)
+
+     These scripts were re-read in full and confirmed compatible with the new
+     architecture with no edits:
+
+     - audio-setup.sh — purely creates meeting_sink; consumed identically by the
+     new screen/record_screen.sh via bash audio-setup.sh. No script-name
+     dependencies.
+     - first_time_login.sh — writes to ~/.meeting-bot/chrome-profile and starts
+     Xvfb on :99. The new screen/capture.py reuses that profile via
+     channel="chrome" and the same :99 display — exactly like the old
+     join_meeting.py. The browser-login/profile contract is preserved.
+     - meeting-bot-trigger.service — runs trigger_server.py with no embedded
+     script paths. Pairs with the one-line edit to trigger_server.py's default.
+     - The Thai button labels and kill-sentinel logic from the prior session are
+     preserved verbatim in screen/capture.py.
+
+     Frame-sampling configuration (option 3)
+
+     User asked to be shown how to configure the scene-change + periodic
+     sampling. From summarize/summarize.py:
+
+     # Skip the periodic safety net entirely (scene-change only):
+     FRAME_PERIOD_SECONDS=0 python3 summarize/summarize.py video.mp4
+     transcript.txt
+
+     # Aggressive sampling (every 10s + any scene change):
+     FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2 python3 summarize/summarize.py
+     ...
+
+     # Very conservative (every 5 minutes, only major slides):
+     FRAME_PERIOD_SECONDS=300 SCENE_THRESHOLD=0.6 python3 summarize/summarize.py
+     ...
+
+     Defaults that work for most meetings: SCENE_THRESHOLD=0.3,
+     FRAME_PERIOD_SECONDS=30. The safety net is the answer to the "user shares a
+     video" concern — a shared video has continuous scene changes, so we still
+     get coverage; the periodic pass additionally guarantees at least one frame
+     per 30s window when nothing is changing.
+
+     AI backend configuration (option 3)
+
+     The Anthropic Python SDK honors ANTHROPIC_BASE_URL, so the FCC endpoint is
+     just env vars — no code change:
+
+     # FCC free proxy:
+     export ANTHROPIC_BASE_URL="https://<your-fcc-host>"
+     export ANTHROPIC_API_KEY="<your-fcc-key>"
+     export SUMMARY_MODEL="<the model FCC exposes, e.g. claude-sonnet-4-5>"
+
+     # Or direct Anthropic API:
+     export ANTHROPIC_BASE_URL="https://api.anthropic.com"
+     export ANTHROPIC_API_KEY="sk-ant-..."
+     export SUMMARY_MODEL="claude-sonnet-4-5"
+
+     # Or Ollama fallback (no SDK needed):
+     export SUMMARY_BACKEND="ollama"
+     export OLLAMA_HOST="http://localhost:11434"
+     export OLLAMA_MODEL="llava:13b"   # vision-capable local model
+
+     These are documented in docs/03-ai-summary.md.
+
+     Reused existing code
+
+     - first_time_login.sh — login flows (no change).
+     - audio-setup.sh — virtual sink (no change).
+     - The Thai-localization + kill-sentinel + waiting-room handling from recent
+     join_meeting.py edits → carried into screen/capture.py.
+     - trigger_server.py — kept; only the default script path changes.
+     - whisper.cpp binary + model — transcribe/transcribe.sh shells out to the
+     same /opt/whisper.cpp/build/bin/whisper-cli that record_and_transcribe.sh
+     already uses.
+     - The mkdir -p /opt/meeting-bot/... pattern from setup.sh is extended, not
+     replaced.
+
+     Verification
+
+     1. screen/record_screen.sh — sudo -H ./screen/record_screen.sh 
+     "https://meet.google.com/<test>" "test-screen". Expect: join succeeds via
+     Thai labels, MP4 produced at
+     /opt/meeting-bot/recordings/test-screen_<ts>.mp4. Play the MP4 with ffplay
+     and confirm both video and audio are present. Confirm time matches the
+     meeting duration.
+     2. kill_meeting.sh still works — start a recording via
+     screen/record_screen.sh, then run sudo ./kill_meeting.sh from another
+     terminal. Expect: pgrep finds the new process names
+     (pipeline.sh/screen/record_screen.sh + screen/capture.py), bot clicks Leave
+     in Meet, MP4 finalizes. Repeat with a chain run (pipeline.sh running) —
+     the script must match both the chain orchestrator AND the in-progress join
+     driver. As an extra check, run pgrep -f "record_and_transcribe\.sh" while a
+     new-style run is active and confirm it returns nothing (proving the old
+     name is truly gone).
+     3. transcribe/transcribe.sh — sudo -H ./transcribe/transcribe.sh 
+     /opt/meeting-bot/recordings/test-screen_<ts>.mp4 "test-screen". Expect: TXT
+     + SRT produced at /opt/meeting-bot/transcripts/test-screen_<ts>.{txt,srt}.
+     Spot-check the transcript against the audio.
+     4. summarize/summarize.py — python3 summarize/summarize.py 
+     /opt/meeting-bot/recordings/test-screen_<ts>.mp4 
+     /opt/meeting-bot/transcripts/test-screen_<ts>.txt. Expect: frame manifest
+     at /opt/meeting-bot/frames/test-screen_<ts>/manifest.json, summary at
+     /opt/meeting-bot/summaries/test-screen_<ts>.md. Confirm the summary has the
+     expected sections and cites timestamps.
+     5. pipeline.sh — sudo -H ./pipeline.sh "https://meet.google.com/<test>" 
+     "all-three". Expect: all three stages run in order, summary produced at the
+     end.
+     6. Trigger server — curl -X POST http://localhost:8765/trigger -H 
+     "Authorization: Bearer $TOKEN" -d '{"url":"...","name":"phone"}'. Expect:
+     202, recording runs in background, MP4 + transcript + summary all produced.
+     7. Frame sampling knobs — FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2 
+     python3 summarize/summarize.py .... Expect: roughly 6× more frames in the
+     manifest than with defaults.
+     8. FCC endpoint — point ANTHROPIC_BASE_URL at the FCC host, run step 4.
+     Expect: a returned Markdown summary (not a connection error). The exact
+     model name goes in SUMMARY_MODEL.
+
+     Out of scope
+
+     - Replacing the existing record_and_transcribe.sh callers (none exist
+     outside the project — the README is the only consumer). The user can keep
+     the old script as a shim if they want a no-video fast path; if not, it gets
+     deleted.
+     - Auto-uploading summaries to a notes platform (Notion, Slack, etc.) — easy
+     to add later as a post-step.
+     - Real-time summaries during the meeting — the current pipeline is
+     post-meeting only.
+     - Whisper speaker diarization — out of scope; the AI summary asks the model
+     to attribute action items by name from the transcript context, which is a
+     reasonable approximation.
+
+● The plan is approved. Let me set up the task list and begin implementation.
+
+● Now let me start the work — task #1 first (verify existing scripts):
+
+● Bash(for f in *.sh; do echo "=== $f ==="; bash -n "$f" && echo "OK" || echo
+      "FAIL"; done)
+  ⎿  === audio-setup.sh ===
+     OK
+     === first_time_login.sh ===
+     … +7 lines (ctrl+o to expand)
+
+● Bash(python3 -m py_compile join_meeting.py && echo "join_meeting.py OK" &&
+      python3 -m py_compile trigger_server.py && echo "trigger_server.py OK")
+  ⎿  join_meeting.py OK
+     trigger_server.py OK
+
+● All scripts pass syntax check. Let me also verify that ffmpeg has the H.264
+  and AAC codecs available (since the new screen recorder needs them):
+
+● Bash(ffmpeg -codecs 2>/dev/null | grep -E "libx264|h264|aac" | head -20 ||
+      echo "ffmpeg not installed in this environment")
+  ⎿   DEV.LS h264                 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10
+      (decoders: h264 h264_v4l2m2m h264_qsv h264_cuvid) (encoders: libx264
+     libx264rgb h264_nvenc h264_qsv h264_v4l2m2m h264_vaapi h264_vulkan)
+     … +4 lines (ctrl+o to expand)
+● Good — libx264 encoder and aac decoder are both available. Now I have all the
+  info I need to start implementation. Let me mark task 1 done and move on:
+
+● Bash(mkdir -p screen transcribe summarize/prompts && ls -la)
+  ⎿  total 176
+     drwxrwxr-x 7 kkattmos kkattmos  4096 Jul 27 08:38 .
+     drwxrwxr-x 4 kkattmos kkattmos  4096 Jul 23 16:01 ..
+     … +15 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● Now I'll create screen/capture.py (renamed from join_meeting.py, with minimal
+  changes — just the module docstring and a comment update to reflect the new
+  path):
+
+● Write(screen/capture.py)
+  ⎿  Wrote 303 lines to screen/capture.py
+       1 #!/usr/bin/env python3
+       3 Screen-capture companion to record_screen.sh. Joins a Zoom or Go
+         ogle Meet call
+       4 in a real (headed, but Xvfb-hosted) Chromium window using a pers
+       5 profile. Handles host-approval waiting rooms, and auto-leaves wh
+         en the meeting
+       7 
+       8 This is the Option 1 driver from the project split:
+       9   - screen/record_screen.sh starts Xvfb + this script + ffmpeg-x
+      10   - The MP4 is muxed by record_screen.sh once this script exits.
+     … +345 lines (ctrl+o to expand)
+
+● Now create the screen/record_screen.sh orchestrator. This is the entry point
+  that combines Xvfb + PulseAudio + Playwright + ffmpeg-x11grab into a single
+  MP4:
+
+● Write(screen/record_screen.sh)
+  ⎿  Wrote 161 lines to screen/record_screen.sh
+       1 #!/bin/bash
+       2 # Option 1: Screen-record a meeting to MP4 (video + audio).
+       4 # Starts Xvfb, opens the meeting in real Chrome via capture.py, 
+         and uses ffmpeg
+       5 # to capture both the virtual display (video) and meeting_sink.m
+       6 # into a single H.264+AAC MP4.
+       7 #
+       8 # This is the building block that pipeline.sh chains to. By itse
+       9 # transcribe or summarize - it only produces the video file.
+      10 #
+     … +174 lines (ctrl+o to expand)
+
+● Bash(chmod +x screen/record_screen.sh screen/capture.py && bash -n
+      screen/record_screen.sh && python3 -m py_compile screen/capture.py && echo
+      "screen/ OK")
+  ⎿  screen/capture.py:12: SyntaxWarning: "\ " is an invalid escape sequenc
+     e. Such sequences will not work in the future. Did you mean "\\ "? A r
+     aw string is also an option.
+     … +2 lines (ctrl+o to expand)
+
+● A \v in the docstring is being flagged. Let me make it a raw string:
+
+● Update(screen/capture.py)
+  ⎿  Added 1 line, removed 1 line
+      1  #!/usr/bin/env python3
+      2 -"""                                                             
+      2 +r"""                                                            
+      3  Screen-capture companion to record_screen.sh. Joins a Zoom or Go
+         ogle Meet call
+      4  in a real (headed, but Xvfb-hosted) Chromium window using a pers
+         istent logged-in
+      5  profile. Handles host-approval waiting rooms, and auto-leaves wh
+         en the meeting
+
+● Bash(python3 -m py_compile screen/capture.py && echo "screen/capture.py
+      clean")
+  ⎿  screen/capture.py clean
+
+● Now screen/extract_frames.py — the scene-change + periodic frame extractor:
+
+● Write(screen/extract_frames.py)
+  ⎿  Wrote 181 lines to screen/extract_frames.py
+       1 #!/usr/bin/env python3
+       3 Extract frames from a meeting recording for the AI summary agent
+         .
+       5 Two passes:
+         cene-change
+       7      score crosses SCENE_THRESHOLD (default 0.3). Catches slide 
+       8      shared-screen cuts, and changes inside shared video streams
+         .
+         NDS (default 30)
+         inutes" cases
+     … +204 lines (ctrl+o to expand)
+
+● Bash(python3 -m py_compile screen/extract_frames.py && echo "extract_frames.py
+      OK")
+  ⎿  extract_frames.py OK
+
+● Now update kill_meeting.sh to match the new script names:
+
+● Write(kill_meeting.sh)
+  ⎿  Added 58 lines, removed 40 lines
+       1  #!/bin/bash
+       2  # Standalone "leave now" for the meeting recording bot.
+       3  #
+       4 -# Use this when record_and_transcribe.sh was launched in the ba
+         -ckground                                                       
+       5 -# (e.g. via trigger_server.py) and you can't reach its terminal
+         - to press                                                      
+       6 -# Ctrl+\. From the recording terminal itself, Ctrl+\ also works
+         -.                                                              
+       4 +# Use this when a recording was launched in the background     
+       5 +# (e.g. via trigger_server.py -> pipeline.sh) and you can't rea
+         +ch its                                                         
+       6 +# terminal to press Ctrl+\. From the recording terminal itself,
+         + Ctrl+\                                                        
+       7 +# also works.                                                  
+       8  #
+       9  # What it does:
+       9 -#   1. Touches /tmp/meeting_bot_kill so join_meeting.py's polli
+         -ng loop                                                        
+      10 +#   1. Touches /tmp/meeting_bot_kill so screen/capture.py's pol
+         +ling loop                                                      
+      11  #      notices on its next iteration and clicks "Leave" in the 
+          meeting UI
+      12  #      (so participants see the bot go, rather than it vanishin
+          g).
+      12 -#   2. Sends SIGTERM to record_and_transcribe.sh so its cleanup
+         - trap                                                          
+      13 -#      runs - stops ffmpeg, kills Xvfb, etc.                   
+      14 -#   3. Waits up to 10s for both processes to exit cleanly. Esca
+         -lates to                                                       
+      15 -#      SIGKILL on the join script only if it's still alive (the
+         - recording                                                     
+      16 -#      shell may still be doing transcription, which is fine to
+         - let finish).                                                  
+      13 +#   2. Sends SIGTERM to the running orchestrator + join driver 
+         ++ (if                                                          
+      14 +#      active) the transcribe/summarize stages. The script name
+         +s matched                                                      
+      15 +#      here are the ones introduced by the 3-option split:     
+      16 +#        - pipeline.sh               (chain orchestrator)      
+      17 +#        - screen/record_screen.sh   (Option 1 standalone recor
+         +der)                                                           
+      18 +#        - screen/capture.py         (the Playwright join drive
+         +r)                                                             
+      19 +#        - transcribe/transcribe.sh  (Option 2 standalone)     
+      20 +#        - summarize/summarize.py    (Option 3 standalone)     
+      21 +#   3. Waits up to 10s for processes to exit cleanly. Escalates
+         + to SIGKILL                                                    
+      22 +#      on the Python join driver only if it's still alive (the 
+         +recording                                                      
+      23 +#      shell may still be finalizing the MP4 or finishing whisp
+         +er.cpp, which                                                  
+      24 +#      is fine to let finish).                                 
+      25  #
+      26  # Usage:
+      27  #   sudo ./kill_meeting.sh
+     ...
+       33  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+       34  
+       35  # 1) Touch the sentinel so the Python loop picks it up on its 
+           next poll
+       28 -#    (POLL_SECONDS = 15s in join_meeting.py, plus 5s for wait_
+          -for_admission).                                               
+       36 +#    (POLL_SECONDS = 15s in screen/capture.py, plus 5s for wai
+          +t_for_admission).                                             
+       37  echo "==> Setting kill sentinel: $KILL_SENTINEL"
+       38  touch "$KILL_SENTINEL"
+       39  
+       40  # 2) Find the relevant processes. -f matches the full command 
+           line so we
+       41  #    only hit our own scripts and not, say, the user's other b
+           ash sessions.
+       34 -REC_PIDS=$(pgrep -f "record_and_transcribe\.sh" || true)      
+       35 -JOIN_PIDS=$(pgrep -f "join_meeting\.py" || true)              
+       42 +#    Patterns match the NEW script layout, not the legacy audi
+          +o-only one.                                                   
+       43 +ORCH_PIDS=$(pgrep -f "pipeline\.sh|screen/record_screen\.sh" |
+          +| true)                                                       
+       44 +JOIN_PIDS=$(pgrep -f "screen/capture\.py" || true)            
+       45 +TRANSCRIBE_PIDS=$(pgrep -f "transcribe/transcribe\.sh" || true
+          +)                                                             
+       46 +SUMMARIZE_PIDS=$(pgrep -f "summarize/summarize\.py" || true)  
+       47 +ALL_OTHER_PIDS="$TRANSCRIBE_PIDS $SUMMARIZE_PIDS"             
+       48  
+       37 -if [ -z "$REC_PIDS$JOIN_PIDS" ]; then                         
+       49 +if [ -z "$ORCH_PIDS$JOIN_PIDS$ALL_OTHER_PIDS" ]; then         
+       50    echo "==> No meeting-bot processes found. Sentinel set anywa
+           y - any"
+       39 -  echo "    join_meeting.py that starts within the next ~15s w
+          -ill exit"                                                     
+       51 +  echo "    capture.py that starts within the next ~15s will e
+          +xit"                                                          
+       52    echo "    immediately, so this is also useful to prevent a f
+           uture run."
+       53    exit 0
+       54  fi
+       55  
+       44 -if [ -n "$REC_PIDS" ]; then                                   
+       45 -  echo "==> Sending SIGTERM to record_and_transcribe.sh (PIDs:
+          - $REC_PIDS)"                                                  
+       46 -  # Bash-builtin kill won't fail the script under set -e when 
+          -one of the                                                    
+       47 -  # targets is already gone; pgrep's result here is stable eno
+          -ugh.                                                          
+       48 -  kill -TERM $REC_PIDS 2>/dev/null || true                    
+       56 +if [ -n "$ORCH_PIDS" ]; then                                  
+       57 +  echo "==> Sending SIGTERM to orchestrator (pipeline.sh / rec
+          +ord_screen.sh) - PIDs: $ORCH_PIDS"                            
+       58 +  kill -TERM $ORCH_PIDS 2>/dev/null || true                   
+       59  fi
+       60  
+       51 -# join_meeting.py doesn't install a signal handler - SIGTERM i
+          -s delivered                                                   
+       52 -# to it via the parent process group's TERM from the shell tra
+          -p. But for                                                    
+       53 -# the kill_meeting.sh case (parent is unrelated), send it dire
+          -ctly so                                                       
+       54 -# the Python interpreter exits without waiting for the next po
+          -ll.                                                           
+       61 +# capture.py doesn't install a signal handler - SIGTERM is del
+          +ivered to it                                                  
+       62 +# via the parent process group's TERM from the shell trap. But
+          + for the                                                      
+       63 +# kill_meeting.sh case (parent is unrelated), send it directly
+          + so the Python                                                
+       64 +# interpreter exits without waiting for the next poll.        
+       65  if [ -n "$JOIN_PIDS" ]; then
+       56 -  echo "==> Sending SIGTERM to join_meeting.py (PIDs: $JOIN_PI
+          -DS)"                                                          
+       66 +  echo "==> Sending SIGTERM to screen/capture.py (PIDs: $JOIN_
+          +PIDS)"                                                        
+       67    kill -TERM $JOIN_PIDS 2>/dev/null || true
+       68  fi
+       69  
+       60 -# 3) Wait for the recording shell to exit cleanly. We only esc
+          -alate on                                                      
+       61 -#    the Python process - the shell may legitimately be in whi
+          -sper-cli                                                      
+       62 -#    (transcription) and we want that to finish on its own.   
+       70 +# Transcribe/summarize stages don't have any special clean-up;
+          + SIGTERM is fine                                              
+       71 +# to interrupt whisper-cli or the LLM API call.               
+       72 +if [ -n "$ALL_OTHER_PIDS" ]; then                             
+       73 +  echo "==> Sending SIGTERM to transcribe/summarize - PIDs: $A
+          +LL_OTHER_PIDS"                                                
+       74 +  kill -TERM $ALL_OTHER_PIDS 2>/dev/null || true              
+       75 +fi                                                            
+       76 +                                                              
+       77 +# 3) Wait for the orchestrator shell to exit cleanly. We only 
+          +escalate on                                                   
+       78 +#    the Python join driver - the shell may legitimately be in
+          + whisper-cli                                                  
+       79 +#    (transcription) or finalizing the MP4, and we want those 
+          +to finish on                                                  
+       80 +#    their own.                                               
+       81  echo "==> Waiting up to 10s for processes to exit..."
+       82  for i in $(seq 1 20); do
+       65 -  REMAINING_JOIN=$(pgrep -f "join_meeting\.py" || true)       
+       66 -  REMAINING_REC=""                                            
+       67 -  for pid in $REC_PIDS; do                                    
+       83 +  REMAINING_JOIN=$(pgrep -f "screen/capture\.py" || true)     
+       84 +  REMAINING_ORCH=""                                           
+       85 +  for pid in $ORCH_PIDS; do                                   
+       86      if kill -0 "$pid" 2>/dev/null; then
+       69 -      REMAINING_REC="$REMAINING_REC $pid"                     
+       87 +      REMAINING_ORCH="$REMAINING_ORCH $pid"                   
+       88      fi
+       89    done
+       72 -  if [ -z "$REMAINING_JOIN" ] && [ -z "$REMAINING_REC" ]; then
+       90 +  if [ -z "$REMAINING_JOIN" ] && [ -z "$REMAINING_ORCH" ]; the
+          +n                                                             
+       91      echo "==> All meeting-bot processes exited cleanly."
+       92      exit 0
+       93    fi
+       94    sleep 0.5
+       95  done
+       96  
+       79 -# Escalate on the Python process only. The recording shell is 
+          -allowed to                                                    
+       80 -# linger if it's still finishing transcription.               
+       97 +# Escalate on the Python join driver only. The recording shell
+          + is allowed to                                                
+       98 +# linger if it's still finishing the MP4 or transcription.    
+       99  if [ -n "$REMAINING_JOIN" ]; then
+       82 -  echo "==> join_meeting.py didn't exit in time - sending SIGK
+          -ILL (PIDs: $REMAINING_JOIN)"                                  
+      100 +  echo "==> screen/capture.py didn't exit in time - sending SI
+          +GKILL (PIDs: $REMAINING_JOIN)"                                
+      101    kill -KILL $REMAINING_JOIN 2>/dev/null || true
+      102  fi
+       85 -if [ -n "$REMAINING_REC" ]; then                              
+       86 -  echo "==> record_and_transcribe.sh still running (PIDs:$REMA
+          -INING_REC) - probably"                                        
+       87 -  echo "    finishing transcription. Leaving it alone; Ctrl+C 
+          -in its terminal"                                              
+       88 -  echo "    (or sudo kill $REMAINING_REC) will stop it if need
+          -ed."                                                          
+      103 +if [ -n "$REMAINING_ORCH" ]; then                             
+      104 +  echo "==> Orchestrator still running (PIDs:$REMAINING_ORCH) 
+          +- probably"                                                   
+      105 +  echo "    finishing MP4 mux / transcription. Leaving it alon
+          +e; Ctrl+C in its"                                             
+      106 +  echo "    terminal (or sudo kill $REMAINING_ORCH) will stop 
+          +it if needed."                                                
+      107  fi
+      108  
+      109  # Clean up the sentinel so a future run doesn't immediately ex
+           it.
+      110  rm -f "$KILL_SENTINEL"
+       93 -echo "==> Done."                                              
+      111 +echo "==> Done."                                              
+      112   No newline at end of file
+
+● Bash(chmod +x kill_meeting.sh && bash -n kill_meeting.sh && echo
+      "kill_meeting.sh OK")
+  ⎿  kill_meeting.sh OK
+● Now transcribe/transcribe.sh — accepts WAV or MP4, runs whisper.cpp:
+
+● Write(transcribe/transcribe.sh)
+  ⎿  Wrote 82 lines to transcribe/transcribe.sh
+       1 #!/bin/bash
+         whisper.cpp.
+       3 #
+       4 # Works standalone - feed it any audio file, including the MP4 f
+       5 # screen/record_screen.sh. If the input is MP4, ffmpeg first ext
+         racts the
+       7 # record_and_transcribe.sh fed to whisper-cli).
+       8 #
+       9 # Usage:
+         ame>" [language]
+     … +85 lines (ctrl+o to expand)
+
+● Bash(chmod +x transcribe/transcribe.sh && bash -n transcribe/transcribe.sh &&
+      echo "transcribe/transcribe.sh OK")
+  ⎿  transcribe/transcribe.sh OK
+
+● Now the AI summarizer — llm_client.py (pluggable backend), summarize.py (main
+  entry), and prompts/summarize.md (prompt template):
+
+● Write(summarize/llm_client.py)
+  ⎿  Wrote 152 lines to summarize/llm_client.py
+      1 #!/usr/bin/env python3
+      2 """
+      3 Pluggable LLM client for the meeting-summary agent.
+      5 Two backends, both selected via env vars:
+      6 
+      7   Anthropic SDK (default) - works against both api.anthropic.com 
+        and any
+        nors
+      9   ANTHROPIC_BASE_URL. Used when SUMMARY_BACKEND=anthropic (the de
+        fault).
+     … +159 lines (ctrl+o to expand)
+
+● Now the prompt template:
+
+● Write(summarize/prompts/summarize.md)
+  ⎿  Wrote 62 lines to summarize/prompts/summarize.md
+       1 You are a meeting summarizer. Your job is to read a meeting tran
+       2 with keyframes extracted from the screen recording, and produce 
+         a focused,
+          minutes.
+       5 The transcript is the primary source for what was *said*. The fr
+         ames are the
+         ns, whiteboards).
+       7 Use the timestamps in the frame manifest to align visuals with w
+       8 discussed at that moment in the transcript.
+      10 # Output format
+     … +72 lines (ctrl+o to expand)
+
+● Now the main summarize.py entry point:
+
+● Write(summarize/summarize.py)
+  ⎿  Wrote 167 lines to summarize/summarize.py
+       1 #!/usr/bin/env python3
+       2 """
+         ted frames
+       4 to a vision-capable LLM.
+       5 
+         's called
+       7 automatically after Option 1 (record) and Option 2 (transcribe).
+       8 
+      10     python3 summarize/summarize.py <video_path> <transcript_path
+         > [<output_md_path>]
+     … +175 lines (ctrl+o to expand)
+
+● Bash(chmod +x summarize/summarize.py summarize/llm_client.py && python3 -m
+      py_compile summarize/summarize.py summarize/llm_client.py && echo
+      "summarize/ OK")
+  ⎿  summarize/ OK
+
+● Now pipeline.sh — the chain orchestrator:
+
+● Write(pipeline.sh)
+  ⎿  Wrote 92 lines to pipeline.sh
+       1 #!/bin/bash
+         marize.
+       3 #
+       4 # Usage:
+         y Name] [Language]
+       6 #
+         er_server.py
+       8 # defaults to this script). It's also what most users will run f
+         rom the
+      10 #
+     … +114 lines (ctrl+o to expand)
+
+● Bash(chmod +x pipeline.sh && bash -n pipeline.sh && echo "pipeline.sh OK")
+  ⎿  pipeline.sh OK
+
+● Now update setup.sh (add anthropic pip package, new output dirs) and
+  trigger_server.py (default script path):
+
+● Update(setup.sh)
+  ⎿  Added 1 line, removed 1 line
+      24  python3 -m venv /opt/meeting-bot-venv
+      25  source /opt/meeting-bot-venv/bin/activate
+      26  pip install --upgrade pip
+      27 -pip install playwright                                         
+      27 +pip install playwright anthropic                               
+      28  playwright install --with-deps chromium
+      29  deactivate
+      30  
+
+● Update(setup.sh)  ⎿  Added 1 line, removed 1 line
+      54  bash ./models/download-ggml-model.sh small
+      55  
+      56  echo "==> Creating working directories"
+      57 -mkdir -p /opt/meeting-bot/{recordings,transcripts}             
+      57 +mkdir -p /opt/meeting-bot/{recordings,transcripts,summaries,fra
+         +mes}                                                           
+      58  mkdir -p ~/.meeting-bot/chrome-profile
+      59  
+      60  echo "==> Done."
+
+● Update(trigger_server.py)
+  ⎿  Added 1 line, removed 1 line
+      20  
+      21  TOKEN = os.environ.get("MEETING_BOT_TOKEN")
+      22  SCRIPT = os.environ.get(
+      23 -    "MEETING_BOT_SCRIPT", "/opt/meeting-bot/record_and_transcri
+         -be.sh"                                                         
+      23 +    "MEETING_BOT_SCRIPT", "/opt/meeting-bot/pipeline.sh"       
+      24  )
+      25  PORT = int(os.environ.get("MEETING_BOT_PORT", "8765"))
+      26  
+
+● Bash(bash -n setup.sh && python3 -m py_compile trigger_server.py && echo
+      "setup + trigger_server OK")
+  ⎿  setup + trigger_server OK
+
+● Now the docs. I'll create CLAUDE.md (the per-option reference for future
+  Claude sessions, per your updated request) and rewrite README.md to lead with
+  the three options. Let me start with the README:
+
+● Write(README.md)
+  ⎿  Added 104 lines, removed 40 lines
+       1 -# Meeting recording + transcription bot                        
+       1 +# Meeting recording + transcription + AI summary bot           
+       2  
+       3  Joins a Zoom or Google Meet call using your logged-in account, 
+          records the
+       4 -audio, and transcribes it locally with whisper.cpp once the cal
+         -l ends.                                                        
+       4 +**screen + audio** to MP4, transcribes the audio locally with w
+         +hisper.cpp,                                                    
+       5 +and (optionally) produces an AI summary that combines the trans
+         +cript with                                                     
+       6 +key frames extracted from the recording.                       
+       7  
+       8 +The project is split into three composable options:            
+       9 +                                                               
+      10 +| | What it does | Entry script | Output |                     
+      11 +|---|---|---|---|                                              
+      12 +| **Option 1: Screen record** | Joins the meeting and records t
+         +he screen + meeting audio to MP4 | `./screen/record_screen.sh` 
+         +| `/opt/meeting-bot/recordings/<name>_<ts>.mp4` |              
+      13 +| **Option 2: Transcribe** | Voice-to-text on any audio/video f
+         +ile via whisper.cpp | `./transcribe/transcribe.sh` | `/opt/meet
+         +ing-bot/transcripts/<name>_<ts>.{txt,srt}` |                   
+      14 +| **Option 3: AI summary** | Sends transcript + extracted keyfr
+         +ames to a vision-capable LLM | `./summarize/summarize.py` | `/o
+         +pt/meeting-bot/summaries/<name>_<ts>.md` |                     
+      15 +                                                               
+      16 +Run them individually, or use the chain:                       
+      17 +```bash                                                        
+      18 +sudo -H ./pipeline.sh "https://meet.google.com/abc-defg-hij" "W
+         +eekly Standup"                                                 
+      19 +# runs Option 1 -> Option 2 -> Option 3 in sequence.           
+      20 +```                                                            
+      21 +                                                               
+      22 +`CLAUDE.md` is the per-option reference for future Claude sessi
+         +ons — it                                                       
+      23 +holds usage, env-var configuration, debugging tips, and archite
+         +ctural                                                         
+      24 +context that doesn't belong in the user-facing README.         
+      25 +                                                               
+      26  Target OS: **Ubuntu 26.04 LTS Server, minimized cloud image**.
+      27  
+      28  ## VM sizing (Proxmox)
+     ...
+      36  Why: the OS itself needs very little (Ubuntu Server minimal run
+          s in ~1.5GB
+      37  RAM / 4GB disk), but Chromium + Xvfb + PipeWire/PulseAudio + ff
+          mpeg running
+      38  concurrently during a call want headroom, and whisper.cpp's `sm
+          all` model
+      19 -needs roughly 1–1.5GB RAM while transcribing (more for `medium`
+         -). Disk adds                                                   
+      20 -up over time: audio recordings are ~115MB per hour of meeting (
+         -16kHz mono                                                     
+      21 -WAV, uncompressed) and aren't auto-deleted, so budget disk for 
+         -how many                                                       
+      22 -hours of meetings you'll keep before manually clearing `/opt/me
+         -eting-bot/recordings`.                                         
+      39 +needs roughly 1–1.5GB RAM while transcribing (more for `medium`
+         +). The                                                         
+      40 +screen recorder adds an x11grab stream and H.264 encode on top 
+         +of the                                                         
+      41 +existing audio path — the recommended config already covers thi
+         +s comfortably.                                                 
+      42 +Disk adds up over time: MP4 recordings are ~200-400MB per hour 
+         +of meeting                                                     
+      43 +(H.264 ultrafast preset, crf 28) and aren't auto-deleted, so bu
+         +dget disk                                                      
+      44 +for how many hours of meetings you'll keep before manually clea
+         +ring                                                           
+      45 +`/opt/meeting-bot/recordings`.                                 
+      46  
+      47  ## Thai language support
+      48  
+     ...
+      50    in the browser) and generates the `th_TH.UTF-8` locale.
+      51  - It downloads whisper.cpp's **multilingual** `small` model (no
+          t the `.en`
+      52    English-only variant) - required for Thai transcription to wo
+          rk at all.
+      30 -- `record_and_transcribe.sh` defaults to `-l th` for transcript
+         -ion. Override                                                  
+      31 -  per-call with a 4th argument, e.g. `./record_and_transcribe.s
+         -h <url> <name> <display_name> auto`                            
+      32 -  to auto-detect language, or `en` for English-only meetings.  
+      53 +- `transcribe/transcribe.sh` defaults to `-l th` for transcript
+         +ion. Override                                                  
+      54 +  per-call with a 3rd argument, e.g.                           
+      55 +  `transcribe/transcribe.sh <audio> <name> auto` to auto-detect
+         + language,                                                     
+      56 +  or `en` for English-only meetings.                           
+      57  - If Thai accuracy with `small` isn't good enough, download the
+           `medium`
+      58    model (`bash ./models/download-ggml-model.sh medium` inside
+      35 -  `/opt/whisper.cpp`) and point `WHISPER_MODEL` in `record_and_
+         -transcribe.sh`                                                 
+      59 +  `/opt/whisper.cpp`) and point `WHISPER_MODEL` in `transcribe/
+         +transcribe.sh`                                                 
+      60    at `ggml-medium.bin`. Expect roughly 3x the RAM and transcrip
+          tion time.
+      61  
+      62  ## Architecture
+      63  
+      40 -1. You paste a meeting link into `record_and_transcribe.sh`    
+      64 +1. You paste a meeting link into `pipeline.sh` (or one of the s
+         +tandalone options)                                             
+      65  2. A headless-but-rendered Chromium browser (Playwright) joins 
+          the call using
+      66     a persistent, already-logged-in profile
+      67  3. Xvfb provides a virtual display for the browser (no physical
+           monitor needed)
+      68  4. If a waiting room applies, the bot waits for host admission 
+          before
+      69     recording starts (up to `ADMIT_TIMEOUT_SECONDS`)
+      46 -5. PulseAudio routes the meeting's audio into a virtual sink; f
+         -fmpeg records                                                  
+      47 -   from that sink to a WAV file                                
+      70 +5. ffmpeg captures:                                            
+      71 +   - **Video** from `DISPLAY=:99` via `x11grab` (1280x800, 15 f
+         +ps)                                                            
+      72 +   - **Audio** from `meeting_sink.monitor` (the same virtual Pu
+         +lseAudio sink                                                  
+      73 +     the bot has always used)                                  
+      74 +   - Both streams are muxed into a single MP4 (H.264 + AAC).   
+      75  6. Recording stops when the browser detects the call ended, or 
+          when the
+      76     participant-count heuristic decides most people have left an
+          d leaves
+      77     on its own (see "Auto-leave on mass exodus" below)
+      51 -7. whisper.cpp transcribes the WAV file into `.txt` and `.srt` 
+      78 +7. whisper.cpp transcribes the MP4's audio track into `.txt` an
+         +d `.srt`                                                       
+      79 +   (only when option 2 or the chain is run)                    
+      80 +8. The AI agent extracts keyframes from the MP4 + reads the tra
+         +nscript +                                                      
+      81 +   asks the configured LLM for a structured Markdown summary   
+      82 +   (only when option 3 or the chain is run)                    
+      83  
+      84  ## One-time setup
+      85  
+     ...
+      90  directory and fails with a confusing "Executable doesn't exist"
+           error.
+      91  
+      92  ```bash
+      62 -chmod +x setup.sh audio-setup.sh first_time_login.sh record_and
+         -_transcribe.sh                                                 
+      93 +chmod +x setup.sh audio-setup.sh first_time_login.sh \         
+      94 +         screen/record_screen.sh transcribe/transcribe.sh pipel
+         +ine.sh kill_meeting.sh                                         
+      95  sudo -H ./setup.sh
+      96  ```
+      97  
+     ...
+      110  
+      111  ## Day-to-day usage
+      112  
+      113 +### All three options at once (the common case)               
+      114 +                                                              
+      115  ```bash
+       82 -sudo -H ./record_and_transcribe.sh "https://meet.google.com/ab
+          -c-defg-hij" "Weekly Standup"                                  
+      116 +sudo -H ./pipeline.sh "https://meet.google.com/abc-defg-hij" "
+          +Weekly Standup"                                               
+      117  # or
+       84 -sudo -H ./record_and_transcribe.sh "https://zoom.us/j/12345678
+          -90" "Client Call"                                             
+      118 +sudo -H ./pipeline.sh "https://zoom.us/j/1234567890" "Client C
+          +all"                                                          
+      119  ```
+      120  
+      121  Outputs land in:
+       88 -- `/opt/meeting-bot/recordings/<name>_<timestamp>.wav`        
+      122 +- `/opt/meeting-bot/recordings/<name>_<timestamp>.mp4`        
+      123  - `/opt/meeting-bot/transcripts/<name>_<timestamp>.txt` and `.
+           srt`
+      124 +- `/opt/meeting-bot/summaries/<name>_<timestamp>.md`          
+      125  
+      126 +### Just one option                                           
+      127 +                                                              
+      128 +```bash                                                       
+      129 +# Option 1 - record only (run again later to transcribe/summar
+          +ize)                                                          
+      130 +sudo -H ./screen/record_screen.sh "https://meet.google.com/abc
+          +-defg-hij" "Weekly Standup"                                   
+      131 +                                                              
+      132 +# Option 2 - transcribe an existing file (any WAV, MP4, M4A, M
+          +KV)                                                           
+      133 +sudo -H ./transcribe/transcribe.sh /opt/meeting-bot/recordings
+          +/Weekly_Standup_<ts>.mp4 "Weekly Standup"                     
+      134 +                                                              
+      135 +# Option 3 - summarize from a transcript + video              
+      136 +python3 ./summarize/summarize.py \                            
+      137 +  /opt/meeting-bot/recordings/Weekly_Standup_<ts>.mp4 \       
+      138 +  /opt/meeting-bot/transcripts/Weekly_Standup_<ts>.txt        
+      139 +```                                                           
+      140 +                                                              
+      141  ## Leaving a meeting early (kill switch)
+      142  
+      143  Sometimes you need the bot to leave right now without you bein
+           g at the
+     ...
+      149  1. **From the recording terminal: press `Ctrl+\`** (SIGQUIT). 
+           The shell's
+      150     signal trap touches a kill sentinel; the Python join script
+            notices on
+      151     its next poll (≤15s), clicks the in-Meet "Leave" button so 
+           participants
+      102 -   see the bot go, and exits. ffmpeg finalizes the WAV, whispe
+          -r transcribes                                                 
+      103 -   what was recorded, and everything cleans up.               
+      152 +   see the bot go, and exits. ffmpeg finalizes the MP4, and th
+          +e chain (if                                                   
+      153 +   running) proceeds to the transcribe + summarize stages.    
+      154  
+      155  2. **From any other terminal: `sudo ./kill_meeting.sh`**. Same
+            outcome —
+      106 -   touches the sentinel, sends SIGTERM to the running recordin
+          -g, waits up                                                   
+      107 -   to 10s for clean exit, then escalates only on the Python pr
+          -ocess if                                                      
+      108 -   needed. Use this when the recording was launched in the bac
+          -kground                                                       
+      109 -   (e.g. via `trigger_server.py`, which detaches from any term
+          -inal).                                                        
+      156 +   touches the sentinel, sends SIGTERM to the running orchestr
+          +ator + join                                                   
+      157 +   driver, waits up to 10s for clean exit, then escalates only
+          + on the Python                                                
+      158 +   process if needed. Use this when the recording was launched
+          + in the                                                       
+      159 +   background (e.g. via `trigger_server.py`, which detaches fr
+          +om any terminal).                                             
+      160  
+      161  Both paths deliberately route through the in-Meet Leave button
+            rather
+      162  than yanking the browser out from under Meet, so other partici
+           pants see
+     ...
+      164  
+      165  ## Waiting rooms / host approval
+      166  
+      117 -`join_meeting.py` explicitly detects a waiting-room/lobby stat
+          -e ("waiting for                                               
+      118 -the host", "ask to join", etc) separately from being admitted 
+          -(presence of a                                                
+      119 -"Leave call"/"Leave meeting" button). It polls every 5s for up
+          - to 10 minutes                                                
+      120 -(`ADMIT_TIMEOUT_SECONDS`) before giving up and exiting — no re
+          -cording happens                                               
+      121 -until admission is confirmed, so you won't get a file full of 
+          -lobby silence.                                                
+      167 +`screen/capture.py` explicitly detects a waiting-room/lobby st
+          +ate ("waiting                                                 
+      168 +for the host", "ask to join", etc) separately from being admit
+          +ted (presence                                                 
+      169 +of a "Leave call"/"Leave meeting" button). It polls every 5s f
+          +or up to 10                                                   
+      170 +minutes (`ADMIT_TIMEOUT_SECONDS`) before giving up and exiting
+          + — no recording                                               
+      171 +happens until admission is confirmed, so you won't get a file 
+          +full of lobby                                                 
+      172 +silence.                                                      
+      173  
+      174  ## Auto-leave on mass exodus
+      175  
+     ...
+      180  - the count falls below 30% of its peak (`DROP_RATIO_THRESHOLD
+           `) — catches
+      181    the "call technically still open but everyone bailed" case
+      182  
+      132 -Tune these constants at the top of `join_meeting.py` if it's l
+          -eaving too                                                    
+      183 +Tune these constants at the top of `screen/capture.py` if it's
+          + leaving too                                                  
+      184  eagerly or not eagerly enough for your meeting sizes.
+      185  
+      186  ## Remote trigger (start a recording from your phone)
+      187  
+      188  `trigger_server.py` exposes a small authenticated HTTP endpoin
+           t that starts
+      138 -`record_and_transcribe.sh` in the background. Meant to be reac
+          -hable only over                                               
+      139 -your Tailscale network — no need to expose it publicly.       
+      189 +`pipeline.sh` in the background. Meant to be reachable only ov
+          +er your                                                       
+      190 +Tailscale network — no need to expose it publicly.            
+      191  
+      192  Setup:
+      193  ```bash
+     ...
+      214    -H "Content-Type: application/json" \
+      215    -d '{"url": "https://meet.google.com/abc-defg-hij", "name": 
+           "Client Call"}'
+      216  ```
+      166 -Returns `202` immediately; the recording runs in the backgroun
+          -d on the VM.                                                  
+      217 +Returns `202` immediately; the full pipeline (record + transcr
+          +ibe + summarize)                                              
+      218 +runs in the background on the VM.                             
+      219  
+      220  ## Known fragility / things to watch
+      221  
+      170 -- **Zoom and Google Meet change their web UI periodically.** `
+          -join_meeting.py`                                              
+      222 +- **Zoom and Google Meet change their web UI periodically.** `
+          +screen/capture.py`                                            
+      223    looks for buttons/text by visible label ("Join now", "Ask to
+            join", "Leave
+      224    call", waiting-room phrases, etc). If a join or admission ch
+           eck fails,
+      225    screenshots land in `/opt/meeting-bot/recordings/` (`join_fa
+           iled.png`,
+     ...
+      231    reads as `None` and the bot falls back entirely on "page clo
+           sed" / "meeting
+      232    ended" title detection to know when to stop.
+      233  - **Admission gating relies on a marker file** (`/tmp/meeting_
+           bot_admitted`).
+      182 -  `join_meeting.py` touches it once it detects it's actually i
+          -nside the call                                                
+      183 -  (not a waiting room); `record_and_transcribe.sh` polls for i
+          -t before                                                      
+      234 +  `screen/capture.py` touches it once it detects it's actually
+          + inside the call                                              
+      235 +  (not a waiting room); `screen/record_screen.sh` polls for it
+          + before                                                       
+      236    starting `ffmpeg`, so recording only covers time you were ac
+           tually admitted.
+      185 -  If `join_meeting.py` crashes between "admitted" and "meeting
+          - ends" without                                                
+      237 +  If `capture.py` crashes between "admitted" and "meeting ends
+          +" without                                                     
+      238    cleaning up, a stale marker could in theory affect the *next
+           * run - this
+      239    is unlikely (marker is also cleared at the start of every ru
+           n) but worth
+      240    knowing if recordings ever start unexpectedly early.
+     ...
+      253    model (the current default, needed for Thai) runs comfortabl
+           y faster than
+      254    real-time. `medium` is ~3x slower/heavier but meaningfully m
+           ore accurate,
+      255    especially for Thai - see the Thai language section above fo
+           r how to switch.
+      256 +  The H.264 encoder in the screen recorder uses `-preset ultra
+          +fast` and                                                     
+      257 +  `-crf 28`, which trades a little quality for much lower CPU 
+          +cost; this                                                    
+      258 +  is fine for talking-heads + slides.                         
+      259  - **`trigger_server.py` runs as root** (see `meeting-bot-trigg
+           er.service`) so
+      260    it can launch the recording pipeline without a login session
+           . It's gated
+      261    by a bearer token and meant to be reachable only over Tailsc
+           ale - don't
+     ...
+      265  
+      266  | File | Purpose |
+      267  |---|---|
+      213 -| `setup.sh` | One-time install of all dependencies |         
+      268 +| `setup.sh` | One-time install of all dependencies (incl. `an
+          +thropic` SDK + new output dirs) |                             
+      269  | `audio-setup.sh` | Creates the PulseAudio virtual sink |
+      270  | `first_time_login.sh` | One-time interactive Google/Zoom log
+           in via VNC |
+      216 -| `join_meeting.py` | Playwright script that joins the call | 
+      217 -| `record_and_transcribe.sh` | Main entry point — run this per
+          - meeting |                                                    
+      271 +| `screen/record_screen.sh` | Option 1 entry — Xvfb + Playwrig
+          +ht + ffmpeg x11grab -> MP4 |                                  
+      272 +| `screen/capture.py` | Playwright driver that joins the call 
+          +(carries Thai labels + kill sentinel) |                       
+      273 +| `screen/extract_frames.py` | Scene-change + periodic frame e
+          +xtractor for the AI summary |                                 
+      274 +| `transcribe/transcribe.sh` | Option 2 entry — accepts WAV / 
+          +MP4 / M4A / MKV, runs whisper.cpp |                           
+      275 +| `summarize/summarize.py` | Option 3 entry — frames + transcr
+          +ipt -> Markdown summary |                                     
+      276 +| `summarize/llm_client.py` | Pluggable LLM client (Anthropic 
+          +/ FCC / Ollama) |                                             
+      277 +| `summarize/prompts/summarize.md` | The summary prompt templa
+          +te |                                                          
+      278 +| `pipeline.sh` | Chains Option 1 -> 2 -> 3 in sequence |     
+      279  | `kill_meeting.sh` | Standalone "leave now" (also: Ctrl+\ in 
+           the recording terminal) |
+      280 +| `trigger_server.py` | Tailscale-only HTTP endpoint that laun
+          +ches `pipeline.sh` |                                          
+      281 +| `meeting-bot-trigger.service` | systemd unit for `trigger_se
+          +rver.py` |                                                    
+      282 +| `CLAUDE.md` | Per-option reference for future Claude session
+          +s (env vars, debugging, conventions) |                        
+      283   No newline at end of file
+
+● Now CLAUDE.md — the persistent project-context file for future Claude
+  sessions:
+
+● Write(CLAUDE.md)
+  ⎿  Wrote 209 lines to CLAUDE.md
+       1 # CLAUDE.md — Project context for future Claude sessions
+       3 This file is the canonical reference for architectural decisions
+         , conventions,
+          should read
+       5 this before exploring the source code so they don't have to re-d
+       6 that's already locked in.
+       7 
+          `README.md`.
+       9 This file is for the things that aren't obvious from reading cod
+      10 history.
+     … +298 lines (ctrl+o to expand)
+
+● Now let me run a final verification pass on all the scripts at once:
+
+● Bash(echo "=== Shell syntax checks ===" && for f in setup.sh audio-setup.sh
+      first_time_login.sh kill_meeting.sh record_and_transcribe.sh
+      screen/record_screen.sh tran…)
+  ⎿  === Shell syntax checks ===
+     setup.sh                                 OK
+     audio-setup.sh                           OK
+     … +42 lines (ctrl+o to expand)
+
+● All scripts pass syntax checks. Let me also verify the path-derivation logic
+  in summarize.py and pipeline.sh actually finds the right files (the ls -1t ...
+  | head -n 1 pattern can return paths with leading whitespace from ls):
+
+● Bash(mkdir -p /tmp/meeting-bot-test/recordings
+      /tmp/meeting-bot-test/transcripts /tmp/meeting-bot-test/summaries
+      /tmp/meeting-bot-test/frames && touch /tmp/meeting-b…)
+  ⎿  ls output:
+     /tmp/meeting-bot-test/recordings/Weekly_Standup_20250727_141500.mp4$
+
+● Good — no trailing whitespace issues on Linux (which is what we target; the
+  project runs on Ubuntu, not macOS where ls adds trailing spaces to certain
+  locale combinations).
+
+  Let me also verify summarize.py actually runs end-to-end on a synthetic input
+  (without making an LLM call):
+
+● Bash(python3 -c "
+      import sys, os…)
+  ⎿  derive from MP4: 'Weekly_Standup'
+     derive from MP4 (different stamp): 'Weekly_Standup'
+     derive from no stamp: 'random_meeting'
+     … +2 lines (ctrl+o to expand)
+
+● All derivation logic and prompt loading works correctly. Let me also test
+  extract_frames.py's probe_duration function (the only function we can test
+  without a real video):
+
+● Bash(python3 -c "
+      import sys…)
+  ⎿  /tmp/nonexistent.mp4: No such file or directory
+     parse_showinfo result: [12.345, 23.456, 34.567]
+     probe_duration on missing file: 0.0
+
+● parse_showinfo correctly extracts timestamps and probe_duration gracefully
+  returns 0.0 for missing files (with stderr noise from ffprobe that won't
+  matter in practice).
+
+  Let me clean up the test directories and complete the task:
+
+● Bash(rm -rf /tmp/meeting-bot-test /tmp/meeting-bot-transcribe-* 2>/dev/null;
+      rm -rf screen/__pycache__ summarize/__pycache__ 2>/dev/null; ls
+      /home/kkattmos/Documents…)
+  ⎿  2026-07-23-171512-read-all-the-md-first-to-see-what-the-project-is.txt
+     CLAUDE.md
+     README.md
+     … +13 lines (ctrl+o to expand)
+
+● Bash(rm -f join_meeting.py record_and_transcribe.sh && rm -rf __pycache__ &&
+      ls -la)
+  ⎿  total 176
+     drwxrwxr-x 6 kkattmos kkattmos  4096 Jul 27 08:52 .
+     drwxrwxr-x 4 kkattmos kkattmos  4096 Jul 23 16:01 ..
+     … +14 lines (ctrl+o to expand)
+
+● Final structure looks clean. Let me do one last full verification:
+
+● Bash(echo "=== Final all-script syntax check ===" && fail=0 && for f in
+      setup.sh audio-setup.sh first_time_login.sh kill_meeting.sh
+      screen/record_screen.sh transcrib…)
+  ⎿  === Final all-script syntax check ===
+     All scripts OK
+
+● All scripts pass. Implementation complete.
+
+  Summary of changes
+
+  New directory structure:
+  - screen/ — Option 1 (screen recording): record_screen.sh (Xvfb + Playwright +
+  ffmpeg-x11grab → MP4), capture.py (the renamed/refactored join driver
+  carrying Thai labels + kill sentinel), extract_frames.py (scene-change +
+  periodic frame extractor).
+  - transcribe/ — Option 2: transcribe.sh accepts WAV/MP4/M4A/MKV, runs
+  whisper-cli.
+  - summarize/ — Option 3: summarize.py (main entry), llm_client.py
+  (Anthropic/FCC/Ollama pluggable backend), prompts/summarize.md (the prompt
+  template).
+  - pipeline.sh — Chains all three when given a meeting URL.
+
+  Updated files:
+  - setup.sh — adds anthropic pip package and the summaries/ + frames/
+  directories.
+  - trigger_server.py — MEETING_BOT_SCRIPT default now points at pipeline.sh.
+  - kill_meeting.sh — pgrep patterns updated to match the new script names
+  (pipeline.sh, screen/record_screen.sh, screen/capture.py,
+  transcribe/transcribe.sh, summarize/summarize.py).
+
+  Removed (legacy): record_and_transcribe.sh, join_meeting.py — folded into
+  screen/record_screen.sh and screen/capture.py.
+
+  Unchanged and verified compatible (re-read in full):
+  - audio-setup.sh — purely sets up meeting_sink; consumed identically by the
+  new recorder.
+  - first_time_login.sh — same profile dir, same Xvfb on :99; works with the new
+  capture.py.
+  - meeting-bot-trigger.service — no embedded script paths.
+
+  Docs:
+  - README.md rewritten to lead with the three options table.
+  - CLAUDE.md created as the canonical reference for future Claude sessions —
+  holds env-var configuration for FCC/Anthropic/Ollama, frame-sampling knobs,
+  conventions, and "things future Claude must not change" notes.
+
+  Verified:
+  - All 8 shell scripts pass bash -n.
+  - All 5 Python files pass python3 -m py_compile (no warnings).
+  - ffmpeg has both libx264 encoder and aac decoder available.
+  - Smoke tests pass: meeting-name derivation strips timestamp suffixes
+  correctly, prompt loading preserves {transcript} and {frame_manifest}
+  placeholders, parse_showinfo extracts timestamps from realistic ffmpeg output,
+  probe_duration returns 0.0 gracefully on missing files.
+
+  Next step for you: re-run sudo -H ./setup.sh to install the anthropic pip
+  package and create the new output directories, then test the chain with a real
+  meeting via sudo -H ./pipeline.sh "<test-url>" "test".
+
+✻ Crunched for 20m 24s
+
+※ recap: Split the meeting bot into three composable options — screen record to MP4, transcribe via whisper, AI summary from frames+transcript — with a pipeline that chains them. All scripts pass syntax checks and helpers smoke-tested. Next: run sudo -H ./setup.sh to install the anthropic package and new output dirs. (disable recaps in /config)
+❯ Also, modify the pipeline (especially in transcribe/ and summarize/) to works 
+  for youtube links as well (like https://www.youtube.com/watch?v=<id>). Also   
+  when running the setup script, got this ==> Building whisper.cpp              
+  fatal: destination path 'whisper.cpp' already exists and is not an empty      
+  directory.                                                                    
+  . Then make sure that the recording part does not accidentally share screen   
+  and turn off camera and microphone upon start, and auto exit (and stops       
+  record) on mass leave. Ask me questions first.                                
+
+● Three substantive asks plus a setup bug to fix. Let me get questions out of
+  the way before changing anything.
+  ⎿  Invalid tool parameters
+
+● User answered Claude's questions:
+  ⎿  · How should YouTube URLs integrate into the pipeline? → Download audio + 
+     video via yt-dlp, feed into Stage 2 & 3 only (Recommended)
+     · How should yt-dlp be installed? → Latest yt-dlp from GitHub releases
+     · How should the recording bot turn off its camera and microphone BEFORE 
+     joining? → Option 1, but you can consider using keyboard shortcuts.
+     · How should we prevent the bot from accidentally sharing its screen in the
+     meeting? → All of 3.
+
+● Got it. "All of 3" for the no-share guard means layer all three defenses:
+  1. Block screen-share API via Chrome flags (so the API is unreachable)
+  2. Block the Chrome permission dialog if it ever appears (defense in depth)
+  3. Detect-and-stop: monitor for "You are presenting" and click "Stop
+  presenting" (last-resort safety net)
+
+  For the camera/mic, you said "Option 1 but consider keyboard shortcuts" — so
+  use the in-Meet UI click logic primarily, but also try Meet's keyboard
+  shortcuts (Ctrl+E for camera, Ctrl+D for mic on Meet) as a fast path. Let me
+  confirm one more thing before I plan:
+
+● User answered Claude's questions:
+  ⎿  · You mentioned auto-exit on mass leave - the current heuristic already 
+     does this. Should I tighten it or add a hard timeout? → Option 1 and 3, 
+     with steps for configuring this.
+     · setup.sh currently fails on re-run because /opt/whisper.cpp already 
+     exists. How should it handle re-runs? → Skip-if-exists with git pull 
+     (Recommended)
+
+● Got it. So:
+  - Auto-exit = existing heuristic + a new hard timeout, with documented config
+  steps in CLAUDE.md.
+  - setup.sh re-runs = skip-if-exists with git pull.
+
+  Let me enter plan mode and lay this all out before changing code.
+
+● Entered plan mode
+  Claude is now exploring and designing an implementation approach.
+
+  Read 1 file (ctrl+o to expand)
+
+● The existing plan is the prior session's split-into-3-options work — that's
+  already been implemented. This new request is a different task: extending the
+  existing implementation with YouTube support, fixing the setup re-run bug, and
+  adding camera/mic/screen-share guards. Different task — I'll overwrite the
+  plan.
+
+  Let me do focused exploration to confirm exact current state before writing
+  the new plan:
+
+  Read 3 files (ctrl+o to expand)
+
+● Good, I have the exact current state. Now let me write the new plan:
+
+● Updated plan
+  ⎿  /plan to preview
+
+● User approved Claude's plan
+  ⎿  Plan saved to: ~/.claude/plans/twinkly-growing-eagle.md · /plan to edit
+     Plan: YouTube support + setup re-run fix + camera/mic/screen-share guards
+
+     Context
+
+     The previous session split the project into three composable options
+     (screen-record, transcribe, AI-summary) and a pipeline.sh chain. That work
+     is complete and merged. This plan covers the user's next set of asks:
+
+     1. YouTube URL support in stages 2 and 3 (transcribe + summarize). Today
+     both stages only accept local files; the user wants to feed a URL like
+     https://www.youtube.com/watch?v=<id> and have it Just Work.
+     2. setup.sh re-run fix. Running setup.sh a second time fails with
+     fatal: destination path 'whisper.cpp' already exists and is not an empty 
+     directory. on the git clone line. The script needs to handle the case
+     where /opt/whisper.cpp is already populated.
+     3. Camera / microphone off before joining. Currently the bot joins with
+     camera and mic on (other participants see and hear a bot). Need to mute
+     both before the recording starts.
+     4. No accidental screen-share. Today there's no guard against the bot
+     clicking "Present" or otherwise sharing the screen during the meeting.
+     Need layered defenses.
+     5. Auto-exit on mass leave with a hard max-duration timeout as a backstop.
+     The current heuristic already does mass-exodus detection; we add a
+     configurable wall-clock timeout so the bot never gets stuck.
+
+     The user answered all the clarifying questions:
+     - YouTube = stage 2 + 3 only, fed by yt-dlp. Stage 1 (record_screen)
+     rejects
+     YouTube URLs because there's no meeting to join.
+     - yt-dlp = latest binary from GitHub releases, installed to /usr/local/bin.
+     - Camera/mic = click the in-Meet UI buttons (Meet: Ctrl+E for camera,
+     Ctrl+D for mic are keyboard shortcuts the user explicitly suggested as a
+     fast path). Plus the existing --use-fake-ui-for-media-stream flag stays.
+     - No-share guard = ALL THREE of: Chrome flag
+     --disable-features=ScreenCapture
+       - click "Block" on any Chrome permission dialog + monitor-and-click-Stop-
+     presenting on the in-Meet banner.
+     - Auto-exit = existing heuristic + new hard timeout MAX_MEETING_MINUTES
+     (default 240), with documented config steps in CLAUDE.md.
+     - setup.sh re-run = if [ -d /opt/whisper.cpp ]; then git pull; else git 
+     clone.
+
+     Files to modify
+
+     setup.sh
+
+     - Replace the git clone line with a guard: if /opt/whisper.cpp exists, run
+     git pull inside it; otherwise clone fresh. After pull/clone, always run
+     cmake -B build && cmake --build build -j$(nproc) --config Release
+     unconditionally — the build is cheap on incremental changes.
+     - Add a yt-dlp install step at the end (latest release binary):
+     echo "==> Installing latest yt-dlp"
+     curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+       -o /usr/local/bin/yt-dlp
+     chmod a+rx /usr/local/bin/yt-dlp
+     /usr/local/bin/yt-dlp --version   # sanity check; fails loudly if download 
+     broken
+     - Sanity check is important because GitHub's "latest" redirect can fail
+     behind
+     some firewalls.
+
+     transcribe/transcribe.sh
+
+     - Detect YouTube URLs (youtube.com/watch?v= or youtu.be/) before the
+     extension check. If matched:
+       - Derive a safe meeting name from the video title (or fall back to the
+     video ID). Use yt-dlp --print filename -o "%(title)s [%(id)s]" with
+     --get-filename or --print to get the title, sanitize it the same way
+     SAFE_NAME is sanitized today.
+       - Download just the audio track to a temp WAV:
+     yt-dlp -x --audio-format wav --audio-quality 0 -o "$WORK_DIR/audio.%(ext)s"
+     "$URL"
+       - Feed the resulting WAV to whisper-cli exactly as the local-file branch
+     does.
+     - Keep the existing local-file path unchanged (WAV, MP4, M4A, MKV).
+     - Add a comment near the top documenting the new input forms.
+
+     summarize/summarize.py
+
+     - Accept a YouTube URL in place of the local video path argument. Detect by
+     substring match on youtube.com / youtu.be.
+     - New helper download_youtube_video(url, out_path) that calls
+     yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" 
+     --merge-output-format mp4 -o out_path url. The merged MP4 is what
+     extract_frames.py already knows how to handle.
+     - If the input is a YouTube URL, call the helper first, then proceed with
+     the existing manifest + LLM flow.
+     - If the input is a local path, leave the existing flow alone.
+
+     pipeline.sh
+
+     - At the top, after arg parsing, detect input type by URL shape:
+       - meet.google.com or zoom.us -> run Stage 1 (record_screen.sh) +
+     Stages 2 & 3 on the produced MP4.
+       - youtube.com / youtu.be -> skip Stage 1 entirely, run Stages 2 & 3
+     against the YouTube URL directly. The summary still gets keyframes
+     (from the downloaded MP4) + transcript (from the downloaded audio).
+     - Clear error if the URL is anything else.
+
+     screen/capture.py
+
+     - Camera/mic off BEFORE joining: after the click-join succeeds, before
+     wait_for_admission, call a new mute_av(page, platform) helper.
+     For Google Meet:
+       a. Try page.keyboard.press("Control+E") (camera) and "Control+D" (mic)
+     — fast path, the user explicitly suggested keyboard shortcuts.
+       b. Fall back to clicking aria-label="Turn off camera" / "Mute microphone"
+     via get_by_role("button", ...). If a button is "Turn on camera" /
+     "Unmute" instead, the camera/mic is already off — log and move on.
+       c. For Zoom: similar pattern; keyboard shortcut for Zoom is Alt+V
+     (camera)
+     and Alt+A (mic). Buttons by aria-label.
+     - Screen-share defense in depth:
+       a. Layer 1: Chrome flag. Add --disable-features=ScreenCapture to the
+     args list in launch_persistent_context. Document in a comment that
+     this can break any case where the bot actually wants to share
+     (currently none — keeps the API unreachable).
+       b. Layer 2: dialog killer. Add a periodic check inside
+     wait_until_meeting_ends for Chrome's "Allow [site] to see your screen?"
+     native dialog, and click "Block". Detect via title/substring match
+     against body.inner_text looking for "see your screen" / "share your
+     screen" / "Ent\xc3\xa3o voc\xc3\xaa quer compartilhar" (Portuguese),
+     then click any button whose label contains "Block".
+       c. Layer 3: monitor in-meeting share state. Inside
+     wait_until_meeting_ends, on each poll, check for the
+     "You are presenting" banner. Google Meet shows
+     aria-label="Stop presenting" (or text "Stop presenting"). If found,
+     click it and log a loud warning: "WARNING: Bot accidentally started
+     presenting - clicking Stop presenting. Investigate cause."
+     - Hard max-duration timeout. Add MAX_MEETING_SECONDS constant (default
+     4 * 3600 = 4 hours, env-overridable via MAX_MEETING_MINUTES). Track
+     start_ts at the top of wait_until_meeting_ends. If time.time() - start_ts >
+     MAX_MEETING_SECONDS, log "Hard timeout reached - leaving."
+     and call leave_meeting(page). The existing kill sentinel / page-closed /
+     title-changed / mass-exodus checks all keep running and still take
+     precedence — the timeout is just a backstop.
+     - Update is_admitted / Thai label lists are untouched.
+
+     CLAUDE.md
+
+     - New section "YouTube support" describing the URL forms accepted by each
+     stage and the dependency on yt-dlp.
+     - New section "Camera/mic/screen-share guards" listing the three layers for
+     screen share, the mute strategy for camera/mic, and the keyboard
+     shortcuts used.
+     - New section "Auto-exit policy" describing the existing heuristic + the
+     new hard timeout, with concrete instructions to configure:
+     # tighten mass-exodus: lower threshold, fewer confirmations
+     # (edit screen/capture.py directly: DROP_RATIO_THRESHOLD, 
+     LOW_COUNT_CONFIRMATIONS)
+     DROP_RATIO_THRESHOLD=0.25
+     LOW_COUNT_CONFIRMATIONS=1
+
+     # change the hard max duration
+     MAX_MEETING_MINUTES=120 python3 screen/capture.py ...
+     - Update "setup.sh re-run" note explaining the new skip-if-exists behavior
+     and what to do if /opt/whisper.cpp got into a broken state
+     (sudo rm -rf /opt/whisper.cpp && sudo -H ./setup.sh).
+
+     README.md
+
+     - Add a "YouTube URLs" subsection in Day-to-day usage showing:
+     # Transcribe a YouTube video
+     sudo -H ./transcribe/transcribe.sh "https://www.youtube.com/watch?v=xyz"
+     "talk"
+
+     # Summarize a YouTube video (transcript + video frames)
+     python3 ./summarize/summarize.py "https://www.youtube.com/watch?v=xyz"
+     /path/to/transcript.txt
+
+     # Full pipeline for a YouTube URL (skips recording, runs 2 + 3)
+     sudo -H ./pipeline.sh "https://www.youtube.com/watch?v=xyz" "talk"
+     - Add a one-line note in "Known fragility" about the camera/mic-off
+     behavior
+     and the screen-share guard.
+     - Update the Files table row for setup.sh to mention the re-run safety.
+
+     Files NOT modified
+
+     - audio-setup.sh — unchanged.
+     - first_time_login.sh — unchanged. The login flow doesn't need to mute the
+     browser; it's only used to establish the cookie session.
+     - kill_meeting.sh — unchanged. New scripts (pipeline.sh,
+     transcribe/transcribe.sh, summarize/summarize.py) match the patterns
+     already added in the previous session.
+     - trigger_server.py — unchanged. pipeline.sh accepts YouTube URLs and
+     the same <url> <name> JSON contract.
+     - meeting-bot-trigger.service — unchanged.
+
+     Verification
+
+     1. setup.sh re-runs: run sudo -H ./setup.sh twice in a row. First run
+     clones fresh; second run git pulls and rebuilds incrementally. Both
+     print "Done." with no fatal error.
+     2. yt-dlp installs: which yt-dlp && yt-dlp --version after setup.sh
+     returns the version string.
+     3. YouTube transcribe:
+     sudo -H ./transcribe/transcribe.sh 
+     "https://www.youtube.com/watch?v=dQw4w9WgXcQ" "test" en.
+     Expect: yt-dlp downloads audio to /tmp/meeting-bot-transcribe-$$/audio.wav,
+     whisper-cli produces transcripts/test_<ts>.txt with English text. Verify
+     the transcript is real (not empty / not garbled).
+     4. YouTube summarize: python3 ./summarize/summarize.py 
+     "https://www.youtube.com/watch?v=..." some_transcript.txt.
+     Expect: yt-dlp downloads merged MP4 to a temp location, frame extraction
+     runs, summary is produced.
+     5. Pipeline auto-routes YouTube:
+     sudo -H ./pipeline.sh "https://www.youtube.com/watch?v=..." "test".
+     Expect: Stage 1 (record_screen.sh) is SKIPPED with a clear message,
+     Stages 2 and 3 run.
+     6. Camera/mic off in Meet: sudo -H ./screen/record_screen.sh 
+     "https://meet.google.com/<test>" "test".
+     While the bot is admitted, take a screenshot from the noVNC window and
+     confirm the camera/mic buttons in the Meet UI show OFF state. Join with
+     a second account and confirm no audio/video from the bot is sent.
+     7. Screen-share guard layers:
+       - Layer 1: launch a meet call, attempt to share screen via DevTools
+     console (page.evaluate('navigator.mediaDevices.getDisplayMedia(...)')).
+     Expect: NotAllowedError or similar, because
+     --disable-features=ScreenCapture
+     blocks the API.
+       - Layer 2: simulate the Chrome native dialog by triggering it; verify
+     the periodic check clicks "Block" within one poll interval.
+       - Layer 3: manually trigger "Present" via the DevTools console
+     (override the click handler); verify the next poll detects the
+     "Stop presenting" banner and clicks it, with the warning logged.
+     8. Hard timeout: set MAX_MEETING_MINUTES=1 and run a meeting. After 1
+     minute, the bot should leave cleanly (not stuck in the meeting). Verify
+     MP4 finalizes and whisper runs.
+
+     Out of scope
+
+     - YouTube playlist support (single video only; yt-dlp supports it but the
+     sanitization step would need to handle multiple outputs).
+     - yt-dlp cookie-based auth (for age-restricted or members-only videos).
+     Falls back to anonymous yt-dlp; user can add cookies later if needed.
+     - Reverse-direction: using the bot to publish to YouTube. Not relevant.
+     - Hardening the --disable-features=ScreenCapture flag against new Chrome
+     versions that rename the feature; this is a known-stable string for
+     Chrome 119+, but if Chrome renames it the layer-1 defense may silently
+     degrade. Layers 2 and 3 catch that case.
+
+● Plan approved. Let me clean up old completed tasks and set up the new work:
+● Tasks set up. Starting with the setup.sh fix + yt-dlp install (task 14):
+
+● Bash(bash -n setup.sh && echo "setup.sh OK")
+  ⎿  setup.sh OK
+
+● Update(setup.sh)
+  ⎿  Added 22 lines, removed 2 lines
+      41  
+      42  echo "==> Building whisper.cpp"
+      43  cd /opt
+      44 -git clone https://github.com/ggerganov/whisper.cpp.git         
+      45 -cd whisper.cpp                                                 
+      44 +if [ -d whisper.cpp ]; then                                    
+      45 +  echo "    /opt/whisper.cpp already exists - pulling latest in
+         +stead of re-cloning."                                          
+      46 +  cd whisper.cpp                                               
+      47 +  git pull                                                     
+      48 +else                                                           
+      49 +  git clone https://github.com/ggerganov/whisper.cpp.git       
+      50 +  cd whisper.cpp                                               
+      51 +fi                                                             
+      52 +# Build is cheap on incremental changes, so always run it - gua
+         +rantees the                                                    
+      53 +# whisper-cli binary is in sync with the source tree.          
+      54  cmake -B build
+      55  cmake --build build -j"$(nproc)" --config Release
+      56  
+     ...
+      61  # record_and_transcribe.sh's WHISPER_MODEL variable.
+      62  bash ./models/download-ggml-model.sh small
+      63  
+      64 +echo "==> Installing latest yt-dlp"                            
+      65 +# Used by transcribe/transcribe.sh and summarize/summarize.py t
+         +o download                                                     
+      66 +# audio + video from YouTube URLs. Installing from GitHub relea
+         +ses (not the                                                   
+      67 +# apt package) so we always get the freshest build - YouTube br
+         +eaks yt-dlp                                                    
+      68 +# regularly and a stale binary is the #1 cause of silent failur
+         +es.                                                            
+      69 +curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/downlo
+         +ad/yt-dlp \                                                    
+      70 +  -o /usr/local/bin/yt-dlp                                     
+      71 +chmod a+rx /usr/local/bin/yt-dlp                               
+      72 +# Sanity check: a broken download (e.g. firewall block on GitHu
+         +b) returns                                                     
+      73 +# an HTML page instead of a binary, which fails immediately on 
+         +--version.                                                     
+      74 +/usr/local/bin/yt-dlp --version                                
+      75 +                                                               
+      76  echo "==> Creating working directories"
+      77  mkdir -p /opt/meeting-bot/{recordings,transcripts,summaries,fra
+          mes}
+      78  mkdir -p ~/.meeting-bot/chrome-profile
+
+● Bash(bash -n setup.sh && echo "setup.sh updated OK")
+  ⎿  setup.sh updated OK
+
+● Now add YouTube support to transcribe.sh. The script needs to detect a YouTube
+  URL before the extension check, derive a safe name from the video title,
+  download audio via yt-dlp, and feed it to whisper:
+
+● Update(transcribe/transcribe.sh)
+  ⎿  Added 58 lines, removed 27 lines
+       1  #!/bin/bash
+       2 -# Option 2: Transcribe an audio file (WAV or MP4) to text using
+         - whisper.cpp.                                                  
+       2 +# Option 2: Transcribe an audio file (WAV/MP4/M4A/MKV) or a You
+         +Tube URL                                                       
+       3 +# to text using whisper.cpp.                                   
+       4  #
+       5 +# Accepts either a local file or a YouTube URL (youtube.com/wat
+         +ch?v= or                                                       
+       6 +# youtu.be/). For YouTube URLs, yt-dlp (installed by setup.sh) 
+         +downloads                                                      
+       7 +# the audio track to a temp WAV before whisper-cli sees it.    
+       8 +#                                                              
+       9  # Works standalone - feed it any audio file, including the MP4 
+          from
+       5 -# screen/record_screen.sh. If the input is MP4, ffmpeg first ex
+         -tracts the                                                     
+       6 -# audio track to a 16kHz mono WAV (matching what the original  
+       7 -# record_and_transcribe.sh fed to whisper-cli).                
+      10 +# screen/record_screen.sh. If the local input is MP4/M4A/MKV, f
+         +fmpeg first                                                    
+      11 +# extracts the audio track to a 16kHz mono WAV.                
+      12  #
+      13  # Usage:
+      10 -#   sudo -H ./transcribe/transcribe.sh <audio_or_video_file> "<
+         -name>" [language]                                              
+      14 +#   sudo -H ./transcribe/transcribe.sh <file_or_youtube_url> "<
+         +name>" [language]                                              
+      15  #
+      16  # Language is a whisper.cpp language code: "th" (Thai, default)
+          , "en",
+      17  # "auto", or any whisper.cpp code.
+     ...
+      21  set -e
+      22  
+      23  if [ -z "$1" ] || [ -z "$2" ]; then
+      20 -  echo "Usage: $0 <audio_or_video_file> <name> [language]"     
+      24 +  echo "Usage: $0 <file_or_youtube_url> <name> [language]"     
+      25    echo "  language: th (default), en, auto, or any whisper.cpp 
+          language code"
+      26    exit 1
+      27  fi
+     ...
+      34  # noticeably better Thai accuracy, at ~3x the transcription tim
+          e/RAM.
+      35  WHISPER_MODEL="/opt/whisper.cpp/models/ggml-small.bin"
+      36  
+      33 -if [ ! -f "$INPUT" ]; then                                     
+      34 -  echo "Input file not found: $INPUT"                          
+      35 -  exit 1                                                       
+      36 -fi                                                             
+      37 -                                                               
+      37  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      38  ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+      39  
+     ...
+       43  WORK_DIR="/tmp/meeting-bot-transcribe-$$"
+       44  mkdir -p "$TRANSCRIPT_DIR" "$WORK_DIR"
+       45  
+       47 -# Detect input type. WAV goes straight in; MP4 is extracted to
+          - 16kHz mono WAV                                               
+       48 -# first (whisper.cpp's small model is fine at this sample rate
+          -, and mono is                                                 
+       49 -# what the original record_and_transcribe.sh fed in).         
+       50 -EXT="${INPUT##*.}"                                            
+       51 -EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')         
+       46 +# YouTube URLs are detected by URL pattern, NOT by file extens
+          +ion - the input                                               
+       47 +# is a URL string, not a file. yt-dlp handles download + forma
+          +t selection.                                                  
+       48 +IS_YOUTUBE=0                                                  
+       49 +if echo "$INPUT" | grep -qE '(youtube\.com/watch\?v=|youtu\.be
+          +/)'; then                                                     
+       50 +  IS_YOUTUBE=1                                                
+       51 +fi                                                            
+       52  
+       53 -AUDIO_FILE="$INPUT"                                           
+       53 +AUDIO_FILE=""                                                 
+       54  TEMP_WAV=""
+       55  
+       56 -if [ "$EXT_LOWER" = "mp4" ] || [ "$EXT_LOWER" = "m4a" ] || [ "
+          -$EXT_LOWER" = "mkv" ]; then                                   
+       57 -  echo "==> Extracting audio track from $EXT_LOWER -> 16kHz mo
+          -no WAV"                                                       
+       56 +if [ "$IS_YOUTUBE" -eq 1 ]; then                              
+       57 +  if ! command -v yt-dlp >/dev/null 2>&1; then                
+       58 +    echo "yt-dlp is not installed. Run setup.sh first."       
+       59 +    rm -rf "$WORK_DIR"                                        
+       60 +    exit 1                                                    
+       61 +  fi                                                          
+       62 +  echo "==> Downloading audio from YouTube URL via yt-dlp"    
+       63    AUDIO_FILE="$WORK_DIR/audio.wav"
+       59 -  ffmpeg -y -i "$INPUT" -vn -ar 16000 -ac 1 "$AUDIO_FILE" \   
+       60 -    > "$WORK_DIR/ffmpeg.log" 2>&1                             
+       64 +  yt-dlp \                                                    
+       65 +    --no-playlist \                                           
+       66 +    --extract-audio \                                         
+       67 +    --audio-format wav \                                      
+       68 +    --audio-quality 0 \                                       
+       69 +    --output "$WORK_DIR/audio.%(ext)s" \                      
+       70 +    "$INPUT" \                                                
+       71 +    > "$WORK_DIR/yt-dlp.log" 2>&1                             
+       72 +  # yt-dlp writes to audio.wav because we asked for wav format
+          +.                                                             
+       73    TEMP_WAV="$AUDIO_FILE"
+       62 -elif [ "$EXT_LOWER" != "wav" ]; then                          
+       63 -  echo "Unsupported input extension: .$EXT_LOWER"             
+       64 -  echo "Supported: .wav, .mp4, .m4a, .mkv"                    
+       65 -  rm -rf "$WORK_DIR"                                          
+       66 -  exit 1                                                      
+       74 +else                                                          
+       75 +  # Local file path. WAV goes straight in; MP4/M4A/MKV are ext
+          +racted to 16kHz                                               
+       76 +  # mono WAV first.                                           
+       77 +  if [ ! -f "$INPUT" ]; then                                  
+       78 +    echo "Input file not found: $INPUT"                       
+       79 +    rm -rf "$WORK_DIR"                                        
+       80 +    exit 1                                                    
+       81 +  fi                                                          
+       82 +  EXT="${INPUT##*.}"                                          
+       83 +  EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')       
+       84 +  if [ "$EXT_LOWER" = "mp4" ] || [ "$EXT_LOWER" = "m4a" ] || [
+          + "$EXT_LOWER" = "mkv" ]; then                                 
+       85 +    echo "==> Extracting audio track from $EXT_LOWER -> 16kHz 
+          +mono WAV"                                                     
+       86 +    AUDIO_FILE="$WORK_DIR/audio.wav"                          
+       87 +    ffmpeg -y -i "$INPUT" -vn -ar 16000 -ac 1 "$AUDIO_FILE" \ 
+       88 +      > "$WORK_DIR/ffmpeg.log" 2>&1                           
+       89 +    TEMP_WAV="$AUDIO_FILE"                                    
+       90 +  elif [ "$EXT_LOWER" = "wav" ]; then                         
+       91 +    AUDIO_FILE="$INPUT"                                       
+       92 +  else                                                        
+       93 +    echo "Unsupported input extension: .$EXT_LOWER"           
+       94 +    echo "Supported: .wav, .mp4, .m4a, .mkv, or a YouTube URL"
+       95 +    rm -rf "$WORK_DIR"                                        
+       96 +    exit 1                                                    
+       97 +  fi                                                          
+       98  fi
+       99  
+      100  echo "==> Transcribing with whisper.cpp (language: $LANGUAGE, 
+           model: $WHISPER_MODEL)"
+     ...
+      105    -otxt -osrt \
+      106    -of "${TRANSCRIPT_DIR}/${SAFE_NAME}_${STAMP}"
+      107  
+       77 -# Clean up the temp WAV if we made one.                       
+      108 +# Clean up the temp workdir if we made one.                   
+      109  [ -n "$TEMP_WAV" ] && rm -rf "$WORK_DIR"
+      110  
+      111  echo "==> Done."
+
+● Bash(bash -n transcribe/transcribe.sh && echo "transcribe.sh OK")
+  ⎿  transcribe.sh OK
+
+● Now summarize.py — accept YouTube URLs and download via yt-dlp:
+
+● Update(summarize/summarize.py)
+  ⎿  Added 112 lines, removed 31 lines
+       7  automatically after Option 1 (record) and Option 2 (transcribe)
+          .
+       8  
+       9  Usage:
+      10 -    python3 summarize/summarize.py <video_path> <transcript_pat
+         -h> [<output_md_path>]                                          
+      10 +    python3 summarize/summarize.py <video_or_youtube_url> <tran
+         +script_path> [<output_md_path>]                                
+      11  
+      12 +The <video_or_youtube_url> argument can be either:             
+      13 +  - A local file path (MP4 from screen/record_screen.sh, or any
+         + container                                                     
+      14 +    ffmpeg can read).                                          
+      15 +  - A YouTube URL (youtube.com/watch?v= or youtu.be/). The vide
+         +o is                                                           
+      16 +    downloaded via yt-dlp before frame extraction.             
+      17 +                                                               
+      18  If <output_md_path> is omitted, writes to
+      19  /opt/meeting-bot/summaries/<derived-name>_<timestamp>.md.
+      20  
+     ...
+      31  """
+      32  import json
+      33  import os
+      34 +import re                                                      
+      35 +import shutil                                                  
+      36 +import subprocess                                              
+      37  import sys
+      38 +import tempfile                                                
+      39  from datetime import datetime
+      40  from pathlib import Path
+      41  
+     ...
+      53  DEFAULT_SUMMARY_DIR = "/opt/meeting-bot/summaries"
+      54  DEFAULT_FRAME_DIR = "/opt/meeting-bot/frames"
+      55  
+      56 +YOUTUBE_URL_RE = re.compile(r"(youtube\.com/watch\?v=|youtu\.be
+         +/)")                                                           
+      57  
+      58 +                                                               
+      59 +def is_youtube_url(s):                                         
+      60 +    return bool(YOUTUBE_URL_RE.search(s))                      
+      61 +                                                               
+      62 +                                                               
+      63 +def sanitize_name(s):                                          
+      64 +    """Mirror the SAFE_NAME rule used in transcribe.sh and pipe
+         +line.sh."""                                                    
+      65 +    return re.sub(r"[^A-Za-z0-9_-]", "_", s.replace(" ", "_")).
+         +strip("_")                                                     
+      66 +                                                               
+      67 +                                                               
+      68  def derive_meeting_name(video_path, transcript_path):
+      69      """Pull a sensible meeting name from the input filenames.""
+          "
+      70      # Filenames look like: weekly_standup_20250727_141500.{mp4,
+          txt}
+     ...
+       78      return src
+       79  
+       80  
+       81 +def download_youtube_video(url, out_dir):                     
+       82 +    """Download a YouTube video as a single MP4 via yt-dlp.   
+       83 +                                                              
+       84 +    Returns the path to the downloaded MP4. Caller is responsi
+          +ble for                                                       
+       85 +    cleaning up `out_dir` (and everything under it).          
+       86 +    """                                                       
+       87 +    if not shutil.which("yt-dlp"):                            
+       88 +        raise SystemExit("yt-dlp is not installed. Run setup.s
+          +h first.")                                                    
+       89 +                                                              
+       90 +    print(f"==> Downloading YouTube video via yt-dlp")        
+       91 +    out_template = str(Path(out_dir) / "video.%(ext)s")       
+       92 +    cmd = [                                                   
+       93 +        "yt-dlp",                                             
+       94 +        "--no-playlist",                                      
+       95 +        # Prefer mp4 video + m4a audio so ffmpeg can mux them 
+          +without                                                       
+       96 +        # transcoding. Falls back to "best" of either containe
+          +r.                                                            
+       97 +        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=
+          +mp4]/best",                                                   
+       98 +        "--merge-output-format", "mp4",                       
+       99 +        "-o", out_template,                                   
+      100 +        url,                                                  
+      101 +    ]                                                         
+      102 +    proc = subprocess.run(cmd, capture_output=True, text=True)
+      103 +    if proc.returncode != 0:                                  
+      104 +        sys.stderr.write(proc.stderr)                         
+      105 +        raise SystemExit(f"yt-dlp failed with exit code {proc.
+          +returncode}")                                                 
+      106 +                                                              
+      107 +    # yt-dlp writes video.mp4 when merge-output-format=mp4 is 
+          +honored, but                                                  
+      108 +    # when the source already is mp4 it might write video.mp4 
+          +directly. Find                                                
+      109 +    # the resulting file by glob.                             
+      110 +    candidates = sorted(Path(out_dir).glob("video.*"))        
+      111 +    if not candidates:                                        
+      112 +        raise SystemExit(f"yt-dlp reported success but no file
+          + found in {out_dir}")                                         
+      113 +    # Prefer video.mp4 specifically; fall back to whatever was
+          + produced.                                                    
+      114 +    for c in candidates:                                      
+      115 +        if c.suffix == ".mp4":                                
+      116 +            return c                                          
+      117 +    return candidates[0]                                      
+      118 +                                                              
+      119 +                                                              
+      120  def load_prompt_template():
+      121      """Load the prompt and return the user-prompt skeleton.
+      122  
+     ...
+      134  
+      135  def extract_frames(video_path, meeting_name, frames_dir):
+      136      """Run extract_frames.py as a subprocess. Returns the mani
+           fest path."""
+       77 -    import subprocess                                         
+      137      out_dir = Path(frames_dir) / meeting_name
+      138      out_dir.mkdir(parents=True, exist_ok=True)
+      139  
+     ...
+      171  
+      172  def main():
+      173      if len(sys.argv) < 3:
+      115 -        print(f"Usage: {sys.argv[0]} <video_path> <transcript_
+          -path> [<output_md_path>]")                                    
+      174 +        print(f"Usage: {sys.argv[0]} <video_or_youtube_url> <t
+          +ranscript_path> [<output_md_path>]")                          
+      175          sys.exit(1)
+      176  
+      118 -    video_path = sys.argv[1]                                  
+      177 +    video_arg = sys.argv[1]                                   
+      178      transcript_path = sys.argv[2]
+      179  
+      121 -    meeting_name = derive_meeting_name(video_path, transcript_
+          -path)                                                         
+      180 +    # YouTube URLs: download to a temp dir, then run the rest 
+          +of the flow                                                   
+      181 +    # against the downloaded MP4. Clean up the temp dir at the
+          + end.                                                         
+      182 +    yt_tmpdir = None                                          
+      183 +    if is_youtube_url(video_arg):                             
+      184 +        yt_tmpdir = tempfile.mkdtemp(prefix="meeting-bot-yt-")
+      185 +        video_arg = str(download_youtube_video(video_arg, yt_t
+          +mpdir))                                                       
+      186 +        # If the user passed a name arg, prefer it; otherwise 
+          +derive from                                                   
+      187 +        # the downloaded filename (yt-dlp names it video.mp4 h
+          +ere, so this                                                  
+      188 +        # is rarely useful - the name comes from the transcrip
+          +t filename).                                                  
+      189 +        if len(sys.argv) <= 4:                                
+      190 +            # Override name derivation: use the YouTube video 
+          +id if we can                                                  
+      191 +            # extract it. yt-dlp puts the title in the file me
+          +tadata, but                                                   
+      192 +            # not in the filename when we set --output to a fi
+          +xed template.                                                 
+      193 +            # The transcript filename (positional arg 2) is wh
+          +at the user                                                   
+      194 +            # provided; derive_meeting_name() handles it.     
+      195 +            pass                                              
+      196  
+      197 +    meeting_name = derive_meeting_name(video_arg, transcript_p
+          +ath)                                                          
+      198 +                                                              
+      199      # Output path: explicit arg, or default in /opt/meeting-bo
+           t/summaries/.
+      200      if len(sys.argv) > 3:
+      201          output_path = sys.argv[3]
+     ...
+      205          out_dir.mkdir(parents=True, exist_ok=True)
+      206          output_path = str(out_dir / f"{meeting_name}_{stamp}.m
+           d")
+      207  
+      132 -    # 1. Extract frames from the video.                       
+      133 -    frames_dir = os.environ.get("FRAME_OUTPUT_DIR", DEFAULT_FR
+          -AME_DIR)                                                      
+      134 -    manifest_path = extract_frames(video_path, meeting_name, f
+          -rames_dir)                                                    
+      208 +    try:                                                      
+      209 +        # 1. Extract frames from the video.                   
+      210 +        frames_dir = os.environ.get("FRAME_OUTPUT_DIR", DEFAUL
+          +T_FRAME_DIR)                                                  
+      211 +        manifest_path = extract_frames(video_arg, meeting_name
+          +, frames_dir)                                                 
+      212  
+      136 -    # 2. Load the frame manifest.                             
+      137 -    frames = load_manifest(manifest_path)                     
+      138 -    if not frames:                                            
+      139 -        raise SystemExit(f"No frames extracted - check extract
+          -_frames.py output above.")                                    
+      140 -    print(f"==> Loaded {len(frames)} frames from manifest")   
+      213 +        # 2. Load the frame manifest.                         
+      214 +        frames = load_manifest(manifest_path)                 
+      215 +        if not frames:                                        
+      216 +            raise SystemExit(f"No frames extracted - check ext
+          +ract_frames.py output above.")                                
+      217 +        print(f"==> Loaded {len(frames)} frames from manifest"
+          +)                                                             
+      218  
+      142 -    # 3. Read the transcript.                                 
+      143 -    print(f"==> Reading transcript: {transcript_path}")       
+      144 -    transcript = Path(transcript_path).read_text().strip()    
+      219 +        # 3. Read the transcript.                             
+      220 +        print(f"==> Reading transcript: {transcript_path}")   
+      221 +        transcript = Path(transcript_path).read_text().strip()
+      222  
+      146 -    # 4. Load the prompt skeleton.                            
+      147 -    prompt_template = load_prompt_template()                  
+      223 +        # 4. Load the prompt skeleton.                        
+      224 +        prompt_template = load_prompt_template()              
+      225  
+      149 -    # 5. Call the LLM.                                        
+      150 -    print(f"==> Summarizing with the configured backend")     
+      151 -    summary = summarize(frames, transcript, prompt_template)  
+      226 +        # 5. Call the LLM.                                    
+      227 +        print(f"==> Summarizing with the configured backend") 
+      228 +        summary = summarize(frames, transcript, prompt_templat
+          +e)                                                            
+      229  
+      153 -    # 6. Write the output.                                    
+      154 -    Path(output_path).write_text(summary)                     
+      155 -    print(f"==> Wrote summary: {output_path}")                
+      230 +        # 6. Write the output.                                
+      231 +        Path(output_path).write_text(summary)                 
+      232 +        print(f"==> Wrote summary: {output_path}")            
+      233  
+      157 -    # 7. Print a short preview to stdout.                     
+      158 -    preview_lines = summary.splitlines()[:30]                 
+      159 -    print("")                                                 
+      160 -    print("--- preview ---")                                  
+      161 -    print("\n".join(preview_lines))                           
+      162 -    if len(summary.splitlines()) > 30:                        
+      163 -        print(f"... ({len(summary.splitlines()) - 30} more lin
+          -es in {output_path})")                                        
+      234 +        # 7. Print a short preview to stdout.                 
+      235 +        preview_lines = summary.splitlines()[:30]             
+      236 +        print("")                                             
+      237 +        print("--- preview ---")                              
+      238 +        print("\n".join(preview_lines))                       
+      239 +        if len(summary.splitlines()) > 30:                    
+      240 +            print(f"... ({len(summary.splitlines()) - 30} more
+          + lines in {output_path})")                                    
+      241 +    finally:                                                  
+      242 +        # Clean up the YouTube temp dir if we created one.    
+      243 +        if yt_tmpdir:                                         
+      244 +            shutil.rmtree(yt_tmpdir, ignore_errors=True)      
+      245  
+      246  
+      247  if __name__ == "__main__":
+
+● Bash(python3 -m py_compile summarize/summarize.py && echo "summarize.py OK")
+  ⎿  Error: minimax-m3:cloud is temporarily unavailable, so auto mode cannot 
+     determine the safety of Bash right now. Wait briefly and then try this 
+     action again. If it keeps failing, continue with other tasks that don't 
+     require this action and come back to it later. Note: reading files, 
+     searching code, and other read-only operations do not require the 
+     classifier and can still be used.
+● Bash(python3 -m py_compile summarize/summarize.py && echo "summarize.py OK")
+  ⎿  summarize.py OK
+  ⎿  Interrupted · What should Claude do instead?
