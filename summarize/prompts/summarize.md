@@ -45,7 +45,7 @@ frame index + timestamp so a reader can jump back to them.
 
 # Input
 
-## Transcript (whisper.cpp output)
+## Transcript
 
 ```
 {transcript}
