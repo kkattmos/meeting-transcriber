@@ -64,7 +64,6 @@ def extract_scene_change_frames(video, out_dir, threshold):
         "-i", video,
         "-vf", f"select='gt(scene,{threshold})',showinfo",
         "-vsync", "vfr",
-        "-frame_pts", "true",
         str(out_dir / "scene_%05d.jpg"),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
