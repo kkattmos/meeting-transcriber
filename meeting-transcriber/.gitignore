@@ -1,0 +1,9 @@
+# Secrets — API keys / tokens. Never commit these.
+# Populated by `setup.sh` (creates the directory) and used by
+# transcribe/yt_transcript_client.py for the youtube-transcript.io key ring.
+# File shape: {"keys": ["acct1-token", ...], "next_index": 0}
+# Edit with sudo if /opt/meeting-bot is owned by root.
+/opt/meeting-bot/secrets/
+
+# Local .env file (real keys). The .env.example template IS committed.
+.env
