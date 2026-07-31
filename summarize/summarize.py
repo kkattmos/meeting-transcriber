@@ -7,7 +7,12 @@ This is the standalone entry point. When pipeline.sh is used, it's called
 automatically after Option 1 (record) and Option 2 (transcribe).
 
 Usage:
-    python3 summarize/summarize.py <video_or_youtube_url> <transcript_path> [<output_md_path>]
+    python3 summarize/summarize.py <video_or_youtube_url> <transcript_path> [<output_md_path>] [--prompt NAME]
+
+--prompt NAME picks which file in prompts/ to use (e.g. --prompt standup
+loads prompts/standup.md). Can also be set via the SUMMARY_PROMPT env var;
+the flag takes precedence over the env var. Defaults to prompts/summarize.md
+if neither is given. NAME can be given with or without the .md suffix.
 
 The <video_or_youtube_url> argument can be either:
   - A local file path (MP4 from screen/record_screen.sh, or any container
@@ -31,6 +36,8 @@ Configuration (env vars):
   SUMMARY_MODEL          default claude-sonnet-4-5
   OLLAMA_HOST            default http://localhost:11434
   OLLAMA_MODEL           default llava:13b (only if backend=ollama)
+  SUMMARY_PROMPT         name of file in prompts/ to use (no .md needed);
+                         overridden by --prompt; default: summarize.md
 """
 import json
 import os
@@ -90,7 +97,8 @@ from llm_client import FrameMeta, summarize, summarize_with_fallback  # noqa: E4
 ROOT_DIR = SCRIPT_DIR.parent
 SCREEN_DIR = ROOT_DIR / "screen"
 
-PROMPT_PATH = SCRIPT_DIR / "prompts" / "summarize.md"
+PROMPTS_DIR = SCRIPT_DIR / "prompts"
+PROMPT_PATH = PROMPTS_DIR / "summarize.md"
 DEFAULT_SUMMARY_DIR = "/opt/meeting-bot/summaries"
 DEFAULT_FRAME_DIR = "/opt/meeting-bot/frames"
 # YouTube downloads go here instead of the default /tmp because a 4-vCPU
@@ -190,14 +198,39 @@ def download_youtube_video(url, out_dir):
     return candidates[0]
 
 
-def load_prompt_template():
+def resolve_prompt_path(prompt_name):
+    """Resolve a --prompt/SUMMARY_PROMPT value to a file in prompts/.
+
+    `prompt_name` may be a bare name ("standup"), a name with the .md
+    suffix ("standup.md"), or None (falls back to the default
+    prompts/summarize.md). Raises SystemExit with a helpful message,
+    including the list of available prompts, if the name doesn't
+    resolve to an existing file.
+    """
+    if not prompt_name:
+        return PROMPT_PATH
+
+    filename = prompt_name if prompt_name.endswith(".md") else f"{prompt_name}.md"
+    path = PROMPTS_DIR / filename
+
+    if not path.is_file():
+        available = sorted(p.stem for p in PROMPTS_DIR.glob("*.md"))
+        available_str = ", ".join(available) if available else "(none found)"
+        raise SystemExit(
+            f"Prompt '{prompt_name}' not found at {path}.\n"
+            f"Available prompts in {PROMPTS_DIR}: {available_str}"
+        )
+    return path
+
+
+def load_prompt_template(prompt_path=PROMPT_PATH):
     """Load the prompt and return the user-prompt skeleton.
 
     The file contains both the system prompt (everything before # Input)
     and the user-prompt skeleton (the # Input section). We return the
     skeleton since it has the {transcript} and {frame_manifest} placeholders
     that llm_client.summarize fills in."""
-    text = PROMPT_PATH.read_text()
+    text = Path(prompt_path).read_text()
     if "# Input" in text:
         skeleton = text.split("# Input", 1)[1]
     else:
@@ -272,17 +305,51 @@ def _sweep_stale_yt_tmpdirs():
         print(f"==> Removed {removed} stale YouTube tempdir(s)")
 
 
+def _extract_prompt_flag(argv):
+    """Pull --prompt NAME / --prompt=NAME out of argv.
+
+    Returns (remaining_argv, prompt_name_or_None). Leaves the rest of
+    argv's order untouched so the existing positional parsing keeps
+    working regardless of where the flag was placed on the command line.
+    """
+    remaining = []
+    prompt_name = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--prompt":
+            if i + 1 >= len(argv):
+                raise SystemExit("--prompt requires a value, e.g. --prompt standup")
+            prompt_name = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--prompt="):
+            prompt_name = arg.split("=", 1)[1]
+            i += 1
+            continue
+        remaining.append(arg)
+        i += 1
+    return remaining, prompt_name
+
+
 def main():
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <video_or_youtube_url> <transcript_path> [<output_md_path>]")
+    argv, prompt_name = _extract_prompt_flag(sys.argv)
+    if prompt_name is None:
+        prompt_name = os.environ.get("SUMMARY_PROMPT")
+
+    if len(argv) < 3:
+        print(
+            f"Usage: {argv[0]} <video_or_youtube_url> <transcript_path> "
+            f"[<output_md_path>] [--prompt NAME]"
+        )
         sys.exit(1)
 
     # Self-heal before doing anything else: stale tempdirs from crashed
     # prior runs can otherwise consume gigabytes under /opt/meeting-bot/tmp.
     _sweep_stale_yt_tmpdirs()
 
-    video_arg = sys.argv[1]
-    transcript_path = sys.argv[2]
+    video_arg = argv[1]
+    transcript_path = argv[2]
 
     # YouTube URLs: download to a temp dir, then run the rest of the flow
     # against the downloaded MP4. Clean up the temp dir at the end.
@@ -296,7 +363,7 @@ def main():
         # If the user passed a name arg, prefer it; otherwise derive from
         # the downloaded filename (yt-dlp names it video.mp4 here, so this
         # is rarely useful - the name comes from the transcript filename).
-        if len(sys.argv) <= 4:
+        if len(argv) <= 4:
             # Override name derivation: use the YouTube video id if we can
             # extract it. yt-dlp puts the title in the file metadata, but
             # not in the filename when we set --output to a fixed template.
@@ -307,8 +374,8 @@ def main():
     meeting_name = derive_meeting_name(video_arg, transcript_path)
 
     # Output path: explicit arg, or default in /opt/meeting-bot/summaries/.
-    if len(sys.argv) > 3:
-        output_path = sys.argv[3]
+    if len(argv) > 3:
+        output_path = argv[3]
     else:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = Path(DEFAULT_SUMMARY_DIR)
@@ -331,7 +398,9 @@ def main():
         transcript = Path(transcript_path).read_text().strip()
 
         # 4. Load the prompt skeleton.
-        prompt_template = load_prompt_template()
+        prompt_path = resolve_prompt_path(prompt_name)
+        print(f"==> Using prompt: {prompt_path}")
+        prompt_template = load_prompt_template(prompt_path)
 
         # 5. Call the LLM.
         # Two dispatch modes:

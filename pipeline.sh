@@ -8,7 +8,10 @@
 # against the YouTube URL (via yt-dlp) or the local file, respectively.
 #
 # Usage:
-#   sudo -H ./pipeline.sh "<meeting_or_youtube_url_or_local_file>" "Meeting Name" [Display Name] [Language]
+#   sudo -H ./pipeline.sh "<meeting_or_youtube_url_or_local_file>" "Meeting Name" [Display Name] [Language] [Prompt]
+#
+# [Prompt] selects a file in summarize/prompts/ (e.g. "standup" for
+# summarize/prompts/standup.md). Defaults to summarize.md if omitted.
 #
 # This is the entry point for the phone/Tailscale trigger (trigger_server.py
 # defaults to this script). It's also what most users will run from the
@@ -28,11 +31,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/source_env.sh"
 
 if [ -z "$1" ]; then
-  echo "Usage: $0 <meeting_or_youtube_url_or_local_file> [meeting_name] [display_name] [language]"
+  echo "Usage: $0 <meeting_or_youtube_url_or_local_file> [meeting_name] [display_name] [language] [prompt]"
   echo "  Input forms: https://meet.google.com/<id>, https://zoom.us/j/<id>,"
   echo "               https://www.youtube.com/watch?v=<id>, https://youtu.be/<id>,"
   echo "               or a path to a local file already on disk"
   echo "  language: th (default), en, auto, or any AssemblyAI language code"
+  echo "  prompt:   name of a file in summarize/prompts/ (default: summarize.md)"
   exit 1
 fi
 
@@ -40,6 +44,10 @@ INPUT_URL="$1"
 MEETING_NAME="${2:-meeting}"
 DISPLAY_NAME="${3:-Meeting Bot}"
 LANGUAGE="${4:-${ASSEMBLYAI_LANGUAGE:-th}}"
+# Falls back to the SUMMARY_PROMPT env var (e.g. set via .env) when the
+# positional arg isn't given, so existing SUMMARY_PROMPT=... invocations
+# keep working unchanged.
+PROMPT_NAME="${5:-${SUMMARY_PROMPT:-}}"
 
 # SCRIPT_DIR is set above (before source_env.sh).
 
@@ -167,12 +175,17 @@ PYTHON_BIN="/opt/meeting-bot-venv/bin/python3"
 if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="python3"
 fi
+PROMPT_ARGS=()
+if [ -n "$PROMPT_NAME" ]; then
+  PROMPT_ARGS=(--prompt "$PROMPT_NAME")
+fi
+
 if [ "$IS_YOUTUBE_URL" -eq 1 ]; then
   # YouTube path: pass the URL directly; summarize.py downloads the MP4
   # via yt-dlp and cleans up the temp file when done.
-  "$PYTHON_BIN" "$SCRIPT_DIR/summarize/summarize.py" "$INPUT_URL" "$TXT_FILE" "$SUMMARY_FILE"
+  "$PYTHON_BIN" "$SCRIPT_DIR/summarize/summarize.py" "$INPUT_URL" "$TXT_FILE" "$SUMMARY_FILE" "${PROMPT_ARGS[@]}"
 else
-  "$PYTHON_BIN" "$SCRIPT_DIR/summarize/summarize.py" "$MP4_FILE" "$TXT_FILE" "$SUMMARY_FILE"
+  "$PYTHON_BIN" "$SCRIPT_DIR/summarize/summarize.py" "$MP4_FILE" "$TXT_FILE" "$SUMMARY_FILE" "${PROMPT_ARGS[@]}"
 fi
 
 echo ""
