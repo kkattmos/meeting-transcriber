@@ -8,8 +8,14 @@ ends or most participants have left.
 This is the Option 1 driver from the project split:
   - screen/record_screen.sh starts Xvfb + this script + ffmpeg-x11grab.
   - The MP4 is muxed by record_screen.sh once this script exits.
-  - The kill sentinel (/tmp/meeting_bot_kill) is honored so kill_meeting.sh
-    and Ctrl+\ in the recording terminal leave the meeting cleanly.
+  - The kill sentinel is honored so kill_meeting.sh and Ctrl+\ in the
+    recording terminal leave the meeting cleanly.
+
+Sentinel location: when MEETING_BOT_RUN_DIR is set (pipeline.sh always sets
+it), the kill/admitted sentinels live in that run's directory rather than in
+/tmp. That's what lets two meetings record at once — a shared /tmp path means
+killing one recording kills every recording. The /tmp paths remain the default
+so a bare `python3 screen/capture.py <url>` still works.
 
 Usage:
     python3 screen/capture.py "<meeting_url>" ["Display Name"]
@@ -37,10 +43,21 @@ MAX_MEETING_SECONDS = int(os.environ.get("MAX_MEETING_MINUTES", "240")) * 60
 # catches the "test call with just me" case that the mass-exit rule misses
 # (peak is 2, so 30% of peak is 0 — never triggers). Set to 0 to disable.
 IDLE_LEAVE_SECONDS = int(os.environ.get("IDLE_LEAVE_MINUTES", "5")) * 60
-ADMITTED_MARKER = "/tmp/meeting_bot_admitted"  # touched once inside the call
-# Sentinel file: when this appears, the bot leaves the meeting cleanly and exits.
-# Touched by record_screen.sh's signal trap (Ctrl+\) or by kill_meeting.sh.
-KILL_SENTINEL = "/tmp/meeting_bot_kill"
+# Sentinels. Per-run when MEETING_BOT_RUN_DIR is set (the pipeline always sets
+# it), so concurrent recordings don't share a kill switch; /tmp otherwise, which
+# keeps a standalone `python3 screen/capture.py <url>` working as before.
+RUN_DIR = os.environ.get("MEETING_BOT_RUN_DIR", "")
+if RUN_DIR:
+    ADMITTED_MARKER = os.path.join(RUN_DIR, "admitted")
+    KILL_SENTINEL = os.path.join(RUN_DIR, "kill")
+    # Failed-join screenshots belong with the run they came from, not in a
+    # shared directory where the next run silently overwrites them.
+    SCREENSHOT_DIR = RUN_DIR
+else:
+    ADMITTED_MARKER = "/tmp/meeting_bot_admitted"  # touched once inside the call
+    # When this appears, the bot leaves the meeting cleanly and exits. Touched
+    # by record_screen.sh's signal trap (Ctrl+\) or by kill_meeting.sh.
+    KILL_SENTINEL = "/tmp/meeting_bot_kill"
 
 
 def kill_requested():

@@ -1,436 +1,537 @@
-# Meeting recording + transcription + AI summary bot
+# meeting-transcriber
 
-Joins a Zoom or Google Meet call using your logged-in account, records the
-**screen + audio** to MP4, transcribes the audio locally with whisper.cpp,
-and (optionally) produces an AI summary that combines the transcript with
-key frames extracted from the recording.
+A meeting/lecture bot for a Proxmox box running **Alpine Linux**. It joins a
+Google Meet or Zoom call in a real signed-in Chrome, records the screen and
+audio to MP4, transcribes it, and writes an AI summary that combines the
+transcript with keyframes pulled from the video. It also works on YouTube links
+and on video files you already have.
 
-The project is split into three composable options:
+The three stages are independent — each has its own entry script and runs
+without the others — and `pipeline.sh` chains them.
 
-| | What it does | Entry script | Output |
-|---|---|---|---|
-| **Option 1: Screen record** | Joins the meeting and records the screen + meeting audio to MP4 | `./screen/record_screen.sh` | `/opt/meeting-bot/recordings/<name>_<ts>.mp4` |
-| **Option 2: Transcribe** | Voice-to-text on any audio/video file via whisper.cpp; YouTube URLs route to the youtube-transcript.io API (multi-account round-robin) | `./transcribe/transcribe.sh` | `/opt/meeting-bot/transcripts/<name>_<ts>.{txt,srt}` |
-| **Option 3: AI summary** | Sends transcript + extracted keyframes to a vision-capable LLM (FCC Claude, NVIDIA NIM, Google Gemini, or Ollama; auto-fallback chain supported) | `./summarize/summarize.py` | `/opt/meeting-bot/summaries/<name>_<ts>.md` |
+- **Everything you run day to day is in [Commands](#commands).**
+- Architectural decisions and the reasons behind them live in `CLAUDE.md`.
 
-Run them individually, or use the chain:
-```bash
-sudo -H ./pipeline.sh "https://meet.google.com/abc-defg-hij" "Weekly Standup"
-# runs Option 1 -> Option 2 -> Option 3 in sequence.
+---
+
+## Table of contents
+
+- [How it works](#how-it-works)
+- [Why there's a container](#why-theres-a-container)
+- [Install](#install)
+- [First-time login (you can't see a window)](#first-time-login-you-cant-see-a-window)
+- [Commands](#commands)
+- [Resuming a failed run](#resuming-a-failed-run)
+- [Parallelism](#parallelism)
+- [Output format](#output-format)
+- [Configuration](#configuration)
+- [Tests](#tests)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph Inputs
+        GM[Google Meet]
+        ZOOM[Zoom]
+        YT[YouTube link]
+        MP4[".mp4 on disk"]
+    end
+
+    REC["record<br/>(container: Chrome + Xvfb + ffmpeg)"]
+    FETCH["fetch_video<br/>(yt-dlp)"]
+    TR["transcribe<br/>(AssemblyAI / youtube-transcript.io)"]
+    FR["frames<br/>(ffmpeg scene-change + periodic)"]
+    SUM["summarize<br/>(Gemini / Claude / NIM / Ollama)"]
+    OUT([summaries/&lt;run_id&gt;.md])
+
+    GM --> REC
+    ZOOM --> REC
+    REC --> TR
+    REC --> FR
+    YT --> FETCH
+    YT --> TR
+    FETCH --> FR
+    MP4 --> TR
+    MP4 --> FR
+    TR --> SUM
+    FR --> SUM
+    SUM --> OUT
 ```
 
-`CLAUDE.md` is the per-option reference for future Claude sessions — it
-holds usage, env-var configuration, debugging tips, and architectural
-context that doesn't belong in the user-facing README.
+Each input becomes a **run**, with its own directory under
+`/opt/meeting-bot/runs/<run_id>/` holding its state, logs, and sentinels.
+Within a run, `transcribe` and `fetch_video → frames` are independent once a
+video exists, so they execute concurrently and `summarize` joins them.
 
-Target OS: **Ubuntu 26.04 LTS Server, minimized cloud image**.
-
-## VM sizing (Proxmox)
-
-| | Minimum (works, tight) | Recommended |
+| Stage | Does | Needs |
 |---|---|---|
-| vCPU | 2 | 4 |
-| RAM | 4 GB | 8 GB |
-| Disk | 20 GB | 40–50 GB |
+| `record` | Joins the call, records screen + audio to MP4 | Docker, a signed-in Chrome profile |
+| `fetch_video` | Downloads a YouTube video (for frames only) | yt-dlp |
+| `transcribe` | Local file → AssemblyAI; YouTube → youtube-transcript.io captions | `ASSEMBLYAI_API_KEY` / yt-transcript tokens |
+| `frames` | Scene-change + periodic keyframes → `manifest.json` | ffmpeg |
+| `summarize` | Transcript + frames → Markdown | `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY` / `NVIDIA_NIM_API_KEY` |
 
-Why: the OS itself needs very little (Ubuntu Server minimal runs in ~1.5GB
-RAM / 4GB disk), but Chromium + Xvfb + PipeWire/PulseAudio + ffmpeg running
-concurrently during a call want headroom, and whisper.cpp's `small` model
-needs roughly 1–1.5GB RAM while transcribing (more for `medium`). The
-screen recorder adds an x11grab stream and H.264 encode on top of the
-existing audio path — the recommended config already covers this comfortably.
-Disk adds up over time: MP4 recordings are ~200-400MB per hour of meeting
-(H.264 ultrafast preset, crf 28) and aren't auto-deleted, so budget disk
-for how many hours of meetings you'll keep before manually clearing
-`/opt/meeting-bot/recordings`.
+Outputs all land under `/opt/meeting-bot/`:
 
-## Thai language support
+```
+/opt/meeting-bot/
+├── recordings/<run_id>.mp4          screen + audio
+├── transcripts/<run_id>.{txt,srt}
+├── frames/<run_id>/                 keyframes + manifest.json
+├── summaries/<run_id>.md            the deliverable
+├── runs/<run_id>/                   state.json, logs/, kill, admitted
+├── chrome-profile/                  persistent Google/Zoom login
+└── secrets/                         youtube_transcript_keys.json
+```
 
-- `setup.sh` installs `fonts-thai-tlwg` (so Thai names/chat render correctly
-  in the browser) and generates the `th_TH.UTF-8` locale.
-- It downloads whisper.cpp's **multilingual** `small` model (not the `.en`
-  English-only variant) - required for Thai transcription of local
-  recordings to work at all.
-- For **YouTube URLs**, the youtube-transcript.io API returns YouTube's
-  existing Thai captions directly, so no model is needed. This is the
-  recommended path for Thai YouTube content — it both avoids the slow
-  local Whisper pass and sidesteps the failure mode where Whisper on a
-  re-voiced Thai video returns only placeholder text like `[เสียงพากย์ไทย]`.
-- For **local recordings** (`.wav`/`.mp4`/`.m4a`/`.mkv`),
-  `transcribe/transcribe.sh` defaults to `-l th` for transcription. Override
-  per-call with a 3rd argument, e.g.
-  `transcribe/transcribe.sh <audio> <name> auto` to auto-detect language,
-  or `en` for English-only meetings.
-- If Thai accuracy with `small` isn't good enough, download the `medium`
-  model (`bash ./models/download-ggml-model.sh medium` inside
-  `/opt/whisper.cpp`) and point `WHISPER_MODEL` in `transcribe/transcribe.sh`
-  at `ggml-medium.bin`. Expect roughly 3x the RAM and transcription time.
+---
 
-## Architecture
+## Why there's a container
 
-1. You paste a meeting link into `pipeline.sh` (or one of the standalone options)
-2. A headless-but-rendered Chromium browser (Playwright) joins the call using
-   a persistent, already-logged-in profile
-3. Xvfb provides a virtual display for the browser (no physical monitor needed)
-4. If a waiting room applies, the bot waits for host admission before
-   recording starts (up to `ADMIT_TIMEOUT_SECONDS`)
-5. ffmpeg captures:
-   - **Video** from `DISPLAY=:99` via `x11grab` (1280x800, 15 fps)
-   - **Audio** from `meeting_sink.monitor` (the same virtual PulseAudio sink
-     the bot has always used)
-   - Both streams are muxed into a single MP4 (H.264 + AAC).
-6. Recording stops when the browser detects the call ended, or when the
-   participant-count heuristic decides most people have left and leaves
-   on its own (see "Auto-leave on mass exodus" below)
-7. whisper.cpp transcribes the MP4's audio track into `.txt` and `.srt`
-   (only when option 2 or the chain is run)
-8. The AI agent extracts keyframes from the MP4 + reads the transcript +
-   asks the configured LLM for a structured Markdown summary
-   (only when option 3 or the chain is run)
+Alpine uses **musl libc**. Google ships no musl build of Chrome, and Playwright
+doesn't support Alpine for its bundled browsers. Meanwhile the bot *needs* real
+Google Chrome — Google's sign-in flow blocks unbranded Chromium with "This
+browser or app may not be secure".
 
-## One-time setup
+So the system is split:
 
-**Run every script in this project with `sudo -H`, consistently.**
-`setup.sh` installs the venv, Chromium, and whisper.cpp under `/root` (because
-it's run with sudo). If a later script runs as a different user, or as root
-without `-H`, Playwright looks for Chromium under a different, empty home
-directory and fails with a confusing "Executable doesn't exist" error.
+- **Alpine host** — Python, ffmpeg, yt-dlp, the transcribe and summarize
+  stages, and the Docker daemon. All musl-clean.
+- **Debian container** (`docker/Dockerfile.recorder`) — Xvfb, PulseAudio, real
+  `google-chrome-stable`, Playwright, ffmpeg. Everything the browser touches.
+
+A useful side effect: each recording gets its own container, hence its own
+PID/IPC/network namespace, so several meetings can record at once without
+fighting over display `:99` or the `meeting_sink` audio sink.
+
+The repo is bind-mounted into the container, so editing a `.py` or `.sh` file
+takes effect on the next run — no rebuild.
+
+---
+
+## Install
+
+Target: Alpine Linux on Proxmox (LXC container or KVM VM), 4 vCPU / 8 GB.
 
 ```bash
-chmod +x setup.sh audio-setup.sh first_time_login.sh \
-         screen/record_screen.sh transcribe/transcribe.sh pipeline.sh kill_meeting.sh
 sudo -H ./setup.sh
 ```
 
-Then log into your Google and Zoom accounts **once**, inside the same browser
-profile the bot will reuse later:
+That installs the host packages, the Python venv at `/opt/meeting-bot-venv`,
+yt-dlp, Docker, creates the directories under `/opt/meeting-bot`, and builds
+the recorder image.
+
+Useful flags:
 
 ```bash
-sudo -H ./first_time_login.sh
+sudo -H ./setup.sh --build-recorder   # only rebuild the container image
+sudo -H ./setup.sh --no-recorder      # host side only, skip the image
+sudo -H ./setup.sh --no-docker        # transcribe/summarize box only
 ```
 
-This opens a VNC session (`http://<vm-ip>:6080/vnc.html`) with a real browser
-window. Log into Google (accounts.google.com) and Zoom (zoom.us) there, then
-press Ctrl+C in the terminal to close it. The session/cookies persist in
-`~/.meeting-bot/chrome-profile`, so this normally only needs to be repeated
-when a session expires or a login triggers extra verification.
-
-## Day-to-day usage
-
-### All three options at once (the common case)
+Then configure:
 
 ```bash
-sudo -H ./pipeline.sh "https://meet.google.com/abc-defg-hij" "Weekly Standup"
-# or
-sudo -H ./pipeline.sh "https://zoom.us/j/1234567890" "Client Call"
+cp .env.example .env && chmod 600 .env
 ```
 
-Outputs land in:
-- `/opt/meeting-bot/recordings/<name>_<timestamp>.mp4`
-- `/opt/meeting-bot/transcripts/<name>_<timestamp>.txt` and `.srt`
-- `/opt/meeting-bot/summaries/<name>_<timestamp>.md`
+Fill in your API keys. For YouTube inputs, also add at least one
+youtube-transcript.io token to
+`/opt/meeting-bot/secrets/youtube_transcript_keys.json`.
 
-### Just one option
+> **Running in an LXC container?** Docker needs `nesting=1` on the CT
+> (Proxmox → the container → Options → Features → Nesting) and a usable
+> storage driver. Without it the daemon won't start and Stage 1 can't run;
+> stages 2 and 3 work regardless.
+
+---
+
+## First-time login (you can't see a window)
+
+Run this once, and again whenever your Google or Zoom session expires. It opens
+a real Chrome on a headless display inside the container, using the same
+persistent profile the recorder reuses, and exposes it to **you** over noVNC.
 
 ```bash
-# Option 1 - record only (run again later to transcribe/summarize)
-sudo -H ./screen/record_screen.sh "https://meet.google.com/abc-defg-hij" "Weekly Standup"
-
-# Option 2 - transcribe an existing file (any WAV, MP4, M4A, MKV)
-sudo -H ./transcribe/transcribe.sh /opt/meeting-bot/recordings/Weekly_Standup_<ts>.mp4 "Weekly Standup"
-
-# Option 3 - summarize from a transcript + video
-python3 ./summarize/summarize.py \
-  /opt/meeting-bot/recordings/Weekly_Standup_<ts>.mp4 \
-  /opt/meeting-bot/transcripts/Weekly_Standup_<ts>.txt
+./first_time_login.sh
 ```
 
-### YouTube URLs
+It prints an `ssh -L ...` command to run on your own machine, then you open
+`http://localhost:6080/vnc.html` and sign in. Nothing is exposed to the network.
 
-Stages 2 and 3 also accept a YouTube URL. Stage 2 (transcribe) uses the
-**youtube-transcript.io** API — fast and returns YouTube's existing captions
-directly; no audio download, no Whisper on CPU. Stage 3 (summarize) still
-uses `yt-dlp` to download the video for frame extraction.
+Other ways in:
 
 ```bash
-# Transcribe a YouTube video (requires at least one API key configured)
-sudo -H ./transcribe/transcribe.sh "https://www.youtube.com/watch?v=xyz" "talk"
-
-# Summarize a YouTube video (transcript + video frames)
-python3 ./summarize/summarize.py \
-  "https://www.youtube.com/watch?v=xyz" \
-  /opt/meeting-bot/transcripts/<existing_transcript>.txt
-
-# Full pipeline for a YouTube URL - skips recording, runs 2 + 3 only
-sudo -H ./pipeline.sh "https://www.youtube.com/watch?v=xyz" "talk"
+./first_time_login.sh --tailscale      # bind to this host's tailnet IP instead
+./first_time_login.sh --bind 0.0.0.0   # every interface (see the warning it prints)
+./first_time_login.sh --screenshot     # also dump the display to a PNG every 10s
+./first_time_login.sh --url https://zoom.us/signin
 ```
 
-The transcript and summary filenames are derived from the video ID, e.g.
-`/opt/meeting-bot/transcripts/yt_xyz_<ts>.txt`.
+`--screenshot` is the fallback for when noVNC can't reach at all: it writes
+`/opt/meeting-bot/login-screenshots/latest.png`, which you can `scp` down to see
+what's actually on screen.
 
-#### YouTube API keys (one-time, per account)
+Sign into Google, then open `zoom.us` in the same window and sign in there too.
+Both land in the shared profile at `/opt/meeting-bot/chrome-profile`. Press
+`Ctrl+C` when done.
 
-The youtube-transcript.io API uses HTTP Basic auth with a single token per
-account. To spread quota across multiple accounts, the transcriber
-round-robins through a key list:
+> The VNC session has no password and fronts a browser holding your Google
+> session. The default localhost binding is the safe one; only use `--bind` on a
+> network you trust, and stop the script as soon as you're signed in.
+
+---
+
+## Commands
+
+### The whole pipeline
 
 ```bash
-sudo nano /opt/meeting-bot/secrets/youtube_transcript_keys.json
-# {
-#   "keys": ["acct1-token", "acct2-token", "acct3-token"],
-#   "next_index": 0
-# }
+./pipeline.sh "https://meet.google.com/abc-defg-hij" --name "Weekly Standup"
+./pipeline.sh "https://zoom.us/j/1234567890" --name "Client Call"
+./pipeline.sh "https://www.youtube.com/watch?v=5GAfjAjLKYk"
+./pipeline.sh /opt/meeting-bot/recordings/existing.mp4
 ```
 
-`setup.sh` creates a starter file with an empty `keys` list on first run;
-just add your tokens and re-run. The cursor at `next_index` advances past
-each successful pick, so a sequence of runs deterministically walks the
-list. The file is `chmod 600` (the client enforces this on first write).
+### Several inputs at once
 
-The keys file path defaults to
-`/opt/meeting-bot/secrets/youtube_transcript_keys.json` and can be
-overridden by setting `YT_TRANSCRIPT_KEYS_FILE=` in your `.env`.
+Any mix of types, processed concurrently:
 
-If the API returns no usable transcript (no captions exist, or captions
-are placeholder strings like `[เสียงพากย์ไทย]`), the transcriber fails
-loudly rather than silently falling back to local Whisper. Set
-`TRANSCRIBE_BACKEND=whisper` to force the old yt-dlp + Whisper path on a
-YouTube URL.
+```bash
+./pipeline.sh "https://youtu.be/aaa" "https://youtu.be/bbb" "https://youtu.be/ccc" --jobs 3
+```
 
-## Leaving a meeting early (kill switch)
+From a file (blank lines and `#` comments are skipped):
 
-Sometimes you need the bot to leave right now without you being at the
-terminal — a meeting gets cut short, you started it from your phone via
-`trigger_server.py`, or you just want to wrap up.
+```bash
+./pipeline.sh --from-file links.txt --jobs 4
+```
 
-Two ways to do it:
+Expand a playlist — opt-in, because a normal watch URL often carries a stray
+`&list=` and silently transcribing 200 videos would be rude:
 
-1. **From the recording terminal: press `Ctrl+\`** (SIGQUIT). The shell's
-   signal trap touches a kill sentinel; the Python join script notices on
-   its next poll (≤15s), clicks the in-Meet "Leave" button so participants
-   see the bot go, and exits. ffmpeg finalizes the MP4, and the chain (if
-   running) proceeds to the transcribe + summarize stages.
+```bash
+./pipeline.sh "https://www.youtube.com/playlist?list=PL..." --playlist
+```
 
-2. **From any other terminal: `sudo ./kill_meeting.sh`**. Same outcome —
-   touches the sentinel, sends SIGTERM to the running orchestrator + join
-   driver, waits up to 10s for clean exit, then escalates only on the Python
-   process if needed. Use this when the recording was launched in the
-   background (e.g. via `trigger_server.py`, which detaches from any terminal).
+Write one combined chapter-shaped file as well as the per-run summaries:
 
-Both paths deliberately route through the in-Meet Leave button rather
-than yanking the browser out from under Meet, so other participants see
-the bot leave cleanly instead of vanishing mid-call.
+```bash
+./pipeline.sh --from-file chapter3_links.txt --prompt lecture-gemini \
+  --combine ~/courses/2_Transcripts/chapter3.md
+```
 
-## Waiting rooms / host approval
+### Options
 
-`screen/capture.py` explicitly detects a waiting-room/lobby state ("waiting
-for the host", "ask to join", etc) separately from being admitted (presence
-of a "Leave call"/"Leave meeting" button). It polls every 5s for up to 10
-minutes (`ADMIT_TIMEOUT_SECONDS`) before giving up and exiting — no recording
-happens until admission is confirmed, so you won't get a file full of lobby
-silence.
+| Flag | Meaning |
+|---|---|
+| `--name N` | Meeting name (single input only; otherwise derived) |
+| `--display-name D` | Name the bot shows in the meeting (default `Meeting Bot`) |
+| `--language L` | `th` (default), `en`, `auto`, or any AssemblyAI code |
+| `--prompt P` | A file in `summarize/prompts/`, e.g. `--prompt lecture-gemini` |
+| `--jobs N` | Inputs processed at once (default 2) |
+| `--from-file F` | Read inputs from a file, one per line |
+| `--playlist` | Expand YouTube playlist URLs |
+| `--combine F` | Also write every summary into one file, in input order |
+| `--force` | Ignore prior state, start clean |
+| `--run-id ID` / `--resume-last` / `--resume-all` | Resume (see below) |
+| `--list` / `--status ID` | Inspect runs |
 
-## Auto-leave on mass exodus
+The legacy positional form still works when unambiguous:
+`./pipeline.sh <input> [name] [display_name] [language] [prompt]`.
 
-The script reads the participant count Zoom/Meet display in their own UI and
-tracks its peak. It auto-leaves if, for two consecutive checks ~15s apart
-(`POLL_SECONDS` / `LOW_COUNT_CONFIRMATIONS`):
-- the count drops to 1 (everyone else left), or
-- the count falls below 30% of its peak (`DROP_RATIO_THRESHOLD`) — catches
-  the "call technically still open but everyone bailed" case
+### Individual stages
 
-Tune these constants at the top of `screen/capture.py` if it's leaving too
-eagerly or not eagerly enough for your meeting sizes.
+```bash
+# 1 — record only
+./screen/record_screen.sh "<meeting_url>" "Meeting Name" ["Display Name"] [out.mp4]
 
-## Remote trigger (start a recording from your phone)
+# 2 — transcribe only  (local file → AssemblyAI, YouTube URL → captions)
+./transcribe/transcribe.sh <file_or_youtube_url> "<name>" [language] [--out-base PATH]
 
-`trigger_server.py` exposes a small authenticated HTTP endpoint that starts
-`pipeline.sh` in the background. Meant to be reachable only over your
-Tailscale network — no need to expose it publicly.
+# 3 — summarize only
+/opt/meeting-bot-venv/bin/python3 ./summarize/summarize.py \
+    <video_or_youtube_url> <transcript.txt> [out.md] \
+    [--prompt NAME] [--frames-manifest PATH] [--source-url URL] [--title TEXT]
 
-Setup:
+# frames only (normally called by the pipeline)
+python3 screen/extract_frames.py <video> <out_dir> ["name"]
+```
+
+### Stopping a recording
+
+```bash
+./kill_meeting.sh                  # every active run
+./kill_meeting.sh --run-id <id>    # just that one
+./kill_meeting.sh --list           # show what's running, kill nothing
+```
+
+`Ctrl+\` in the recording terminal does the same thing. Either way the bot
+clicks **Leave** in the meeting UI so other participants see it go, rather than
+having the browser killed under it.
+
+### Remote trigger (start a run from your phone over Tailscale)
+
 ```bash
 sudo cp meeting-bot-trigger.service /etc/systemd/system/
 sudo cp trigger_server.py /opt/meeting-bot/trigger_server.py
 echo "MEETING_BOT_TOKEN=$(openssl rand -hex 24)" | sudo tee /etc/meeting-bot.env
-sudo systemctl daemon-reload
 sudo systemctl enable --now meeting-bot-trigger
 ```
 
-Note the generated token in `/etc/meeting-bot.env` — you'll need it below.
-
-Restrict it to Tailscale only (adjust interface name if different):
 ```bash
-sudo ufw allow in on tailscale0 to any port 8765 proto tcp
-sudo ufw deny 8765
-```
-
-Trigger from your phone (e.g. via an SSH/Shortcuts app that can run curl, or
-Termux on Android):
-```bash
-curl -X POST http://<tailscale-hostname>:8765/trigger \
-  -H "Authorization: Bearer <token from /etc/meeting-bot.env>" \
-  -H "Content-Type: application/json" \
+curl -X POST http://<tailscale-host>:8765/trigger \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
   -d '{"url": "https://meet.google.com/abc-defg-hij", "name": "Client Call"}'
 ```
-Returns `202` immediately; the full pipeline (record + transcribe + summarize)
-runs in the background on the VM.
 
-## Configuration via `.env`
+Returns `202` immediately and runs `pipeline.sh` in the background.
 
-All env vars live in a single file at the repo root. Copy the template,
-edit, done:
+> Alpine uses OpenRC, not systemd. On an Alpine host, write an
+> `/etc/init.d/meeting-bot-trigger` OpenRC script instead of using the bundled
+> `.service` file — the unit is kept for systemd hosts.
+
+---
+
+## Resuming a failed run
+
+Every run records what it finished and where the output went, so nothing
+successful is ever redone. **Just run the same command again** — it finds the
+unfinished run for that input and restarts at the first stage that isn't done:
 
 ```bash
-cp .env.example .env
-chmod 600 .env
-$EDITOR .env
+./pipeline.sh "https://youtu.be/abc"     # died at summarize (API was down)
+./pipeline.sh "https://youtu.be/abc"     # resumes; reuses transcript + frames
 ```
 
-`pipeline.sh`, `transcribe.sh`, and `summarize.py` all load `.env`
-automatically (`summarize.py` has a tiny Python loader for direct
-invocations). One-off overrides via `KEY=val ./pipeline.sh ...` still
-win — `.env` only fills in values that aren't already exported.
+Explicit forms:
 
-The full list of supported keys is in `.env.example` with comments
-describing each. The most common ones:
+```bash
+./pipeline.sh --list                 # what runs exist and how far each got
+./pipeline.sh --status <run_id>      # per-stage detail, artifacts, last error
+./pipeline.sh --run-id <run_id>      # resume that one
+./pipeline.sh --resume-last          # resume the most recent
+./pipeline.sh --resume-all           # resume everything unfinished
+./pipeline.sh <input> --force        # ignore prior state, start over
+```
 
-| Key | What it does |
+Two details worth knowing:
+
+- **A stage counts as done only if its output is still on disk.** Delete a
+  transcript and re-run, and it regenerates rather than being skipped.
+- **A run is locked while it's being processed**, so two invocations can't work
+  the same run. If the owning process died, the lock is taken over instead of
+  blocking forever — a killed run has to stay resumable.
+
+Old run directories (which hold YouTube downloads) can be swept:
+
+```bash
+python3 lib/runstate.py sweep --days 30
+```
+
+---
+
+## Parallelism
+
+Three independent levels, all tunable:
+
+| Level | Control | Default |
+|---|---|---|
+| Inputs processed at once | `--jobs N` / `PIPELINE_JOBS` | 2 |
+| Within a run: `transcribe` ∥ `fetch_video`→`frames` | always on | — |
+| Chunks of a long transcript summarized at once | `SUMMARY_MAX_PARALLEL` | 3 |
+
+On a 4-vCPU box, `--jobs 2` or `3` is sensible; frame extraction is the
+CPU-hungry part. Chunk concurrency is kept low on purpose — every chunk carries
+images, and firing a dozen multi-megabyte requests is a good way to earn the
+429s you then have to sit out.
+
+---
+
+## Output format
+
+Summaries from `lecture-*` and `tutorial-*` prompts are wrapped in a
+course-note document, shaped to drop straight into a chapter file:
+
+```markdown
+<!-- meeting-transcriber
+     source: https://www.youtube.com/watch?v=5GAfjAjLKYk
+     source_type: youtube
+     model: gemini/gemini-2.5-flash
+     prompt: lecture-gemini.md
+     run_id: yt_5GAfjAjLKYk_20260809_120000
+     generated: 2026-08-09
+-->
+
+Chapter N — <topic> (<date>)
+
+# 2110203 L01 : Signals and Transformations
+
+Youtube Link: `https://www.youtube.com/watch?v=5GAfjAjLKYk`
+
+<details>
+    <summary> View Transcript </summary>
+
+    ...the full transcript, indented four spaces...
+</details>
+<br>
+
+...the model's structured summary...
+
+<br><br>
+```
+
+- The provenance header is an HTML comment: invisible when rendered, greppable
+  in the raw file, and harmless when pasted into a larger document.
+- `Chapter N — <topic> (<date>)` is a literal placeholder for you to fill in.
+  The chapter number isn't derivable from the video, and a plausible-looking
+  guess would be worse than an obvious blank.
+- The title comes from yt-dlp, the link and transcript are inserted by the code
+  — the model never writes them, so they can't be hallucinated or truncated.
+- `--combine` concatenates several of these with one Chapter line at the top,
+  in **input order** (runs finish out of order when several go at once).
+
+`meeting-*` prompts keep the plain executive-summary format — no wrapper.
+
+Available prompts: `ls summarize/prompts/`. Pick one with `--prompt <name>`
+(no `.md` needed). `_merge.md` is internal and not selectable.
+
+---
+
+## Configuration
+
+All non-secret settings live in `.env` at the repo root (`cp .env.example .env`,
+`chmod 600 .env`). Already-exported variables always win, so one-off overrides
+work: `SUMMARY_BACKEND=gemini ./pipeline.sh ...`.
+
+### Summarization
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SUMMARY_BACKEND` | `fallback` | `fallback`, `gemini`, `anthropic`, `nvidia_nim`, `ollama` |
+| `SUMMARY_FALLBACK_CHAIN` | `gemini,fcc,nvidia_nim` | Tried in order; first success wins |
+| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | — | For `gemini` |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` | — | For `anthropic`/`fcc` (FCC proxy works via the base URL) |
+| `SUMMARY_MODEL` | `claude-sonnet-4-5` | Anthropic model |
+| `NVIDIA_NIM_API_KEY`, `NVIDIA_NIM_MODEL` | — | For `nvidia_nim` |
+| `SUMMARY_PROMPT` | `summarize.md` | Prompt file; `--prompt` overrides |
+| `SUMMARY_MAX_TOKENS` | 4096 | |
+
+### Transient failures (503 "server is busy", 429, 5xx)
+
+| Variable | Default |
 |---|---|
-| `SUMMARY_BACKEND` | `anthropic`, `nvidia_nim`, `gemini`, `ollama`, or `fallback` |
-| `SUMMARY_FALLBACK_CHAIN` | Comma-separated order for fallback mode. Default `fcc,nvidia_nim,gemini` |
-| `ANTHROPIC_API_KEY` | FCC Claude |
-| `NVIDIA_NIM_API_KEY` | NVIDIA NIM |
-| `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) | Google Gemini |
-| `WHISPER_LANGUAGE` | Whisper default for local files (default `th`) |
-| `SCENE_THRESHOLD` / `FRAME_PERIOD_SECONDS` | Frame-extraction tuning |
-| `MAX_MEETING_MINUTES` | Hard cap on meeting recording length |
+| `SUMMARY_MAX_RETRIES` | 5 |
+| `SUMMARY_RETRY_BASE_SECONDS` | 2.0 |
+| `SUMMARY_RETRY_MAX_SECONDS` | 60.0 |
 
-YouTube-API keys live in a separate JSON file because the format is
-inherently array-shaped:
+Retries use exponential backoff with full jitter and honor `Retry-After`. A
+backend is only abandoned once its own retries are exhausted; then the chain
+advances. `400/401/403/404/422` never retry — a bad key fails the same way
+forever, and retrying just delays the fallback.
 
-```bash
-sudo nano /opt/meeting-bot/secrets/youtube_transcript_keys.json
-```
+### Long transcripts
 
-See "YouTube API keys" under "YouTube URLs" below.
+| Variable | Default | Meaning |
+|---|---|---|
+| `SUMMARY_CHUNK_CHARS` | 24000 | Above this, chunk + merge. `0` disables |
+| `SUMMARY_CHUNK_OVERLAP` | 800 | Context repeated across a boundary |
+| `SUMMARY_MAX_PARALLEL` | 3 | Concurrent chunk requests |
 
-## AI summary backends
+### Transcription
 
-The summary step (`summarize/summarize.py`) sends the transcript + extracted
-keyframes to a vision-capable LLM. Four backends are supported, plus an
-auto-fallback chain that walks them in order until one succeeds.
-
-| Backend | `SUMMARY_BACKEND` | Required env vars | Notes |
-|---|---|---|---|
-| FCC Claude (default) | `anthropic` | `ANTHROPIC_API_KEY`, optional `ANTHROPIC_BASE_URL` + `SUMMARY_MODEL` | Honors the FCC proxy URL the same way the `anthropic` SDK always has. |
-| NVIDIA NIM | `nvidia_nim` | `NVIDIA_NIM_API_KEY`, optional `NVIDIA_NIM_BASE_URL` (default `https://integrate.api.nvidia.com/v1`) + `NVIDIA_NIM_MODEL` (default `meta/llama-3.1-70b-instruct`) | Speaks the OpenAI chat-completions protocol; self-hosted NIM works too. |
-| Google Gemini | `gemini` | `GOOGLE_API_KEY` (or `GEMINI_API_KEY`), optional `GEMINI_MODEL` (default `gemini-2.5-flash`) | Uses the `google-genai` SDK. |
-| Ollama (local) | `ollama` | `OLLAMA_HOST`, `OLLAMA_MODEL` (default `llava:13b`) | Original local-only path. |
-| Auto-fallback | `fallback` | the union of each backend you wire in | Walks `SUMMARY_FALLBACK_CHAIN` in order; first to succeed wins. Default chain: `fcc,nvidia_nim,gemini`. |
-
-Quick examples:
-
-```bash
-# FCC Claude only (original behavior)
-export SUMMARY_BACKEND=anthropic
-export ANTHROPIC_BASE_URL="https://<your-fcc-host>"
-export ANTHROPIC_API_KEY="<your-fcc-key>"
-python3 ./summarize/summarize.py recording.mp4 transcript.txt
-
-# NVIDIA NIM only
-export SUMMARY_BACKEND=nvidia_nim
-export NVIDIA_NIM_API_KEY="nvapi-..."
-python3 ./summarize/summarize.py recording.mp4 transcript.txt
-
-# Auto-fallback: try FCC, then NIM, then Gemini
-export SUMMARY_BACKEND=fallback
-export SUMMARY_FALLBACK_CHAIN=fcc,nvidia_nim,gemini
-export ANTHROPIC_API_KEY=... NVIDIA_NIM_API_KEY=... GOOGLE_API_KEY=...
-python3 ./summarize/summarize.py recording.mp4 transcript.txt
-```
-
-All four vision-aware backends receive the same frames + the same
-prompt template, so behavior is consistent across providers. The fallback
-chain costs one extra retry per failed backend — its purpose is to keep
-the pipeline running when one provider is rate-limiting or down.
-
-## Known fragility / things to watch
-
-- **Zoom and Google Meet change their web UI periodically.** `screen/capture.py`
-  looks for buttons/text by visible label ("Join now", "Ask to join", "Leave
-  call", waiting-room phrases, etc). If a join or admission check fails,
-  screenshots land in `/opt/meeting-bot/recordings/` (`join_failed.png`,
-  `not_admitted.png`) — check those first, then update the selectors.
-- **Auto-leave is a heuristic, not a guarantee.** The participant count is
-  scraped with regex over visible page text (see `get_participant_count()`),
-  since neither platform exposes it as a stable API in the web client. If
-  that text format changes, or a meeting's UI never shows a count, the count
-  reads as `None` and the bot falls back entirely on "page closed" / "meeting
-  ended" title detection to know when to stop.
-- **Admission gating relies on a marker file** (`/tmp/meeting_bot_admitted`).
-  `screen/capture.py` touches it once it detects it's actually inside the call
-  (not a waiting room); `screen/record_screen.sh` polls for it before
-  starting `ffmpeg`, so recording only covers time you were actually admitted.
-  If `capture.py` crashes between "admitted" and "meeting ends" without
-  cleaning up, a stale marker could in theory affect the *next* run - this
-  is unlikely (marker is also cleared at the start of every run) but worth
-  knowing if recordings ever start unexpectedly early.
-- **No native recording indicator.** This pipeline captures audio via a
-  virtual PulseAudio sink, entirely separate from Zoom's/Meet's own "Record"
-  feature — it never clicks their record button, so none of their on-screen
-  recording banners appear to other participants. Worth being deliberate
-  about whether that's acceptable for your meetings; see the recording-
-  transparency discussion earlier in this conversation if you want the bot
-  to trigger native recording or announce itself instead.
-- **Bot-detection risk**: logging into Google/Zoom via an automated browser
-  can occasionally trigger suspicious-activity checks. Logging in once,
-  manually, via `first_time_login.sh`'s VNC session (rather than scripting
-  the login itself) avoids most of this.
-- **CPU load**: with 4 vCPUs and no GPU, whisper.cpp's `small` multilingual
-  model (the current default, needed for Thai) runs comfortably faster than
-  real-time. `medium` is ~3x slower/heavier but meaningfully more accurate,
-  especially for Thai - see the Thai language section above for how to switch.
-  The H.264 encoder in the screen recorder uses `-preset ultrafast` and
-  `-crf 28`, which trades a little quality for much lower CPU cost; this
-  is fine for talking-heads + slides.
-- **`trigger_server.py` runs as root** (see `meeting-bot-trigger.service`) so
-  it can launch the recording pipeline without a login session. It's gated
-  by a bearer token and meant to be reachable only over Tailscale - don't
-  expose port 8765 publicly.
-- **Camera/mic are muted before recording starts** via `mute_av()` in
-  `screen/capture.py` (keyboard shortcuts first, then aria-label fallbacks).
-  If the heuristic fails, the recording still proceeds with a warning logged
-  — check the warning and update the selectors if it ever shows up.
-- **Screen-share is blocked three ways** in `screen/capture.py`: a Chrome
-  flag (`--disable-features=ScreenCapture`), a runtime dialog killer, and
-  a "Stop presenting" banner monitor that auto-clicks if the bot somehow
-  starts presenting. The recording continues in all cases; the monitor
-  just logs a loud warning when it kicks in.
-- **A hard max-duration timeout** (default 4 hours, override with
-  `MAX_MEETING_MINUTES=N`) is the backstop for the mass-exit heuristic —
-  the bot will always leave the meeting after N minutes, no matter what
-  participant-count telemetry says.
-
-## Files
-
-| File | Purpose |
+| Variable | Default |
 |---|---|
-| `setup.sh` | One-time install of all dependencies (idempotent: skips existing whisper.cpp via `git pull`; installs `yt-dlp` from GitHub releases) |
-| `.env.example` | Template for the per-user `.env` config (copy to `.env` and edit) |
-| `source_env.sh` | Tiny `.env` loader sourced by every entry script |
-| `audio-setup.sh` | Creates the PulseAudio virtual sink |
-| `first_time_login.sh` | One-time interactive Google/Zoom login via VNC |
-| `screen/record_screen.sh` | Option 1 entry — Xvfb + Playwright + ffmpeg x11grab -> MP4 |
-| `screen/capture.py` | Playwright driver that joins the call (carries Thai labels + kill sentinel) |
-| `screen/extract_frames.py` | Scene-change + periodic frame extractor for the AI summary |
-| `transcribe/transcribe.sh` | Option 2 entry — accepts WAV / MP4 / M4A / MKV; YouTube URLs auto-route to the youtube-transcript.io API |
-| `transcribe/yt_transcript_client.py` | YouTube captions API client with multi-account round-robin key file |
-| `summarize/summarize.py` | Option 3 entry — frames + transcript -> Markdown summary |
-| `summarize/llm_client.py` | Pluggable LLM client (Anthropic / FCC / NVIDIA NIM / Gemini / Ollama) + auto-fallback chain |
-| `summarize/prompts/summarize.md` | The summary prompt template |
-| `pipeline.sh` | Chains Option 1 -> 2 -> 3 in sequence |
-| `kill_meeting.sh` | Standalone "leave now" (also: Ctrl+\ in the recording terminal) |
-| `trigger_server.py` | Tailscale-only HTTP endpoint that launches `pipeline.sh` |
-| `meeting-bot-trigger.service` | systemd unit for `trigger_server.py` |
-| `CLAUDE.md` | Per-option reference for future Claude sessions (env vars, debugging, conventions) |
+| `ASSEMBLYAI_API_KEY` | — (required for local files) |
+| `ASSEMBLYAI_LANGUAGE` | `th` |
+| `ASSEMBLYAI_MODEL` | SDK chain `universal-3-5-pro`, `universal-2` |
+| `YT_TRANSCRIPT_KEYS_FILE` | `/opt/meeting-bot/secrets/youtube_transcript_keys.json` |
+
+Multiple youtube-transcript.io accounts rotate round-robin to spread quota:
+
+```json
+{ "keys": ["acct1-token", "acct2-token"], "next_index": 0 }
+```
+
+### Frames
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCENE_THRESHOLD` | 0.3 | ffmpeg scene-change score cutoff |
+| `FRAME_PERIOD_SECONDS` | 30 | Periodic safety-net sample; `0` disables |
+
+Aggressive: `FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2`.
+Slides only: `FRAME_PERIOD_SECONDS=300 SCENE_THRESHOLD=0.6`.
+
+### Meeting behaviour
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAX_MEETING_MINUTES` | 240 | Hard wall-clock cap |
+| `IDLE_LEAVE_MINUTES` | 5 | Leave after this long alone (or with one other); `0` disables |
+| `PIPELINE_JOBS` | 2 | Same as `--jobs` |
+
+The bot also leaves on the kill sentinel, when the page says the meeting ended,
+or when participants drop below 30% of their peak for two consecutive polls.
+
+---
+
+## Tests
+
+None of these need API keys, a network, or `/opt` — they all run against
+temporary directories.
+
+```bash
+python3 lib/test_runstate.py            # run state, resume, concurrency (13)
+python3 summarize/test_summarize_units.py  # retry, chunking, map-reduce, document (31)
+bash lib/test_pipeline_e2e.sh           # full orchestration, stages stubbed (72)
+python3 transcribe/test_yt_transcript_client.py
+```
+
+`test_pipeline_e2e.sh` runs `pipeline.sh` and `run_one.sh` for real — routing,
+the DAG, parallel branches, state transitions, resume, `--force`, `--combine`,
+locking — with the four expensive stages replaced by stubs honoring the same
+contract. It proves the machinery is correct; it does **not** prove Chrome can
+join a Meet call or that your keys work. For those, do one real low-stakes run
+per input type.
+
+---
+
+## Troubleshooting
+
+**`docker is installed but the daemon isn't reachable`**
+`service docker start`. In an LXC container it also needs `nesting=1` and a
+usable storage driver.
+
+**`recorder image is not built`**
+`sudo -H ./setup.sh --build-recorder`.
+
+**Google says "This browser or app may not be secure"**
+The login must go through `first_time_login.sh`, which launches Chrome directly.
+Playwright sets automation flags Google detects, even with `channel="chrome"`.
+
+**The bot never gets admitted**
+Check `runs/<run_id>/join_failed.png` or `not_admitted.png`, and
+`runs/<run_id>/logs/record.log`.
+
+**The MP4 is empty**
+See `recordings/<run_id>_ffmpeg.log`. Usually the audio sink or the display
+didn't come up inside the container.
+
+**A YouTube transcript comes back as `[เสียงพากย์ไทย]`**
+That's a re-voiced video whose only captions are a placeholder. Every API key
+hits the same upstream captions, so retrying won't help — the placeholder is
+written through deliberately so you can see it in the `.txt`.
+
+**A run half-finished**
+`./pipeline.sh --status <run_id>` shows which stage failed and the error;
+`./pipeline.sh --run-id <run_id>` picks up from there.
+
+**Everything is slow on a long video**
+Frame extraction is CPU-bound. Raise `FRAME_PERIOD_SECONDS`, or lower `--jobs`
+so runs aren't competing for the same cores.
