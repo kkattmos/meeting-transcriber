@@ -131,14 +131,22 @@ looks_like_input() {
 
 declare -a INPUTS=()
 declare -a LEGACY_EXTRAS=()
-for arg in "${POSITIONAL[@]:-}"; do
-  [ -z "$arg" ] && { LEGACY_EXTRAS+=(""); continue; }
-  if looks_like_input "$arg"; then
-    INPUTS+=("$arg")
-  else
-    LEGACY_EXTRAS+=("$arg")
-  fi
-done
+# Guard the empty case explicitly: "${POSITIONAL[@]:-}" on an empty array
+# expands to a single empty string, which would be counted as a legacy
+# positional and make `--from-file` with no positionals look ambiguous.
+if [ "${#POSITIONAL[@]}" -gt 0 ]; then
+  for arg in "${POSITIONAL[@]}"; do
+    # Empty positionals are placeholders in the legacy form
+    # (`pipeline.sh <url> "" "" en`), so they hold their slot.
+    if [ -z "$arg" ]; then
+      LEGACY_EXTRAS+=("")
+    elif looks_like_input "$arg"; then
+      INPUTS+=("$arg")
+    else
+      LEGACY_EXTRAS+=("$arg")
+    fi
+  done
+fi
 
 # Pull inputs out of a file too. Blank lines and #-comments are skipped, so a
 # link list can be annotated.
@@ -161,11 +169,19 @@ if [ "${#INPUTS[@]}" -eq 1 ] && [ "${#LEGACY_EXTRAS[@]}" -gt 0 ]; then
   [ -n "${LEGACY_EXTRAS[1]:-}" ] && DISPLAY_NAME="${LEGACY_EXTRAS[1]}"
   [ -n "${LEGACY_EXTRAS[2]:-}" ] && LANGUAGE="${LEGACY_EXTRAS[2]}"
   [ -n "${LEGACY_EXTRAS[3]:-}" ] && [ -z "$PROMPT_NAME" ] && PROMPT_NAME="${LEGACY_EXTRAS[3]}"
-elif [ "${#INPUTS[@]}" -gt 1 ] && [ "${#LEGACY_EXTRAS[@]}" -gt 0 ]; then
-  echo "ERROR: don't mix multiple inputs with the legacy positional form." >&2
-  echo "  Unrecognized arguments: ${LEGACY_EXTRAS[*]}" >&2
-  echo "  With several inputs, use the flags: --name, --language, --prompt, ..." >&2
-  exit 1
+elif [ "${#INPUTS[@]}" -gt 1 ]; then
+  # Only *non-empty* leftovers are ambiguous; a bare "" carries no meaning
+  # once there's more than one input.
+  declare -a REAL_EXTRAS=()
+  for extra in "${LEGACY_EXTRAS[@]:-}"; do
+    [ -n "$extra" ] && REAL_EXTRAS+=("$extra")
+  done
+  if [ "${#REAL_EXTRAS[@]}" -gt 0 ]; then
+    echo "ERROR: don't mix multiple inputs with the legacy positional form." >&2
+    echo "  Unrecognized arguments: ${REAL_EXTRAS[*]}" >&2
+    echo "  With several inputs, use the flags: --name, --language, --prompt, ..." >&2
+    exit 1
+  fi
 fi
 
 if [ "${#INPUTS[@]}" -gt 1 ] && [ -n "$NAME" ]; then
@@ -247,6 +263,20 @@ elif [ "$RESUME_ALL" -eq 1 ]; then
   echo "==> Resuming ${#RUN_DIRS[@]} unfinished run(s)"
 else
   if [ "${#INPUTS[@]}" -eq 0 ]; then
+    # Arguments were given, but none of them look like an input. Say which,
+    # rather than dumping the usage text and leaving the user to spot the typo.
+    declare -a UNRECOGNIZED=()
+    for extra in "${LEGACY_EXTRAS[@]:-}"; do
+      [ -n "$extra" ] && UNRECOGNIZED+=("$extra")
+    done
+    if [ "${#UNRECOGNIZED[@]}" -gt 0 ]; then
+      echo "ERROR: unrecognized input: ${UNRECOGNIZED[0]}" >&2
+      echo "  Expected a Google Meet or Zoom URL, a YouTube URL, or a path to" >&2
+      echo "  a local media file that exists on disk." >&2
+      echo "  (A local path is only recognized if the file is actually there —" >&2
+      echo "   check for a typo in the path.)" >&2
+      exit 1
+    fi
     usage
     exit 1
   fi
