@@ -214,6 +214,36 @@ Shaped to match the user's course files (`2_Transcripts/chapter1.md`,
 - `--combine` concatenates several documents with one Chapter line at the top,
   in **input** order — runs finish out of order when several go at once.
 
+## Cross-session queueing (`lib/slotqueue.py`)
+
+`--jobs` throttles concurrency *within one* `pipeline.sh` invocation. It does
+nothing about several invocations running at once, which is the normal case
+here (multiple terminals, or the trigger server firing repeatedly). The slot
+queue is the machine-wide coordination those separate processes share, via
+files under `/opt/meeting-bot/queue/`.
+
+- One FIFO queue per component: `record`, `fetch_video`, `transcribe`,
+  `frames`, `summarize`. Limit is `QUEUE_SLOTS_<COMPONENT>`, falling back to
+  `QUEUE_SLOTS_DEFAULT`.
+- **Unlimited unless configured.** Unset means the acquire path returns
+  immediately and touches no files at all — the queue is opt-in, and an
+  unconfigured box behaves exactly as it did before the queue existed.
+- **A slot is held by the calling shell's PID**, not by a supervising process.
+  That's what lets a bash stage hold a slot for an hour without a babysitter.
+  Holders whose PID is gone are pruned by the next caller, so a SIGKILL'd run
+  or a reboot releases its slot with no cleanup daemon — the queue cannot wedge
+  permanently.
+- A waiter whose own holder PID dies aborts instead of taking a slot nobody
+  will use or release.
+- `run_stage` in `run_one.sh` reads `$BASHPID` **into a variable before** the
+  `$( ... )` command substitution. Inside the substitution, `$BASHPID` is the
+  substitution's own throwaway subshell, which exits immediately — the queue
+  would see a dead holder and reclaim the slot instantly, serializing nothing.
+  This was a real bug; don't inline it back.
+- `QUEUE_SLOTS_RECORD` is supported but dangerous and documented as such:
+  recording is the only time-sensitive stage, so a queued meeting isn't delayed,
+  it's missed. It stays unlimited by default.
+
 ## Things future Claude MUST NOT change
 
 Decisions with a specific reason behind them. If you want to change one, stop
@@ -283,6 +313,16 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   retry in lockstep.
 - **The document wrapper is built in code, not requested in the prompt.** See
   the output-format section above.
+- **Queue slots default to unlimited.** Turning any of them on by default
+  would silently serialize existing setups, and for `record` would silently
+  start missing overlapping meetings. Opt-in only.
+- **The queue holder is the calling shell's PID, read before the command
+  substitution.** See the queueing section above — inlining `$BASHPID` into
+  `$( ... )` breaks serialization in a way that looks like it works.
+- **youtube-transcript.io tokens stay in the JSON keys file, not `.env`.**
+  Multiple accounts are an array and the rotation cursor lives beside the keys
+  it belongs to. The error message when it's empty explains this at length
+  because operators reasonably look in `.env` first.
 - **`whisper.cpp` is gone.** It hadn't been on any pipeline path since the
   AssemblyAI switch, and `setup.sh` no longer builds it. Don't re-add a
   `TRANSCRIBE_BACKEND=whisper` escape hatch without explicit sign-off.
@@ -301,15 +341,16 @@ All run without API keys, network, or `/opt`, against temp directories.
 | File | Covers | Count |
 |---|---|---|
 | `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI | 13 |
+| `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `summarize/test_summarize_units.py` | retry classification/backoff, chunking, map-reduce, document | 31 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages | 72 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, incl. two concurrent sessions | 77 |
 | `transcribe/test_yt_transcript_client.py` | key rotation and retry | — |
 
 `test_pipeline_e2e.sh` is the important one: it runs the real `pipeline.sh` and
 `run_one.sh` and stubs only the four expensive stages, behind the same
-argument/output contract. It has already caught three real bugs (`--from-file`
-with no positionals, an unhelpful unrecognized-input error, and the double
-YouTube download). Add to it when you touch orchestration.
+argument/output contract. It has already caught four real bugs (`--from-file`
+with no positionals, an unhelpful unrecognized-input error, the double YouTube
+download, and the `$BASHPID`-in-substitution queue bug). Add to it when you touch orchestration.
 
 **What no test here covers:** Chrome actually joining a live Meet/Zoom call,
 real AssemblyAI/Gemini/youtube-transcript.io round-trips, ffmpeg's x11grab and
@@ -337,8 +378,10 @@ itself. Those need the real box and real keys.
 │   └── login_entry.sh            <- runs INSIDE the container
 ├── lib/
 │   ├── runstate.py               <- run state + locking + CLI
+│   ├── slotqueue.py              <- machine-wide component queue
 │   ├── run_one.sh                <- the per-run stage DAG
 │   ├── test_runstate.py
+│   ├── test_slotqueue.py
 │   └── test_pipeline_e2e.sh
 ├── screen/
 │   ├── record_screen.sh          <- host wrapper

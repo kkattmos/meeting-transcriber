@@ -337,18 +337,63 @@ python3 lib/runstate.py sweep --days 30
 
 ## Parallelism
 
-Three independent levels, all tunable:
+Four independent levels, all tunable:
 
 | Level | Control | Default |
 |---|---|---|
-| Inputs processed at once | `--jobs N` / `PIPELINE_JOBS` | 2 |
+| Inputs processed at once, **within one invocation** | `--jobs N` / `PIPELINE_JOBS` | 2 |
 | Within a run: `transcribe` ∥ `fetch_video`→`frames` | always on | — |
 | Chunks of a long transcript summarized at once | `SUMMARY_MAX_PARALLEL` | 3 |
+| A component running at once, **across all invocations** | `QUEUE_SLOTS_<COMPONENT>` | unlimited |
 
 On a 4-vCPU box, `--jobs 2` or `3` is sensible; frame extraction is the
 CPU-hungry part. Chunk concurrency is kept low on purpose — every chunk carries
 images, and firing a dozen multi-megabyte requests is a good way to earn the
 429s you then have to sit out.
+
+### Queueing across separate sessions
+
+`--jobs` only limits concurrency *inside one* `./pipeline.sh` invocation. Run
+the script in three terminals — or trigger it three times from your phone — and
+you get three independent sets of stages competing for the same CPUs and the
+same rate-limited APIs.
+
+The queue is the machine-wide throttle those sessions coordinate through. Set a
+slot count and they take turns, first-come-first-served:
+
+```bash
+# in .env
+QUEUE_SLOTS_TRANSCRIBE=1     # one transcription at a time, box-wide
+QUEUE_SLOTS_FRAMES=1         # one ffmpeg frame extraction at a time
+QUEUE_SLOTS_SUMMARIZE=2      # two summaries in flight
+QUEUE_SLOTS_DEFAULT=1        # fallback for anything not named above
+```
+
+A session that can't get a slot waits and says where it stands, so a blocked
+run never looks hung:
+
+```
+  queue: waiting for a 'transcribe' slot (1 ahead, 1/1 in use)
+```
+
+**Everything is unlimited unless you set its variable** — with nothing
+configured, no queue files are created and behaviour is exactly as before.
+
+> **Think twice about `QUEUE_SLOTS_RECORD`.** Recording is the one
+> time-sensitive stage. If two meetings overlap and there's a single record
+> slot, the second meeting isn't delayed — it's *missed*, and you can't go back
+> and record it. Leave it unset unless your meetings never overlap.
+
+Inspect and unstick:
+
+```bash
+python3 lib/slotqueue.py status
+python3 lib/slotqueue.py reset --component transcribe
+```
+
+A slot is held by the shell running the stage. If that process dies — a kill, a
+reboot — the next caller notices the PID is gone and reclaims the slot, so the
+queue can't wedge permanently and needs no cleanup daemon.
 
 ---
 
@@ -452,11 +497,23 @@ forever, and retrying just delays the fallback.
 | `ASSEMBLYAI_MODEL` | SDK chain `universal-3-5-pro`, `universal-2` |
 | `YT_TRANSCRIPT_KEYS_FILE` | `/opt/meeting-bot/secrets/youtube_transcript_keys.json` |
 
-Multiple youtube-transcript.io accounts rotate round-robin to spread quota:
+**Where the YouTube API key goes.** Not in `.env` — the tokens live in their
+own JSON file, because multiple accounts are a list and the rotation cursor is
+stored beside the keys it belongs to:
+
+```bash
+sudo nano /opt/meeting-bot/secrets/youtube_transcript_keys.json
+```
 
 ```json
-{ "keys": ["acct1-token", "acct2-token"], "next_index": 0 }
+{ "keys": ["your-token-here", "second-account-token"], "next_index": 0 }
 ```
+
+The client rotates through them round-robin to spread quota, advancing the
+cursor past each successful key. `setup.sh` creates the file with an empty
+`keys` list; only YouTube inputs need it (local recordings use
+`ASSEMBLYAI_API_KEY` from `.env`). Set `YT_TRANSCRIPT_KEYS_FILE` if you want it
+somewhere else.
 
 ### Frames
 
@@ -488,8 +545,9 @@ temporary directories.
 
 ```bash
 python3 lib/test_runstate.py            # run state, resume, concurrency (13)
+python3 lib/test_slotqueue.py           # cross-session component queue (23)
 python3 summarize/test_summarize_units.py  # retry, chunking, map-reduce, document (31)
-bash lib/test_pipeline_e2e.sh           # full orchestration, stages stubbed (72)
+bash lib/test_pipeline_e2e.sh           # full orchestration, stages stubbed (77)
 python3 transcribe/test_yt_transcript_client.py
 ```
 

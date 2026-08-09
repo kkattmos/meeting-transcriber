@@ -59,6 +59,12 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$out" ] || out="/tmp/stub_transcript"
 mkdir -p "$(dirname "$out")"
+# Trace start/end so a test can tell whether two sessions overlapped.
+if [ -n "${STUB_TRACE:-}" ]; then
+  echo "start $(basename "$out")" >> "$STUB_TRACE"
+  sleep "${STUB_TRANSCRIBE_SECONDS:-0}"
+  echo "end $(basename "$out")" >> "$STUB_TRACE"
+fi
 # Long enough to trigger the chunking path in a real summarize run.
 for i in $(seq 1 50); do echo "transcript line $i for ${args[0]}"; done > "$out.txt"
 printf '1\n00:00:00,000 --> 00:00:05,000\nline one\n' > "$out.srt"
@@ -331,6 +337,65 @@ check "legacy: display name parsed" "$(state get --run-dir "$RUNS/$run" --key di
 
 out=$(pipeline "https://youtu.be/aaaaaaaaaaa" "https://youtu.be/bbbbbbbbbbb" "Some Name" 2>&1); rc=$?
 check "legacy: refuses ambiguous mix" "$rc" "1"
+
+echo ""
+echo "=================================================================="
+echo "7. Cross-session queue (several ./pipeline.sh sessions at once)"
+echo "=================================================================="
+
+run_two_sessions() {
+  # Two INDEPENDENT pipeline.sh invocations, started at the same moment —
+  # the thing --jobs cannot coordinate.
+  rm -f "$TESTROOT/trace.txt"
+  export STUB_TRACE="$TESTROOT/trace.txt"
+  export STUB_TRANSCRIBE_SECONDS=1
+  pipeline "https://www.youtube.com/watch?v=sessAAAAAAA" >/dev/null 2>&1 &
+  local p1=$!
+  pipeline "https://www.youtube.com/watch?v=sessBBBBBBB" >/dev/null 2>&1 &
+  local p2=$!
+  wait $p1; wait $p2
+  unset STUB_TRACE STUB_TRANSCRIBE_SECONDS
+}
+
+echo "--- with no QUEUE_SLOTS set, both sessions transcribe at once"
+run_two_sessions
+overlap=$(awk 'NR<=2 && /^start/ {n++} END {print n+0}' "$TESTROOT/trace.txt")
+check "queue off: the two sessions overlapped" "$overlap" "2"
+
+echo "--- with QUEUE_SLOTS_TRANSCRIBE=1, they take turns"
+export QUEUE_SLOTS_TRANSCRIBE=1
+export QUEUE_POLL_SECONDS=0.2
+# Fresh inputs so these are new runs rather than resumes of the ones above.
+rm -f "$TESTROOT/trace.txt"
+export STUB_TRACE="$TESTROOT/trace.txt"
+export STUB_TRANSCRIBE_SECONDS=1
+pipeline "https://www.youtube.com/watch?v=queueAAAAAA" >/dev/null 2>&1 &
+q1=$!
+pipeline "https://www.youtube.com/watch?v=queueBBBBBB" >/dev/null 2>&1 &
+q2=$!
+wait $q1; wait $q2
+unset STUB_TRACE STUB_TRANSCRIBE_SECONDS
+
+# Serialized means every "start" is immediately followed by its own "end".
+serialized=1
+prev_event=""; prev_name=""
+while read -r event name; do
+  if [ "$event" = "start" ] && [ "$prev_event" = "start" ]; then serialized=0; fi
+  prev_event="$event"; prev_name="$name"
+done < "$TESTROOT/trace.txt"
+check "queue on: transcribe was serialized across sessions" "$serialized" "1"
+check "queue on: both sessions still completed" \
+  "$(grep -c '^end' "$TESTROOT/trace.txt")" "2"
+
+echo "--- the queue file records who held the slot"
+python3 "$STAGING/lib/slotqueue.py" status --component transcribe 2>&1 | grep -q "transcribe" \
+  && ok "queue: status reports the component" || bad "queue: status broken"
+
+echo "--- slots are released after the runs finish"
+held=$(python3 "$STAGING/lib/slotqueue.py" status --component transcribe 2>&1 | grep -c "running" || true)
+check "queue: no slot left held" "$held" "0"
+
+unset QUEUE_SLOTS_TRANSCRIBE QUEUE_POLL_SECONDS
 
 echo ""
 echo "=================================================================="

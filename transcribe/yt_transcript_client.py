@@ -89,8 +89,43 @@ def extract_video_id(url):
     return m.group(1)
 
 
+def _missing_keys_message(path, created):
+    """The "where do I put my API key?" message.
+
+    Spelled out in full because this is the one credential in the project that
+    does NOT live in .env - it's a JSON file because multiple accounts are an
+    array - and that surprises people who go looking in .env first.
+    """
+    lead = (f"Created a starter keys file at {path}."
+            if created else
+            f"The keys file {path} has no API tokens in it.")
+    return f"""{lead}
+
+youtube-transcript.io tokens do NOT go in .env - they live in this JSON file,
+because multiple accounts are a list and the rotation cursor is stored next to
+the keys it belongs to.
+
+Edit it:
+
+    sudo nano {path}
+
+so it looks like this (one token per account; the client rotates through them
+round-robin to spread quota):
+
+    {{
+      "keys": ["your-token-here", "second-account-token"],
+      "next_index": 0
+    }}
+
+Get a token from https://www.youtube-transcript.io (account -> API), then
+re-run the same command. Only YouTube inputs need this; local recordings use
+ASSEMBLYAI_API_KEY from .env instead.
+
+Set YT_TRANSCRIPT_KEYS_FILE in .env if you want the file somewhere else."""
+
+
 def _read_keys_file(path):
-    """Load the keys file. Returns the parsed dict; creates a starter file
+    r"""Load the keys file. Returns the parsed dict; creates a starter file
     with an empty keys list if the file doesn't exist yet (so the user can
     edit it without running a separate init step)."""
     if not path.exists():
@@ -111,10 +146,7 @@ def _read_keys_file(path):
                 f"warning: could not chmod 600 {path} — please do it manually",
                 file=sys.stderr,
             )
-        raise SystemExit(
-            f"Created starter keys file at {path}. Add at least one API "
-            f"token to its 'keys' list and re-run."
-        )
+        raise SystemExit(_missing_keys_message(path, created=True))
 
     try:
         data = json.loads(path.read_text())
@@ -123,10 +155,7 @@ def _read_keys_file(path):
 
     keys = data.get("keys") or []
     if not isinstance(keys, list) or not keys:
-        raise SystemExit(
-            f"Keys file {path} has an empty 'keys' list. Add at least one "
-            f"API token."
-        )
+        raise SystemExit(_missing_keys_message(path, created=False))
     cursor = int(data.get("next_index", 0)) % len(keys)
     return {"keys": keys, "next_index": cursor, "_path": path}
 

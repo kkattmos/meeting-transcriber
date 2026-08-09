@@ -31,6 +31,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-/opt/meeting-bot}"
 RUNSTATE="$SCRIPT_DIR/runstate.py"
+SLOTQUEUE="$SCRIPT_DIR/slotqueue.py"
 
 PYTHON_BIN="/opt/meeting-bot-venv/bin/python3"
 [ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"
@@ -134,11 +135,40 @@ run_stage() {
     echo "[$stage] retrying after a previous failure"
   fi
 
+  # Machine-wide queue slot. This is what makes several concurrent
+  # `./pipeline.sh` sessions take turns instead of all piling onto the same
+  # CPUs and APIs: whichever asks first runs first, the rest wait here.
+  #
+  # No-op unless QUEUE_SLOTS_<STAGE> is set — with nothing configured this
+  # returns an empty ticket immediately and touches no files.
+  #
+  # $BASHPID, not $$: inside the parallel branch subshells $$ is still the
+  # parent's pid, and the slot must be owned by the process that actually
+  # holds it so a dead branch releases it.
+  #
+  # It has to be read into a variable FIRST. Inside "$( ... )" bash expands
+  # $BASHPID to the command substitution's own throwaway subshell, which exits
+  # the instant the substitution completes — the queue would then see a dead
+  # holder and immediately reclaim the slot, serializing nothing.
+  local holder_pid=$BASHPID
+  local ticket
+  ticket="$("$PYTHON_BIN" "$SLOTQUEUE" acquire \
+              --component "$stage" --pid "$holder_pid" --label "$RUN_ID")" || return 1
+
+  # The slot is released on every exit path below, including a stage that
+  # fails. (If this shell is killed outright, the queue reclaims the slot by
+  # noticing the pid is gone.)
+  release_slot() {
+    [ -n "$ticket" ] && "$PYTHON_BIN" "$SLOTQUEUE" release \
+      --component "$stage" --ticket "$ticket" 2>/dev/null || true
+  }
+
   rs start --run-dir "$RUN_DIR" --stage "$stage"
   local log="$LOG_DIR/$stage.log"
   local rc
   "$@" 2>&1 | tee -a "$log" | awk -v s="$stage" '{print "[" s "] " $0; fflush()}'
   rc=${PIPESTATUS[0]}
+  release_slot
 
   if [ "$rc" -ne 0 ]; then
     # Keep the tail of the log in state.json so `runstate show` explains the
