@@ -418,23 +418,18 @@ def main():
 
     # YouTube URLs: download to a temp dir, then run the rest of the flow
     # against the downloaded MP4. Clean up the temp dir at the end.
+    #
+    # Skipped entirely when --frames-manifest is given: the video is only ever
+    # needed to extract frames, so once the caller has a manifest there is
+    # nothing left to download. pipeline.sh always passes one — this is what
+    # stops a YouTube run from downloading the same video twice.
     yt_tmpdir = None
-    if is_youtube_url(video_arg):
+    if is_youtube_url(video_arg) and not manifest_arg:
         # Always create YT_TMP_ROOT on demand so the script works on a
         # fresh VM where setup.sh hasn't run yet.
         YT_TMP_ROOT.mkdir(parents=True, exist_ok=True)
         yt_tmpdir = tempfile.mkdtemp(prefix="meeting-bot-yt-", dir=str(YT_TMP_ROOT))
         video_arg = str(download_youtube_video(video_arg, yt_tmpdir))
-        # If the user passed a name arg, prefer it; otherwise derive from
-        # the downloaded filename (yt-dlp names it video.mp4 here, so this
-        # is rarely useful - the name comes from the transcript filename).
-        if len(argv) <= 4:
-            # Override name derivation: use the YouTube video id if we can
-            # extract it. yt-dlp puts the title in the file metadata, but
-            # not in the filename when we set --output to a fixed template.
-            # The transcript filename (positional arg 2) is what the user
-            # provided; derive_meeting_name() handles it.
-            pass
 
     meeting_name = derive_meeting_name(video_arg, transcript_path)
 
