@@ -20,7 +20,7 @@
 # (region, login state, captions availability, audio quality) and re-run.
 #
 # Usage:
-#   sudo -H ./transcribe/transcribe.sh <file_or_youtube_url> "<name>" [language]
+#   ./transcribe/transcribe.sh <file_or_youtube_url> "<name>" [language] [--out-base PATH]
 #
 # Language is an ISO-639-1 code AssemblyAI recognises: "th" (Thai, default),
 # "en", "auto", or any AssemblyAI language code. Ignored on the YouTube path
@@ -28,6 +28,11 @@
 #
 # Output:
 #   /opt/meeting-bot/transcripts/<name>_<timestamp>.{txt,srt}
+#
+# --out-base PATH overrides that with PATH.txt / PATH.srt. The pipeline passes
+# it so the output path is a function of the run id rather than of the clock:
+# a resumed run has to land on the same filenames the first attempt used, or it
+# can't tell what already succeeded.
 set -e
 
 # Load `.env` from the repo root (one file for every stage). No-op if no
@@ -38,8 +43,18 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 # shellcheck disable=SC1091
 . "$ROOT_DIR/source_env.sh"
 
-if [ -z "$1" ] || [ -z "$2" ]; then
-  echo "Usage: $0 <file_or_youtube_url> <name> [language]"
+OUT_BASE=""
+declare -a ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --out-base) OUT_BASE="${2:-}"; shift 2 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- "${ARGS[@]:-}"
+
+if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+  echo "Usage: $0 <file_or_youtube_url> <name> [language] [--out-base PATH]"
   echo "  language: th (default), en, auto, or any AssemblyAI language code"
   exit 1
 fi
@@ -51,7 +66,13 @@ LANGUAGE="${3:-${ASSEMBLYAI_LANGUAGE:-th}}"
 
 STAMP=$(date +%Y%m%d_%H%M%S)
 SAFE_NAME=$(echo "$MEETING_NAME" | tr ' ' '_' | tr -cd 'A-Za-z0-9_-')
-TRANSCRIPT_DIR="/opt/meeting-bot/transcripts"
+TRANSCRIPT_DIR="${MEETING_BOT_ROOT:-/opt/meeting-bot}/transcripts"
+if [ -n "$OUT_BASE" ]; then
+  OUTPUT_BASE="$OUT_BASE"
+  TRANSCRIPT_DIR="$(dirname "$OUTPUT_BASE")"
+else
+  OUTPUT_BASE="${TRANSCRIPT_DIR}/${SAFE_NAME}_${STAMP}"
+fi
 WORK_DIR="/tmp/meeting-bot-transcribe-$$"
 mkdir -p "$TRANSCRIPT_DIR" "$WORK_DIR"
 
@@ -139,7 +160,7 @@ fi
 # writer covers both. Keeping it in one place means changes to the
 # output format only need to be made once.
 echo "==> Writing transcript + subtitles"
-"$PYTHON_BIN" - "$SEGMENTS_FILE" "${TRANSCRIPT_DIR}/${SAFE_NAME}_${STAMP}" <<'PYEOF'
+"$PYTHON_BIN" - "$SEGMENTS_FILE" "$OUTPUT_BASE" <<'PYEOF'
 import json, sys
 from pathlib import Path
 segments = json.loads(Path(sys.argv[1]).read_text())
@@ -168,5 +189,5 @@ PYEOF
 rm -rf "$WORK_DIR"
 
 echo "==> Done."
-echo "Transcript: ${TRANSCRIPT_DIR}/${SAFE_NAME}_${STAMP}.txt"
-echo "Subtitles:  ${TRANSCRIPT_DIR}/${SAFE_NAME}_${STAMP}.srt"
+echo "Transcript: ${OUTPUT_BASE}.txt"
+echo "Subtitles:  ${OUTPUT_BASE}.srt"

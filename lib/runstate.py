@@ -261,6 +261,7 @@ def main():
     p.add_argument("--safe-name")
     p.add_argument("--language")
     p.add_argument("--prompt")
+    p.add_argument("--display-name")
 
     p = with_run_dir(sub.add_parser("status"))
     p.add_argument("--stage", required=True)
@@ -289,6 +290,12 @@ def main():
     p = sub.add_parser("latest")
     p.add_argument("--root", default=str(DEFAULT_ROOT))
 
+    p = sub.add_parser("find")
+    p.add_argument("--root", default=str(DEFAULT_ROOT))
+    p.add_argument("--input", required=True)
+    p.add_argument("--incomplete", action="store_true",
+                   help="only match runs that haven't finished summarizing")
+
     p = sub.add_parser("list")
     p.add_argument("--root", default=str(DEFAULT_ROOT))
     p.add_argument("--limit", type=int, default=20)
@@ -306,6 +313,20 @@ def main():
             return 1
         print(runs[0].name)
         return 0
+
+    if args.cmd == "find":
+        # Powers auto-resume: re-running the same command should pick up the
+        # run that didn't finish rather than starting a fresh one. Matching is
+        # on the exact input string, newest first.
+        for d in _iter_runs(args.root):
+            st = RunState(d)
+            if st.get("input") != args.input:
+                continue
+            if args.incomplete and st.status("summarize") == DONE:
+                continue
+            print(d.name)
+            return 0
+        return 1
 
     if args.cmd == "list":
         runs = _iter_runs(args.root)[: args.limit]
@@ -342,7 +363,7 @@ def main():
     if args.cmd == "init":
         state.init(input=args.input, input_type=args.input_type, name=args.name,
                    safe_name=args.safe_name, language=args.language,
-                   prompt=args.prompt)
+                   prompt=args.prompt, display_name=args.display_name)
         return 0
 
     if args.cmd == "status":
