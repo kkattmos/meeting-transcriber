@@ -200,6 +200,10 @@ do_summarize() {
     "${TRANSCRIPT_BASE}.txt"
     "$SUMMARY_FILE"
     --frames-manifest "$FRAMES_DIR/manifest.json"
+    # On the YouTube path $video is the local download, so the original URL has
+    # to be threaded through separately — it's what the document header cites
+    # and what the video title is looked up from.
+    --source-url "$INPUT"
   )
   [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
   "$PYTHON_BIN" "${args[@]}"

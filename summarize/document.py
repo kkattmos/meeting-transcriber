@@ -169,6 +169,30 @@ def strip_provenance_and_chapter(text):
     return text.lstrip("\n")
 
 
+def _main():
+    """CLI used by pipeline.sh --combine.
+
+        document.py combine --output chapter3.md a.md b.md c.md
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Combine per-run summaries")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("combine")
+    p.add_argument("--output", required=True)
+    p.add_argument("--no-chapter-line", action="store_true")
+    p.add_argument("summaries", nargs="+")
+    args = ap.parse_args()
+
+    text = combine_documents(args.summaries,
+                             chapter_line=not args.no_chapter_line)
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text)
+    print(f"==> Combined {len(args.summaries)} summary/summaries -> {out}")
+    return 0
+
+
 def combine_documents(paths, chapter_line=True):
     """Concatenate per-run documents into one chapter-file-shaped markdown.
 
@@ -185,3 +209,7 @@ def combine_documents(paths, chapter_line=True):
             continue
         chunks.append(strip_provenance_and_chapter(text).rstrip() + "\n")
     return "\n".join(chunks)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

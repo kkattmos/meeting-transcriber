@@ -34,6 +34,10 @@
 #   --jobs N            how many inputs to process at once (default 2)
 #   --from-file F       read inputs from a file, one per line, # for comments
 #   --playlist          expand YouTube playlist URLs into their videos
+#   --combine F         also write every summary into one file, in input order,
+#                       shaped like a course chapter file (one Chapter line at
+#                       the top, then each video's section). Per-run summaries
+#                       are still written individually.
 #
 # The legacy positional form still works:
 #   ./pipeline.sh <input> [name] [display_name] [language] [prompt]
@@ -63,6 +67,7 @@ RESUME_LAST=0
 RESUME_ALL=0
 EXPLICIT_RUN_ID=""
 FROM_FILE=""
+COMBINE_FILE=""
 declare -a POSITIONAL=()
 
 usage() { sed -n '2,45p' "$0"; }
@@ -75,6 +80,7 @@ while [ "$#" -gt 0 ]; do
     --prompt)       PROMPT_NAME="${2:-}"; shift 2 ;;
     --jobs)         JOBS="${2:-2}"; shift 2 ;;
     --from-file)    FROM_FILE="${2:-}"; shift 2 ;;
+    --combine)      COMBINE_FILE="${2:-}"; shift 2 ;;
     --run-id)       EXPLICIT_RUN_ID="${2:-}"; shift 2 ;;
     --playlist)     EXPAND_PLAYLIST=1; shift ;;
     --force)        FORCE=1; shift ;;
@@ -343,6 +349,25 @@ for run_dir in "${RUN_DIRS[@]}"; do
     echo "        resume:   ./pipeline.sh --run-id $run_id"
   fi
 done
+
+# --- Combined output ---------------------------------------------------------
+# Concatenate in INPUT order, not completion order — runs finish out of order
+# when several run at once, and a chapter file has to follow the lecture order.
+if [ -n "$COMBINE_FILE" ]; then
+  declare -a SUMMARY_PATHS=()
+  for run_dir in "${RUN_DIRS[@]}"; do
+    md="$(rs get --run-dir "$run_dir" --key stages.summarize.artifacts.md 2>/dev/null || true)"
+    [ -n "$md" ] && [ -f "$md" ] && SUMMARY_PATHS+=("$md")
+  done
+  if [ "${#SUMMARY_PATHS[@]}" -eq 0 ]; then
+    echo ""
+    echo "==> --combine: no summaries were produced, nothing to combine."
+  else
+    mkdir -p "$(dirname "$COMBINE_FILE")"
+    "$PYTHON_BIN" "$SCRIPT_DIR/summarize/document.py" combine \
+      --output "$COMBINE_FILE" "${SUMMARY_PATHS[@]}"
+  fi
+fi
 
 if [ "$FAILED" -gt 0 ]; then
   echo ""

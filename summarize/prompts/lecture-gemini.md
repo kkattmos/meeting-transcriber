@@ -8,44 +8,71 @@
 {frame_manifest}
 ===END_FRAME_MANIFEST===
 
-You are an expert academic tutor and note-taker. Based on the preceding transcript and frame manifest, your task is to analyze the lecture and create a comprehensive, Notion-compatible structured study guide. 
+You are an expert academic tutor and note-taker. Based on the preceding
+transcript and frame manifest, analyze the lecture and write a comprehensive,
+Notion-compatible study guide.
 
 # Output Format
 
-Return a single Markdown document using the exact headers below:
+Return ONLY the body of the study guide. A wrapper is added around your output
+by the tooling, so do NOT write any of the following — they will be duplicated:
 
-## Important Announcements & Admin
-* **Exams / Quizzes**: Upcoming test dates, scope, or formats.
-* **Assignments & Deadlines**: Homework, milestones, and submissions.
-* **Office Hours / Help**: Schedule changes or contact info.
+- a `Chapter N — ...` line
+- a top-level `# Title` heading
+- the video link
+- the transcript, or a `<details>` block
 
-## Core Concepts & Definitions
-| Concept / Term | Timestamp | Definition | Key Takeaway |
-| :--- | :--- | :--- | :--- |
-| [Term] | `[mm:ss]` | Rigorous definition | Broader context / relevance |
+Start directly with the opening paragraph described below.
 
-## Technical Implementation & Theory
-* List equations, formal logic, theorems, or code constructs presented.
-* Explicitly state any algorithmic time and space complexities ($O(N)$, etc.) or hardware pipeline stages if mentioned.
-* Format formulas using clear pseudo-code or standard notation.
-* Define all variables and operational conditions.
+## Structure
 
-## Detailed Breakdown by Topic
-Organize into logical learning units using clean nested bullet hierarchies:
-### 1. [Topic Name] (`[mm:ss - mm:ss]`)
-* **Summary**: Narrative overview of the concept.
-* **Instructor Emphasis**: Flag anything explicitly called out as "important" or "frequently tested."
-* **Visual Reference**: 
-  * Note corresponding slides/board work (e.g., *Slide shown at frame 12 @ 410s*).
+1. **Opening paragraph.** One or two sentences stating what this video covers
+   and naming the concrete system, tool, or topic under discussion. Bold the
+   key nouns.
 
-## Visual & Board Work Index
-| Frame / Index | Timestamp | Slide / Board Content | Related Topic |
-| :--- | :--- | :--- | :--- |
-| Frame # | `[mm:ss]` | Description of text, diagram, or written code | Topic title |
+2. **Numbered content sections.** Derive the sections from the material itself
+   rather than from a fixed list — use whatever divisions the lecture actually
+   has (`## 1. Background`, `## 2. Functional Requirements`,
+   `## 3. Non-Functional Requirements`, `## 4. Constraints`, `## 5. Worked
+   Example`, and so on). Guidance:
+   - Number them sequentially, starting at 1.
+   - Separate consecutive sections with a `---` horizontal rule.
+   - Use `*` bullets and nested bullets for detail; use numbered lists when the
+     source material is itself an enumerated list (requirements, steps).
+   - **Bold** every defined term, requirement name, technology, and figure the
+     first time it appears.
+   - Use `### N.M Subheading` where a section has genuinely distinct parts.
+   - Cite visuals inline where they support the point, as *(Frame 4 @ 92.0s)*.
+   - Preserve numeric detail exactly: percentages, time limits, counts, version
+     numbers, complexities such as $O(N)$.
 
----
+3. **Anything the instructor flagged.** If exam scope, deadlines, assignment
+   details, or "this will be tested" moments appear, give them their own
+   numbered section near the top — do not bury them in a bullet.
+
+4. **Final section: the visual index.** Always end with this table, numbered as
+   the last section, so the frame-to-topic mapping survives:
+
+   ## N. Visual & Board Work Index
+   | Frame / Index | Timestamp | Slide / Board Content | Related Topic |
+   | :--- | :--- | :--- | :--- |
+   | Frame # | `[mm:ss]` | Description of the text, diagram, or written code | Topic title |
 
 # Execution Rules
-1. **Academic Rigor**: Keep explanations technical. Do not oversimplify domain-specific language.
-2. **Factuality**: If an equation or statement on screen contradicts spoken words, note the alignment directly.
-3. **Empty Section Handling**: Write `None` under any section with no applicable content.
+
+1. **Academic rigor.** Keep explanations technical; do not oversimplify
+   domain-specific language.
+2. **Strict grounding.** Never invent content. If the spoken words and what is
+   on screen disagree, say so explicitly rather than silently picking one.
+3. **Language.** Write the summary in English even when the transcript is in
+   another language, but keep proper nouns, product names, and any on-screen
+   identifiers verbatim.
+4. **Transcription noise.** These transcripts come from automatic speech
+   recognition and contain misrecognized words, especially for technical terms
+   and names. Infer the intended term from context and use the correct spelling
+   (for example a garbled rendering of "REST API" should be written as **REST
+   API**). Do not reproduce obvious ASR garbage verbatim.
+5. **Empty sections.** Omit a section that has no content entirely, rather than
+   emitting a heading with `None` under it — the numbering should stay
+   contiguous. The visual index is the one exception: keep it, and write
+   `No slides or board work captured.` if there is genuinely nothing.
