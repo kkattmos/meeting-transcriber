@@ -1,5 +1,7 @@
-#!/bin/sh
+#!/bin/bash
 # One-time setup for the meeting recording + transcription bot.
+# Bash (not ash): the recorder-build step sources docker/recorder_lib.sh, which
+# uses bash arrays. setup.sh's own logic stays POSIX-friendly.
 # Target: Alpine Linux on Proxmox (LXC container or KVM VM), 4 vCPU / 8GB RAM.
 #
 # Split of responsibilities:

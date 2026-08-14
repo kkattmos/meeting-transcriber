@@ -331,6 +331,12 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   dual-target detection without asking.
 - **Alpine has no systemd.** `meeting-bot-trigger.service` is kept for systemd
   hosts; an Alpine deployment needs an OpenRC init script.
+- **`setup.sh` runs under bash, not ash.** Its one bash-only construct is the
+  `local -a` arrays in `docker/recorder_lib.sh` (which Alpine's `ash` rejects
+  with `syntax error: unexpected "(" (expecting "}")` at parse time, *before*
+  the `docker build` line ever runs). Bash is already an apk dep — the cost of
+  not re-shebanging is a silent break at the recorder-build step on every fresh
+  install. Don't drop it back to `#!/bin/sh`.
 - **deno is optional and installed from apk, not GitHub.** Deno's official
   release tarballs are glibc-linked and will not run on musl.
 
