@@ -130,9 +130,16 @@ case "$BIND_MODE" in
     echo "    http://${BIND_ADDR}:${NOVNC_PORT}/vnc.html"
     ;;
   *)
-    echo "noVNC is bound to ${BIND_ADDR}:${NOVNC_PORT}. Open:"
+    # BIND_ADDR may be 0.0.0.0 (a bind-any wildcard) or a literal IP. Pick a
+    # routable URL the operator can actually paste — 0.0.0.0 isn't a valid
+    # destination, so fall back to this host's primary IPv4.
+    DISPLAY_HOST="$BIND_ADDR"
+    if [ "$DISPLAY_HOST" = "0.0.0.0" ] || [ -z "$DISPLAY_HOST" ]; then
+      DISPLAY_HOST="$(recorder_host_ipv4 2>/dev/null || hostname -i 2>/dev/null | awk '{print $1}')"
+    fi
+    echo "noVNC is bound to ${BIND_ADDR}:${NOVNC_PORT} on this host. Open:"
     echo ""
-    echo "    http://${BIND_ADDR}:${NOVNC_PORT}/vnc.html"
+    echo "    http://${DISPLAY_HOST}:${NOVNC_PORT}/vnc.html"
     echo ""
     echo "WARNING: this VNC session has no password and hands whoever reaches it"
     echo "full control of a browser holding your Google session. Only do this on"

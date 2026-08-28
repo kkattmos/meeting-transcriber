@@ -129,3 +129,15 @@ recorder_tailscale_ip() {
     tailscale ip -4 2>/dev/null | head -n 1
   fi
 }
+
+# Best-effort: this host's primary routable IPv4. Used when the bind mode is
+# 0.0.0.0 (a wildcard, not a destination) so we can print a URL the operator
+# can actually open. Empty on hosts with no non-loopback IPv4 — the caller
+# falls back to `hostname -i` in that case.
+recorder_host_ipv4() {
+  # `ip -4 route get 1.1.1.1` returns the source address the kernel would use
+  # to reach the public internet. That is the canonical "this host's primary
+  # routable IPv4" on every modern Linux, including musl/Alpine.
+  ip -4 route get 1.1.1.1 2>/dev/null \
+    | awk '/src/ {for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}'
+}
