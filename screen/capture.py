@@ -567,6 +567,18 @@ def main():
     if os.path.exists(KILL_SENTINEL):
         os.remove(KILL_SENTINEL)
 
+    # Same bind-mounted profile, same ephemeral-container-hostname problem as
+    # first_time_login.sh: a previous run's Chrome (or this same recorder
+    # container, if it was killed mid-run before capture.py's own cleanup
+    # ran) can leave a SingletonLock behind that refuses to match this
+    # container's hostname/pid, and Chrome refuses to launch entirely. Any
+    # lock still present here is stale by definition — nothing else can be
+    # holding it while we're about to start.
+    for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        lock_path = os.path.join(PROFILE_DIR, lock_name)
+        if os.path.exists(lock_path) or os.path.islink(lock_path):
+            os.remove(lock_path)
+
     with sync_playwright() as p:
         # channel="chrome" forces real Google Chrome (installed by setup.sh)
         # rather than Playwright's bundled unbranded Chromium. Google blocks

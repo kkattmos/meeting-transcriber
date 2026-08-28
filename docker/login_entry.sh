@@ -63,6 +63,15 @@ fi
 
 echo "==> Launching Google Chrome (profile: $PROFILE_DIR)"
 mkdir -p "$PROFILE_DIR"
+# The profile dir is bind-mounted from the host and outlives this container,
+# but the container itself is ephemeral and gets a new hostname every run
+# (first_time_login.sh does `docker rm -f` before each start). Chrome's
+# SingletonLock encodes the hostname+pid of whoever last held it, so a lock
+# left behind by a previous container (crash, Ctrl+C racing the trap, `docker
+# rm -f` on a hung container) makes this container's Chrome refuse to start
+# with "profile appears to be in use by another computer". Since this is
+# always a fresh container, any lock present here is guaranteed stale.
+rm -f "$PROFILE_DIR"/Singleton{Lock,Socket,Cookie}
 # Launched DIRECTLY, not through Playwright. Even with channel="chrome",
 # Playwright sets --enable-automation and navigator.webdriver=true, which
 # Google's sign-in flow rejects with "This browser or app may not be secure".
