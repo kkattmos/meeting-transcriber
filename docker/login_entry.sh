@@ -85,6 +85,9 @@ google-chrome-stable \
   --no-sandbox \
   --no-first-run \
   --no-default-browser-check \
+  --disable-gpu \
+  --disable-software-rasterizer \
+  --disable-dev-shm-usage \
   --disable-features=ScreenCapture \
   --window-position=0,0 \
   --window-size=1920,1080 \
