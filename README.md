@@ -406,7 +406,7 @@ course-note document, shaped to drop straight into a chapter file:
 <!-- meeting-transcriber
      source: https://www.youtube.com/watch?v=5GAfjAjLKYk
      source_type: youtube
-     model: gemini/gemini-2.5-flash
+     model: gemini/gemini-3.6-flash
      prompt: lecture-gemini.md
      run_id: yt_5GAfjAjLKYk_20260809_120000
      generated: 2026-08-09
@@ -460,7 +460,7 @@ work: `SUMMARY_BACKEND=gemini ./pipeline.sh ...`.
 | `SUMMARY_BACKEND` | `fallback` | `fallback`, `gemini`, `anthropic`, `nvidia_nim`, `ollama` |
 | `SUMMARY_FALLBACK_CHAIN` | `gemini,fcc,nvidia_nim` | Tried in order; first success wins |
 | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | — | For `gemini` |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | Google retires model names; `gemini-2.5-flash` now 404s. |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` | — | For `anthropic`/`fcc` (FCC proxy works via the base URL) |
 | `SUMMARY_MODEL` | `claude-sonnet-4-5` | Anthropic model |
 | `NVIDIA_NIM_API_KEY`, `NVIDIA_NIM_MODEL` | — | For `nvidia_nim` |
