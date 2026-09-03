@@ -135,6 +135,70 @@ class CallApiWireFormatTest(unittest.TestCase):
             ytc._call_api("jNQXAC9IVRw", "any-key")
 
 
+class TracksShapeTest(unittest.TestCase):
+    """The live API shape (verified 2026-09), where timing lives.
+
+    A real response is one entry per video carrying a flat `text` string
+    plus `tracks: [{language, transcript: [{start, dur, text}, ...]}]`.
+    Before `_pick_track` existed, the parser fell through to the entry dict
+    itself and produced a SINGLE segment holding the whole transcript with
+    offset 0 and duration 0 — which silently destroyed every timestamp the
+    chunker uses to match frames to text.
+    """
+
+    def _entry(self, *langs):
+        return [{
+            "id": "vid",
+            "text": "whole transcript as one string",
+            "languages": [{"label": l, "languageCode": l} for l in langs],
+            "tracks": [
+                {
+                    "language": l,
+                    "transcript": [
+                        {"start": "0", "dur": "6.951", "text": f"{l} one"},
+                        {"start": "6.951", "dur": "2", "text": f"{l} two"},
+                    ],
+                }
+                for l in langs
+            ],
+        }]
+
+    def test_tracks_give_one_segment_per_caption_line(self):
+        segs = ytc._normalise_segments(self._entry("en"))
+        self.assertEqual(len(segs), 2)
+        self.assertEqual([s["text"] for s in segs], ["en one", "en two"])
+
+    def test_seconds_are_converted_to_milliseconds(self):
+        segs = ytc._normalise_segments(self._entry("en"))
+        self.assertEqual(segs[0]["offset_ms"], 0)
+        self.assertEqual(segs[0]["duration_ms"], 6951)
+        self.assertEqual(segs[1]["offset_ms"], 6951)
+        self.assertEqual(segs[1]["duration_ms"], 2000)
+
+    def test_the_flat_text_field_is_not_used_as_a_segment(self):
+        segs = ytc._normalise_segments(self._entry("en"))
+        self.assertNotIn("whole transcript as one string",
+                         [s["text"] for s in segs])
+
+    def test_preferred_language_selects_its_track(self):
+        segs = ytc._normalise_segments(self._entry("ar", "en"), "en")
+        self.assertEqual(segs[0]["text"], "en one")
+
+    def test_region_variant_matches_the_bare_code(self):
+        segs = ytc._normalise_segments(self._entry("ar", "en-US"), "en")
+        self.assertEqual(segs[0]["text"], "en-US one")
+
+    def test_unavailable_language_falls_back_to_first_track(self):
+        # A transcript in the wrong language beats no transcript at all.
+        segs = ytc._normalise_segments(self._entry("ar"), "en")
+        self.assertEqual(segs[0]["text"], "ar one")
+
+    def test_older_shape_still_parses(self):
+        body = [{"id": "x", "transcripts": [
+            {"text": "legacy", "offset": 0, "duration": 1.0}]}]
+        self.assertEqual(ytc._normalise_segments(body)[0]["text"], "legacy")
+
+
 class NormaliseSegmentsEmptyBodyTest(unittest.TestCase):
     """Empty-body / placeholder-text behavior, pinned for the loud-fail
     contract.

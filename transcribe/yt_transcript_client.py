@@ -38,7 +38,8 @@ Public API
 - extract_video_id(url) -> str
 - fetch_transcript(video_id) -> list[dict]
     Returns [{'text': str, 'offset_ms': int, 'duration_ms': int}, ...]
-- CLI: `python3 -m yt_transcript_client <video_url>` prints segments to stdout
+- CLI: `python3 -m yt_transcript_client <video_url> [<language>]` prints
+  segments to stdout
 """
 import json
 import os
@@ -239,7 +240,40 @@ def _call_api(video_id, api_key):
     return resp.json()
 
 
-def _normalise_segments(raw):
+def _pick_track(entry, prefer_language=None):
+    """Return the transcript segment list from an entry's `tracks`, or None.
+
+    The current API shape (verified 2026-09) is:
+
+        [{"id": ..., "title": ..., "text": "<whole transcript, one string>",
+          "languages": [{"label": "en", "languageCode": "en"}, ...],
+          "tracks": [{"language": "en",
+                      "transcript": [{"start": "6.951", "dur": "2",
+                                      "text": "..."}, ...]}]}]
+
+    `tracks[].transcript` is the only place per-segment timing lives, and
+    timing is what lets chunking hand each chunk the frames that were on
+    screen while those words were spoken. The flat `text` field has none.
+    """
+    tracks = entry.get("tracks")
+    if not isinstance(tracks, list) or not tracks:
+        return None
+    chosen = None
+    if prefer_language:
+        want = str(prefer_language).lower()
+        for t in tracks:
+            lang = str(t.get("language") or "").lower()
+            # "en" should match "en-US"; an exact match wins outright.
+            if lang == want or lang.startswith(want + "-") or want.startswith(lang + "-"):
+                chosen = t
+                break
+    if chosen is None:
+        chosen = tracks[0]
+    segments = chosen.get("transcript")
+    return segments if isinstance(segments, list) else None
+
+
+def _normalise_segments(raw, prefer_language=None):
     """Convert the API's response shape into a flat list of segments.
 
     The API's exact field names are documented to drift between versions, so
@@ -251,9 +285,16 @@ def _normalise_segments(raw):
 
     out = []
     for entry in raw:
-        # Most API versions return one entry per video, with segments under
-        # 'transcripts' or 'segments'. Some return segments directly.
-        segments = entry.get("transcripts") or entry.get("segments") or entry
+        # Current shape first: the timed segments under tracks[].transcript.
+        # Without this the fallbacks below land on the entry dict itself and
+        # its flat `text` field, producing ONE segment holding the entire
+        # transcript with no timing at all — which is exactly what happened
+        # before this branch existed.
+        segments = _pick_track(entry, prefer_language)
+        if segments is None:
+            # Older/other shapes: segments under 'transcripts' or 'segments',
+            # or the entry itself.
+            segments = entry.get("transcripts") or entry.get("segments") or entry
         if isinstance(segments, dict):
             segments = [segments]
         if not isinstance(segments, list):
@@ -287,9 +328,13 @@ def _normalise_segments(raw):
     return out
 
 
-def fetch_transcript(video_id, keys_file=None):
+def fetch_transcript(video_id, keys_file=None, prefer_language=None):
     """Fetch a transcript for `video_id`, trying each configured key in
     round-robin order until one succeeds.
+
+    `prefer_language` picks among the caption tracks the video actually has
+    ("en" matches "en-US"); the first track is used when it doesn't match,
+    since a transcript in the wrong language still beats no transcript.
 
     Returns a list of {'text', 'offset_ms', 'duration_ms'} segments.
 
@@ -331,7 +376,7 @@ def fetch_transcript(video_id, keys_file=None):
         next_cursor = (pick + 1) % len(keys)
         _write_cursor(keys_path, next_cursor)
 
-        segments = _normalise_segments(raw)
+        segments = _normalise_segments(raw, prefer_language)
         if not segments:
             # The API returned 200 but no usable segments. Don't bother
             # retrying on a different key — every key hits the same
@@ -387,11 +432,16 @@ def main():
     Prints the segments as JSON to stdout (so the bash wrapper can pipe it
     to the writer). Exits non-zero on failure.
     """
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <youtube_url>", file=sys.stderr)
+    if len(sys.argv) not in (2, 3):
+        print(f"Usage: {sys.argv[0]} <youtube_url> [<language>]",
+              file=sys.stderr)
         sys.exit(1)
     video_id = extract_video_id(sys.argv[1])
-    segments = fetch_transcript(video_id)
+    # "auto" means "whatever the video has" — same as passing nothing.
+    prefer = sys.argv[2] if len(sys.argv) == 3 else None
+    if prefer in ("auto", ""):
+        prefer = None
+    segments = fetch_transcript(video_id, prefer_language=prefer)
     json.dump(segments, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
 

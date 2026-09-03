@@ -97,7 +97,9 @@ SEGMENTS_FILE=""
 if [ "$IS_YOUTUBE" -eq 1 ]; then
   echo "==> Fetching YouTube transcript via youtube-transcript.io"
   SEGMENTS_FILE="$WORK_DIR/segments.json"
-  if ! "$PYTHON_BIN" "$SCRIPT_DIR/yt_transcript_client.py" "$INPUT" \
+  # $LANGUAGE only picks among the caption tracks the video already has —
+  # nothing is translated or transcribed here.
+  if ! "$PYTHON_BIN" "$SCRIPT_DIR/yt_transcript_client.py" "$INPUT" "$LANGUAGE" \
         > "$SEGMENTS_FILE" 2>"$WORK_DIR/yt-client.log"; then
     cat "$WORK_DIR/yt-client.log"
     echo "ERROR: youtube-transcript.io fetch failed (see $WORK_DIR/yt-client.log)"

@@ -139,6 +139,13 @@ each other.
   emits, so the shared writer produces comparable output for both.
 - YouTube URLs → youtube-transcript.io (`yt_transcript_client.py`). No audio
   download; captions come back as `{text, offset_ms, duration_ms}` segments.
+- **The timed segments live in `tracks[].transcript`**, as
+  `{start, dur, text}` with seconds-as-strings. The entry's flat `text` field
+  is the whole transcript in one string with no timing; parsing that instead
+  (which is what the old fall-through did) yields a single segment, a useless
+  `.srt`, and a chunker with no timestamps to assign frames by. `_pick_track`
+  also honours a preferred language, matching "en" against "en-US" — it only
+  chooses among tracks the video already has, it never translates.
 - Both feed one shared writer producing `.txt` + `.srt`.
 - `--out-base PATH` overrides the timestamped default (see the run model).
 - Language default `th`, override via arg or `ASSEMBLYAI_LANGUAGE`.
@@ -382,7 +389,7 @@ All run without API keys, network, or `/opt`, against temp directories.
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `summarize/test_summarize_units.py` | retry classification/backoff, chunking, map-reduce, document | 31 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, incl. two concurrent sessions | 81 |
-| `transcribe/test_yt_transcript_client.py` | key rotation and retry | — |
+| `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 14 |
 
 `test_pipeline_e2e.sh` is the important one: it runs the real `pipeline.sh` and
 `run_one.sh` and stubs only the four expensive stages, behind the same
