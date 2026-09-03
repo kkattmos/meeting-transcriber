@@ -193,6 +193,36 @@ class TracksShapeTest(unittest.TestCase):
         segs = ytc._normalise_segments(self._entry("ar"), "en")
         self.assertEqual(segs[0]["text"], "ar one")
 
+    def test_human_label_matches_via_the_languages_array(self):
+        # tracks[].language is a label ("English - English"), not a code;
+        # the ISO code only appears in the sibling languages array.
+        body = [{
+            "id": "vid",
+            "languages": [
+                {"label": "Japanese", "languageCode": "ja"},
+                {"label": "English - English", "languageCode": "en"},
+            ],
+            "tracks": [
+                {"language": "Japanese",
+                 "transcript": [{"start": "0", "dur": "1", "text": "ja"}]},
+                {"language": "English - English",
+                 "transcript": [{"start": "0", "dur": "1", "text": "en"}]},
+            ],
+        }]
+        self.assertEqual(ytc._normalise_segments(body, "en")[0]["text"], "en")
+        self.assertEqual(ytc._normalise_segments(body, "ja")[0]["text"], "ja")
+
+    def test_caption_markup_is_unescaped_and_stripped(self):
+        body = [{
+            "id": "vid",
+            "tracks": [{"language": "en", "transcript": [
+                {"start": "0", "dur": "1", "text": "&lt;i&gt;Ooh&lt;/i&gt;"},
+                {"start": "1", "dur": "1", "text": "rock &amp; roll"},
+            ]}],
+        }]
+        segs = ytc._normalise_segments(body)
+        self.assertEqual([s["text"] for s in segs], ["Ooh", "rock & roll"])
+
     def test_older_shape_still_parses(self):
         body = [{"id": "x", "transcripts": [
             {"text": "legacy", "offset": 0, "duration": 1.0}]}]

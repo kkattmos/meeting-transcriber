@@ -41,6 +41,7 @@ Public API
 - CLI: `python3 -m yt_transcript_client <video_url> [<language>]` prints
   segments to stdout
 """
+import html
 import json
 import os
 import re
@@ -240,6 +241,20 @@ def _call_api(video_id, api_key):
     return resp.json()
 
 
+def _clean_caption_text(text):
+    """Unescape entities and drop caption markup.
+
+    YouTube caption cues arrive HTML-escaped, so italics reach us as the
+    literal characters "&lt;i&gt;" and an ampersand as "&amp;". Left alone
+    they end up in the .txt, in the .srt, and inside the <details> block of
+    the summary document.
+    """
+    text = html.unescape(str(text))
+    # Caption markup is only ever simple tags like <i> / </i> / <b>.
+    text = re.sub(r"</?[a-zA-Z][^>]*>", "", text)
+    return text.strip()
+
+
 def _pick_track(entry, prefer_language=None):
     """Return the transcript segment list from an entry's `tracks`, or None.
 
@@ -260,11 +275,23 @@ def _pick_track(entry, prefer_language=None):
         return None
     chosen = None
     if prefer_language:
+        # A track's `language` is a human label ("English - English",
+        # "Japanese"), not a code. The sibling `languages` array carries the
+        # ISO code for the same label, in the same order, so use it to
+        # translate before matching — otherwise every comparison against
+        # "en" fails and we silently fall back to tracks[0].
+        code_by_label = {}
+        for lang in entry.get("languages") or []:
+            if isinstance(lang, dict) and lang.get("label"):
+                code_by_label[str(lang["label"])] = str(lang.get("languageCode") or "")
         want = str(prefer_language).lower()
         for t in tracks:
-            lang = str(t.get("language") or "").lower()
-            # "en" should match "en-US"; an exact match wins outright.
-            if lang == want or lang.startswith(want + "-") or want.startswith(lang + "-"):
+            label = str(t.get("language") or "")
+            candidates = {label.lower(), code_by_label.get(label, "").lower()}
+            candidates.discard("")
+            # "en" should match "en-US" and vice versa.
+            if any(c == want or c.startswith(want + "-") or want.startswith(c + "-")
+                   for c in candidates):
                 chosen = t
                 break
     if chosen is None:
@@ -301,12 +328,12 @@ def _normalise_segments(raw, prefer_language=None):
             continue
 
         for seg in segments:
-            text = (
+            text = _clean_caption_text(
                 seg.get("text")
                 or seg.get("transcript")
                 or seg.get("caption")
                 or ""
-            ).strip()
+            )
             # Offset / duration can come back as either seconds (float) or
             # milliseconds (int). Normalise to int milliseconds.
             offset = seg.get("offset") or seg.get("start") or seg.get("startMs") or 0

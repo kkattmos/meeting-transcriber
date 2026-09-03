@@ -144,8 +144,14 @@ each other.
   is the whole transcript in one string with no timing; parsing that instead
   (which is what the old fall-through did) yields a single segment, a useless
   `.srt`, and a chunker with no timestamps to assign frames by. `_pick_track`
-  also honours a preferred language, matching "en" against "en-US" — it only
-  chooses among tracks the video already has, it never translates.
+  also honours a preferred language — but a track's `language` is a human
+  label ("English - English"), so the ISO code has to come from the sibling
+  `languages` array, which pairs label with `languageCode` in the same order.
+  Matching the label directly against "en" always fails and falls back to
+  `tracks[0]`. It only chooses among tracks the video already has; it never
+  translates, and many videos expose just one track (often not English).
+  Caption text arrives HTML-escaped (`&lt;i&gt;`, `&amp;`), so
+  `_clean_caption_text` unescapes and drops the markup.
 - Both feed one shared writer producing `.txt` + `.srt`.
 - `--out-base PATH` overrides the timestamped default (see the run model).
 - Language default `th`, override via arg or `ASSEMBLYAI_LANGUAGE`.
@@ -389,7 +395,7 @@ All run without API keys, network, or `/opt`, against temp directories.
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `summarize/test_summarize_units.py` | retry classification/backoff, chunking, map-reduce, document | 31 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, incl. two concurrent sessions | 81 |
-| `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 14 |
+| `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 
 `test_pipeline_e2e.sh` is the important one: it runs the real `pipeline.sh` and
 `run_one.sh` and stubs only the four expensive stages, behind the same
