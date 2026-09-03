@@ -181,10 +181,12 @@ def download_youtube_video(url, out_dir):
     Note: we deliberately avoid the separate-stream + merge path
     ("bestvideo+bestaudio --merge-output-format mp4"). That merge step now
     requires a JavaScript runtime (deno/node) to be installed for YouTube
-    extraction, which is overkill for a single-file download. The single-
-    stream "best[ext=mp4]/best" format returns one muxed file yt-dlp can
-    hand back without re-muxing, and falls back to webm when mp4 isn't
-    available.
+    extraction, which is overkill for a single-file download. Instead the
+    format chain prefers a muxed stream and then falls back to a video-only
+    one: the video exists solely to extract frames from, so a missing audio
+    track costs nothing, and no re-muxing is needed either way. (YouTube
+    stopped exposing muxed format 18 on many videos in 2026-09, which is why
+    the video-only fallback exists at all.)
     """
     if not shutil.which("yt-dlp"):
         raise SystemExit("yt-dlp is not installed. Run setup.sh first.")
@@ -195,9 +197,10 @@ def download_youtube_video(url, out_dir):
         "yt-dlp",
         "--no-playlist",
         # Single-file format. No merge step -> no JS-runtime dependency.
-        # On some videos yt-dlp may fall back to webm when no mp4 stream
-        # is exposed; the caller accepts whatever container lands in out_dir.
-        "-f", "best[ext=mp4]/best",
+        # Muxed first, then video-only (frames need no audio). On some videos
+        # yt-dlp may fall back to webm when no mp4 stream is exposed; the
+        # caller accepts whatever container lands in out_dir.
+        "-f", "best[ext=mp4]/best/bv*[ext=mp4][vcodec^=avc1][height<=720]/bv*[ext=mp4][height<=720]/bv*[height<=720]/bv*",
         "-o", out_template,
         url,
     ]

@@ -290,12 +290,20 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **Multiple youtube-transcript.io accounts rotate round-robin** via the key
   file. Don't collapse this to a single env var — multi-account quota spreading
   was an explicit request.
-- **The YouTube download uses `-f "best[ext=mp4]/best"`**, NOT
-  `bestvideo+bestaudio --merge-output-format mp4`. The merge path needs a JS
-  runtime (deno) for YouTube extraction and a clean postprocess merge; the
-  single-stream format returns one muxed file. Verified 2026-08: format 18
-  resolves with no JS runtime installed. If YouTube breaks this, add a
-  runtime-agnostic fallback rather than re-enabling the merge.
+- **The YouTube download never merges streams.** The format chain is
+  `best[ext=mp4]/best/bv*[ext=mp4][vcodec^=avc1][height<=720]/bv*[ext=mp4][height<=720]/bv*[height<=720]/bv*`
+  — muxed first, then **video-only**. NOT `bestvideo+bestaudio
+  --merge-output-format mp4`: the merge path needs a JS runtime (deno) for
+  YouTube extraction and a clean postprocess merge. Dropping audio is free
+  here because this file exists *only* to extract frames from — the YouTube
+  transcript comes from captions and never touches it. `avc1` is preferred
+  over AV1 so a 4-vCPU box decodes frames cheaply (AV1 works, just slower).
+  History: format 18 (muxed 360p) resolved fine in 2026-08, but by 2026-09
+  YouTube exposes no muxed format at all on many videos and `best[ext=mp4]/best`
+  alone fails with "Requested format is not available". Keep any future fix
+  runtime-agnostic rather than re-enabling the merge.
+  The same string appears in `lib/run_one.sh` and `summarize/summarize.py` —
+  change both.
 - **`summarize.py` does not download the video when `--frames-manifest` is
   given.** The video exists only to produce frames; once a manifest exists
   there's nothing to download. The pipeline always passes one, so re-adding the
