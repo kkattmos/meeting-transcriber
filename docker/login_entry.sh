@@ -22,11 +22,15 @@ CHROME_PID=""
 SHOT_PID=""
 
 cleanup() {
-  [ -n "$SHOT_PID" ] && kill "$SHOT_PID" 2>/dev/null
-  [ -n "$CHROME_PID" ] && kill "$CHROME_PID" 2>/dev/null
-  pkill -f "x11vnc -display :${DISPLAY_NUM}" 2>/dev/null
-  pkill -f "websockify" 2>/dev/null
-  pkill -f "Xvfb :${DISPLAY_NUM}" 2>/dev/null
+  # `|| true` on every line: this is an EXIT trap under `set -e`, where the
+  # first failing command both aborts the trap and sets the script's exit
+  # status. Any of these can legitimately fail (already-dead pid, nothing
+  # matching pkill). Same bug as screen/record_in_container.sh's cleanup.
+  [ -n "$SHOT_PID" ] && kill "$SHOT_PID" 2>/dev/null || true
+  [ -n "$CHROME_PID" ] && kill "$CHROME_PID" 2>/dev/null || true
+  pkill -f "x11vnc -display :${DISPLAY_NUM}" 2>/dev/null || true
+  pkill -f "websockify" 2>/dev/null || true
+  pkill -f "Xvfb :${DISPLAY_NUM}" 2>/dev/null || true
   true
 }
 trap cleanup EXIT

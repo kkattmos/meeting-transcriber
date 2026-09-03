@@ -50,8 +50,16 @@ XVFB_PID=""
 JOIN_PID=""
 
 cleanup() {
-  [ -n "$FFMPEG_PID" ] && kill -INT "$FFMPEG_PID" 2>/dev/null
-  [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null
+  # Every line ends in `|| true` because this runs as an EXIT trap under
+  # `set -e`. By the time we get here the ffmpeg process has normally been
+  # signalled and reaped already, so `kill` fails — and a failing command
+  # inside an EXIT trap under errexit aborts the trap AND becomes the
+  # script's exit status. That made every successful recording exit 1:
+  # record_screen.sh runs the container in attach mode, so pipeline.sh saw
+  # a failed `record` stage and never went on to transcribe or summarize a
+  # perfectly good MP4. Do not drop these.
+  [ -n "$FFMPEG_PID" ] && kill -INT "$FFMPEG_PID" 2>/dev/null || true
+  [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
   true
 }
 

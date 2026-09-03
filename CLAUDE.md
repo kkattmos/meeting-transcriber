@@ -291,6 +291,12 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **`--disable-features=ScreenCapture` is intentional** — the bot has no reason
   to share its screen. Layers 2 and 3 in `capture.py` (dialog killer, "Stop
   presenting" monitor) are the catch-nets if Chrome renames the flag.
+- **EXIT traps in the `set -e` scripts end every line with `|| true`.**
+  `record_in_container.sh` and `login_entry.sh` both kill pids that are
+  usually already gone. Under errexit a failing command in an EXIT trap
+  aborts the trap *and becomes the script's exit status* — which made every
+  successful recording exit 1, so `pipeline.sh` marked `record` failed and
+  never transcribed the MP4 it had just produced. Verified 2026-09.
 - **Camera/mic mute is best-effort (log warning + continue), not abort.** A
   failed UI heuristic must not block a real meeting.
 - **Google Meet pre-join uses a Tab-scan, not fixed Tab counts.** The pre-join
