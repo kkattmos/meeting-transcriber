@@ -131,6 +131,12 @@ each other.
 
 - Local files → AssemblyAI (`assemblyai_client.py`). MP3/MP4/M4A/WAV go
   directly; WEBM/OGG are demuxed to MP3 with ffmpeg first.
+- **AssemblyAI segments are sentences, not words.** `transcribe_file` calls
+  `transcript.get_sentences()` and falls back to `transcript.words` only if
+  that fails. Word-level segments made the `.txt` one word per line — which
+  is what gets embedded verbatim in the summary document — and the `.srt` one
+  word per cue. Sentence granularity also matches what the YouTube backend
+  emits, so the shared writer produces comparable output for both.
 - YouTube URLs → youtube-transcript.io (`yt_transcript_client.py`). No audio
   download; captions come back as `{text, offset_ms, duration_ms}` segments.
 - Both feed one shared writer producing `.txt` + `.srt`.

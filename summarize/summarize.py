@@ -329,7 +329,7 @@ def _sweep_stale_yt_tmpdirs():
 
 
 def _wrap_document(body, *, original_input, source_url, video_path, transcript,
-                   title_override, prompt_path, meeting_name):
+                   title_override, prompt_path, meeting_name, run_id=None):
     """Build the course-note document around the model's summary body."""
     # The source we cite is the URL the user actually gave us. On the pipeline's
     # YouTube path, video_path is a local download, so --source-url carries the
@@ -352,12 +352,15 @@ def _wrap_document(body, *, original_input, source_url, video_path, transcript,
         backend=llm_client.LAST_BACKEND,
         model=llm_client.LAST_MODEL,
         prompt_name=Path(prompt_path).name,
-        run_id=meeting_name,
+        # The real run id when the pipeline passes one, so the provenance
+        # comment points at /opt/meeting-bot/runs/<id>/. Standalone
+        # invocations have no run, so the meeting name stands in.
+        run_id=run_id or meeting_name,
     )
 
 
 FLAGS_WITH_VALUES = ("--prompt", "--frames-manifest", "--source-url",
-                     "--title", "--format")
+                     "--title", "--format", "--run-id")
 
 
 def _extract_flags(argv):
@@ -400,12 +403,13 @@ def main():
     source_url = options.get("source_url")
     title_override = options.get("title")
     doc_format = options.get("format") or os.environ.get("SUMMARY_DOC_FORMAT", "auto")
+    run_id = options.get("run_id")
 
     if len(argv) < 3:
         print(
             f"Usage: {argv[0]} <video_or_youtube_url> <transcript_path> "
             f"[<output_md_path>] [--prompt NAME] [--frames-manifest PATH] "
-            f"[--source-url URL] [--title TEXT] [--format auto|always|never]"
+            f"[--source-url URL] [--title TEXT] [--format auto|always|never] [--run-id ID]"
         )
         sys.exit(1)
 
@@ -505,6 +509,7 @@ def main():
                 title_override=title_override,
                 prompt_path=prompt_path,
                 meeting_name=meeting_name,
+                run_id=run_id,
             )
 
         # 7. Write the output.

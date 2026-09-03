@@ -237,6 +237,9 @@ do_summarize() {
     # to be threaded through separately — it's what the document header cites
     # and what the video title is looked up from.
     --source-url "$INPUT"
+    # So the document's provenance comment names the run dir the
+    # artifacts actually live in, not just the meeting name.
+    --run-id "$RUN_ID"
   )
   [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
   "$PYTHON_BIN" "${args[@]}"

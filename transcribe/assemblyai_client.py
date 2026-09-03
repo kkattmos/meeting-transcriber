@@ -11,8 +11,10 @@ Public API
 ----------
 - transcribe_file(path, language) -> list[dict]
     Returns [{'text': str, 'offset_ms': int, 'duration_ms': int}, ...] —
-    one segment per word. Same shape as yt_transcript_client.fetch_transcript()
-    so transcribe.sh's writer can consume both backends without branching.
+    one segment per *sentence* (falling back to one per word if the
+    sentences endpoint is unavailable). Same shape as
+    yt_transcript_client.fetch_transcript() so transcribe.sh's writer can
+    consume both backends without branching.
 - CLI: `python3 -m assemblyai_client <local_audio_or_video_path> [<language>]`
     Prints the segment list as JSON to stdout. Exits non-zero on failure.
 
@@ -127,6 +129,33 @@ def _words_to_segments(words):
     return segments
 
 
+def _sentences_to_segments(sentences):
+    """Convert AssemblyAI's Sentence list into our segment shape.
+
+    One sentence == one segment. This is the granularity we actually want:
+    the .txt becomes readable prose (it is embedded verbatim in the summary
+    document) and the .srt becomes real subtitles rather than one word per
+    cue. It also matches what the YouTube backend emits, so both backends
+    produce comparable output.
+    """
+    segments = []
+    for s in sentences:
+        text = (getattr(s, "text", "") or "").strip()
+        if not text:
+            continue
+        start = getattr(s, "start", None)
+        end = getattr(s, "end", None)
+        if start is None or end is None:
+            segments.append({"text": text, "offset_ms": 0, "duration_ms": 0})
+        else:
+            segments.append({
+                "text": text,
+                "offset_ms": int(start),
+                "duration_ms": max(int(end) - int(start), 1),
+            })
+    return segments
+
+
 def transcribe_file(path, language=None):
     """Submit a local audio/video file to AssemblyAI and return segments.
 
@@ -170,8 +199,25 @@ def transcribe_file(path, language=None):
             f"{transcript.status!r}; expected 'completed'."
         )
 
-    words = getattr(transcript, "words", None) or []
-    segments = _words_to_segments(words)
+    # Sentences first, words only as a fallback. get_sentences() is a
+    # second (free) GET against /v2/transcript/<id>/sentences; if it fails
+    # or the SDK is too old to have it, word-level output is still usable,
+    # just ugly — a transcript we can read beats no transcript at all.
+    segments = []
+    get_sentences = getattr(transcript, "get_sentences", None)
+    if callable(get_sentences):
+        try:
+            segments = _sentences_to_segments(get_sentences() or [])
+        except Exception as exc:  # noqa: BLE001 - any SDK/API failure
+            print(
+                f"WARNING: could not fetch sentence-level transcript "
+                f"({exc.__class__.__name__}: {exc}); falling back to "
+                "word-level segments.",
+                file=sys.stderr,
+            )
+    if not segments:
+        words = getattr(transcript, "words", None) or []
+        segments = _words_to_segments(words)
 
     if not segments:
         # Mirror transcribe.sh's exit-2 loud-fail for empty responses.
