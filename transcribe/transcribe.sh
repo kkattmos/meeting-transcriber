@@ -144,9 +144,16 @@ else
 
   echo "==> Transcribing with AssemblyAI (language: $LANGUAGE)"
   SEGMENTS_FILE="$WORK_DIR/segments.json"
-  if ! "$PYTHON_BIN" "$SCRIPT_DIR/assemblyai_client.py" "$AUDIO_FILE" "$LANGUAGE" \
-        > "$SEGMENTS_FILE" 2>"$WORK_DIR/assemblyai-client.log"; then
-    EXIT_CODE=$?
+  # Run it plainly and capture $? on the next line. Inside `if ! cmd; then`,
+  # $? is the status of the *negated* condition — i.e. always 0 — so the old
+  # `exit "$EXIT_CODE"` here exited 0 on failure. transcribe.sh then looked
+  # successful, run_one.sh marked the stage done, and it recorded .txt/.srt
+  # artifacts that had never been written. (runstate's on-disk artifact check
+  # caught it after the fact, but only on the next resume.)
+  "$PYTHON_BIN" "$SCRIPT_DIR/assemblyai_client.py" "$AUDIO_FILE" "$LANGUAGE" \
+        > "$SEGMENTS_FILE" 2>"$WORK_DIR/assemblyai-client.log"
+  EXIT_CODE=$?
+  if [ "$EXIT_CODE" -ne 0 ]; then
     cat "$WORK_DIR/assemblyai-client.log"
     echo "ERROR: AssemblyAI transcription failed (see $WORK_DIR/assemblyai-client.log)"
     rm -rf "$WORK_DIR"

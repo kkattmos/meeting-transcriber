@@ -332,7 +332,10 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **Artifact paths derive from the run id, not the clock.** Resume depends on
   it. This is why `--out-base` exists.
 - **`runstate.py status` verifies artifacts exist on disk** before reporting
-  `done`. Don't "optimize" this away.
+  `done`, and `mark_done` in `run_one.sh` refuses to record an absolute
+  artifact path that doesn't exist yet. Don't "optimize" either away — they
+  are what turns "the stage lied about succeeding" into an error naming the
+  missing file, instead of a traceback two stages later.
 - **A stale `run.lock` is taken over, not fatal.** Otherwise a killed run could
   never be resumed.
 - **Missing credentials raise `BackendUnavailable`, not `SystemExit`.**
@@ -378,14 +381,16 @@ All run without API keys, network, or `/opt`, against temp directories.
 | `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI | 13 |
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `summarize/test_summarize_units.py` | retry classification/backoff, chunking, map-reduce, document | 31 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, incl. two concurrent sessions | 77 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, incl. two concurrent sessions | 81 |
 | `transcribe/test_yt_transcript_client.py` | key rotation and retry | — |
 
 `test_pipeline_e2e.sh` is the important one: it runs the real `pipeline.sh` and
 `run_one.sh` and stubs only the four expensive stages, behind the same
 argument/output contract. It has already caught four real bugs (`--from-file`
 with no positionals, an unhelpful unrecognized-input error, the double YouTube
-download, and the `$BASHPID`-in-substitution queue bug). Add to it when you touch orchestration.
+download, and the `$BASHPID`-in-substitution queue bug), and now covers a
+fifth: a stage that exits 0 without writing its artifacts must not be
+recorded as `done` (see `mark_done`). Add to it when you touch orchestration.
 
 **What no test here covers:** Chrome actually joining a live Meet/Zoom call,
 real AssemblyAI/Gemini/youtube-transcript.io round-trips, ffmpeg's x11grab and

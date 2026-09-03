@@ -53,6 +53,11 @@ cat > "$STAGING/transcribe/transcribe.sh" <<'STUB'
 #!/bin/bash
 # stub transcriber: honors --out-base, writes .txt + .srt
 [ -f "$STUB_FAIL_TRANSCRIBE" ] && { echo "stub: transcribe failing on purpose" >&2; exit 1; }
+# The nastier failure: exit 0 having written nothing. transcribe.sh really
+# did this (it captured $? inside `if ! cmd; then`, where $? is the negated
+# condition and so always 0), and run_one.sh recorded artifacts that were
+# never created.
+[ -f "$STUB_LIE_TRANSCRIBE" ] && { echo "stub: transcribe claiming success without output"; exit 0; }
 out=""
 while [ "$#" -gt 0 ]; do
   case "$1" in --out-base) out="$2"; shift 2 ;; *) args+=("$1"); shift ;; esac
@@ -120,6 +125,7 @@ export PATH="$FAKE_BIN:$PATH"
 
 export STUB_FAIL_RECORD="$TESTROOT/fail_record"
 export STUB_FAIL_TRANSCRIBE="$TESTROOT/fail_transcribe"
+export STUB_LIE_TRANSCRIBE="$TESTROOT/lie_transcribe"
 export STUB_FAIL_FRAMES="$TESTROOT/fail_frames"
 export STUB_FAIL_SUMMARIZE="$TESTROOT/fail_summarize"
 export STUB_FAIL_FETCH="$TESTROOT/fail_fetch"
@@ -214,6 +220,21 @@ echo ""
 echo "=================================================================="
 echo "3. Resume — the point of the whole exercise"
 echo "=================================================================="
+
+echo "--- A stage that exits 0 without its artifacts is not 'done'"
+touch "$STUB_LIE_TRANSCRIBE"
+LIAR="https://www.youtube.com/watch?v=liar00000001"
+out=$(pipeline "$LIAR" 2>&1); rc=$?
+check "liar: run exits 1" "$rc" "1"
+run=$(latest_run)
+check "liar: transcribe not marked done" \
+  "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "failed"
+check "liar: summarize never ran" \
+  "$(state status --run-dir "$RUNS/$run" --stage summarize)" "pending"
+echo "$out" | grep -q "does not exist" \
+  && ok "liar: says which artifact was missing" \
+  || bad "liar: no missing-artifact message"
+rm -f "$STUB_LIE_TRANSCRIBE"
 
 echo "--- A run that fails at summarize keeps its earlier work"
 touch "$STUB_FAIL_SUMMARIZE"

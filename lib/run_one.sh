@@ -184,7 +184,27 @@ run_stage() {
 mark_done() {
   local stage="$1"; shift
   local args=()
-  for kv in "$@"; do args+=(--artifact "$kv"); done
+  local kv path
+  # A stage that exits 0 without producing its artifacts is a bug in that
+  # stage, but recording `done` for a file that isn't there turns it into a
+  # confusing failure two stages later (summarize opening a missing
+  # transcript). Refuse at the source instead: `runstate.py status` already
+  # re-checks artifacts on disk, this just moves the detection to the moment
+  # the claim is made.
+  for kv in "$@"; do
+    args+=(--artifact "$kv")
+    path="${kv#*=}"
+    case "$path" in
+      /*)
+        if [ ! -e "$path" ]; then
+          rs fail --run-dir "$RUN_DIR" --stage "$stage" \
+            --error "$stage reported success but did not produce $path"
+          echo "[$stage] reported success but $path does not exist" >&2
+          return 1
+        fi
+        ;;
+    esac
+  done
   rs done --run-dir "$RUN_DIR" --stage "$stage" "${args[@]}"
 }
 
@@ -271,7 +291,7 @@ if [ "$INPUT_TYPE" = "meeting" ]; then
   if ! run_stage record do_record; then
     exit 1
   fi
-  mark_done record "video=$MP4_FILE"
+  mark_done record "video=$MP4_FILE" || exit 1
 else
   echo "[record] skipped — $INPUT_TYPE input has no meeting to join"
 fi
@@ -304,7 +324,7 @@ branch_frames() {
         echo "[fetch_video] yt-dlp produced no file" >&2
         return 1
       fi
-      mark_done fetch_video "video=$got"
+      mark_done fetch_video "video=$got" || return 1
     else
       echo "[fetch_video] already done — skipping"
     fi
@@ -346,7 +366,7 @@ if ! run_stage summarize do_summarize "$VIDEO_FILE"; then
   echo "    Resume with:  ./pipeline.sh --run-id $RUN_ID" >&2
   exit 1
 fi
-mark_done summarize "md=$SUMMARY_FILE"
+mark_done summarize "md=$SUMMARY_FILE" || exit 1
 
 echo ""
 echo "=================================================================="
