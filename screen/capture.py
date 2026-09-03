@@ -270,6 +270,56 @@ def is_waiting_for_admission(page):
     return any(p in text for p in waiting_phrases)
 
 
+def join_rejection_reason(page):
+    """Return a human-readable reason if the page is a terminal refusal.
+
+    These are the pages where waiting cannot help: the meeting code is bad,
+    the organizer isn't there to admit anyone, the room is locked, the
+    request to join was declined. Detecting them is what lets an
+    unconfirmed join click fall through to wait_for_admission() safely —
+    the only cost of waiting is time, and here we know waiting is futile.
+
+    English + Thai, same convention as the rest of capture.py.
+    """
+    try:
+        text = " ".join(page.inner_text("body").split()).lower()
+    except Exception:
+        return None
+    # (substring to match, message to print)
+    rejections = [
+        ("you can't join this video call",
+         "Google Meet refused the join: nobody can enter unless the "
+         "organizer is in the call or the bot's account was invited."),
+        ("คุณไม่สามารถเข้าร่วม",
+         "Google Meet refused the join (Thai UI): nobody can enter unless "
+         "the organizer is in the call or the bot's account was invited."),
+        ("check your meeting code",
+         "Google Meet rejected the meeting code."),
+        ("ตรวจสอบรหัสการประชุม",
+         "Google Meet rejected the meeting code (Thai UI)."),
+        ("no one responded to your request",
+         "Nobody admitted the bot from the waiting room."),
+        ("ไม่มีใครตอบรับคำขอ",
+         "Nobody admitted the bot from the waiting room (Thai UI)."),
+        ("you can't join this meeting",
+         "The meeting refused the join."),
+        ("invalid meeting id",
+         "Zoom rejected the meeting ID."),
+        ("this meeting has been locked",
+         "The Zoom meeting is locked."),
+        ("meeting has been ended",
+         "The meeting has already ended."),
+        ("this meeting id is not valid",
+         "Zoom rejected the meeting ID."),
+        ("removed you from the meeting",
+         "The bot was removed from the meeting."),
+    ]
+    for needle, message in rejections:
+        if needle in text:
+            return message
+    return None
+
+
 def wait_for_admission(page, timeout_seconds=ADMIT_TIMEOUT_SECONDS):
     print("Waiting for host approval (if a waiting room applies)...")
     start = time.time()
@@ -280,8 +330,13 @@ def wait_for_admission(page, timeout_seconds=ADMIT_TIMEOUT_SECONDS):
         if is_admitted(page):
             print("Admitted into the meeting.")
             return True
-        if not is_waiting_for_admission(page) and is_admitted(page):
-            return True
+        # A refusal can also arrive mid-wait ("no one responded to your
+        # request"). Waiting out the full timeout on those wastes ten
+        # minutes and buries the actual reason.
+        reason = join_rejection_reason(page)
+        if reason:
+            print(f"Cannot join: {reason}")
+            return False
         time.sleep(5)
     print(f"Not admitted within {timeout_seconds}s - giving up.")
     return False
@@ -631,10 +686,23 @@ def main():
             clicked = False
 
         if not clicked:
+            # An unconfirmed click is NOT the same as a failed join. Zoom's
+            # web client swallows the button behind its "Joining Meeting..."
+            # interstitial, so click_first_match times out while the join is
+            # in fact under way; exiting here abandoned a call we were about
+            # to be in. Only a terminal refusal page is fatal — anything
+            # else falls through to wait_for_admission(), which already has
+            # its own timeout and screenshot.
             page.screenshot(path=os.path.join(SCREENSHOT_DIR, "join_failed.png"))
-            print("Could not confirm join click - screenshot saved. Exiting.")
-            context.close()
-            return
+            reason = join_rejection_reason(page)
+            if reason:
+                print(f"Cannot join: {reason} (screenshot saved)")
+                context.close()
+                return
+            print(
+                "Could not confirm the join click, but the page shows no "
+                "refusal - screenshot saved, waiting for admission anyway."
+            )
 
         if not wait_for_admission(page):
             page.screenshot(path=os.path.join(SCREENSHOT_DIR, "not_admitted.png"))

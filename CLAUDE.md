@@ -271,6 +271,15 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **Locale is `th-TH`**, so Thai participant names render in chat. Side effect:
   Meet's UI labels come back in Thai, which is why `capture.py` carries both
   English and Thai labels for every selector.
+- **An unconfirmed join click is not a failed join.** `capture.py` falls
+  through to `wait_for_admission()` whenever the click can't be confirmed but
+  `join_rejection_reason()` finds no refusal on the page. Zoom's web client
+  hides the button behind its "Joining Meeting..." interstitial, so
+  `click_first_match` times out *while the join is succeeding* — the old
+  fail-fast path abandoned calls the bot was seconds from entering. The
+  refusal detector (English + Thai) is what keeps this from costing the full
+  600s `ADMIT_TIMEOUT_SECONDS` on a genuinely dead link; it also runs inside
+  the admission wait loop, so "no one responded to your request" fails fast.
 - **The kill switch routes through the in-Meet Leave button**, not by killing
   the browser process, so other participants see the bot leave cleanly.
   `kill_meeting.sh` force-removes a container only as post-grace escalation.
