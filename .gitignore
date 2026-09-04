@@ -1,12 +1,15 @@
-# Secrets — API keys / tokens. Never commit these.
-# Populated by `setup.sh` (creates the directory) and used by
-# transcribe/yt_transcript_client.py for the youtube-transcript.io key ring.
-# File shape: {"keys": ["acct1-token", ...], "next_index": 0}
-# Edit with sudo if /opt/meeting-bot is owned by root.
-/opt/meeting-bot/secrets/
-
-# Local .env file (real keys). The .env.example template IS committed.
+# Local .env file (real keys and the operator's own output paths).
+# The .env.example template IS committed.
+#
+# Every credential lives here now: the Anthropic key, the numbered Gemini,
+# AssemblyAI and youtube-transcript.io keys. The separate
+# /opt/meeting-bot/secrets/youtube_transcript_keys.json of the Alpine branch
+# is gone — see CLAUDE.md.
 .env
+
+# Left over from the Alpine layout; ignored so an upgraded box doesn't
+# accidentally commit an old key file that's still sitting on disk.
+/opt/meeting-bot/secrets/
 
 # Python bytecode. These were committed once by accident; because the VM
 # regenerates them on every run, the tracked copies show up as local changes

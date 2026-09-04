@@ -14,58 +14,111 @@ Before writing AssemblyAI code, read https://www.assemblyai.com/docs/agent-instr
 and https://www.assemblyai.com/docs/llms.txt. The API has changed — do not rely on
 memorized parameter names.
 
+### Note on the Anthropic API
+Before writing Anthropic code, load the `claude-api` skill. The request surface
+moved twice in 2025-2026 and memorized patterns are wrong: `budget_tokens` is
+**rejected** by current models, effort is `output_config.effort`, and thinking
+is `{"type": "adaptive"}`. See the summarize section below.
+
+## Branches
+
+- **`debian13`** (this one) — Debian 13 host, everything native.
+- **`alpinelinux`** — the previous architecture, preserved verbatim: Alpine
+  host plus a Debian container for the browser stages. Consult it before
+  reintroducing anything container-shaped; it is also where the Docker files,
+  `docker/recorder_lib.sh` and `audio-setup.sh` still live.
+- `main` — the Alpine tree as it was when the port started.
+
 ## What this project is, in one paragraph
 
-A meeting/lecture bot for a **Alpine Linux** guest on Proxmox. It joins a Google
+A meeting/lecture bot for a **Debian 13** guest on Proxmox. It joins a Google
 Meet or Zoom call in a persistent real-Chrome profile (so Google's sign-in flow
 doesn't get blocked by automation-detection heuristics), records both the screen
 and the meeting audio into an MP4, transcribes the audio with the AssemblyAI
 pre-recorded API (or youtube-transcript.io for YouTube URLs), and produces an AI
-summary combining the transcript with keyframes extracted from the recording.
-It accepts several inputs per invocation, runs them concurrently, and resumes
+summary — Markdown plus a PDF with the cited keyframes cropped to the slide and
+inlined — combining the transcript with keyframes extracted from the recording
+and, optionally, the lecturer's own slides from a GitHub repo or a folder. It
+accepts several inputs per invocation, runs them concurrently, and resumes
 anything that failed partway.
 
-## The host/container split — read this first
+## Everything runs on one host — read this first
 
-**The host is Alpine, which is musl. Chrome is glibc-only.** Google ships no
-musl build, and Playwright does not support Alpine for its bundled browsers.
-The project needs *real* Chrome (see the MUST-NOT-CHANGE list). Those facts are
-irreconcilable on one filesystem, so:
+The Alpine branch split the system in two because **Alpine is musl and Chrome is
+glibc-only**: Google ships no musl build, and Playwright doesn't support Alpine
+for its bundled browsers. Debian 13 is glibc, so `google-chrome-stable` installs
+and runs natively and **the container split is gone**. No Docker, no image
+build, no bind mounts, no `docker/` directory.
 
-- **Alpine host** — Python venv, ffmpeg, yt-dlp, stages 2 and 3
-  (transcribe/summarize), the Docker daemon, and all the orchestration.
-- **Debian container** (`docker/Dockerfile.recorder`) — Xvfb, PulseAudio, real
-  `google-chrome-stable`, Playwright, ffmpeg. Stage 1 and the first-time login.
+What the container used to provide for free was per-run isolation: every
+recording had its own PID/IPC/network namespace, so display `:99` and a sink
+called `meeting_sink` could be hardcoded and never collide. Natively there is
+one X server and one PulseAudio daemon for the whole box, so both are now
+allocated per run in `lib/xsession.sh`:
 
-`docker/recorder_lib.sh` is the shared launcher. The repo is bind-mounted at
-`/app` **read-only** (with `PYTHONDONTWRITEBYTECODE=1`, so root-owned `.pyc`
-files don't appear in the user's checkout), and `/opt/meeting-bot` is mounted
-read-write at the same path inside and out, so every path in state.json means
-the same thing on both sides.
+- **Display.** `xsession_pick_display` claims the first free number in
+  `DISPLAY_MIN..DISPLAY_MAX` (90-119) by creating `/tmp/.X<n>-lock` with
+  `set -o noclobber` — an atomic `O_EXCL` create. That is what makes two runs
+  starting in the same second pick different numbers; a "check then start"
+  scheme races. Xvfb is then started with `-nolock`, because the lock we just
+  made would otherwise look to it like a server already running.
+- **Audio.** Each run loads its own `module-null-sink` named after the run id,
+  and Chrome is pointed at it with the **`PULSE_SINK` environment variable**.
+  `pactl set-default-sink` is deliberately NOT used: the default sink is global
+  state, and flipping it would move a concurrently-recording meeting's audio
+  into this run's MP4. ffmpeg records `<sink>.monitor`.
 
-**Per-run isolation is a side effect of the container, not of naming.** Display
-`:99` and the sink `meeting_sink` stay hardcoded inside the container because
-each recording gets its own PID/IPC/network namespace. Do not "fix" this by
-allocating display numbers per run — the container boundary already solved it.
+If you are tempted to hardcode a display number again, don't — that only worked
+because of the container boundary that no longer exists.
 
 ## Configuration
 
-Non-secret env vars live in a single `.env` at the repo root; `.env.example` is
-the committed template. `.env` is gitignored alongside
-`/opt/meeting-bot/secrets/`.
+Non-secret env vars *and* the API keys live in a single `.env` at the repo root;
+`.env.example` is the committed template. `.env` is gitignored.
 
-`pipeline.sh`, `lib/run_one.sh`, `transcribe.sh`, `first_time_login.sh` and
-`record_screen.sh` all source `source_env.sh`. `summarize.py` carries its own
-`_load_dotenv()` for direct invocation. The loader fills in unset values only —
-an already-exported var always wins.
+**`.env.example` carries no explanatory comments on purpose** — just names and
+defaults. Every explanation lives in README.md's Configuration section, so
+there is one place to update when a default changes. Don't re-add prose to the
+template.
 
-YouTube-API keys live in a separate JSON file because they're inherently an
-array: `/opt/meeting-bot/secrets/youtube_transcript_keys.json`, overridable via
-`YT_TRANSCRIPT_KEYS_FILE`.
+`pipeline.sh`, `lib/run_one.sh`, `transcribe.sh`, `first_time_login.sh`,
+`verify_e2e.sh` and `record_screen.sh` all source `source_env.sh`;
+`summarize.py` carries its own `_load_dotenv()` for direct invocation. The
+loader fills in unset values only — an already-exported var always wins.
+
+### Output directories are five independent, required variables
+
+`RECORDINGS_DIR`, `TRANSCRIPTS_DIR`, `FRAMES_DIR`, `SUMMARIES_DIR`, `PDF_DIR`.
+None of them is derived from another or from `MEETING_BOT_ROOT`, which now holds
+only the pipeline's own bookkeeping (`runs/`, `state/`, `tmp/`, `resources/`,
+`chrome-profile/`). `lib/paths.py` and `lib/paths.sh` resolve them and **fail
+with the variable's name if one is unset** rather than falling back to a
+default. That is deliberate: with independent paths a wrong default doesn't
+error, it silently writes the deliverable somewhere the operator will never
+look. Any of them may contain spaces — the test suites use a root with a space
+in it precisely so quoting regressions fail loudly.
+
+### API keys are numbered slots with a persisted cursor
+
+`lib/keyring.py`. `GEMINI_API_KEY_1..3`, `ASSEMBLYAI_API_KEY_1..3`,
+`YT_TRANSCRIPT_KEY_1..10`, and a single `ANTHROPIC_API_KEY`; the unnumbered name
+is accepted as slot 1 so older `.env` files keep working.
+
+**The rotation cursor is on disk** (`$MEETING_BOT_ROOT/state/keycursor.json`,
+written under an flock), not per-process. Rotation only spreads quota if
+consecutive *processes* start on different keys — a per-process cursor sends
+every run at key #1 and exhausts that account first. Every read and write of the
+cursor is best-effort: a lost cursor costs one duplicated request, never a
+failed run.
+
+The youtube-transcript.io tokens used to live in
+`/opt/meeting-bot/secrets/youtube_transcript_keys.json`. **That file is gone**
+and its support is removed; `.env` is the only source. The error message says so
+explicitly, because operators following an older README will go looking for it.
 
 ## The run model
 
-Everything mutable about a run lives in `/opt/meeting-bot/runs/<run_id>/`:
+Everything mutable about a run lives in `$MEETING_BOT_ROOT/runs/<run_id>/`:
 
 ```
 runs/<run_id>/
@@ -75,14 +128,16 @@ runs/<run_id>/
   logs/<stage>.log
   kill            per-run kill sentinel
   admitted        per-run admission marker
+  record.pid      record/join/ffmpeg pids + display + sink for this recording
   video.mp4       YouTube download, when applicable
 ```
 
 `run_id` is `<safe_name>_<YYYYmmdd_HHMMSS>`, and **all artifact paths derive
 from it** — never from a fresh timestamp. A resumed run must land on the same
 filenames the first attempt used or it can't tell what already succeeded. This
-is why `transcribe.sh` has `--out-base` and why `pipeline.sh` no longer uses
-`ls -1t` globbing to find the previous stage's output.
+is why `transcribe.sh` has `--out-base` and why `summarize.py` takes
+`--pdf-out` (PDF_DIR is not derivable from the .md path — the two directories
+are configured separately).
 
 Stage DAG (`lib/run_one.sh`):
 
@@ -108,22 +163,29 @@ each other.
   resumable, which is exactly the case resume exists for.
 - `--force` resets all stages; `--run-id` / `--resume-last` / `--resume-all`
   are the explicit forms.
+- The run's `resources` list is stored in `state.json` and replayed on every
+  attempt, so a resume summarizes against the same slides.
 
 ## Per-stage reference
 
-### Stage 1 — Recording (`screen/record_screen.sh` → `screen/record_in_container.sh`)
+### Stage 1 — Recording (`screen/record_screen.sh`)
 
-- Host script resolves paths, installs the `Ctrl+\` trap, and runs the container
-  in **attach** mode so its exit code propagates to the pipeline.
-- In-container script does Xvfb → `audio-setup.sh` → `capture.py` → ffmpeg.
-- **Geometry is 1920x1080 everywhere**: the Xvfb head, Chrome's `--kiosk`
-  window (`capture.py`), and ffmpeg's `-video_size`. A mismatch produces black
-  edges. `--kiosk` alone isn't enough on some Xvfb/Chrome combos, which is why
-  `--window-size` is also passed.
+One script now, not a host wrapper plus an in-container body.
+
+- Allocates a display and a sink (`lib/xsession.sh`), starts Xvfb, exports
+  `DISPLAY` and `PULSE_SINK`, runs `capture.py`, waits for the `admitted`
+  marker, then starts ffmpeg.
+- **Geometry must agree everywhere**: the Xvfb head, Chrome's `--kiosk` window
+  (`capture.py` reads `RECORD_GEOMETRY`), and ffmpeg's `-video_size`. A
+  mismatch produces black edges. `--kiosk` alone isn't enough on some
+  Xvfb/Chrome combos, which is why `--window-size` is also passed.
 - Encoder: `libx264 -preset ultrafast -crf 28`, audio `aac -b:a 128k`.
-- Kill: the host touches `runs/<id>/kill` (bind-mounted), `capture.py` sees it
-  on the next poll and clicks Leave. `kill_meeting.sh` force-removes the
-  container only after a grace period.
+- Writes `runs/<id>/record.pid` (record/join/ffmpeg pids, display, sink) so
+  `kill_meeting.sh` can escalate against the right processes without guessing.
+- Kill: the host touches `runs/<id>/kill`, `capture.py` sees it on the next
+  poll and clicks Leave. `kill_meeting.sh` signals the recorded pids only after
+  a grace period, and sends ffmpeg `SIGINT` (not `SIGKILL`) so the MP4 is
+  finalised and playable.
 - Failure artifacts (`join_failed.png`, `not_admitted.png`) go in the run dir,
   not a shared directory where the next run would overwrite them.
 
@@ -137,6 +199,11 @@ each other.
   is what gets embedded verbatim in the summary document — and the `.srt` one
   word per cue. Sentence granularity also matches what the YouTube backend
   emits, so the shared writer produces comparable output for both.
+- **Key rotation is failure-class aware.** A key rejected for auth/quota
+  reasons (`_is_key_level_error`) hands over to the next key; anything else —
+  a silent file, an unsupported language — is raised immediately, because
+  another key would fail identically and three uploads of the same video is a
+  real cost.
 - YouTube URLs → youtube-transcript.io (`yt_transcript_client.py`). No audio
   download; captions come back as `{text, offset_ms, duration_ms}` segments.
 - **The timed segments live in `tracks[].transcript`**, as
@@ -155,10 +222,14 @@ each other.
 - Both feed one shared writer producing `.txt` + `.srt`.
 - `--out-base PATH` overrides the timestamped default (see the run model).
 - Language default `th`, override via arg or `ASSEMBLYAI_LANGUAGE`.
+- `ASSEMBLYAI_BASE_URL` and `YT_TRANSCRIPT_API_URL` exist so
+  `lib/test_media_e2e.sh` can run the real clients against local stub servers.
+  They are test seams, not features — but they are also the only way to
+  exercise these clients without spending money, so don't remove them.
 
 ### Stage 3 — Summarize (`summarize/`)
 
-Split across five modules:
+Split across seven modules:
 
 - `summarize.py` — entry point and orchestration.
 - `llm_client.py` — backend dispatch + the fallback chain.
@@ -166,10 +237,27 @@ Split across five modules:
 - `chunking.py` — splitting long transcripts, assigning frames to chunks.
 - `mapreduce.py` — parallel chunk summarization + the merge call.
 - `document.py` — the course-note document wrapper and `--combine`.
+- `pdf.py` + `framecrop.py` — the PDF export and its frame cropping.
 
-Backends: `gemini` (default first in the chain), `anthropic`/`fcc`,
-`nvidia_nim`, `ollama`. `SUMMARY_BACKEND=fallback` is the default mode and
-walks `SUMMARY_FALLBACK_CHAIN` (default `gemini,fcc,nvidia_nim`).
+Backends: `anthropic` (default, aliases `claude`/`fcc`) and `gemini`.
+`SUMMARY_BACKEND=fallback` is the default mode and walks
+`SUMMARY_FALLBACK_CHAIN` (default `anthropic,gemini`). **NVIDIA NIM and Ollama
+were removed** in the Debian 13 port — neither had been on a configured path,
+and both carried env surface and untested code.
+
+**Anthropic request shape.** `ANTHROPIC_MODEL` defaults to `claude-opus-5`.
+`SUMMARY_EFFORT` maps onto `output_config.effort` (low|medium|high|xhigh|max),
+and thinking is `{"type": "adaptive"}`. There is deliberately **no thinking-
+budget setting**: `thinking.budget_tokens` is rejected with a 400 by every
+current model. Both parameters are passed as normal keyword arguments and
+retried inside `extra_body` if the installed SDK is too old to know them
+(`_call_with_kwarg_fallback`) — a stale `pip install anthropic` on the box
+should degrade, not fail the stage.
+
+**Gemini key rotation happens outside `with_retries`.** retry.py handles "the
+provider is busy"; the rotation loop handles "this key is exhausted or
+revoked". Inside the retry wrapper, a dead key would burn the full backoff
+schedule before the chain ever advanced.
 
 **Retry policy.** Every backend's network call goes through
 `retry.with_retries`. Retryable: 408/409/425/429/500/502/503/504, connection and
@@ -193,9 +281,27 @@ proceeds over what succeeded and the document says which parts are missing.
 
 **Frames.** `screen/extract_frames.py` does a scene-change pass
 (`SCENE_THRESHOLD`, default 0.3) plus a periodic pass (`FRAME_PERIOD_SECONDS`,
-default 30), deduplicated by ±half-period, into `frames/<run_id>/manifest.json`.
+default 30), deduplicated by ±half-period, into `$FRAMES_DIR/<run_id>/manifest.json`.
 The pipeline runs this as its own stage and passes `--frames-manifest` to
 `summarize.py`.
+
+**Reference material** (`lib/resources.py`). `--resources` takes a GitHub URL
+(optionally `@branch`, or a `/tree/<branch>/<subdir>` URL pasted from the
+browser) or a local file/folder. Text from `.md/.txt/.pdf/.pptx/.docx` is
+appended to the prompt template, capped at `RESOURCE_MAX_CHARS`; slide images
+(pdftoppm, LibreOffice for pptx) go into the PDF's Appendix B.
+
+Two non-obvious details:
+- **Braces in the material are doubled before injection.** The prompt template
+  is later run through `str.format()` for `{transcript}` and
+  `{frame_manifest}`; an unescaped `{x}` in someone's slides raises KeyError
+  and takes down a run that had already paid for transcription.
+- **A missing *local* path is fatal; an unreachable GitHub repo is not.** A bad
+  local path is always a typo, and finding out after paying for a summary is
+  worse than failing in the first second. A repo that won't clone only degrades
+  the summary, so it becomes a note.
+- OOXML text is extracted with `zipfile` + a regex, not python-pptx/python-docx:
+  we want the words, not the layout, and that is two fewer dependencies.
 
 ## Output document format
 
@@ -233,13 +339,53 @@ Shaped to match the user's course files (`2_Transcripts/chapter1.md`,
 - `--combine` concatenates several documents with one Chapter line at the top,
   in **input** order — runs finish out of order when several go at once.
 
+### The PDF (`summarize/pdf.py`)
+
+WeasyPrint, markdown→HTML→PDF. Chosen over headless Chrome (which would couple
+stage 3 to the browser half) and over pandoc/LaTeX (a gigabyte of texlive, and
+Thai in LaTeX is genuinely painful).
+
+- **The first citation of each frame becomes the image; later ones stay text.**
+  The model cites frames as *(Frame 12 @ 410.0s)*; a lecture that refers back
+  to one diagram eight times should not print it eight times.
+- **Figures are hoisted out of the block they were cited in** (`_end_of_block`)
+  so a `<figure>` never lands inside a `<p>`, `<td>` or `<li>`, which produces
+  invalid nesting and wrecks table layout.
+- **The transcript moves to Appendix A.** A PDF has no collapsed `<details>`,
+  and 80KB of ASR output at the top buries the summary.
+- **A PDF failure is a warning, not a failed stage.** The markdown is already
+  written by then and is what everything downstream depends on. Turning off
+  *both* outputs is an error rather than a run that writes nothing.
+- `run_one.sh` records whichever of the two files actually exists as the
+  stage's artifacts — see the `--no-pdf` / `--no-markdown` paths.
+
+### Frame cropping (`summarize/framecrop.py`)
+
+`slide` mode looks for the largest bright rectangle (slides are overwhelmingly
+light on dark UI) and accepts it only if it passes **all** of: minimum side
+(240px), minimum area (18% of the frame), aspect ratio in 0.9-3.2, brighter
+than the frame as a whole, and not the whole frame. Otherwise it falls back to
+a mechanical border trim, and then to no crop at all.
+
+Every one of those guards is load-bearing, and two of them were written after
+the tests caught real failures: without the size/area floor a white logo or a
+cursor highlight becomes "the slide" and the PDF gets a 30-pixel thumbnail;
+without the full-frame check, rounding in the downscaled analysis pass reports
+a 2-pixel "crop" on every frame and re-encodes the lot for nothing. **A
+confidently wrong crop is worse than an uncropped frame** — that is the whole
+design rule here.
+
+Analysis runs on a 200px-wide grayscale copy, so cost is a few milliseconds per
+frame regardless of source resolution. Pillow is optional: without it frames
+are copied through uncropped with one warning.
+
 ## Cross-session queueing (`lib/slotqueue.py`)
 
 `--jobs` throttles concurrency *within one* `pipeline.sh` invocation. It does
 nothing about several invocations running at once, which is the normal case
 here (multiple terminals, or the trigger server firing repeatedly). The slot
 queue is the machine-wide coordination those separate processes share, via
-files under `/opt/meeting-bot/queue/`.
+files under `$MEETING_BOT_ROOT/queue/`.
 
 - One FIFO queue per component: `record`, `fetch_video`, `transcribe`,
   `frames`, `summarize`. Limit is `QUEUE_SLOTS_<COMPONENT>`, falling back to
@@ -270,17 +416,19 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 
 - **Playwright uses `channel="chrome"`**, NOT the bundled Chromium. The bundled
   build gets Google's "This browser or app may not be secure" block on sign-in.
-- **Login uses a direct `google-chrome` launch, not Playwright.** Even with
-  `channel="chrome"`, Playwright injects automation flags (DevTools Protocol,
-  `navigator.webdriver=true`) that Google detects. Do not route the login
-  through Playwright.
-- **The browser stages run in the Debian container.** This is what makes real
-  Chrome possible on a musl host. Do not "simplify" it by switching to Alpine's
-  `chromium` package or a glibc shim without explicit sign-off — the first
-  reintroduces the sign-in block, the second is unsupported by both Chrome and
-  Playwright.
-- **Chrome runs with `--no-sandbox`.** Required because everything runs as root
-  in the container. Sandbox + root = crash on launch.
+- **Login uses a direct `google-chrome-stable` launch, not Playwright.** Even
+  with `channel="chrome"`, Playwright injects automation flags (DevTools
+  Protocol, `navigator.webdriver=true`) that Google detects. Do not route the
+  login through Playwright.
+- **Chrome must be `google-chrome-stable`, not Debian's `chromium`.** The
+  branded build is what gets through the sign-in flow. This is the requirement
+  the whole Alpine-container era existed to satisfy; don't trade it away now
+  that it's cheap to meet.
+- **Chrome runs with `--no-sandbox`.** Required because everything runs as root.
+  Sandbox + root = crash on launch.
+- **Display numbers and sink names are allocated per run, never hardcoded.**
+  The container boundary that made `:99` safe is gone. See the isolation
+  section above, including why `pactl set-default-sink` must not be used.
 - **Locale is `th-TH`**, so Thai participant names render in chat. Side effect:
   Meet's UI labels come back in Thai, which is why `capture.py` carries both
   English and Thai labels for every selector.
@@ -295,7 +443,8 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   the admission wait loop, so "no one responded to your request" fails fast.
 - **The kill switch routes through the in-Meet Leave button**, not by killing
   the browser process, so other participants see the bot leave cleanly.
-  `kill_meeting.sh` force-removes a container only as post-grace escalation.
+  `kill_meeting.sh` signals pids only as post-grace escalation, and gives
+  ffmpeg `SIGINT` so the MP4 stays playable.
 - **H.264 is `libx264 -preset ultrafast -crf 28`.** Keeps CPU low on a 4-vCPU
   VM with no GPU; visually fine for talking heads and slides.
 - **The frame-sampling combo is scene-change + periodic.** Scene-change catches
@@ -305,10 +454,10 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   to share its screen. Layers 2 and 3 in `capture.py` (dialog killer, "Stop
   presenting" monitor) are the catch-nets if Chrome renames the flag.
 - **EXIT traps in the `set -e` scripts end every line with `|| true`.**
-  `record_in_container.sh` and `login_entry.sh` both kill pids that are
-  usually already gone. Under errexit a failing command in an EXIT trap
-  aborts the trap *and becomes the script's exit status* — which made every
-  successful recording exit 1, so `pipeline.sh` marked `record` failed and
+  `record_screen.sh`, `first_time_login.sh` and `xsession_stop_xvfb` all kill
+  pids that are usually already gone. Under errexit a failing command in an
+  EXIT trap aborts the trap *and becomes the script's exit status* — which made
+  every successful recording exit 1, so `pipeline.sh` marked `record` failed and
   never transcribed the MP4 it had just produced. Verified 2026-09.
 - **Camera/mic mute is best-effort (log warning + continue), not abort.** A
   failed UI heuristic must not block a real meeting.
@@ -321,17 +470,17 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   same upstream captions, so retrying won't help. Placeholder-only text (e.g.
   `[เสียงพากย์ไทย]`) is written through so the operator can see it in the
   `.txt`; only a genuinely empty response is an error.
-- **Multiple youtube-transcript.io accounts rotate round-robin** via the key
-  file. Don't collapse this to a single env var — multi-account quota spreading
-  was an explicit request.
+- **Multi-key rotation is round-robin with an on-disk cursor.** Don't collapse
+  any of the numbered key sets to a single variable, and don't make the cursor
+  per-process — see the keyring section.
 - **The YouTube download never merges streams.** The format chain is
   `best[ext=mp4]/best/bv*[ext=mp4][vcodec^=avc1][height<=720]/bv*[ext=mp4][height<=720]/bv*[height<=720]/bv*`
   — muxed first, then **video-only**. NOT `bestvideo+bestaudio
-  --merge-output-format mp4`: the merge path needs a JS runtime (deno) for
-  YouTube extraction and a clean postprocess merge. Dropping audio is free
-  here because this file exists *only* to extract frames from — the YouTube
-  transcript comes from captions and never touches it. `avc1` is preferred
-  over AV1 so a 4-vCPU box decodes frames cheaply (AV1 works, just slower).
+  --merge-output-format mp4`: the merge path needs a JS runtime for YouTube
+  extraction and a clean postprocess merge. Dropping audio is free here because
+  this file exists *only* to extract frames from — the YouTube transcript comes
+  from captions and never touches it. `avc1` is preferred over AV1 so a 4-vCPU
+  box decodes frames cheaply (AV1 works, just slower).
   History: format 18 (muxed 360p) resolved fine in 2026-08, but by 2026-09
   YouTube exposes no muxed format at all on many videos and `best[ext=mp4]/best`
   alone fails with "Requested format is not available". Keep any future fix
@@ -343,7 +492,9 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   there's nothing to download. The pipeline always passes one, so re-adding the
   download would make every YouTube run fetch the same video twice.
 - **Artifact paths derive from the run id, not the clock.** Resume depends on
-  it. This is why `--out-base` exists.
+  it. This is why `--out-base` and `--pdf-out` exist.
+- **The five output directories are required, with no defaults.** See the
+  configuration section: a silent default is worse than an error here.
 - **`runstate.py status` verifies artifacts exist on disk** before reporting
   `done`, and `mark_done` in `run_one.sh` refuses to record an absolute
   artifact path that doesn't exist yet. Don't "optimize" either away — they
@@ -356,59 +507,68 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   catch it and one unset key killed the whole run. Keep it a normal exception.
 - **Retry jitter is full, not proportional.** Parallel chunk requests must not
   retry in lockstep.
+- **No `thinking.budget_tokens`, ever.** Current Claude models reject it with a
+  400. Effort is `output_config.effort`; thinking is adaptive.
 - **The document wrapper is built in code, not requested in the prompt.** See
   the output-format section above.
+- **A failed PDF render must not fail the run.** The markdown is the artifact.
+- **Frame cropping declines rather than guesses.** See the framecrop section.
+- **Reference material is escaped before it enters the prompt template**, and
+  framed as data rather than instructions — it is untrusted input exactly like
+  the transcript.
 - **Queue slots default to unlimited.** Turning any of them on by default
   would silently serialize existing setups, and for `record` would silently
   start missing overlapping meetings. Opt-in only.
 - **The queue holder is the calling shell's PID, read before the command
   substitution.** See the queueing section above — inlining `$BASHPID` into
   `$( ... )` breaks serialization in a way that looks like it works.
-- **youtube-transcript.io tokens stay in the JSON keys file, not `.env`.**
-  Multiple accounts are an array and the rotation cursor lives beside the keys
-  it belongs to. The error message when it's empty explains this at length
-  because operators reasonably look in `.env` first.
 - **`whisper.cpp` is gone.** It hadn't been on any pipeline path since the
-  AssemblyAI switch, and `setup.sh` no longer builds it. Don't re-add a
-  `TRANSCRIBE_BACKEND=whisper` escape hatch without explicit sign-off.
-- **Ubuntu/Debian host support was dropped.** `setup.sh` is apk-only and fails
-  fast on a non-Alpine host with a pointer to git history. Don't reintroduce
-  dual-target detection without asking.
-- **Alpine has no systemd.** `meeting-bot-trigger.service` is kept for systemd
-  hosts; an Alpine deployment needs an OpenRC init script.
-- **`setup.sh` runs under bash, not ash.** Its one bash-only construct is the
-  `local -a` arrays in `docker/recorder_lib.sh` (which Alpine's `ash` rejects
-  with `syntax error: unexpected "(" (expecting "}")` at parse time, *before*
-  the `docker build` line ever runs). Bash is already an apk dep — the cost of
-  not re-shebanging is a silent break at the recorder-build step on every fresh
-  install. Don't drop it back to `#!/bin/sh`.
-- **deno is optional and installed from apk, not GitHub.** Deno's official
-  release tarballs are glibc-linked and will not run on musl.
+  AssemblyAI switch. Don't re-add a `TRANSCRIBE_BACKEND=whisper` escape hatch
+  without explicit sign-off.
+- **Alpine support was dropped in the Debian 13 port.** `setup.sh` is apt-only
+  and fails fast elsewhere with a pointer to the `alpinelinux` branch. Don't
+  reintroduce dual-target detection without asking.
+- **Don't reintroduce Docker.** The container existed only to give Chrome a
+  glibc filesystem. On Debian that is free, and the container cost a daemon, an
+  image build, bind mounts, and a second copy of ffmpeg.
 
 ## Tests
 
-All run without API keys, network, or `/opt`, against temp directories.
+All of these run without API keys, network, or `/opt`, against temp directories
+— including one whose path contains a space, so quoting regressions fail loudly.
+`verify_e2e.sh` is the exception: it is the live checklist.
 
 | File | Covers | Count |
 |---|---|---|
 | `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI | 13 |
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
+| `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
+| `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
 | `summarize/test_summarize_units.py` | retry classification/backoff, chunking, map-reduce, document | 31 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, incl. two concurrent sessions | 81 |
+| `summarize/test_pdf_units.py` | crop geometry, citation rewriting, real PDF render | 23 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources` | 106 |
+| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers | 49 |
 
-`test_pipeline_e2e.sh` is the important one: it runs the real `pipeline.sh` and
-`run_one.sh` and stubs only the four expensive stages, behind the same
-argument/output contract. It has already caught four real bugs (`--from-file`
-with no positionals, an unhelpful unrecognized-input error, the double YouTube
-download, and the `$BASHPID`-in-substitution queue bug), and now covers a
-fifth: a stage that exits 0 without writing its artifacts must not be
-recorded as `done` (see `mark_done`). Add to it when you touch orchestration.
+`test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs
+only the four expensive stages, behind the same argument/output contract. It has
+caught five real bugs so far (`--from-file` with no positionals, an unhelpful
+unrecognized-input error, the double YouTube download, the
+`$BASHPID`-in-substitution queue bug, and a stage exiting 0 without writing its
+artifacts). Add to it when you touch orchestration.
+
+`test_media_e2e.sh` is the counterpart: real media, real SDKs, stub servers
+(`lib/fake_api_server.py`) speaking the providers' HTTP protocols. It is the
+only place that can assert on **what we actually send** — that
+`output_config.effort` carries `SUMMARY_EFFORT`, that thinking is adaptive,
+that `budget_tokens` is absent, that frames are attached as image blocks. When
+you change the request shape, assert it here.
 
 **What no test here covers:** Chrome actually joining a live Meet/Zoom call,
-real AssemblyAI/Gemini/youtube-transcript.io round-trips, ffmpeg's x11grab and
-PulseAudio inside the container on real hardware, and the container image build
-itself. Those need the real box and real keys.
+real AssemblyAI/Anthropic/Gemini/youtube-transcript.io round-trips, and Chrome
+rendering inside Xvfb on real hardware. `./verify_e2e.sh` runs those on the real
+box; its `--preflight` covers the display/audio/capture chain with a real
+two-second recording and needs no keys.
 
 ## File layout
 
@@ -416,35 +576,39 @@ itself. Those need the real box and real keys.
 .
 ├── README.md                     <- all user-facing docs (the only other .md)
 ├── CLAUDE.md                     <- this file
-├── .env.example
+├── .env.example                  <- names and defaults only; prose lives in README
 ├── source_env.sh
-├── setup.sh                      <- Alpine/apk, builds the recorder image
-├── audio-setup.sh                <- runs INSIDE the container
-├── first_time_login.sh           <- noVNC login via the container
-├── kill_meeting.sh               <- per-run or global, container-aware
+├── setup.sh                      <- Debian/apt, installs Chrome + the venv
+├── first_time_login.sh           <- noVNC login, native Chrome
+├── kill_meeting.sh               <- per-run or global, pid-file based
 ├── pipeline.sh                   <- multi-input orchestrator
+├── verify_e2e.sh                 <- live checks: preflight + mp4/YouTube/Meet/Zoom
 ├── trigger_server.py
-├── meeting-bot-trigger.service   <- systemd hosts only; Alpine needs OpenRC
-├── docker/
-│   ├── Dockerfile.recorder       <- Debian + real Chrome
-│   ├── recorder_lib.sh           <- shared container launcher
-│   └── login_entry.sh            <- runs INSIDE the container
+├── meeting-bot-trigger.service   <- systemd unit (setup.sh --with-trigger)
 ├── lib/
 │   ├── runstate.py               <- run state + locking + CLI
 │   ├── slotqueue.py              <- machine-wide component queue
+│   ├── keyring.py                <- numbered API keys + rotation cursor
+│   ├── paths.py / paths.sh       <- the five required output directories
+│   ├── xsession.sh               <- per-run Xvfb display + PulseAudio sink
+│   ├── resources.py              <- slides/notes from GitHub or a folder
 │   ├── run_one.sh                <- the per-run stage DAG
+│   ├── fake_api_server.py        <- stub Anthropic/AssemblyAI/YouTube servers
 │   ├── test_runstate.py
 │   ├── test_slotqueue.py
-│   └── test_pipeline_e2e.sh
+│   ├── test_keyring.py
+│   ├── test_resources.py
+│   ├── test_pipeline_e2e.sh
+│   └── test_media_e2e.sh
 ├── screen/
-│   ├── record_screen.sh          <- host wrapper
-│   ├── record_in_container.sh    <- runs INSIDE the container
+│   ├── record_screen.sh          <- stage 1, native (no container)
 │   ├── capture.py                <- Playwright join driver
 │   └── extract_frames.py
 ├── transcribe/
 │   ├── transcribe.sh
 │   ├── assemblyai_client.py
-│   └── yt_transcript_client.py
+│   ├── yt_transcript_client.py
+│   └── test_yt_transcript_client.py
 └── summarize/
     ├── summarize.py
     ├── llm_client.py
@@ -452,7 +616,10 @@ itself. Those need the real box and real keys.
     ├── chunking.py
     ├── mapreduce.py
     ├── document.py
+    ├── pdf.py                    <- markdown -> PDF, frames inlined
+    ├── framecrop.py              <- slide-region detection
     ├── test_summarize_units.py
+    ├── test_pdf_units.py
     └── prompts/
         ├── summarize.md          <- default
         ├── lecture-{claude,gemini}.md
@@ -464,8 +631,10 @@ itself. Those need the real box and real keys.
 ## Things future Claude might want to add
 
 - Auto-upload summaries to Slack / Notion / Obsidian after `pipeline.sh`.
-- An OpenRC init script for `trigger_server.py` (Alpine has no systemd).
 - Real-time incremental summary during a meeting (needs a long-running agent;
   the pipeline is post-meeting only).
 - Speaker diarization, so summaries can attribute quotes without inferring.
 - A web UI for re-summarizing a past run with different settings.
+- Slide-to-transcript alignment: match rendered slide images against extracted
+  frames so the PDF can show the *source* slide rather than a screen capture of
+  it.

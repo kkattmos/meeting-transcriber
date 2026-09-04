@@ -262,6 +262,9 @@ def main():
     p.add_argument("--language")
     p.add_argument("--prompt")
     p.add_argument("--display-name")
+    # Repeatable: the slides/reference sources for this run, replayed to
+    # summarize.py on every attempt so a resume uses the same material.
+    p.add_argument("--resources", action="append", default=None)
 
     p = with_run_dir(sub.add_parser("status"))
     p.add_argument("--stage", required=True)
@@ -363,7 +366,8 @@ def main():
     if args.cmd == "init":
         state.init(input=args.input, input_type=args.input_type, name=args.name,
                    safe_name=args.safe_name, language=args.language,
-                   prompt=args.prompt, display_name=args.display_name)
+                   prompt=args.prompt, display_name=args.display_name,
+                   resources=args.resources or [])
         return 0
 
     if args.cmd == "status":
@@ -386,8 +390,15 @@ def main():
         value = state.get(args.key)
         if value is None:
             return 1
-        print(value if not isinstance(value, (dict, list))
-              else json.dumps(value))
+        if isinstance(value, list):
+            # One item per line so bash can read it with `mapfile` without
+            # parsing JSON — this is how run_one.sh replays --resources.
+            for item in value:
+                print(item)
+        elif isinstance(value, dict):
+            print(json.dumps(value))
+        else:
+            print(value)
         return 0
 
     if args.cmd == "reset":

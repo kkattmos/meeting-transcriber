@@ -1,3 +1,8 @@
+# Installed by `sudo ./setup.sh --with-trigger`, which substitutes the
+# @REPO_ROOT@ and @VENV@ placeholders and writes the result to
+# /etc/systemd/system/. Debian has systemd, so this unit is the supported way
+# to run the trigger server (the Alpine branch could only keep it for
+# reference).
 [Unit]
 Description=Meeting bot remote trigger server
 After=network-online.target tailscaled.service
@@ -5,8 +10,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/meeting-bot.env
-ExecStart=/usr/bin/python3 /opt/meeting-bot/trigger_server.py
+WorkingDirectory=@REPO_ROOT@
+# The repo's own .env carries the API keys and output directories; the
+# leading "-" means a missing /etc/meeting-bot.env is not an error. Put
+# MEETING_BOT_TOKEN in either one.
+EnvironmentFile=-@REPO_ROOT@/.env
+EnvironmentFile=-/etc/meeting-bot.env
+ExecStart=@VENV@/bin/python3 @REPO_ROOT@/trigger_server.py
 Restart=on-failure
 RestartSec=5
 User=root

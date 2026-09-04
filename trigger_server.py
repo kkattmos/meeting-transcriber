@@ -12,7 +12,8 @@ POST /trigger
     {"urls": ["https://youtu.be/a", "https://youtu.be/b"], "jobs": 2,
      "language": "th", "prompt": "lecture-gemini"}
 
-  Optional fields: name, language, prompt, jobs, display_name, combine, force.
+  Optional fields: name, language, prompt, jobs, display_name, combine,
+  resources (a GitHub repo or local path with the session's slides), and force.
 
   Responds 202 immediately; pipeline.sh runs detached. Its output goes to
   /opt/meeting-bot/logs/trigger_<timestamp>.log — the response carries the path,
@@ -118,6 +119,14 @@ class Handler(BaseHTTPRequestHandler):
             value = body.get(field)
             if value:
                 cmd += [flag, str(value)]
+        # `resources` may be a single spec or a list of them; pipeline.sh takes
+        # the flag repeatedly.
+        resources = body.get("resources")
+        if isinstance(resources, str):
+            resources = [resources]
+        for spec in resources or []:
+            if isinstance(spec, str) and spec.strip():
+                cmd += ["--resources", spec.strip()]
         if body.get("force"):
             cmd.append("--force")
 

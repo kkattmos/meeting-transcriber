@@ -28,12 +28,13 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # shellcheck disable=SC1091
 . "$ROOT_DIR/source_env.sh"
+# shellcheck disable=SC1091
+. "$ROOT_DIR/lib/paths.sh"
 
-MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-/opt/meeting-bot}"
 RUNSTATE="$SCRIPT_DIR/runstate.py"
 SLOTQUEUE="$SCRIPT_DIR/slotqueue.py"
 
-PYTHON_BIN="/opt/meeting-bot-venv/bin/python3"
+PYTHON_BIN="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
 [ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"
 
 RUN_DIR=""
@@ -68,12 +69,19 @@ SAFE_NAME="$(cfg safe_name)"
 LANGUAGE="$(cfg language)"
 PROMPT_NAME="$(cfg prompt)"
 DISPLAY_NAME="$(cfg display_name)"
+# Reference material for this run (slides repo / folder), one spec per line.
+# Replayed on every attempt so a resumed run summarizes against the same
+# material the first attempt used.
+declare -a RESOURCE_SPECS=()
+while IFS= read -r _spec; do
+  [ -n "$_spec" ] && RESOURCE_SPECS+=("$_spec")
+done < <(rs get --run-dir "$RUN_DIR" --key resources 2>/dev/null || true)
 [ -n "$DISPLAY_NAME" ] || DISPLAY_NAME="Meeting Bot"
 [ -n "$LANGUAGE" ] || LANGUAGE="${ASSEMBLYAI_LANGUAGE:-th}"
 
 # --- Single-writer lock ------------------------------------------------------
 # mkdir is atomic on every filesystem we care about, and unlike a lockfile it
-# needs no flock binary (Alpine's base image has none). A lock whose owner is
+# needs no flock binary and no cleanup path. A lock whose owner is
 # gone is stale and gets taken over — otherwise a SIGKILL'd run could never be
 # resumed, which is exactly the situation resume exists for.
 LOCK_DIR="$RUN_DIR/run.lock"
@@ -108,19 +116,23 @@ fi
 # --- Artifact paths ----------------------------------------------------------
 # Derived from the run id, never from a fresh timestamp: a resume has to land on
 # the same paths the previous attempt used, or it can't tell what's already done.
-MP4_FILE="$MEETING_BOT_ROOT/recordings/${RUN_ID}.mp4"
-TRANSCRIPT_BASE="$MEETING_BOT_ROOT/transcripts/${RUN_ID}"
-FRAMES_DIR="$MEETING_BOT_ROOT/frames/${RUN_ID}"
-SUMMARY_FILE="$MEETING_BOT_ROOT/summaries/${RUN_ID}.md"
-mkdir -p "$MEETING_BOT_ROOT/recordings" "$MEETING_BOT_ROOT/transcripts" \
-         "$MEETING_BOT_ROOT/frames" "$MEETING_BOT_ROOT/summaries"
+# The five directories are configured independently in .env — none of them is
+# assumed to be a subdirectory of another.
+paths_require || exit 2
+MP4_FILE="${RECORDINGS_DIR}/${RUN_ID}.mp4"
+TRANSCRIPT_BASE="${TRANSCRIPTS_DIR}/${RUN_ID}"
+RUN_FRAMES_DIR="${FRAMES_DIR}/${RUN_ID}"
+SUMMARY_FILE="${SUMMARIES_DIR}/${RUN_ID}.md"
+SUMMARY_PDF="${PDF_DIR}/${RUN_ID}.pdf"
+paths_mkdir RECORDINGS_DIR TRANSCRIPTS_DIR FRAMES_DIR SUMMARIES_DIR PDF_DIR
 
 export MEETING_BOT_RUN_DIR="$RUN_DIR"
 
 # --- Stage helper ------------------------------------------------------------
 # Runs a stage unless it's already done, streaming its output to both the run
 # log and stdout with a [stage] prefix so parallel branches stay readable.
-# awk (not `sed -u`) because busybox sed has no unbuffered mode.
+# awk with an explicit fflush(), not `sed -u`: it flushes per line on every
+# sed/awk implementation rather than relying on a GNU extension.
 stage_status() { rs status --run-dir "$RUN_DIR" --stage "$1"; }
 
 run_stage() {
@@ -242,7 +254,7 @@ do_transcribe() {
 do_frames() {
   local video="$1"
   "$PYTHON_BIN" "$ROOT_DIR/screen/extract_frames.py" \
-    "$video" "$FRAMES_DIR" "$SAFE_NAME"
+    "$video" "$RUN_FRAMES_DIR" "$SAFE_NAME"
 }
 
 do_summarize() {
@@ -252,7 +264,10 @@ do_summarize() {
     "$video"
     "${TRANSCRIPT_BASE}.txt"
     "$SUMMARY_FILE"
-    --frames-manifest "$FRAMES_DIR/manifest.json"
+    --frames-manifest "$RUN_FRAMES_DIR/manifest.json"
+    # PDF_DIR is independent of SUMMARIES_DIR, so the PDF path is passed
+    # explicitly rather than derived from the .md path.
+    --pdf-out "$SUMMARY_PDF"
     # On the YouTube path $video is the local download, so the original URL has
     # to be threaded through separately — it's what the document header cites
     # and what the video title is looked up from.
@@ -262,6 +277,10 @@ do_summarize() {
     --run-id "$RUN_ID"
   )
   [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
+  local spec
+  for spec in "${RESOURCE_SPECS[@]:-}"; do
+    [ -n "$spec" ] && args+=(--resources "$spec")
+  done
   "$PYTHON_BIN" "${args[@]}"
 }
 
@@ -336,7 +355,7 @@ branch_frames() {
     return 1
   fi
   run_stage frames do_frames "$VIDEO_FILE" || return 1
-  mark_done frames "manifest=$FRAMES_DIR/manifest.json"
+  mark_done frames "manifest=$RUN_FRAMES_DIR/manifest.json"
 }
 
 echo ""
@@ -366,7 +385,20 @@ if ! run_stage summarize do_summarize "$VIDEO_FILE"; then
   echo "    Resume with:  ./pipeline.sh --run-id $RUN_ID" >&2
   exit 1
 fi
-mark_done summarize "md=$SUMMARY_FILE" || exit 1
+# Either output can be switched off (SUMMARY_WRITE_MARKDOWN / SUMMARY_WRITE_PDF,
+# or --no-markdown / --no-pdf), and a PDF that fails to render is a warning
+# rather than a failed stage — so record whichever files actually exist. At
+# least one must, or summarize.py would have exited non-zero above.
+declare -a SUMMARY_ARTIFACTS=()
+[ -f "$SUMMARY_FILE" ] && SUMMARY_ARTIFACTS+=("md=$SUMMARY_FILE")
+[ -f "$SUMMARY_PDF" ] && SUMMARY_ARTIFACTS+=("pdf=$SUMMARY_PDF")
+if [ "${#SUMMARY_ARTIFACTS[@]}" -eq 0 ]; then
+  rs fail --run-dir "$RUN_DIR" --stage summarize \
+     --error "summarize exited 0 but wrote neither $SUMMARY_FILE nor $SUMMARY_PDF"
+  echo "[summarize] produced no output files" >&2
+  exit 1
+fi
+mark_done summarize "${SUMMARY_ARTIFACTS[@]}" || exit 1
 
 echo ""
 echo "=================================================================="
@@ -374,4 +406,6 @@ echo "Run complete: $RUN_ID"
 echo "=================================================================="
 [ "$INPUT_TYPE" = "meeting" ] && echo "Recording:  $MP4_FILE"
 echo "Transcript: ${TRANSCRIPT_BASE}.txt"
-echo "Summary:    $SUMMARY_FILE"
+[ -f "$SUMMARY_FILE" ] && echo "Summary:    $SUMMARY_FILE"
+[ -f "$SUMMARY_PDF" ] && echo "PDF:        $SUMMARY_PDF"
+true

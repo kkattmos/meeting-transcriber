@@ -20,7 +20,9 @@ CLI:
 Environment:
   SCENE_THRESHOLD       default 0.3   (ffmpeg scene score, 0.0-1.0)
   FRAME_PERIOD_SECONDS  default 30    (0 disables the periodic safety net)
-  FRAME_OUTPUT_DIR      default /opt/meeting-bot/frames
+
+The output directory is always an argument — FRAMES_DIR from .env only decides
+where the *caller* (summarize.py / lib/run_one.sh) puts the per-run directory.
 """
 import json
 import os
@@ -31,7 +33,6 @@ from pathlib import Path
 
 DEFAULT_SCENE_THRESHOLD = 0.3
 DEFAULT_PERIOD_SECONDS = 30
-DEFAULT_OUTPUT_ROOT = "/opt/meeting-bot/frames"
 
 
 def parse_showinfo(stderr_text):
@@ -114,7 +115,6 @@ def main():
 
     threshold = float(os.environ.get("SCENE_THRESHOLD", DEFAULT_SCENE_THRESHOLD))
     period = int(os.environ.get("FRAME_PERIOD_SECONDS", DEFAULT_PERIOD_SECONDS))
-    output_root = os.environ.get("FRAME_OUTPUT_DIR", DEFAULT_OUTPUT_ROOT)
 
     out_dir = Path(out_dir_arg)
     if out_dir.exists() and any(out_dir.iterdir()):

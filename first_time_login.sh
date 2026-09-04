@@ -3,8 +3,7 @@
 # expires. It opens a real, viewable Google Chrome using the SAME persistent
 # profile the recorder reuses later, so the bot joins meetings already signed in.
 #
-# The Alpine host has no display and (in Proxmox) no window you can see, so
-# Chrome runs on a headless Xvfb inside the recorder container and is exposed
+# The box has no monitor, so Chrome runs on a headless Xvfb here and is exposed
 # to YOU over noVNC — a plain web page you open from your own machine.
 #
 #   ./first_time_login.sh                     bind noVNC to localhost, print an ssh -L command
@@ -13,30 +12,36 @@
 #   ./first_time_login.sh --screenshot        also dump the display to a PNG every 10s
 #   ./first_time_login.sh --url <url>         open somewhere other than accounts.google.com
 #
-# Chrome lives in the container because Google ships no musl build and
-# unbranded Chromium gets blocked by the sign-in flow. See CLAUDE.md.
+# Chrome is launched DIRECTLY here, not through Playwright: even with
+# channel="chrome", Playwright sets --enable-automation and
+# navigator.webdriver=true, which Google's sign-in flow rejects with "This
+# browser or app may not be secure". See CLAUDE.md — routing this through
+# Playwright is a known-broken "fix".
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$SCRIPT_DIR"
-export REPO_ROOT
 
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/source_env.sh"
 # shellcheck disable=SC1091
-. "$SCRIPT_DIR/docker/recorder_lib.sh"
+. "$SCRIPT_DIR/lib/paths.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/xsession.sh"
 
 BIND_ADDR="127.0.0.1"
 BIND_MODE="localhost"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
+VNC_PORT="${VNC_PORT:-5901}"
 SCREENSHOT_INTERVAL=0
 START_URL="https://accounts.google.com/"
-CONTAINER_NAME="${LOGIN_CONTAINER_NAME:-meeting-bot-login}"
+GEOMETRY="${RECORD_GEOMETRY:-1920x1080}"
+CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-$MEETING_BOT_ROOT/chrome-profile}"
+SCREENSHOT_DIR="${SCREENSHOT_DIR:-$MEETING_BOT_ROOT/login-screenshots}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --tailscale)
-      TS_IP="$(recorder_tailscale_ip)"
+      TS_IP="$(xsession_tailscale_ip)"
       if [ -z "$TS_IP" ]; then
         echo "ERROR: --tailscale given but no Tailscale IPv4 found." >&2
         echo "  Is tailscaled running on this host?  tailscale status" >&2
@@ -66,7 +71,7 @@ while [ "$#" -gt 0 ]; do
       START_URL="$2"; shift 2
       ;;
     -h|--help)
-      sed -n '2,18p' "$0"; exit 0
+      sed -n '2,20p' "$0"; exit 0
       ;;
     *)
       echo "Unknown argument: $1 (try --help)" >&2; exit 1
@@ -74,40 +79,97 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-recorder_require_docker
-recorder_require_image
+xsession_require_tools Xvfb x11vnc websockify google-chrome-stable || exit 1
 
-# A leftover container from a previous run holds the port and the profile lock.
-docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+NOVNC_WEB=""
+for candidate in /usr/share/novnc /usr/share/webapps/novnc; do
+  [ -d "$candidate" ] && NOVNC_WEB="$candidate" && break
+done
+if [ -z "$NOVNC_WEB" ]; then
+  echo "ERROR: noVNC's web assets were not found (looked in /usr/share/novnc)." >&2
+  echo "  Install them with:  sudo apt-get install novnc" >&2
+  exit 1
+fi
+
+mkdir -p "$CHROME_PROFILE_DIR"
+
+CHROME_PID=""
+SHOT_PID=""
+WEBSOCKIFY_PID=""
 
 cleanup() {
+  # `|| true` everywhere: EXIT trap under `set -e`, and every one of these can
+  # legitimately fail (already-dead pid, nothing matching pkill).
   echo ""
-  echo "==> Stopping the login container"
-  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  echo "==> Shutting the login session down"
+  [ -n "$SHOT_PID" ] && kill "$SHOT_PID" 2>/dev/null || true
+  [ -n "$CHROME_PID" ] && kill "$CHROME_PID" 2>/dev/null || true
+  [ -n "$WEBSOCKIFY_PID" ] && kill "$WEBSOCKIFY_PID" 2>/dev/null || true
+  [ -n "${XVFB_DISPLAY_NUM:-}" ] && \
+    pkill -f "x11vnc -display :${XVFB_DISPLAY_NUM}" 2>/dev/null || true
+  xsession_stop_xvfb || true
+  true
 }
 trap cleanup EXIT INT TERM
 
-echo "==> Starting Chrome + noVNC in the recorder container"
-recorder_run "$CONTAINER_NAME" detach \
-  -e "SCREENSHOT_INTERVAL=$SCREENSHOT_INTERVAL" \
-  -e "START_URL=$START_URL" \
-  -p "$BIND_ADDR:$NOVNC_PORT:6080" \
-  -- bash /app/docker/login_entry.sh >/dev/null
+DISPLAY_NUM="$(xsession_pick_display)" || exit 1
+echo "==> Starting virtual display :$DISPLAY_NUM ($GEOMETRY)"
+xsession_start_xvfb "$DISPLAY_NUM" "$GEOMETRY" || exit 1
 
-# Give the stack (Xvfb -> x11vnc -> websockify -> Chrome) a moment, then confirm
-# it actually came up. Failing here beats the operator staring at a browser tab
-# that never connects — they can't see the console to find out why.
-for _ in $(seq 1 20); do
-  if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
-    echo "ERROR: the login container exited during startup. Last 40 log lines:" >&2
-    docker logs "$CONTAINER_NAME" 2>&1 | tail -n 40 >&2 || true
-    exit 1
-  fi
-  if docker exec "$CONTAINER_NAME" pgrep -f google-chrome >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+echo "==> Starting x11vnc on $VNC_PORT"
+# -rfbport pins the port; without it x11vnc auto-picks the first free one and
+# silently breaks the fixed websockify target below.
+x11vnc -display ":$DISPLAY_NUM" -rfbport "$VNC_PORT" -forever -shared -nopw \
+       -quiet -bg >/dev/null
+
+echo "==> Starting the noVNC bridge on ${BIND_ADDR}:${NOVNC_PORT}"
+websockify --web="$NOVNC_WEB" "${BIND_ADDR}:${NOVNC_PORT}" \
+           "localhost:${VNC_PORT}" >/dev/null 2>&1 &
+WEBSOCKIFY_PID=$!
+sleep 1
+
+# Optional blind-diagnostics: dump the display to a PNG every N seconds so the
+# operator can confirm what's on screen over plain SSH when noVNC won't reach.
+# Off by default — a login screen is exactly the thing you don't want
+# accidentally persisted to disk.
+if [ "$SCREENSHOT_INTERVAL" -gt 0 ] 2>/dev/null; then
+  mkdir -p "$SCREENSHOT_DIR"
+  echo "==> Screenshot mode: writing $SCREENSHOT_DIR/latest.png every ${SCREENSHOT_INTERVAL}s"
+  (
+    while true; do
+      ffmpeg -y -loglevel error -f x11grab -video_size "$GEOMETRY" \
+        -i ":$DISPLAY_NUM" -frames:v 1 "$SCREENSHOT_DIR/latest.png" 2>/dev/null || true
+      sleep "$SCREENSHOT_INTERVAL"
+    done
+  ) &
+  SHOT_PID=$!
+fi
+
+echo "==> Launching Google Chrome (profile: $CHROME_PROFILE_DIR)"
+# Chrome's SingletonLock encodes the hostname+pid of whoever last held it, so
+# a lock left behind by a killed session (Ctrl+C racing the trap, a reboot)
+# makes this Chrome refuse to start with "profile appears to be in use by
+# another computer". Nothing else is using it at this point: this script owns
+# the profile for as long as it runs, and the recorder never runs concurrently
+# with a login session.
+rm -f "$CHROME_PROFILE_DIR"/Singleton{Lock,Socket,Cookie}
+# --no-sandbox: this runs as root. Sandbox + root = crash on launch.
+# NOT --kiosk (unlike the recording path): the operator needs an address bar
+# and tabs to get through Google's and Zoom's sign-in flows.
+google-chrome-stable \
+  --user-data-dir="$CHROME_PROFILE_DIR" \
+  --no-sandbox \
+  --no-first-run \
+  --no-default-browser-check \
+  --disable-gpu \
+  --disable-software-rasterizer \
+  --disable-dev-shm-usage \
+  --disable-features=ScreenCapture \
+  --window-position=0,0 \
+  --window-size="${GEOMETRY/x/,}" \
+  --lang=th-TH \
+  "$START_URL" >/dev/null 2>&1 &
+CHROME_PID=$!
 
 echo ""
 echo "=================================================================="
@@ -135,7 +197,7 @@ case "$BIND_MODE" in
     # destination, so fall back to this host's primary IPv4.
     DISPLAY_HOST="$BIND_ADDR"
     if [ "$DISPLAY_HOST" = "0.0.0.0" ] || [ -z "$DISPLAY_HOST" ]; then
-      DISPLAY_HOST="$(recorder_host_ipv4 2>/dev/null || hostname -i 2>/dev/null | awk '{print $1}')"
+      DISPLAY_HOST="$(xsession_host_ipv4 2>/dev/null || hostname -i 2>/dev/null | awk '{print $1}')"
     fi
     echo "noVNC is bound to ${BIND_ADDR}:${NOVNC_PORT} on this host. Open:"
     echo ""
@@ -153,13 +215,12 @@ echo "    $CHROME_PROFILE_DIR"
 if [ "$SCREENSHOT_INTERVAL" -gt 0 ]; then
   echo ""
   echo "Screenshot mode is on — if noVNC won't reach, check what's on screen with:"
-  echo "    scp $(id -un)@$(hostname):$MEETING_BOT_ROOT/login-screenshots/latest.png ."
+  echo "    scp $(id -un)@$(hostname):$SCREENSHOT_DIR/latest.png ."
 fi
 echo ""
 echo "Press Ctrl+C here when you're done."
 echo "=================================================================="
 echo ""
 
-# Stream the container's output so a crash is visible rather than silent, and
-# block until the operator interrupts (or Chrome exits on its own).
-docker logs -f "$CONTAINER_NAME" 2>&1 || true
+# Block until the operator interrupts (or Chrome exits on its own).
+wait "$CHROME_PID" || true

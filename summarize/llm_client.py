@@ -2,27 +2,34 @@
 """
 Pluggable LLM client for the meeting-summary agent.
 
-Four single-backend modes plus an auto-fallback chain, all selected by env var:
+Two backends plus an auto-fallback chain, all selected by env var:
 
   Auto-fallback (`SUMMARY_BACKEND=fallback`, the default) - walks
-  `SUMMARY_FALLBACK_CHAIN` in order. Each entry is one of: `gemini`, `fcc`
-  (alias for anthropic), `anthropic`, `nvidia_nim`, `ollama`. A backend is only
-  abandoned after its own retries are exhausted; the first to return wins. If
-  every backend fails, the accumulated history is raised. Default chain:
-  `gemini,fcc,nvidia_nim`.
+  `SUMMARY_FALLBACK_CHAIN` in order. Each entry is one of: `anthropic`
+  (aliases: `claude`, `fcc`) or `gemini`. A backend is only abandoned after
+  its own retries are exhausted; the first to return wins. If every backend
+  fails, the accumulated history is raised. Default chain:
+  `anthropic,gemini`.
 
-  Google Gemini (`SUMMARY_BACKEND=gemini`) - the google-genai SDK. Reads
-  `GEMINI_MODEL` and `GOOGLE_API_KEY` / `GEMINI_API_KEY`.
+  Anthropic Claude (`SUMMARY_BACKEND=anthropic`) - the default and primary
+  backend. Reads ANTHROPIC_MODEL (default claude-opus-5), SUMMARY_EFFORT, and
+  a single ANTHROPIC_API_KEY. Works against api.anthropic.com or any proxy
+  that speaks the Messages API, because the SDK honors ANTHROPIC_BASE_URL.
 
-  Anthropic SDK (`SUMMARY_BACKEND=anthropic`) - works against both
-  api.anthropic.com and any proxy that speaks the Messages API (FCC, LiteLLM),
-  because the SDK honors ANTHROPIC_BASE_URL.
+  Google Gemini (`SUMMARY_BACKEND=gemini`) - the google-genai SDK, with up to
+  three keys rotated round-robin (GEMINI_API_KEY_1..3).
 
-  NVIDIA NIM (`SUMMARY_BACKEND=nvidia_nim`) - OpenAI-compatible chat
-  completions against integrate.api.nvidia.com or a self-hosted NIM.
+EFFORT, NOT A TOKEN BUDGET. SUMMARY_EFFORT maps straight onto the Messages
+API's `output_config.effort` (low | medium | high | xhigh | max), which is how
+current Claude models are told how hard to think. The older
+`thinking.budget_tokens` knob is rejected outright by Opus 5, so there is
+deliberately no token-budget setting here. Thinking itself is adaptive: the
+model decides when to use it.
 
-  Ollama (`SUMMARY_BACKEND=ollama`) - /api/generate with a vision-capable local
-  model (e.g. llava:13b). The original local-only option.
+SDK-VERSION TOLERANCE. `output_config` and `thinking` are passed as normal
+keyword arguments and, if the installed SDK is too old to know them, retried
+inside `extra_body`. That keeps a stale `pip install anthropic` from turning
+into a hard failure of the whole summarize stage on a box nobody has updated.
 
 TRANSIENT FAILURES. Every backend's network call goes through
 summarize/retry.py: 503 "server is busy", 429, 5xx and connection errors are
@@ -31,31 +38,24 @@ only a backend that keeps failing hands over to the next in the chain. See
 retry.py for the policy and its env vars.
 
 MISSING CREDENTIALS raise BackendUnavailable, which the chain treats as "skip
-this one" rather than a fatal error — a chain of three backends shouldn't die
+this one" rather than a fatal error - a chain of two backends shouldn't die
 because the first one's key isn't configured.
 
-All four vision-aware backends take the same extracted frames; the prompt and
-frame-list shape don't vary by provider.
+Both backends take the same extracted frames; the prompt and frame-list shape
+don't vary by provider.
 
 Env vars:
-  SUMMARY_BACKEND       "fallback" (default), "gemini", "anthropic",
-                        "nvidia_nim", or "ollama"
-  SUMMARY_FALLBACK_CHAIN  default "gemini,fcc,nvidia_nim"
-  GEMINI_MODEL          default gemini-2.5-flash
-  GOOGLE_API_KEY        required for gemini (GEMINI_API_KEY also accepted)
+  SUMMARY_BACKEND       "fallback" (default), "anthropic", or "gemini"
+  SUMMARY_FALLBACK_CHAIN  default "anthropic,gemini"
+  ANTHROPIC_API_KEY     required for anthropic (ANTHROPIC_API_KEY_1 also read)
+  ANTHROPIC_MODEL       default claude-opus-5 (SUMMARY_MODEL also accepted)
   ANTHROPIC_BASE_URL    default https://api.anthropic.com
-  ANTHROPIC_API_KEY     required for anthropic / fcc
-  SUMMARY_MODEL         model for the anthropic backend
-                        (default: claude-sonnet-4-5)
-  NVIDIA_NIM_BASE_URL   default https://integrate.api.nvidia.com/v1
-  NVIDIA_NIM_API_KEY    required for nvidia_nim
-  NVIDIA_NIM_MODEL      default meta/llama-3.1-70b-instruct
-  OLLAMA_HOST           default http://localhost:11434
-  OLLAMA_MODEL          default llava:13b
-  SUMMARY_MAX_TOKENS    default 4096
+  SUMMARY_EFFORT        low | medium | high (default) | xhigh | max
+  GEMINI_API_KEY_1..3   required for gemini (GOOGLE_API_KEY also accepted)
+  GEMINI_MODEL          default gemini-3.6-flash
+  SUMMARY_MAX_TOKENS    default 16000
 """
 import base64
-import json
 import mimetypes
 import os
 import sys
@@ -64,11 +64,23 @@ from pathlib import Path
 from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 from retry import with_retries  # noqa: E402
+from keyring import KeyRing, missing_keys_message  # noqa: E402
 
 DEFAULT_BACKEND = "fallback"
-DEFAULT_FALLBACK_CHAIN = "gemini,fcc,nvidia_nim"
+DEFAULT_FALLBACK_CHAIN = "anthropic,gemini"
+
+DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+
+# The Messages API's effort levels, in order. Anything else is a typo, and a
+# typo that reaches the API comes back as an opaque 400 mid-run.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_EFFORT = "high"
+
+GEMINI_MAX_KEYS = 3
 
 # Which backend and model actually produced the last successful summary. The
 # document header records this, and on a fallback chain it's the only way to
@@ -105,9 +117,20 @@ class FrameMeta:
 
 def _max_tokens():
     try:
-        return int(os.environ.get("SUMMARY_MAX_TOKENS", 4096))
+        return int(os.environ.get("SUMMARY_MAX_TOKENS", 16000))
     except ValueError:
-        return 4096
+        return 16000
+
+
+def effort_level():
+    """The configured effort, validated. Falls back to `high` with a warning."""
+    value = (os.environ.get("SUMMARY_EFFORT") or DEFAULT_EFFORT).strip().lower()
+    if value not in EFFORT_LEVELS:
+        print(f"  warning: SUMMARY_EFFORT={value!r} is not one of "
+              f"{', '.join(EFFORT_LEVELS)} — using {DEFAULT_EFFORT}",
+              file=sys.stderr)
+        return DEFAULT_EFFORT
+    return value
 
 
 def _read_image_b64(path):
@@ -134,28 +157,51 @@ def _render(frames, transcript, prompt_template):
     return sorted_frames, user_text
 
 
+def _call_with_kwarg_fallback(func, label, base_kwargs, modern_kwargs):
+    """Call `func`, moving `modern_kwargs` into extra_body on an old SDK.
+
+    `output_config` and `thinking` are recent additions. An SDK that predates
+    them raises TypeError for the unexpected keyword before any request is
+    made, and `extra_body` passes them through on the wire unchanged — so the
+    same code works on both without pinning a version.
+    """
+    try:
+        return with_retries(func, label=label, **base_kwargs, **modern_kwargs)
+    except TypeError as exc:
+        if "unexpected keyword" not in str(exc):
+            raise
+        print(f"  note: installed SDK doesn't accept "
+              f"{', '.join(modern_kwargs)} directly — passing via extra_body",
+              file=sys.stderr)
+        return with_retries(func, label=label, **base_kwargs,
+                            extra_body=dict(modern_kwargs))
+
+
 def summarize_anthropic(frames: List[FrameMeta], transcript: str,
                         prompt_template: str) -> str:
-    """Anthropic Messages API — Anthropic direct, FCC, or any compatible proxy."""
+    """Anthropic Messages API — the default backend."""
     try:
         import anthropic
     except ImportError as exc:
         raise BackendUnavailable(f"anthropic SDK not installed: {exc}") from exc
 
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    model = os.environ.get("SUMMARY_MODEL", "claude-sonnet-4-5")
+    model = (os.environ.get("ANTHROPIC_MODEL")
+             or os.environ.get("SUMMARY_MODEL")
+             or DEFAULT_ANTHROPIC_MODEL)
 
-    if not api_key:
-        env_file = Path(__file__).resolve().parent.parent / ".env"
-        raise BackendUnavailable(
-            "ANTHROPIC_API_KEY is not set. "
-            f"Looked in: process environment, {env_file}, /etc/meeting-bot.env. "
-            "Add ANTHROPIC_API_KEY=<key> to .env, or select a different "
-            "SUMMARY_BACKEND — only anthropic/fcc need this key."
-        )
+    # One key only — this is the account the operator pays for. The ring is
+    # still used so ANTHROPIC_API_KEY_1 reads the same as ANTHROPIC_API_KEY.
+    ring = KeyRing.from_env("ANTHROPIC_API_KEY", max_slots=1)
+    if not ring:
+        raise BackendUnavailable(missing_keys_message(
+            "ANTHROPIC_API_KEY", 1,
+            extra=("\nOnly one Anthropic key is used. Get one at "
+                   "https://console.anthropic.com, or select a different "
+                   "SUMMARY_BACKEND."),
+        ))
 
-    client = anthropic.Anthropic(base_url=base_url, api_key=api_key)
+    client = anthropic.Anthropic(base_url=base_url, api_key=ring.keys[0])
     sorted_frames, user_text = _render(frames, transcript, prompt_template)
 
     content = []
@@ -167,12 +213,21 @@ def summarize_anthropic(frames: List[FrameMeta], transcript: str,
         })
     content.append({"type": "text", "text": user_text})
 
-    message = with_retries(
+    effort = effort_level()
+    message = _call_with_kwarg_fallback(
         client.messages.create,
-        label=f"anthropic/{model}",
-        model=model,
-        max_tokens=_max_tokens(),
-        messages=[{"role": "user", "content": content}],
+        f"anthropic/{model} (effort={effort})",
+        {
+            "model": model,
+            "max_tokens": _max_tokens(),
+            "messages": [{"role": "user", "content": content}],
+        },
+        {
+            # Adaptive thinking: the model decides how much reasoning the
+            # summary needs. budget_tokens is rejected by current models.
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": effort},
+        },
     )
 
     _record_used("anthropic", model)
@@ -180,110 +235,31 @@ def summarize_anthropic(frames: List[FrameMeta], transcript: str,
     return "\n".join(parts).strip()
 
 
-def summarize_ollama(frames: List[FrameMeta], transcript: str,
-                     prompt_template: str) -> str:
-    """Local Ollama server with a vision-capable model."""
-    import urllib.request
-
-    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-    model = os.environ.get("OLLAMA_MODEL", "llava:13b")
-
-    sorted_frames, user_text = _render(frames, transcript, prompt_template)
-    images = [_read_image_b64(f.path)[0] for f in sorted_frames]
-
-    payload = {
-        "model": model,
-        "prompt": user_text,
-        "images": images,
-        "stream": False,
-    }
-
-    def _call():
-        req = urllib.request.Request(
-            f"{host}/api/generate",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        # Without a timeout a wedged local model hangs the stage forever, and
-        # the retry wrapper never gets a chance to do anything.
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-
-    result = with_retries(_call, label=f"ollama/{model}")
-    _record_used("ollama", model)
-    return result.get("response", "").strip()
-
-
-def summarize_nim(frames: List[FrameMeta], transcript: str,
-                  prompt_template: str) -> str:
-    """NVIDIA NIM, or any OpenAI-compatible chat-completions endpoint."""
-    try:
-        import openai
-    except ImportError as exc:
-        raise BackendUnavailable(f"openai SDK not installed: {exc}") from exc
-
-    base_url = os.environ.get("NVIDIA_NIM_BASE_URL",
-                              "https://integrate.api.nvidia.com/v1")
-    api_key = os.environ.get("NVIDIA_NIM_API_KEY")
-    model = os.environ.get("NVIDIA_NIM_MODEL", "meta/llama-3.1-70b-instruct")
-
-    if not api_key:
-        raise BackendUnavailable(
-            "NVIDIA_NIM_API_KEY is not set (needed for the nvidia_nim backend)"
-        )
-
-    client = openai.OpenAI(base_url=base_url, api_key=api_key)
-    sorted_frames, user_text = _render(frames, transcript, prompt_template)
-
-    content = []
-    for frame in sorted_frames:
-        b64, mime = _read_image_b64(frame.path)
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{b64}"},
-        })
-    content.append({"type": "text", "text": user_text})
-
-    response = with_retries(
-        client.chat.completions.create,
-        label=f"nvidia_nim/{model}",
-        model=model,
-        messages=[{"role": "user", "content": content}],
-        max_tokens=_max_tokens(),
-        temperature=0.2,
-    )
-
-    if not response.choices:
-        raise RuntimeError("NVIDIA NIM returned no choices")
-    _record_used("nvidia_nim", model)
-    return (response.choices[0].message.content or "").strip()
-
-
 def summarize_gemini(frames: List[FrameMeta], transcript: str,
                      prompt_template: str) -> str:
-    """Google Gemini via the google-genai SDK.
+    """Google Gemini via the google-genai SDK, rotating up to three keys.
 
-    Only the new `google-genai` SDK is wired up; the legacy
-    `google.generativeai` import path is no longer supported. Accepts
-    GOOGLE_API_KEY or GEMINI_API_KEY, whichever the operator already has set.
+    Rotation happens outside the retry wrapper on purpose: retry.py handles a
+    provider that is busy, this loop handles a key that is exhausted or
+    revoked. A key whose quota is gone would otherwise burn the full retry
+    schedule before the chain ever moved on.
     """
     try:
         from google import genai as new_genai
     except ImportError as exc:
         raise BackendUnavailable(f"google-genai SDK not installed: {exc}") from exc
 
-    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-
-    if not api_key:
-        raise BackendUnavailable(
-            "GOOGLE_API_KEY (or GEMINI_API_KEY) is not set "
-            "(needed for the gemini backend)"
-        )
+    model_name = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    ring = KeyRing.from_env("GEMINI_API_KEY", aliases=("GOOGLE_API_KEY",),
+                            max_slots=GEMINI_MAX_KEYS)
+    if not ring:
+        raise BackendUnavailable(missing_keys_message(
+            "GEMINI_API_KEY", GEMINI_MAX_KEYS,
+            extra=("\nGOOGLE_API_KEY is also accepted. Get keys at "
+                   "https://aistudio.google.com/apikey."),
+        ))
 
     sorted_frames, user_text = _render(frames, transcript, prompt_template)
-
-    client = new_genai.Client(api_key=api_key)
     parts = [{"text": user_text}]
     for frame in sorted_frames:
         data, mime = _read_image_b64(frame.path)
@@ -294,22 +270,36 @@ def summarize_gemini(frames: List[FrameMeta], transcript: str,
             }
         })
 
-    response = with_retries(
-        client.models.generate_content,
-        label=f"gemini/{model_name}",
-        model=model_name,
-        contents=[{"role": "user", "parts": parts}],
-    )
-    _record_used("gemini", model_name)
-    return (response.text or "").strip()
+    last_error = None
+    for slot, key in ring.rotate():
+        client = new_genai.Client(api_key=key)
+        try:
+            response = with_retries(
+                client.models.generate_content,
+                label=f"gemini/{model_name} ({ring.label(slot)})",
+                model=model_name,
+                contents=[{"role": "user", "parts": parts}],
+            )
+        except Exception as exc:  # noqa: BLE001 - try the next key
+            if len(ring) == 1:
+                raise
+            print(f"  !! gemini {ring.label(slot)} failed: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            last_error = exc
+            continue
+        ring.commit(slot)
+        _record_used("gemini", model_name)
+        return (response.text or "").strip()
+
+    raise RuntimeError(
+        f"All {len(ring)} Gemini key(s) failed. Last error: {last_error}")
 
 
 # chain-name -> backend function
 _BACKENDS = {
     "anthropic": summarize_anthropic,
-    "fcc": summarize_anthropic,   # alias kept for the user's preferred config
-    "ollama": summarize_ollama,
-    "nvidia_nim": summarize_nim,
+    "claude": summarize_anthropic,
+    "fcc": summarize_anthropic,   # alias kept for the user's older configs
     "gemini": summarize_gemini,
 }
 
@@ -322,7 +312,7 @@ def summarize_with_fallback(frames: List[FrameMeta], transcript: str,
     raises here, so reaching the next entry means that provider is genuinely
     unusable right now — not merely busy.
 
-    Chain syntax: comma-separated names, e.g. "gemini,fcc,nvidia_nim". Unknown
+    Chain syntax: comma-separated names, e.g. "anthropic,gemini". Unknown
     entries are skipped with a warning; `disabled` is a sentinel for
     short-circuiting a chain without editing the env var.
     """
@@ -365,6 +355,6 @@ def summarize(frames: List[FrameMeta], transcript: str,
     if func is None:
         raise SystemExit(
             f"Unknown SUMMARY_BACKEND: {backend!r} "
-            f"(expected gemini, anthropic, nvidia_nim, ollama, or fallback)"
+            f"(expected anthropic, gemini, or fallback)"
         )
     return func(frames, transcript, prompt_template)

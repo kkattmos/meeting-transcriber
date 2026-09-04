@@ -27,7 +27,7 @@
 # because captions come pre-transcribed.
 #
 # Output:
-#   /opt/meeting-bot/transcripts/<name>_<timestamp>.{txt,srt}
+#   $TRANSCRIPTS_DIR/<name>_<timestamp>.{txt,srt}
 #
 # --out-base PATH overrides that with PATH.txt / PATH.srt. The pipeline passes
 # it so the output path is a function of the run id rather than of the clock:
@@ -42,6 +42,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 # shellcheck disable=SC1091
 . "$ROOT_DIR/source_env.sh"
+# shellcheck disable=SC1091
+. "$ROOT_DIR/lib/paths.sh"
 
 OUT_BASE=""
 declare -a ARGS=()
@@ -66,14 +68,17 @@ LANGUAGE="${3:-${ASSEMBLYAI_LANGUAGE:-th}}"
 
 STAMP=$(date +%Y%m%d_%H%M%S)
 SAFE_NAME=$(echo "$MEETING_NAME" | tr ' ' '_' | tr -cd 'A-Za-z0-9_-')
-TRANSCRIPT_DIR="${MEETING_BOT_ROOT:-/opt/meeting-bot}/transcripts"
 if [ -n "$OUT_BASE" ]; then
   OUTPUT_BASE="$OUT_BASE"
   TRANSCRIPT_DIR="$(dirname "$OUTPUT_BASE")"
 else
+  paths_require TRANSCRIPTS_DIR || exit 1
+  TRANSCRIPT_DIR="$TRANSCRIPTS_DIR"
   OUTPUT_BASE="${TRANSCRIPT_DIR}/${SAFE_NAME}_${STAMP}"
 fi
-WORK_DIR="/tmp/meeting-bot-transcribe-$$"
+# Under MEETING_BOT_ROOT rather than /tmp: demuxing a long WEBM writes an MP3
+# here, and /tmp is a small tmpfs on this box.
+WORK_DIR="${MEETING_BOT_ROOT}/tmp/transcribe-$$"
 mkdir -p "$TRANSCRIPT_DIR" "$WORK_DIR"
 
 # YouTube URLs are detected by URL pattern, NOT by file extension - the input
@@ -86,7 +91,7 @@ fi
 # Same venv used by the summarize step. Falls back to system python3 if the
 # venv is missing (e.g. user is running on a system where setup.sh hasn't
 # run).
-PYTHON_BIN="/opt/meeting-bot-venv/bin/python3"
+PYTHON_BIN="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
 if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="python3"
 fi

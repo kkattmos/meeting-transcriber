@@ -26,8 +26,14 @@ import re
 import time
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-PROFILE_DIR = os.path.expanduser("~/.meeting-bot/chrome-profile")
-SCREENSHOT_DIR = "/opt/meeting-bot/recordings"
+# The persistent Chrome profile, shared with first_time_login.sh. It lives
+# under MEETING_BOT_ROOT (not a user's $HOME) so it survives reinstalls and is
+# the same profile whichever script opens it.
+_BOT_ROOT = os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot")
+PROFILE_DIR = os.environ.get("CHROME_PROFILE_DIR",
+                             os.path.join(_BOT_ROOT, "chrome-profile"))
+SCREENSHOT_DIR = os.environ.get("RECORDINGS_DIR",
+                                os.path.join(_BOT_ROOT, "recordings"))
 
 ADMIT_TIMEOUT_SECONDS = 600      # how long to wait in a waiting room before giving up
 POLL_SECONDS = 15                # how often to check participant count / end state
@@ -46,6 +52,10 @@ IDLE_LEAVE_SECONDS = int(os.environ.get("IDLE_LEAVE_MINUTES", "5")) * 60
 # Sentinels. Per-run when MEETING_BOT_RUN_DIR is set (the pipeline always sets
 # it), so concurrent recordings don't share a kill switch; /tmp otherwise, which
 # keeps a standalone `python3 screen/capture.py <url>` working as before.
+# Chrome's window has to match the Xvfb head exactly or the recording gets
+# black edges; record_screen.sh sets RECORD_GEOMETRY for both.
+WINDOW_SIZE = (os.environ.get("RECORD_GEOMETRY", "1920x1080")
+               .lower().replace("x", ","))
 RUN_DIR = os.environ.get("MEETING_BOT_RUN_DIR", "")
 if RUN_DIR:
     ADMITTED_MARKER = os.path.join(RUN_DIR, "admitted")
@@ -622,13 +632,12 @@ def main():
     if os.path.exists(KILL_SENTINEL):
         os.remove(KILL_SENTINEL)
 
-    # Same bind-mounted profile, same ephemeral-container-hostname problem as
-    # first_time_login.sh: a previous run's Chrome (or this same recorder
-    # container, if it was killed mid-run before capture.py's own cleanup
-    # ran) can leave a SingletonLock behind that refuses to match this
-    # container's hostname/pid, and Chrome refuses to launch entirely. Any
-    # lock still present here is stale by definition — nothing else can be
-    # holding it while we're about to start.
+    # Chrome's SingletonLock encodes the hostname and pid of whoever last held
+    # the profile. A run killed before its cleanup ran (SIGKILL, reboot,
+    # Ctrl+C racing the trap) leaves one behind, and the next Chrome refuses to
+    # launch at all — "the profile appears to be in use by another computer".
+    # Any lock still present here is stale by definition: this process is about
+    # to be the only user of the profile.
     for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
         lock_path = os.path.join(PROFILE_DIR, lock_name)
         if os.path.exists(lock_path) or os.path.islink(lock_path):
@@ -658,10 +667,10 @@ def main():
                 # Xvfb/Chrome combinations leave a few px of margin on the
                 # right and bottom (Chrome auto-sizes the window slightly
                 # smaller than the display in --kiosk mode). The matching
-                # 1920x1080 Xvfb geometry and ffmpeg -video_size live in
-                # first_time_login.sh and screen/record_screen.sh.
+                # matching Xvfb geometry and ffmpeg -video_size come from
+                # RECORD_GEOMETRY in screen/record_screen.sh.
                 "--kiosk",
-                "--window-size=1920,1080",
+                f"--window-size={WINDOW_SIZE}",
                 "--no-sandbox",
                 "--use-fake-ui-for-media-stream",
                 # Layer 1 of the screen-share defense: disables the

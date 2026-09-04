@@ -30,7 +30,12 @@
 #   --name N            meeting name (single input only; otherwise derived)
 #   --display-name D    name the bot shows in the meeting (default "Meeting Bot")
 #   --language L        th (default), en, auto, or any AssemblyAI language code
-#   --prompt P          a file in summarize/prompts/ (e.g. --prompt lecture-gemini)
+#   --prompt P          a file in summarize/prompts/ (e.g. --prompt lecture-claude)
+#   --resources SPEC    slides / notes for this session, as a GitHub repo
+#                       (optionally @branch, or a /tree/<branch>/<subdir> URL)
+#                       or a local file or folder. Repeatable. Their text is
+#                       given to the summarizer as reference material and their
+#                       slide images are embedded in the PDF.
 #   --jobs N            how many inputs to process at once (default 2)
 #   --from-file F       read inputs from a file, one per line, # for comments
 #   --playlist          expand YouTube playlist URLs into their videos
@@ -46,12 +51,13 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/source_env.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/paths.sh"
 
-MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-/opt/meeting-bot}"
 RUNS_DIR="$MEETING_BOT_ROOT/runs"
 RUNSTATE="$SCRIPT_DIR/lib/runstate.py"
 
-PYTHON_BIN="/opt/meeting-bot-venv/bin/python3"
+PYTHON_BIN="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
 [ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"
 rs() { "$PYTHON_BIN" "$RUNSTATE" "$@"; }
 
@@ -69,8 +75,16 @@ EXPLICIT_RUN_ID=""
 FROM_FILE=""
 COMBINE_FILE=""
 declare -a POSITIONAL=()
+declare -a RESOURCE_SPECS=()
+# RESOURCES in .env is the default for every run; --resources adds to it.
+if [ -n "${RESOURCES:-}" ]; then
+  while IFS= read -r _spec; do
+    _spec="$(printf '%s' "$_spec" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -n "$_spec" ] && RESOURCE_SPECS+=("$_spec")
+  done < <(printf '%s\n' "$RESOURCES" | tr ',' '\n')
+fi
 
-usage() { sed -n '2,45p' "$0"; }
+usage() { sed -n '2,48p' "$0"; }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -82,6 +96,9 @@ while [ "$#" -gt 0 ]; do
     --from-file)    FROM_FILE="${2:-}"; shift 2 ;;
     --combine)      COMBINE_FILE="${2:-}"; shift 2 ;;
     --run-id)       EXPLICIT_RUN_ID="${2:-}"; shift 2 ;;
+    --resources)
+      [ -n "${2:-}" ] || { echo "--resources needs a value" >&2; exit 1; }
+      RESOURCE_SPECS+=("$2"); shift 2 ;;
     --playlist)     EXPAND_PLAYLIST=1; shift ;;
     --force)        FORCE=1; shift ;;
     --resume-last)  RESUME_LAST=1; shift ;;
@@ -310,11 +327,17 @@ else
         run_dir="$RUNS_DIR/${safe}_$(date +%Y%m%d_%H%M%S)_$suffix"
         suffix=$((suffix + 1))
       done
-      rs init --run-dir "$run_dir" \
-        --input "$input" --input-type "$kind" \
-        --name "${NAME:-$safe}" --safe-name "$safe" \
-        --language "$LANGUAGE" --prompt "$PROMPT_NAME" \
+      declare -a init_args=(
+        --run-dir "$run_dir"
+        --input "$input" --input-type "$kind"
+        --name "${NAME:-$safe}" --safe-name "$safe"
+        --language "$LANGUAGE" --prompt "$PROMPT_NAME"
         --display-name "$DISPLAY_NAME"
+      )
+      for spec in "${RESOURCE_SPECS[@]:-}"; do
+        [ -n "$spec" ] && init_args+=(--resources "$spec")
+      done
+      rs init "${init_args[@]}"
     fi
     RUN_DIRS+=("$run_dir")
   done
@@ -338,8 +361,8 @@ launch() {
 
   (
     if [ "$TOTAL" -gt 1 ]; then
-      # Prefix every line so concurrent runs stay readable. awk rather than
-      # `sed -u` because busybox sed has no unbuffered mode.
+      # Prefix every line so concurrent runs stay readable. awk with an
+      # explicit fflush() rather than `sed -u`, which is a GNU extension.
       bash "$SCRIPT_DIR/lib/run_one.sh" "${args[@]}" 2>&1 \
         | awk -v r="$run_id" '{print r " | " $0; fflush()}'
       echo "${PIPESTATUS[0]}" > "$RESULT_DIR/$run_id"
@@ -370,8 +393,10 @@ for run_dir in "${RUN_DIRS[@]}"; do
   rc="$(cat "$RESULT_DIR/$run_id" 2>/dev/null || echo "?")"
   if [ "$rc" = "0" ]; then
     summary="$(rs get --run-dir "$run_dir" --key stages.summarize.artifacts.md 2>/dev/null || true)"
+    pdf="$(rs get --run-dir "$run_dir" --key stages.summarize.artifacts.pdf 2>/dev/null || true)"
     echo "  OK    $run_id"
     [ -n "$summary" ] && echo "        -> $summary"
+    [ -n "$pdf" ] && echo "        -> $pdf"
   else
     FAILED=$((FAILED + 1))
     echo "  FAIL  $run_id  (exit $rc)"
@@ -391,7 +416,9 @@ if [ -n "$COMBINE_FILE" ]; then
   done
   if [ "${#SUMMARY_PATHS[@]}" -eq 0 ]; then
     echo ""
-    echo "==> --combine: no summaries were produced, nothing to combine."
+    echo "==> --combine: no markdown summaries were produced, nothing to"
+    echo "    combine. (--combine works on the .md files; it has nothing to do"
+    echo "    if SUMMARY_WRITE_MARKDOWN=0 / --no-markdown is in effect.)"
   else
     mkdir -p "$(dirname "$COMBINE_FILE")"
     "$PYTHON_BIN" "$SCRIPT_DIR/summarize/document.py" combine \

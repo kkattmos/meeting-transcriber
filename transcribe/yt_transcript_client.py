@@ -12,17 +12,17 @@ real transcript (Thai included).
 
 Multiple accounts / API keys
 ----------------------------
-To spread quota across multiple accounts, this client round-robins through
-a list of keys stored at /opt/meeting-bot/secrets/youtube_transcript_keys.json:
+To spread quota across multiple accounts, this client round-robins through the
+numbered keys in the repo-root .env file:
 
-    {
-        "keys":   ["acct1-token", "acct2-token", "acct3-token"],
-        "next_index": 0   # cursor — advances after each successful pick
-    }
+    YT_TRANSCRIPT_KEY_1=acct1-token
+    YT_TRANSCRIPT_KEY_2=acct2-token
+    ...                             (up to YT_TRANSCRIPT_KEY_10)
 
-The cursor is persisted back to disk so a sequence of runs deterministically
-walks the list. Use chmod 600 on the file (the script will enforce this on
-first write).
+The rotation cursor is persisted by lib/keyring.py under
+$MEETING_BOT_ROOT/state/keycursor.json, so consecutive runs start on different
+accounts instead of always hammering the first one. (Before the Debian 13
+port these keys lived in a separate JSON file; they are .env-only now.)
 
 Authentication
 --------------
@@ -51,20 +51,20 @@ from pathlib import Path
 import requests
 import requests.exceptions
 
-# Canonical path for the keys file. Matches what setup.sh creates and what
-# .gitignore excludes. Override with YT_TRANSCRIPT_KEYS_FILE for tests.
-# Falls back to the YT_TRANSCRIPT_KEYS_FILE env var so users can point it
-# somewhere else via .env without touching code.
-DEFAULT_KEYS_FILE = Path(
-    os.environ.get(
-        "YT_TRANSCRIPT_KEYS_FILE",
-        "/opt/meeting-bot/secrets/youtube_transcript_keys.json",
-    )
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from keyring import KeyRing, missing_keys_message  # noqa: E402
+
+# youtube-transcript.io publishes a 10-account ceiling per operator; the ring
+# reads YT_TRANSCRIPT_KEY_1..10 from .env.
+KEY_NAME = "YT_TRANSCRIPT_KEY"
+MAX_KEYS = 10
 
 # youtube-transcript.io API endpoint. Stable as of 2025; if it changes, only
-# this constant needs to move.
-API_URL = "https://www.youtube-transcript.io/api/transcripts"
+# this constant needs to move. YT_TRANSCRIPT_API_URL points it somewhere else,
+# which is how the end-to-end test exercises this client against a local stub
+# server instead of spending a real caption quota on every test run.
+API_URL = os.environ.get("YT_TRANSCRIPT_API_URL",
+                         "https://www.youtube-transcript.io/api/transcripts")
 
 # Video ID extraction. Matches both youtube.com/watch?v=<id> and youtu.be/<id>.
 # 11-char ID matches what YouTube itself enforces; we accept >=6 to be lenient.
@@ -91,103 +91,30 @@ def extract_video_id(url):
     return m.group(1)
 
 
-def _missing_keys_message(path, created):
+def _keys_message():
     """The "where do I put my API key?" message.
 
-    Spelled out in full because this is the one credential in the project that
-    does NOT live in .env - it's a JSON file because multiple accounts are an
-    array - and that surprises people who go looking in .env first.
+    Worth spelling out: these tokens used to live in a JSON file under
+    /opt/meeting-bot/secrets/, and anyone following an older README will go
+    looking for it.
     """
-    lead = (f"Created a starter keys file at {path}."
-            if created else
-            f"The keys file {path} has no API tokens in it.")
-    return f"""{lead}
-
-youtube-transcript.io tokens do NOT go in .env - they live in this JSON file,
-because multiple accounts are a list and the rotation cursor is stored next to
-the keys it belongs to.
-
-Edit it:
-
-    sudo nano {path}
-
-so it looks like this (one token per account; the client rotates through them
-round-robin to spread quota):
-
-    {{
-      "keys": ["your-token-here", "second-account-token"],
-      "next_index": 0
-    }}
-
-Get a token from https://www.youtube-transcript.io (account -> API), then
-re-run the same command. Only YouTube inputs need this; local recordings use
-ASSEMBLYAI_API_KEY from .env instead.
-
-Set YT_TRANSCRIPT_KEYS_FILE in .env if you want the file somewhere else."""
+    return missing_keys_message(
+        KEY_NAME, MAX_KEYS,
+        extra=("\nGet a token from https://www.youtube-transcript.io "
+               "(account -> API).\nOnly YouTube inputs need this; local "
+               "recordings use ASSEMBLYAI_API_KEY_1..3 instead.\n\n"
+               "These tokens no longer live in "
+               "/opt/meeting-bot/secrets/youtube_transcript_keys.json — "
+               "that file is gone; .env is the only source now."),
+    )
 
 
-def _read_keys_file(path):
-    r"""Load the keys file. Returns the parsed dict; creates a starter file
-    with an empty keys list if the file doesn't exist yet (so the user can
-    edit it without running a separate init step)."""
-    if not path.exists():
-        # Bootstrap a starter file. Caller is expected to edit it; we just
-        # make the workflow discoverable.
-        path.parent.mkdir(parents=True, exist_ok=True)
-        starter = {"keys": [], "next_index": 0, "_comment": (
-            "Add your youtube-transcript.io API tokens to the 'keys' list. "
-            "Each entry is a separate account. Save the file and re-run."
-        )}
-        path.write_text(json.dumps(starter, indent=2) + "\n")
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            # Non-fatal — log via stderr and continue. The file is still
-            # root-owned in most setups.
-            print(
-                f"warning: could not chmod 600 {path} — please do it manually",
-                file=sys.stderr,
-            )
-        raise SystemExit(_missing_keys_message(path, created=True))
-
-    try:
-        data = json.loads(path.read_text())
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"Keys file {path} is not valid JSON: {e}")
-
-    keys = data.get("keys") or []
-    if not isinstance(keys, list) or not keys:
-        raise SystemExit(_missing_keys_message(path, created=False))
-    cursor = int(data.get("next_index", 0)) % len(keys)
-    return {"keys": keys, "next_index": cursor, "_path": path}
-
-
-def _write_cursor(path, cursor):
-    """Persist the round-robin cursor back to disk.
-
-    Best-effort: we don't want a transient write failure (disk full, perms)
-    to mask a successful transcript fetch. The next run will pick the same
-    key again, which is fine — the worst case is one duplicate request.
-    """
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        # If we can't read it, we can't update it; bail silently.
-        return
-    data["next_index"] = cursor % max(1, len(data.get("keys") or []))
-    try:
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2) + "\n")
-        tmp.replace(path)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    except OSError as e:
-        print(
-            f"warning: could not persist cursor to {path}: {e}",
-            file=sys.stderr,
-        )
+def _key_ring():
+    """The configured key ring, or SystemExit with instructions if empty."""
+    ring = KeyRing.from_env(KEY_NAME, max_slots=MAX_KEYS)
+    if not ring:
+        raise SystemExit(_keys_message())
+    return ring
 
 
 def _call_api(video_id, api_key):
@@ -355,7 +282,7 @@ def _normalise_segments(raw, prefer_language=None):
     return out
 
 
-def fetch_transcript(video_id, keys_file=None, prefer_language=None):
+def fetch_transcript(video_id, prefer_language=None, ring=None):
     """Fetch a transcript for `video_id`, trying each configured key in
     round-robin order until one succeeds.
 
@@ -368,22 +295,14 @@ def fetch_transcript(video_id, keys_file=None, prefer_language=None):
     Raises SystemExit (with the last error) if every key fails.
     Raises ValueError if the API returns no usable segments for the video.
     """
-    path = Path(keys_file) if keys_file else DEFAULT_KEYS_FILE
-    state = _read_keys_file(path)
-    keys = state["keys"]
-    cursor = state["next_index"]
-    keys_path = state["_path"]
+    ring = ring or _key_ring()
 
     last_error = None
-    for i, key in enumerate(keys):
-        pick = (cursor + i) % len(keys)
+    for slot, key in ring.rotate():
         try:
-            raw = _call_api(video_id, keys[pick])
+            raw = _call_api(video_id, key)
         except RuntimeError as e:
-            print(
-                f"  key #{pick + 1}/{len(keys)} failed: {e}",
-                file=sys.stderr,
-            )
+            print(f"  {ring.label(slot)} failed: {e}", file=sys.stderr)
             last_error = e
             continue
         except requests.exceptions.RequestException as e:
@@ -391,17 +310,14 @@ def fetch_transcript(video_id, keys_file=None, prefer_language=None):
             # (only some subclasses do). Fall back to str(e) for a
             # human-readable label.
             reason = getattr(e, "reason", None) or str(e)
-            print(
-                f"  key #{pick + 1}/{len(keys)} network error: {reason}",
-                file=sys.stderr,
-            )
+            print(f"  {ring.label(slot)} network error: {reason}",
+                  file=sys.stderr)
             last_error = e
             continue
 
-        # Success — persist the cursor for the next call. Advance past the
-        # key we just used so the *next* request lands on a different one.
-        next_cursor = (pick + 1) % len(keys)
-        _write_cursor(keys_path, next_cursor)
+        # Success — advance the persisted cursor so the *next* run starts on a
+        # different account.
+        ring.commit(slot)
 
         segments = _normalise_segments(raw, prefer_language)
         if not segments:
@@ -419,7 +335,7 @@ def fetch_transcript(video_id, keys_file=None, prefer_language=None):
 
     # All keys failed. Surface the most informative error we saw.
     raise SystemExit(
-        f"All {len(keys)} youtube-transcript.io key(s) failed for video "
+        f"All {len(ring)} youtube-transcript.io key(s) failed for video "
         f"{video_id!r}. Last error: {last_error}"
     )
 
