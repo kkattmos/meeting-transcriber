@@ -14,6 +14,8 @@
 # checks when you have a call you can point the bot at.
 #
 #   ./verify_e2e.sh --preflight                     no API calls, no spend
+#   ./verify_e2e.sh --browser-smoke                 real Chrome on Xvfb, recorded,
+#                                                   but no meeting and no spend
 #   ./verify_e2e.sh --mp4 /path/to/recording.mp4    real transcribe + summarize
 #   ./verify_e2e.sh --youtube "<url>"               real captions + summarize
 #   ./verify_e2e.sh --meet "<meet url>" --minutes 3
@@ -40,23 +42,26 @@ bad()  { FAIL=$((FAIL + 1)); echo "  FAIL  — $1"; }
 warn() { WARN=$((WARN + 1)); echo "  warn  — $1"; }
 
 DO_PREFLIGHT=0
+DO_BROWSER=0
 MP4=""; YOUTUBE=""; MEET=""; ZOOM=""; MINUTES=3
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --preflight) DO_PREFLIGHT=1; shift ;;
+    --browser-smoke) DO_BROWSER=1; shift ;;
     --mp4)       MP4="${2:-}"; shift 2 ;;
     --youtube)   YOUTUBE="${2:-}"; shift 2 ;;
     --meet)      MEET="${2:-}"; shift 2 ;;
     --zoom)      ZOOM="${2:-}"; shift 2 ;;
     --minutes)   MINUTES="${2:-3}"; shift 2 ;;
-    --all)       DO_PREFLIGHT=1; shift ;;
+    --all)       DO_PREFLIGHT=1; DO_BROWSER=1; shift ;;
     -h|--help)   sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "Unknown argument: $1 (try --help)" >&2; exit 1 ;;
   esac
 done
 
-if [ "$DO_PREFLIGHT" -eq 0 ] && [ -z "$MP4$YOUTUBE$MEET$ZOOM" ]; then
+if [ "$DO_PREFLIGHT" -eq 0 ] && [ "$DO_BROWSER" -eq 0 ] \
+   && [ -z "$MP4$YOUTUBE$MEET$ZOOM" ]; then
   DO_PREFLIGHT=1
 fi
 
@@ -234,6 +239,131 @@ else
   bad "no free X display"
 fi
 rm -rf "$(dirname "$SMOKE_MP4")"
+fi
+
+# ---------------------------------------------------------------------------
+if [ "$DO_BROWSER" -eq 1 ]; then
+echo ""
+echo "=================================================================="
+echo "Browser smoke — real Chrome, recorded, without a meeting"
+echo "=================================================================="
+# Everything stage 1 does except joining a call: Chrome under Xvfb through
+# Playwright with the recorder's own flags, its audio in this run's sink, and
+# ffmpeg capturing the result. If this passes, a failure to record a real
+# meeting is about the meeting, not about the machine.
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/xsession.sh"
+SMOKE_DIR="$(mktemp -d)"
+SMOKE_MP4="$SMOKE_DIR/browser.mp4"
+SMOKE_PNG="$SMOKE_DIR/browser.png"
+GEOM="${RECORD_GEOMETRY:-1920x1080}"
+
+if ! command -v google-chrome-stable >/dev/null 2>&1; then
+  bad "browser: google-chrome-stable is not installed"
+elif ! "$PY" -c "import playwright" 2>/dev/null; then
+  bad "browser: playwright is not installed in $PY"
+else
+  DISPLAY_NUM="$(xsession_pick_display)" || DISPLAY_NUM=""
+  if [ -z "$DISPLAY_NUM" ]; then
+    bad "browser: no free display"
+  else
+    SINK="$(xsession_sink_name "smoke_$$")"
+    smoke_cleanup() {
+      [ -n "${SMOKE_FFMPEG:-}" ] && kill -INT "$SMOKE_FFMPEG" 2>/dev/null || true
+      xsession_audio_stop "$SINK" || true
+      xsession_stop_xvfb || true
+      true
+    }
+    if xsession_start_xvfb "$DISPLAY_NUM" "$GEOM" && xsession_audio_start "$SINK"; then
+      export DISPLAY=":$DISPLAY_NUM"
+      export PULSE_SINK="$SINK"
+      ffmpeg -y -loglevel error -f x11grab -video_size "$GEOM" -framerate 10 \
+        -i ":$DISPLAY_NUM" -f pulse -i "${SINK}.monitor" \
+        -c:v libx264 -preset ultrafast -crf 28 -c:a aac -pix_fmt yuv420p \
+        -t 8 "$SMOKE_MP4" >/dev/null 2>&1 &
+      SMOKE_FFMPEG=$!
+
+      if "$PY" "$SCRIPT_DIR/screen/browser_smoke.py" --seconds 5 \
+           --screenshot "$SMOKE_PNG" > "$SMOKE_DIR/smoke.log" 2>&1; then
+        ok "browser: Chrome launched via Playwright with the recorder's flags"
+        WIN="$(grep -o 'Window is [0-9]*x[0-9]*' "$SMOKE_DIR/smoke.log" | awk '{print $3}')"
+        echo "  viewport: ${WIN:-unknown} (head is $GEOM; 1px under is normal)"
+        [ -s "$SMOKE_PNG" ] && ok "browser: page screenshot captured" \
+          || warn "browser: no screenshot written"
+      else
+        bad "browser: Chrome failed to launch — see $SMOKE_DIR/smoke.log"
+        sed 's/^/    /' "$SMOKE_DIR/smoke.log" | tail -n 15
+      fi
+
+      wait "$SMOKE_FFMPEG" 2>/dev/null
+      SMOKE_FFMPEG=""
+      if [ -s "$SMOKE_MP4" ]; then
+        ok "browser: recorded $(stat -c %s "$SMOKE_MP4") bytes of the live browser"
+        ffprobe -v error -select_streams a -show_entries stream=codec_name \
+          -of default=nw=1:nk=1 "$SMOKE_MP4" 2>/dev/null | grep -q . \
+          && ok "browser: the recording has an audio stream" \
+          || bad "browser: the recording has no audio stream"
+        # A capture of a blank display compresses to almost nothing; a real
+        # browser window does not. This is the check that catches "Chrome
+        # started but rendered nowhere".
+        if [ "$(stat -c %s "$SMOKE_MP4")" -gt 20000 ]; then
+          ok "browser: the capture has real picture content in it"
+        else
+          bad "browser: the capture is suspiciously small — Chrome may not have rendered"
+        fi
+        # The check that actually matters: measure the recorded frame for the
+        # black bands a mispositioned or mis-sized window leaves behind. This
+        # is how the missing --window-position=0,0 was found; comparing window
+        # sizes would not have caught it.
+        ffmpeg -y -loglevel error -ss 3 -i "$SMOKE_MP4" -frames:v 1 \
+          "$SMOKE_DIR/frame.png" 2>/dev/null
+        if [ -s "$SMOKE_DIR/frame.png" ] && "$PY" -c "import PIL" 2>/dev/null; then
+          BANDS="$("$PY" - "$SMOKE_DIR/frame.png" <<'PYEOF'
+from PIL import Image
+import sys
+img = Image.open(sys.argv[1]).convert("RGB")
+px, (w, h) = img.load(), img.size
+lit = lambda vals: max(sum(v) / 3 for v in vals)
+row = lambda y: lit([px[x, y] for x in range(w)])
+col = lambda x: lit([px[x, y] for y in range(h)])
+def first(rng, fn):
+    for i in rng:
+        if fn(i) > 4:
+            return i
+    return -1
+top = first(range(h), row); bottom = first(range(h - 1, -1, -1), row)
+left = first(range(w), col); right = first(range(w - 1, -1, -1), col)
+if min(top, bottom, left, right) < 0:
+    print("blank")
+else:
+    print(f"{left} {top} {w - 1 - right} {h - 1 - bottom}")
+PYEOF
+)"
+          if [ "$BANDS" = "blank" ]; then
+            bad "browser: the captured frame is entirely black"
+          elif [ "$(echo "$BANDS" | tr " " "\n" | sort -rn | head -1)" -le 2 ]; then
+            # Chrome's kiosk viewport comes out a pixel under the window size,
+            # so a 1px line at the right and bottom is expected and invisible.
+            # Anything thicker means the window is genuinely misplaced — that
+            # is what the missing --window-position=0,0 looked like (10px).
+            ok "browser: the browser fills the display (bands $BANDS, within 2px)"
+          else
+            bad "browser: black bands (left top right bottom) = $BANDS — the window does not fill the head"
+          fi
+        else
+          warn "browser: could not measure black edges (need Pillow + a decodable frame)"
+        fi
+      else
+        bad "browser: ffmpeg produced no file"
+      fi
+      smoke_cleanup
+    else
+      bad "browser: could not bring up the display or the audio sink"
+      smoke_cleanup
+    fi
+  fi
+fi
+echo "  artifacts: $SMOKE_DIR"
 fi
 
 # ---------------------------------------------------------------------------

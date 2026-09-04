@@ -777,11 +777,20 @@ That is what `verify_e2e.sh` is for:
 ```bash
 ./verify_e2e.sh --preflight                    # tools, packages, keys, profile,
                                                # and a real 2-second Xvfb+Pulse+ffmpeg capture
+./verify_e2e.sh --browser-smoke                # real Chrome on Xvfb, recorded — no meeting, no spend
 ./verify_e2e.sh --mp4 /path/to/recording.mp4   # real AssemblyAI + real summarizer
 ./verify_e2e.sh --youtube "<url>"              # real captions + real summarizer
 ./verify_e2e.sh --meet "<url>" --minutes 3     # real Chrome joins, records, leaves
 ./verify_e2e.sh --zoom "<url>" --minutes 3
 ```
+
+`--browser-smoke` is worth running after any change to the recording path: it
+launches Chrome through Playwright with the recorder's exact flags
+(`screen/browser_smoke.py` imports them from `capture.py`), records eight
+seconds of it, and then **measures the recorded frame for black bands**. That
+check is what caught Chrome placing its kiosk window at (10,10) — a 10-pixel
+black band down the left and top of every recording that comparing window sizes
+would have missed.
 
 The meeting checks record for `--minutes`, then stop through the normal
 `kill_meeting.sh` path, so they exercise the kill switch too. They check the
@@ -819,6 +828,12 @@ The sink wasn't wired to the browser. Check that `PULSE_SINK` reached Chrome
 (`runs/<run_id>/record.pid` records the sink name) and that
 `pactl list short sinks` shows it. `./verify_e2e.sh --preflight` reproduces the
 whole chain in two seconds.
+
+**The recording has black bands down one edge**
+The Chrome window isn't filling the Xvfb head. `./verify_e2e.sh --browser-smoke`
+measures it. A band of 1px at the right and bottom is normal (Chrome's kiosk
+viewport is a pixel under the window); anything thicker means `RECORD_GEOMETRY`,
+`--window-size` and `--window-position` disagree.
 
 **The MP4 is empty**
 See `<recording>_ffmpeg.log` next to the MP4. Usually the display or the sink

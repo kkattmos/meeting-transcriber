@@ -56,6 +56,41 @@ IDLE_LEAVE_SECONDS = int(os.environ.get("IDLE_LEAVE_MINUTES", "5")) * 60
 # black edges; record_screen.sh sets RECORD_GEOMETRY for both.
 WINDOW_SIZE = (os.environ.get("RECORD_GEOMETRY", "1920x1080")
                .lower().replace("x", ","))
+# The Chrome command line, in one place so screen/browser_smoke.py can launch
+# an identical browser without a live meeting — a flag that breaks recording
+# should break the smoke test too.
+#
+# --kiosk launches Chrome in true fullscreen with no chrome (no tab bar, no
+# address bar, no system UI). The window fills the Xvfb head, so ffmpeg's
+# x11grab captures only the meeting UI - no black edges. --kiosk also disables
+# F11-toggle, which keeps the unattended recording from accidentally leaving
+# fullscreen. --window-size pins the drawable area to the head size; without it
+# some Xvfb/Chrome combinations leave a few px of margin on the right and
+# bottom (Chrome auto-sizes the window slightly smaller than the display in
+# --kiosk mode). The matching Xvfb geometry and ffmpeg -video_size come from
+# RECORD_GEOMETRY in screen/record_screen.sh.
+#
+# --no-sandbox is required because the pipeline runs as root; without it Chrome
+# aborts with "Running as root without --no-sandbox is not supported" before
+# the page ever loads.
+#
+# --disable-features=ScreenCapture is layer 1 of the screen-share defense: it
+# disables the getDisplayMedia API entirely. The bot has no legitimate reason
+# to share its screen; if Chrome ever renames this feature flag, layers 2 and 3
+# (in wait_until_meeting_ends) are the runtime catch-nets.
+CHROME_ARGS = [
+    "--kiosk",
+    f"--window-size={WINDOW_SIZE}",
+    # Without this Chrome places its window at (10,10) even in kiosk mode, and
+    # every recording gets a 10px black band down the left and top edges —
+    # found by verify_e2e.sh --browser-smoke, which measures the captured
+    # frame rather than trusting the window size.
+    "--window-position=0,0",
+    "--no-sandbox",
+    "--use-fake-ui-for-media-stream",
+    "--disable-features=ScreenCapture",
+]
+
 RUN_DIR = os.environ.get("MEETING_BOT_RUN_DIR", "")
 if RUN_DIR:
     ADMITTED_MARKER = os.path.join(RUN_DIR, "admitted")
@@ -656,30 +691,7 @@ def main():
             # the whole pipeline as root (sudo -H, matching setup.sh). Without
             # it, Chrome aborts with "Running as root without --no-sandbox is
             # not supported" before the page ever loads.
-            args=[
-                # --kiosk launches Chrome in true fullscreen with no chrome
-                # (no tab bar, no address bar, no system UI). The window
-                # fills the 1920x1080 Xvfb head, so ffmpeg's x11grab captures
-                # only the meeting UI - no black edges. --kiosk also disables
-                # F11-toggle, which keeps the unattended recording from
-                # accidentally leaving fullscreen. --window-size pins the
-                # drawable area to the Xvfb head size; without it some
-                # Xvfb/Chrome combinations leave a few px of margin on the
-                # right and bottom (Chrome auto-sizes the window slightly
-                # smaller than the display in --kiosk mode). The matching
-                # matching Xvfb geometry and ffmpeg -video_size come from
-                # RECORD_GEOMETRY in screen/record_screen.sh.
-                "--kiosk",
-                f"--window-size={WINDOW_SIZE}",
-                "--no-sandbox",
-                "--use-fake-ui-for-media-stream",
-                # Layer 1 of the screen-share defense: disables the
-                # getDisplayMedia API entirely. The bot has no legitimate
-                # reason to share its screen; if Chrome ever renames this
-                # feature flag, Layers 2 and 3 (in wait_until_meeting_ends)
-                # are the runtime catch-nets.
-                "--disable-features=ScreenCapture",
-            ],
+            args=CHROME_ARGS,
             permissions=["camera", "microphone"],
             no_viewport=True,
             locale="th-TH",  # renders Thai participant names/chat correctly

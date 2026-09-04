@@ -426,6 +426,14 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   that it's cheap to meet.
 - **Chrome runs with `--no-sandbox`.** Required because everything runs as root.
   Sandbox + root = crash on launch.
+- **`--window-position=0,0` stays in `CHROME_ARGS`.** Without it Chrome places
+  its kiosk window at (10,10) and every recording carries a 10px black band
+  down the left and top edges. Found by `verify_e2e.sh --browser-smoke`, which
+  measures the recorded frame rather than trusting the reported window size —
+  a 1px band at the right and bottom is Chrome's viewport rounding and is fine.
+- **`CHROME_ARGS` in `capture.py` is the single source of the command line**,
+  imported by `screen/browser_smoke.py`. A flag that breaks recording has to
+  break the smoke test too, or the smoke test is testing a different browser.
 - **Display numbers and sink names are allocated per run, never hardcoded.**
   The container boundary that made `:99` safe is gone. See the isolation
   section above, including why `pactl set-default-sink` must not be used.
@@ -549,6 +557,7 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources` | 106 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers | 49 |
+| `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 
 `test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs
 only the four expensive stages, behind the same argument/output contract. It has
@@ -564,11 +573,12 @@ only place that can assert on **what we actually send** — that
 that `budget_tokens` is absent, that frames are attached as image blocks. When
 you change the request shape, assert it here.
 
-**What no test here covers:** Chrome actually joining a live Meet/Zoom call,
-real AssemblyAI/Anthropic/Gemini/youtube-transcript.io round-trips, and Chrome
-rendering inside Xvfb on real hardware. `./verify_e2e.sh` runs those on the real
-box; its `--preflight` covers the display/audio/capture chain with a real
-two-second recording and needs no keys.
+**What no test here covers:** Chrome actually joining a live Meet/Zoom call, and
+real AssemblyAI/Anthropic/Gemini/youtube-transcript.io round-trips.
+`./verify_e2e.sh` runs those on the real box. Its `--preflight` and
+`--browser-smoke` need no keys and no meeting: between them they cover the
+display/audio/capture chain and Chrome rendering under Xvfb with the recorder's
+own flags, which is everything about stage 1 except the call itself.
 
 ## File layout
 
@@ -602,7 +612,8 @@ two-second recording and needs no keys.
 │   └── test_media_e2e.sh
 ├── screen/
 │   ├── record_screen.sh          <- stage 1, native (no container)
-│   ├── capture.py                <- Playwright join driver
+│   ├── capture.py                <- Playwright join driver; owns CHROME_ARGS
+│   ├── browser_smoke.py          <- the same browser, without a meeting
 │   └── extract_frames.py
 ├── transcribe/
 │   ├── transcribe.sh
