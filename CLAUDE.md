@@ -116,6 +116,28 @@ The youtube-transcript.io tokens used to live in
 and its support is removed; `.env` is the only source. The error message says so
 explicitly, because operators following an older README will go looking for it.
 
+### Python dependencies are pinned, and uv is optional
+
+`requirements.in` / `requirements-browser.in` are the files a human edits;
+`requirements.txt` / `requirements-browser.txt` are generated from them by
+`uv pip compile --generate-hashes` and are what `setup.sh` installs. Never edit
+the generated files by hand — regenerate them (the command is in
+`requirements.in`'s header).
+
+Two files, not one, because `setup.sh --no-chrome` builds a box that never
+opens a browser and shouldn't carry playwright's bundled Node driver. The
+browser file is compiled with `-c requirements.txt` so shared transitive deps
+(typing-extensions today) land on the same version in both.
+
+**`setup.sh` uses uv when it is on PATH and pip when it isn't.** uv installs
+the same pinned set about 40x faster (4s vs 2m43s cold, measured on the target
+box), but it is not in Debian's archive — it comes from astral.sh — so it
+cannot be a hard requirement of a script whose whole job is bootstrapping a
+fresh machine. Both paths verify the hashes, so the resulting venv is identical.
+The venv itself is still created by `python3 -m venv`, not `uv venv`: a uv-made
+venv has no `pip` inside it, and the pip fallback plus the troubleshooting
+steps in README both need one.
+
 ## The run model
 
 Everything mutable about a run lives in `$MEETING_BOT_ROOT/runs/<run_id>/`:
@@ -587,6 +609,10 @@ own flags, which is everything about stage 1 except the call itself.
 ├── README.md                     <- all user-facing docs (the only other .md)
 ├── CLAUDE.md                     <- this file
 ├── .env.example                  <- names and defaults only; prose lives in README
+├── requirements.in               <- edit this
+├── requirements.txt              <- generated, hash-pinned; setup.sh installs it
+├── requirements-browser.in       <- playwright only, for the browser stages
+├── requirements-browser.txt      <- generated
 ├── source_env.sh
 ├── setup.sh                      <- Debian/apt, installs Chrome + the venv
 ├── first_time_login.sh           <- noVNC login, native Chrome

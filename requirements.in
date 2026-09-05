@@ -1,0 +1,34 @@
+# Direct Python dependencies for the transcribe and summarize stages.
+#
+# This is the file you edit. The pinned, hash-checked `requirements.txt` beside
+# it is generated from it and is what setup.sh actually installs — so two boxes
+# set up months apart get byte-identical SDK versions instead of whatever PyPI
+# was serving that week. That drift is not hypothetical: an SDK that quietly
+# changes its request surface is how `budget_tokens` turned into a 400 on every
+# summarize call.
+#
+# Regenerate after editing (needs uv — see README's Install section):
+#
+#     uv pip compile --generate-hashes requirements.in -o requirements.txt
+#     uv pip compile --generate-hashes -c requirements.txt \
+#         requirements-browser.in -o requirements-browser.txt
+#
+# The `-c requirements.txt` on the second one keeps shared transitive deps at
+# the same versions in both files.
+#
+# Resolved for the deployment target: CPython 3.13 on linux-x86_64 (Debian 13).
+# A different target needs its own recompile.
+
+# The default summary backend.
+anthropic
+# The fallback summary backend.
+google-genai
+# youtube-transcript.io client. urllib gets rate-limited on that endpoint where
+# requests does not — different User-Agent and TLS stack.
+requests
+# Pre-recorded transcription for local files.
+assemblyai
+# The PDF export: markdown -> HTML -> PDF, and the frame cropping.
+weasyprint
+markdown
+pillow

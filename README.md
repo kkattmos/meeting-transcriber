@@ -153,6 +153,35 @@ poppler, Pango for the PDF renderer, Thai fonts), real `google-chrome-stable`
 from Google's repository, the Python venv at `/opt/meeting-bot-venv`, yt-dlp,
 and the working directories.
 
+**Python dependencies are pinned.** `requirements.txt` (and
+`requirements-browser.txt`, which is skipped by `--no-chrome`) hold every
+package and transitive dependency at an exact version with a SHA-256 hash. Both
+are generated from the `requirements.in` files beside them. This is what stops
+two boxes built months apart from getting different SDK versions — the failure
+mode there is an SDK that quietly changes its request surface and turns a
+working install into a 400 on every summary.
+
+**uv is optional but worth installing** — same pinned result, ~40x faster
+(measured on this target: 4s versus 2m43s):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+`setup.sh` uses it automatically when it's on `PATH` and falls back to pip
+otherwise; both verify the lockfile's hashes, so the venv is identical either
+way. uv is not in Debian's archive, which is why it stays optional.
+
+To change a dependency, edit `requirements.in`, then regenerate (needs uv):
+
+```bash
+uv pip compile --generate-hashes requirements.in -o requirements.txt
+```
+
+```bash
+uv pip compile --generate-hashes -c requirements.txt requirements-browser.in -o requirements-browser.txt
+```
+
 Useful flags:
 
 ```bash
@@ -841,9 +870,12 @@ didn't come up.
 
 **No PDF, but the markdown is there**
 The renderer is optional at runtime by design. The warning names what's
-missing — usually `weasyprint` or its Pango libraries:
-`sudo apt-get install libpango-1.0-0 libpangoft2-1.0-0` and
-`/opt/meeting-bot-venv/bin/pip install weasyprint markdown pillow`.
+missing — usually `weasyprint` or its Pango libraries. Install the system half
+with `sudo apt-get install libpango-1.0-0 libpangoft2-1.0-0`, then re-run
+`sudo -H ./setup.sh` to restore the Python half from the lockfile. (Installing
+individual packages by hand with `/opt/meeting-bot-venv/bin/pip install
+weasyprint` works too, but leaves the venv out of step with
+`requirements.txt`.)
 
 **Frames in the PDF are uncropped**
 Pillow isn't installed, or the slide detector declined on every frame (a

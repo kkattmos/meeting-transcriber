@@ -1,0 +1,8 @@
+# Dependencies only the browser stages need — kept out of requirements.in so
+# `setup.sh --no-chrome` (a transcribe/summarize-only box) doesn't pull the
+# bundled Node driver, which is the bulk of the playwright wheel.
+#
+# Compiled against requirements.txt as a constraint so shared transitive deps
+# land on the same versions in both files. See requirements.in for the command.
+
+playwright
