@@ -17,3 +17,16 @@
 # which silently leaves the deployment on old code.
 __pycache__/
 *.py[cod]
+
+.bash_history
+.bashrc
+.cache/
+.claude.json
+.claude/
+.config/
+.gitconfig
+.local
+.profile
+.seadrive-cli/
+.ssh/
+seadrive-cli/
