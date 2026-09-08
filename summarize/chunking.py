@@ -14,8 +14,19 @@ frames that were on screen while those words were spoken. Without an .srt we
 fall back to splitting the plain text and dividing the frames proportionally,
 which is approximate but still better than sending every frame to every chunk.
 
+A segment is the atom here — chunk boundaries and frame windows are both drawn
+on segment edges — so a transcript whose segments are enormous defeats both.
+That is not hypothetical: AssemblyAI returns almost no sentence boundaries for
+Thai, and a real 2.6-hour lecture came back as **three** cues, the first a
+single 29-minute "sentence". Chunks then came out at 60k and 70k characters
+against a 40k limit (a segment cannot be split), and every frame window was
+half an hour wide, so the model had no way to tell which slide belonged to
+which sentence. `split_long_segments` cuts those back down before chunking.
+
 Env vars:
   SUMMARY_CHUNK_CHARS      default 24000  (0 disables chunking entirely)
+  SUMMARY_SEGMENT_MAX_SECONDS default 120 (0 disables segment splitting)
+  SUMMARY_SEGMENT_MAX_CHARS   default 2000
   SUMMARY_CHUNK_OVERLAP    default 800    (chars of context repeated between
                                            chunks, so a sentence split across a
                                            boundary isn't lost)
@@ -77,6 +88,21 @@ def chunk_overlap():
         return 800
 
 
+def segment_max_seconds():
+    """Longest segment we'll hand the chunker. 0 disables the split."""
+    try:
+        return max(0, int(os.environ.get("SUMMARY_SEGMENT_MAX_SECONDS", 120)))
+    except ValueError:
+        return 120
+
+
+def segment_max_chars():
+    try:
+        return max(1, int(os.environ.get("SUMMARY_SEGMENT_MAX_CHARS", 2000)))
+    except ValueError:
+        return 2000
+
+
 def max_parallel():
     try:
         return max(1, int(os.environ.get("SUMMARY_MAX_PARALLEL", 3)))
@@ -109,6 +135,87 @@ def parse_srt(path):
         if text:
             segments.append(Segment(start, end, text))
     return segments
+
+
+# Where a cut is tidy: whitespace, or the punctuation Thai and English
+# transcripts actually contain. Thai doesn't space its words, so on Thai this
+# usually finds a sentence-ish break or nothing at all — hence the hard cut.
+_NICE_BREAK = re.compile(r"[\s。．.!?！？,，、;；:：ฯ]")
+
+
+def split_long_segments(segments, max_seconds=None, max_chars=None):
+    """Cut over-long segments into pieces, interpolating their timestamps.
+
+    Only segments past a limit are touched, so a well-formed transcript (cues
+    of a few seconds each) comes back byte-identical and every existing run
+    behaves exactly as it did. See the module docstring for the transcript
+    that made this necessary.
+
+    Timestamps are interpolated linearly on character offset — it assumes an
+    even speaking rate, which is wrong in detail and enormously closer than
+    "all 1,700 seconds of this belong to one instant". The alternative,
+    leaving a 29-minute atom in place, gives every frame in that half hour an
+    equal claim on every sentence in it.
+    """
+    max_seconds = segment_max_seconds() if max_seconds is None else max_seconds
+    max_chars = segment_max_chars() if max_chars is None else max_chars
+    if max_seconds <= 0:
+        return list(segments)
+
+    out = []
+    for seg in segments:
+        duration = max(0.0, seg.end_s - seg.start_s)
+        text = seg.text
+        pieces = max(_ceil_div(duration, max_seconds),
+                     _ceil_div(len(text), max_chars))
+        if pieces <= 1 or not text:
+            out.append(seg)
+            continue
+        for start_i, end_i in _split_points(text, pieces):
+            # Linear on character offset: the piece covering characters
+            # [start_i, end_i) of the segment gets the same fraction of its
+            # time span.
+            frac_a = start_i / len(text)
+            frac_b = end_i / len(text)
+            out.append(Segment(
+                start_s=seg.start_s + duration * frac_a,
+                end_s=seg.start_s + duration * frac_b,
+                text=text[start_i:end_i],
+            ))
+    return out
+
+
+def _ceil_div(value, limit):
+    """How many pieces of at most `limit` it takes to cover `value`."""
+    if limit <= 0 or value <= 0:
+        return 1
+    return int(value // limit) + (1 if value % limit else 0)
+
+
+def _split_points(text, pieces):
+    """[(start, end)] cutting `text` into `pieces`, preferring tidy breaks."""
+    target = len(text) / pieces
+    bounds = [0]
+    for i in range(1, pieces):
+        ideal = int(round(i * target))
+        # Look for whitespace or punctuation within 10% of the ideal cut, so a
+        # word (or, on Thai, a phrase) isn't sliced through the middle when
+        # there is a break to be had.
+        window = max(1, int(target * 0.1))
+        best = None
+        for offset in range(window):
+            for candidate in (ideal - offset, ideal + offset):
+                if bounds[-1] < candidate < len(text) and \
+                        _NICE_BREAK.match(text[candidate]):
+                    best = candidate + 1
+                    break
+            if best is not None:
+                break
+        cut = best if best is not None else ideal
+        if cut > bounds[-1]:
+            bounds.append(min(cut, len(text)))
+    bounds.append(len(text))
+    return [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
 
 
 def find_srt_for(transcript_path):
@@ -157,12 +264,17 @@ def chunk_by_segments(segments, frames, limit=None, overlap=None):
     for i, group in enumerate(chunks):
         start_s = group[0].start_s
         end_s = group[-1].end_s
-        # The last chunk keeps any frames past its final segment (a trailing
-        # slide after the last spoken word would otherwise be dropped).
+        # The edge chunks keep the frames outside the spoken range: a title
+        # slide that is already up before the first word (real case — the
+        # frame at t=0, when segment 1 starts at 0.3s) and a trailing slide
+        # after the last one would otherwise belong to no chunk at all, and a
+        # frame no chunk carries is a frame the model can never cite.
+        is_first = i == 0
         is_last = i == len(chunks) - 1
         selected = [
             f for f in frames
-            if f.timestamp_s >= start_s and (is_last or f.timestamp_s < end_s)
+            if (is_first or f.timestamp_s >= start_s)
+            and (is_last or f.timestamp_s < end_s)
         ]
         out.append(Chunk(
             index=i,
@@ -226,6 +338,6 @@ def build_chunks(transcript, frames, transcript_path=None):
         if srt:
             segments = parse_srt(srt)
             if segments:
-                return chunk_by_segments(segments, frames)
+                return chunk_by_segments(split_long_segments(segments), frames)
 
     return chunk_by_text(transcript, frames)

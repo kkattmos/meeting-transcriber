@@ -667,6 +667,113 @@ class BackendChainTest(unittest.TestCase):
         self.assertEqual(out, "FROM GEMINI")
 
 
+class SegmentGranularityTest(unittest.TestCase):
+    """Over-long transcript segments are cut before they reach the chunker.
+
+    A segment is the atom for both chunk boundaries and frame windows, so an
+    AssemblyAI Thai transcript that comes back as three 30-minute "sentences"
+    blew the chunk limit (60k and 70k chars against 40k) and gave every frame
+    window a half-hour of slack. Real case: Week01, 3 cues for 2.6 hours.
+    """
+
+    def test_a_well_formed_transcript_is_untouched(self):
+        segs = [chunking.Segment(0.0, 3.0, "hello"),
+                chunking.Segment(3.0, 7.0, "there")]
+        self.assertEqual(chunking.split_long_segments(segs), segs)
+
+    def test_a_long_segment_is_split_and_keeps_every_character(self):
+        seg = chunking.Segment(0.0, 1782.0, "ก" * 16000)
+        out = chunking.split_long_segments([seg])
+        self.assertGreater(len(out), 10)
+        self.assertEqual("".join(s.text for s in out), seg.text)
+
+    def test_the_pieces_tile_the_original_time_span(self):
+        seg = chunking.Segment(100.0, 1000.0, "x" * 9000)
+        out = chunking.split_long_segments([seg])
+        self.assertAlmostEqual(out[0].start_s, 100.0, places=6)
+        self.assertAlmostEqual(out[-1].end_s, 1000.0, places=6)
+        for a, b in zip(out, out[1:]):
+            self.assertLessEqual(a.end_s, b.start_s + 1e-9)
+
+    def test_no_piece_exceeds_the_duration_cap(self):
+        seg = chunking.Segment(0.0, 1800.0, "y" * 20000)
+        out = chunking.split_long_segments([seg], max_seconds=120,
+                                           max_chars=100000)
+        for piece in out:
+            self.assertLessEqual(piece.end_s - piece.start_s, 120.5)
+
+    def test_the_char_cap_splits_a_short_but_dense_segment(self):
+        seg = chunking.Segment(0.0, 10.0, "z" * 9000)
+        out = chunking.split_long_segments([seg], max_seconds=120,
+                                           max_chars=2000)
+        self.assertGreaterEqual(len(out), 5)
+
+    def test_splitting_prefers_a_word_boundary(self):
+        words = ("alpha bravo charlie delta echo foxtrot " * 200).strip()
+        out = chunking.split_long_segments([chunking.Segment(0.0, 600.0, words)],
+                                           max_seconds=120, max_chars=100000)
+        self.assertGreater(len(out), 1)
+        # No piece may start or end mid-word.
+        for piece in out[:-1]:
+            self.assertTrue(piece.text.endswith(" ") or
+                            piece.text.rstrip().split()[-1] in words.split())
+
+    def test_zero_disables_the_split(self):
+        seg = chunking.Segment(0.0, 5000.0, "q" * 50000)
+        self.assertEqual(chunking.split_long_segments([seg], max_seconds=0),
+                         [seg])
+
+    def test_chunks_from_giant_segments_respect_the_char_limit(self):
+        # Three 30-minute cues, the shape that started this.
+        segs = [chunking.Segment(0.0, 1800.0, "a" * 20000),
+                chunking.Segment(1800.0, 5400.0, "b" * 60000),
+                chunking.Segment(5400.0, 9000.0, "c" * 40000)]
+        chunks = chunking.chunk_by_segments(
+            chunking.split_long_segments(segs), [], limit=40000, overlap=800)
+        for c in chunks:
+            self.assertLessEqual(len(c.text), 41000)
+
+    def test_frame_windows_stop_overlapping_once_segments_are_fine(self):
+        segs = [chunking.Segment(0.0, 1800.0, "a" * 20000),
+                chunking.Segment(1800.0, 5400.0, "b" * 60000)]
+        chunks = chunking.chunk_by_segments(
+            chunking.split_long_segments(segs), [], limit=40000, overlap=800)
+        # Each chunk may reach back only as far as its carried lead-in, not
+        # over the whole of the previous chunk.
+        for a, b in zip(chunks, chunks[1:]):
+            self.assertGreater(b.start_s, a.start_s)
+
+
+class EdgeFrameTest(unittest.TestCase):
+    """A frame no chunk carries is a frame the model can never cite."""
+
+    def segs(self):
+        return [chunking.Segment(10.0, 100.0, "a" * 100),
+                chunking.Segment(100.0, 200.0, "b" * 100)]
+
+    def frames(self, *stamps):
+        return [llm_client.FrameMeta(timestamp_s=t, kind="periodic",
+                                     path=f"/f/{t}.jpg") for t in stamps]
+
+    def test_a_frame_before_the_first_word_reaches_the_first_chunk(self):
+        # Real case: the frame at t=0 with segment 1 starting at 0.3s.
+        chunks = chunking.chunk_by_segments(self.segs(), self.frames(0.0),
+                                            limit=150, overlap=0)
+        self.assertIn(0.0, [f.timestamp_s for f in chunks[0].frames])
+
+    def test_a_frame_after_the_last_word_reaches_the_last_chunk(self):
+        chunks = chunking.chunk_by_segments(self.segs(), self.frames(999.0),
+                                            limit=150, overlap=0)
+        self.assertIn(999.0, [f.timestamp_s for f in chunks[-1].frames])
+
+    def test_every_frame_lands_in_at_least_one_chunk(self):
+        frames = self.frames(0.0, 50.0, 150.0, 999.0)
+        chunks = chunking.chunk_by_segments(self.segs(), frames,
+                                            limit=150, overlap=0)
+        carried = {f.timestamp_s for c in chunks for f in c.frames}
+        self.assertEqual(carried, {0.0, 50.0, 150.0, 999.0})
+
+
 class FrameNumberingTest(unittest.TestCase):
     """Frame numbers must mean the same thing to the model and to the PDF.
 

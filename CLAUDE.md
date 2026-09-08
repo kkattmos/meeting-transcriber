@@ -414,6 +414,15 @@ claude -p --output-format json --model <CLAUDE_CLI_MODEL> --effort <SUMMARY_EFFO
 - **`--no-session-persistence`**, or every summary leaves a full transcript in
   `~/.claude/projects` on a 15GB disk.
 
+**`CLAUDE_CLI_BIN` should be set, not left to `PATH`.** The CLI installs into
+`~/.local/bin`, which root's minimal `.profile` does not add to `PATH` and a
+systemd unit does not inherit. `_claude_cli_bin()` returning `None` is not an
+error anyone sees: it raises `BackendUnavailable`, the chain advances, and
+Gemini answers. Found 2026-09-08 on the deployment box with the variable
+commented out in `.env` — 51 summaries had been billed to Gemini keys while
+the operator believed the subscription was paying. The symptom is in every
+document's provenance header (`model: gemini/...`) and nowhere else.
+
 **The subprocess environment is scrubbed** (`_claude_cli_env`): `ANTHROPIC_API_KEY`,
 `ANTHROPIC_API_KEY_1`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` are
 removed before launch. This is the most important line in the file. If any of
@@ -462,6 +471,23 @@ is exponential with **full** jitter (not ±10%) specifically because parallel
 chunk requests must not retry in lockstep against the server that just said it
 was overloaded. `Retry-After` wins when present and ≤ 300s; a longer one means
 give up and let the chain advance.
+
+**Segment granularity.** A segment is the atom for both chunk boundaries and
+frame windows, so `chunking.split_long_segments` cuts any segment over
+`SUMMARY_SEGMENT_MAX_SECONDS` (120) or `SUMMARY_SEGMENT_MAX_CHARS` (2000) into
+pieces with linearly interpolated timestamps, before chunking. Segments under
+the caps are returned untouched, so a normal transcript behaves exactly as it
+did.
+
+This exists because **AssemblyAI returns almost no sentence boundaries for
+Thai**: Week01, a 2.6-hour lecture, came back as *three* cues, the first a
+single 29-minute "sentence". A segment can't be split by `chunk_by_segments`,
+so chunks came out at 60k and 70k characters against a 40k limit, chunk 1's
+window ran 0-6966s while chunk 0's was 0-1782s, and every frame in a half-hour
+had an equal claim on every sentence in it. After the split: 3 segments become
+79, the longest drops from 5184s to 127s, chunks land at 39.6k/39.3k/8.7k, and
+the windows are sequential. Interpolating on character offset assumes an even
+speaking rate — wrong in detail, and enormously closer than one 29-minute atom.
 
 **Chunking.** Above `SUMMARY_CHUNK_CHARS` (24000), the transcript is split and
 chunks are summarized concurrently, then merged by one more LLM call using
@@ -824,6 +850,9 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   spend off the subscription the operator is paying for. If a run has to be
   billed to a console account, that is a new backend beside `claude-cli`, not a
   change to it.
+- **`CLAUDE_CLI_BIN` is set to an absolute path in `.env`.** Relying on `PATH`
+  makes a signed-in, working CLI invisible to the pipeline, and the only
+  evidence is which model the provenance header names.
 - **`ANTHROPIC_*` must stay scrubbed from the CLI's environment.** See the
   summarize section: leaving one set redirects billing silently, and an empty
   one breaks auth in a way that looks like a broken subscription.
@@ -887,7 +916,7 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
-| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, map-reduce, global frame numbering, document, the claude-cli command line + envelope parsing | 67 |
+| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the claude-cli command line + envelope parsing | 76 |
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, real PDF render | 54 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources` | 106 |

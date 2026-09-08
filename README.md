@@ -829,6 +829,8 @@ immediately rather than burning the full retry schedule first.
 |---|---|---|
 | `SUMMARY_CHUNK_CHARS` | 24000 | Above this, chunk + merge. `0` disables |
 | `SUMMARY_CHUNK_OVERLAP` | 800 | Context repeated across a boundary |
+| `SUMMARY_SEGMENT_MAX_SECONDS` | 120 | Transcript segments longer than this are split before chunking. `0` disables |
+| `SUMMARY_SEGMENT_MAX_CHARS` | 2000 | Same, by length |
 | `SUMMARY_MAX_PARALLEL` | 3 | Concurrent chunk requests |
 
 ### Transcription
@@ -882,11 +884,11 @@ python3 lib/test_runstate.py                 # run state, resume, concurrency (1
 python3 lib/test_slotqueue.py                # cross-session component queue (23)
 python3 lib/test_keyring.py                  # numbered keys + rotation cursor (22)
 python3 lib/test_resources.py                # resource specs, extraction, GitHub (27)
-python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, document, claude-cli (64)
-python3 summarize/test_pdf_units.py          # frame cropping, citations, PDF render (23)
+python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli (76)
+python3 summarize/test_pdf_units.py          # frame cropping, citations, PDF render (54)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
 bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (106)
-bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (60)
+bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (62)
 ```
 
 Two of those are worth understanding:
@@ -1001,7 +1003,21 @@ full-screen camera shot has no slide to find). `PDF_FRAME_CROP=border` gives
 you the plain border trim instead.
 
 **Every summary is coming out of Gemini**
-The Claude backend is being skipped. `claude auth status` — if it says
+The Claude backend is being skipped, and there are two independent reasons for
+it. Check both — the first is easy to miss because an interactive shell can
+find `claude` when the pipeline cannot.
+
+*The binary isn't on the pipeline's PATH.* `claude` installs to
+`~/.local/bin`, which a minimal root `.profile` never adds to `PATH`, and a
+systemd unit or cron job gets an even barer environment. `_claude_cli_bin()`
+then returns `None`, the backend raises `BackendUnavailable`, and the chain
+falls through to Gemini without anything looking broken. **Set
+`CLAUDE_CLI_BIN` to the absolute path in `.env`** rather than relying on
+`PATH`; that is what the variable is for. Seen on the deployment box, where
+every summary in a 51-file library had quietly been billed to Gemini keys
+while the operator believed they were spending a Claude subscription.
+
+*Or the CLI isn't logged in.* `claude auth status` — if it says
 `"loggedIn": false`, run `claude auth login` (or `claude setup-token` on a
 headless box) *as the user the pipeline runs as*; the login lives in that
 user's `~/.claude`, so a login as yourself doesn't help a systemd unit running

@@ -85,6 +85,8 @@ Configuration (env vars):
   Long transcripts, summarized in parallel then merged — summarize/chunking.py:
   SUMMARY_CHUNK_CHARS    default 24000 (0 disables chunking)
   SUMMARY_CHUNK_OVERLAP  default 800
+  SUMMARY_SEGMENT_MAX_SECONDS default 120 (0 disables segment splitting)
+  SUMMARY_SEGMENT_MAX_CHARS   default 2000
   SUMMARY_MAX_PARALLEL   default 3
 """
 import json
