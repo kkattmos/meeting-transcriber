@@ -1,30 +1,38 @@
 #!/usr/bin/env python3
 """
-Render a summary document to PDF, with the video frames it cites shown inline.
+Render a summary document to PDF: the readable deliverable beside the markdown.
 
-The markdown summary is the primary artifact; this is the readable one. The
-model cites keyframes as *(Frame 12 @ 410.0s)* — in markdown that's a
-dangling reference to a JPEG nobody opens, so here the first citation of each
-frame becomes the actual picture, cropped down to the slide (see
-framecrop.py), captioned with its timestamp. Later citations of the same frame
-stay as plain text so a lecture that keeps referring back to one diagram
-doesn't print it eight times.
+Four things happen here that the markdown doesn't need.
 
-Layout decisions:
+  * **Maths gets typeset.** The model writes LaTeX; markdown readers render
+    it and WeasyPrint — no JS engine, no MathML — would print the source. So
+    every expression is lifted out before the HTML conversion and comes back
+    as Computer Modern, set by matplotlib's mathtext. See mathrender.py.
 
-  * The transcript moves to the back. In markdown it lives in a collapsed
-    <details> block; a PDF has no "collapsed", and 80KB of ASR output at the
-    top of the document would bury the summary. It becomes "Appendix A —
-    Transcript" on its own page, in a smaller face.
-  * Reference material gets Appendix B: the slide/page images collected from
+  * **Keyframes go to the back, not into the argument.** A keyframe is a
+    screenshot of a video call: mostly a participant's face, a half-drawn
+    slide, or (the scene-change pass being drawn to exactly this) solid black.
+    Printed full width mid-paragraph they were noise, so by default the
+    citations stay as the model wrote them and the frames they name become a
+    thumbnail contact sheet in Appendix A — blank ones dropped, each frame
+    once, and only the ones actually cited get cropped at all.
+    `PDF_FRAMES=inline` restores the old behaviour; `none` drops them.
+
+  * **The transcript is present but invisible.** A PDF has no collapsed
+    <details>, and eighty kilobytes of ASR output — as an appendix or at the
+    top — buries the summary. It goes in as a white 1pt layer between
+    BEGIN_TRANSCRIPT and END_TRANSCRIPT markers instead: the reader never sees
+    it, `pdftotext` always finds it. `PDF_TRANSCRIPT=appendix` prints it.
+
+  * **Reference material gets Appendix B**: the slide images collected from
     the GitHub repo or folder passed via --resources, each captioned with the
-    file it came from.
-  * The provenance comment becomes a real footer line (model, prompt, run id,
-    date) instead of an invisible HTML comment.
+    file it came from. The provenance comment becomes a real footer line.
 
 WeasyPrint does the rendering: pip-installable, needs no browser, embeds local
-images by path, and shapes Thai correctly given a Thai font (the page CSS asks
-for Noto Sans Thai first, and setup.sh installs it).
+images by path, and shapes Thai correctly given a Thai font. The default face
+is Adwaita Sans at 8pt with Arial and Liberation Sans behind it and Noto Sans
+Thai for the Thai — see DEFAULT_FONT_STACK, and note that dropping the Thai
+font from a custom PDF_FONT_FAMILY turns a Thai lecture into tofu boxes.
 
 Nothing here is allowed to take the run down. `render()` raises PdfUnavailable
 when the toolchain is missing, and summarize.py turns that into a warning: the
@@ -42,13 +50,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import framecrop  # noqa: E402
+import mathrender  # noqa: E402
 
 
 class PdfUnavailable(RuntimeError):
     """The PDF toolchain isn't installed (weasyprint / markdown)."""
 
 
-DEFAULT_FONT_STACK = ("Noto Sans Thai", "Noto Sans", "DejaVu Sans", "sans-serif")
+# Adwaita Sans first (installed by setup.sh), Arial next so a box that has the
+# real thing uses it, then Liberation Sans — which is what "Arial" resolves to
+# on a Debian box without it. Noto Sans Thai has to stay in the stack: Adwaita
+# has no Thai glyphs, and a Thai lecture summary in tofu boxes is not a PDF.
+DEFAULT_FONT_STACK = ("Adwaita Sans", "Arial", "Liberation Sans",
+                      "Noto Sans Thai", "Noto Sans", "DejaVu Sans",
+                      "sans-serif")
+DEFAULT_FONT_SIZE_PT = 8.0
+# Contact-sheet thumbnails are three to a row on an A4 page — about 55mm wide.
+# Anything past ~640px of source is detail the print can't show.
+DEFAULT_CONTACT_MAX_WIDTH = 640
 
 # *(Frame 12 @ 410.0s)*, (Frame 12), [frame 12 @ 410.0s (scene_change)] — the
 # model is told to use the first form, but it is a language model and the other
@@ -68,6 +87,61 @@ def _font_stack():
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     return ", ".join(f'"{p}"' if " " in p and not p.startswith('"') else p
                      for p in parts)
+
+
+def _font_size():
+    """PDF_FONT_SIZE, in points. Everything else in the sheet is relative."""
+    raw = (os.environ.get("PDF_FONT_SIZE") or "").strip()
+    if not raw:
+        return DEFAULT_FONT_SIZE_PT
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"  warning: PDF_FONT_SIZE={raw!r} is not a number; using "
+              f"{DEFAULT_FONT_SIZE_PT}", file=sys.stderr)
+        return DEFAULT_FONT_SIZE_PT
+    return value if 4.0 <= value <= 24.0 else DEFAULT_FONT_SIZE_PT
+
+
+def frames_mode():
+    """PDF_FRAMES: contact (default), inline, or none.
+
+    `contact` keeps the citations as the model wrote them and collects the
+    frames they name into a thumbnail appendix. It is the default because
+    inline frames were the export's worst feature: a keyframe is a screenshot
+    of a video call, so most of them are a participant's face, a half-drawn
+    slide or — the scene-change pass being what it is — solid black, printed
+    full width in the middle of an argument they illustrate only by accident.
+    """
+    value = (os.environ.get("PDF_FRAMES") or "contact").strip().lower()
+    if value not in ("contact", "inline", "none"):
+        print(f"  warning: PDF_FRAMES={value!r} — expected contact, inline or "
+              f"none; using contact", file=sys.stderr)
+        return "contact"
+    return value
+
+
+def transcript_mode():
+    """PDF_TRANSCRIPT: hidden (default), appendix, or none.
+
+    `hidden` writes the transcript into the page as white 1pt text between
+    BEGIN_TRANSCRIPT / END_TRANSCRIPT markers: invisible to a reader, and
+    still the first thing `pdftotext` hands an agent. See _hidden_transcript.
+    """
+    value = (os.environ.get("PDF_TRANSCRIPT") or "hidden").strip().lower()
+    if value not in ("hidden", "appendix", "none"):
+        print(f"  warning: PDF_TRANSCRIPT={value!r} — expected hidden, "
+              f"appendix or none; using hidden", file=sys.stderr)
+        return "hidden"
+    return value
+
+
+def _contact_max_width():
+    try:
+        return int(os.environ.get("PDF_CONTACT_MAX_WIDTH",
+                                  str(DEFAULT_CONTACT_MAX_WIDTH)))
+    except ValueError:
+        return DEFAULT_CONTACT_MAX_WIDTH
 
 
 def _page_size():
@@ -126,16 +200,29 @@ def _split_document(text):
     return text.strip(), transcript, provenance
 
 
-def _prepare_frames(frames, work_dir, crop_mode=None, max_width=None):
-    """Crop every frame once, up front. Returns {frame_number: info}."""
+def _prepare_frames(frames, work_dir, crop_mode=None, max_width=None,
+                    wanted=None, drop_blank=True):
+    """Crop the frames worth printing. Returns {frame_number: info}.
+
+    `wanted` limits the work to the frame numbers the document actually cites
+    — in contact-sheet mode that is a handful out of the hundreds a three-hour
+    lecture produces, and cropping is the expensive part of this file.
+    `drop_blank` discards the solid-black frames the scene-change pass
+    collects (see framecrop.is_blank); a dropped frame simply has no picture,
+    and its citation stays as text.
+    """
     crop_mode = crop_mode or framecrop.crop_mode_from_env()
     max_width = max_width or framecrop.max_width_from_env()
     work_dir = Path(work_dir)
     prepared = {}
     ordered = sorted(frames, key=lambda f: f.timestamp_s)
     for index, frame in enumerate(ordered, start=1):
+        if wanted is not None and index not in wanted:
+            continue
         src = Path(frame.path)
         if not src.is_file():
+            continue
+        if drop_blank and framecrop.is_blank(src):
             continue
         dst = work_dir / f"frame_{index:04d}.jpg"
         try:
@@ -151,6 +238,22 @@ def _prepare_frames(frames, work_dir, crop_mode=None, max_width=None):
             "kind": frame.kind,
         }
     return prepared
+
+
+# Every way the model writes a frame number, including the second and third
+# number of a compound citation like "(Frame 33 @ 0:34:40, Frame 15 @ ...)"
+# which FRAME_CITE_RE only sees the first of.
+FRAME_MENTION_RE = re.compile(r"frames?\s*#?\s*(\d+)", re.IGNORECASE)
+
+
+def _cited_frame_numbers(html_body):
+    """Every frame number the document mentions, in first-mention order."""
+    seen = []
+    for match in FRAME_MENTION_RE.finditer(html_body):
+        number = int(match.group(1))
+        if number not in seen:
+            seen.append(number)
+    return seen
 
 
 def _figure_html(src, caption):
@@ -230,50 +333,80 @@ def _end_of_block(text, pos):
 
 
 def _css():
+    size = _font_size()
     return f"""
 @page {{
     size: {_page_size()};
     margin: 18mm 16mm 20mm 16mm;
     @bottom-center {{
         content: counter(page) " / " counter(pages);
-        font-size: 8pt;
+        font-size: 7pt;
         color: #777;
     }}
 }}
 body {{
     font-family: {_font_stack()};
-    font-size: 10.5pt;
+    font-size: {size:g}pt;
     line-height: 1.5;
     color: #16181d;
 }}
-h1 {{ font-size: 20pt; margin: 0 0 4pt 0; line-height: 1.25; }}
-h2 {{ font-size: 14pt; margin: 16pt 0 6pt 0; border-bottom: 1px solid #d8dbe0;
+h1 {{ font-size: 1.9em; margin: 0 0 4pt 0; line-height: 1.25; }}
+h2 {{ font-size: 1.35em; margin: 14pt 0 5pt 0; border-bottom: 1px solid #d8dbe0;
       padding-bottom: 3pt; break-after: avoid; }}
-h3 {{ font-size: 11.5pt; margin: 12pt 0 4pt 0; break-after: avoid; }}
+h3 {{ font-size: 1.12em; margin: 10pt 0 3pt 0; break-after: avoid; }}
+h4 {{ font-size: 1em; margin: 8pt 0 3pt 0; break-after: avoid; }}
 p, li {{ orphans: 2; widows: 2; }}
-ul, ol {{ margin: 4pt 0 4pt 18pt; padding: 0; }}
-code {{ font-family: "DejaVu Sans Mono", monospace; font-size: 9pt;
+ul, ol {{ margin: 4pt 0 4pt 16pt; padding: 0; }}
+code {{ font-family: "DejaVu Sans Mono", monospace; font-size: 0.92em;
         background: #f2f3f5; padding: 0 2px; border-radius: 2px; }}
 pre {{ background: #f2f3f5; padding: 6pt; border-radius: 3px;
-       font-size: 8.5pt; white-space: pre-wrap; word-wrap: break-word; }}
+       font-size: 0.88em; white-space: pre-wrap; word-wrap: break-word; }}
 table {{ border-collapse: collapse; width: 100%; margin: 8pt 0;
-         font-size: 9pt; }}
-th, td {{ border: 1px solid #d8dbe0; padding: 4pt 6pt; text-align: left;
+         font-size: 0.95em; }}
+th, td {{ border: 1px solid #d8dbe0; padding: 3pt 5pt; text-align: left;
           vertical-align: top; }}
 th {{ background: #f2f3f5; }}
-hr {{ border: none; border-top: 1px solid #d8dbe0; margin: 14pt 0; }}
+hr {{ border: none; border-top: 1px solid #d8dbe0; margin: 12pt 0; }}
 figure.frame {{ margin: 10pt 0; text-align: center; break-inside: avoid; }}
 figure.frame img {{ max-width: 100%; max-height: 105mm;
                     border: 1px solid #d8dbe0; border-radius: 3px; }}
-figure.frame figcaption {{ font-size: 8.5pt; color: #666; margin-top: 3pt; }}
-.docmeta {{ font-size: 8.5pt; color: #666; margin: 0 0 10pt 0; }}
+figure.frame figcaption {{ font-size: 0.9em; color: #666; margin-top: 3pt; }}
+.docmeta {{ font-size: 0.9em; color: #666; margin: 0 0 10pt 0; }}
 .docmeta span {{ margin-right: 10pt; }}
-.source {{ font-size: 9.5pt; color: #333; margin: 0 0 12pt 0;
+.source {{ font-size: 0.95em; color: #333; margin: 0 0 12pt 0;
            word-break: break-all; }}
 .appendix {{ break-before: page; }}
-.transcript {{ font-size: 8.5pt; line-height: 1.45; color: #333;
+.transcript {{ font-size: 0.9em; line-height: 1.45; color: #333;
                white-space: pre-wrap; }}
-.notes {{ font-size: 8.5pt; color: #8a6d3b; }}
+.notes {{ font-size: 0.9em; color: #8a6d3b; }}
+
+/* Contact sheet: three thumbnails to a row, inline-block rather than grid
+   because that lays out identically on every WeasyPrint version we might
+   meet on the box. */
+.contact {{ margin-top: 6pt; }}
+figure.thumb {{ display: inline-block; width: 31.5%; margin: 0 1% 8pt 0;
+                text-align: center; vertical-align: top;
+                break-inside: avoid; }}
+figure.thumb img {{ width: 100%; border: 1px solid #d8dbe0;
+                    border-radius: 2px; }}
+figure.thumb figcaption {{ font-size: 0.85em; color: #666; margin-top: 2pt; }}
+
+/* Maths. The images carry their own width/height/vertical-align in points,
+   computed from what mathtext reported, so there is nothing to size here. */
+img.math {{ margin: 0; }}
+.math-block {{ display: block; text-align: center; margin: 7pt 0;
+               break-inside: avoid; }}
+.math-line {{ display: block; margin: 2pt 0; }}
+.math-fallback {{ font-family: "CMU Serif", "Latin Modern Roman",
+                  "DejaVu Serif", serif; font-style: italic; }}
+
+/* The transcript layer. White on white at 1pt: no reader sees it, every text
+   extractor gets it. Not display:none — WeasyPrint would then put nothing in
+   the PDF at all, which is the opposite of the point. */
+.hidden-transcript {{ color: #ffffff; font-size: 1pt; line-height: 1pt;
+                      letter-spacing: 0; word-spacing: 0;
+                      overflow-wrap: anywhere; margin: 0; }}
+.hidden-next {{ break-before: page; }}
 """
 
 
@@ -290,10 +423,87 @@ def _meta_html(provenance, extra_meta):
 
 
 def _appendix_transcript(transcript):
+    """The visible transcript appendix — only with PDF_TRANSCRIPT=appendix."""
     if not transcript.strip():
         return ""
-    return ('<div class="appendix"><h2>Appendix A — Transcript</h2>'
+    return ('<div class="appendix"><h2>Appendix C — Transcript</h2>'
             f'<div class="transcript">{html.escape(transcript)}</div></div>')
+
+
+# Poppler (pdftotext, and so anything built on it — including this project's
+# own resources.py) stops returning text after roughly 50,000 characters on a
+# single page, silently. The PDF itself is complete: pypdf reads all 85k of a
+# real lecture transcript back off one page. But an agent reaching for the
+# obvious tool would get 60% of it and no warning, so the hidden layer is cut
+# into page-sized pieces instead. Measured on this box against WeasyPrint 69 /
+# poppler; 40k leaves room for the marker text and for whatever the visible
+# content contributes to the same page.
+HIDDEN_CHUNK_CHARS = 40000
+
+
+def _hidden_chunk_chars():
+    try:
+        value = int(os.environ.get("PDF_HIDDEN_CHUNK_CHARS",
+                                   str(HIDDEN_CHUNK_CHARS)))
+    except ValueError:
+        return HIDDEN_CHUNK_CHARS
+    return value if 1000 <= value <= 45000 else HIDDEN_CHUNK_CHARS
+
+
+def _hidden_transcript(transcript):
+    """The transcript as an invisible layer: white, 1pt, marker-delimited.
+
+    The operator reads the summary; agents read the transcript. Printing it
+    cost fifteen pages of Thai ASR output nobody looks at, and dropping it
+    lost the one copy that travels with the document. So it goes in unseen
+    instead: normal flow — not `display: none`, which would put nothing in the
+    PDF at all and defeat the whole point — white on white at 1pt.
+
+    The BEGIN_TRANSCRIPT / END_TRANSCRIPT markers are the contract with
+    whatever reads this. An agent running `pdftotext` gets the summary
+    followed by a labelled transcript rather than a wall of text with no seam
+    in it, and can tell where one ends and the other begins.
+
+    Cost: a couple of blank-looking pages at the back on a long lecture, for
+    the reason in HIDDEN_CHUNK_CHARS above. That is the price of the layer
+    being complete rather than quietly half there.
+    """
+    if not transcript.strip():
+        return ""
+    limit = _hidden_chunk_chars()
+    text = transcript.strip()
+    chunks = [text[i:i + limit] for i in range(0, len(text), limit)] or [""]
+    parts = []
+    for index, chunk in enumerate(chunks):
+        # Only the continuation pieces force a page: the first is allowed to
+        # share whatever room is left on the last page of the summary.
+        css_class = ("hidden-transcript" if index == 0
+                     else "hidden-transcript hidden-next")
+        lead = ("BEGIN_TRANSCRIPT (verbatim source transcript, hidden layer) "
+                if index == 0 else "")
+        tail = " END_TRANSCRIPT" if index == len(chunks) - 1 else ""
+        parts.append(f'<div class="{css_class}">{lead}'
+                     f'{html.escape(chunk)}{tail}</div>')
+    return "".join(parts)
+
+
+def _appendix_frames(prepared):
+    """Appendix A — the cited keyframes, as a thumbnail contact sheet."""
+    if not prepared:
+        return ""
+    parts = ['<div class="appendix"><h2>Appendix A — Keyframes</h2>',
+             '<p>Frames referenced in the summary above, in order of '
+             'appearance in the recording.</p>',
+             '<div class="contact">']
+    for number in sorted(prepared):
+        info = prepared[number]
+        caption = f"Frame {number} — {_fmt_timestamp(info['timestamp'])}"
+        parts.append(
+            f'<figure class="thumb">'
+            f'<img src="file://{html.escape(info["path"])}" />'
+            f'<figcaption>{html.escape(caption)}</figcaption></figure>')
+    parts.append("</div></div>")
+    return "".join(parts)
 
 
 def _appendix_resources(bundle, slide_images):
@@ -358,44 +568,78 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
     work_dir = Path(work_dir) if work_dir else output_path.parent / ".pdf-frames"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    body_md, transcript, provenance = _split_document(markdown_text)
-
-    # The document's own "# Title" line becomes the PDF title; keep it in the
-    # body too so a run without a wrapper still shows a heading.
-    doc_title = title or provenance.get("title")
-    if not doc_title:
-        m = re.search(r"^#\s+(.+)$", body_md, re.MULTILINE)
-        doc_title = m.group(1).strip() if m else "Summary"
-
-    prepared = _prepare_frames(frames, work_dir, crop_mode, max_width)
-    slide_images = collect_slide_images(resources)
-
-    body_html = _markdown_to_html(body_md)
-    body_html = _inline_citations(body_html, prepared, slide_images)
-
-    source_line = ""
-    src = source or provenance.get("source")
-    if src:
-        source_line = (f'<p class="source"><b>Source:</b> '
-                       f'{html.escape(str(src))}</p>')
-
-    document = (
-        f"<html><head><meta charset='utf-8'>"
-        f"<title>{html.escape(doc_title)}</title></head><body>"
-        f"{_meta_html(provenance, {'generated': date.today().isoformat()})}"
-        f"{source_line}"
-        f"{body_html}"
-        f"{_appendix_resources(resources, slide_images)}"
-        f"{_appendix_transcript(transcript)}"
-        f"</body></html>"
-    )
-
+    # Everything from here on is inside the try: the scratch directory
+    # exists by now, and a failure anywhere — a broken document, an
+    # unrenderable frame, WeasyPrint itself — must still release it.
     try:
-        HTML(string=document, base_url=str(output_path.parent)).write_pdf(
-            str(output_path), stylesheets=[CSS(string=_css())])
+        body_md, transcript, provenance = _split_document(markdown_text)
+
+        # The document's own "# Title" line becomes the PDF title; keep it in the
+        # body too so a run without a wrapper still shows a heading.
+        doc_title = title or provenance.get("title")
+        if not doc_title:
+            m = re.search(r"^#\s+(.+)$", body_md, re.MULTILINE)
+            doc_title = m.group(1).strip() if m else "Summary"
+
+        slide_images = collect_slide_images(resources)
+
+        # Maths comes out of the markdown *before* the HTML conversion: python-
+        # markdown would eat the underscores and backslashes otherwise. It goes
+        # back in after the citation passes, so those never have to step over a
+        # base64 data: URI. See mathrender.
+        body_md, math_exprs = mathrender.extract(body_md)
+
+        body_html = _markdown_to_html(body_md)
+
+        mode = frames_mode()
+        if mode == "inline":
+            prepared = _prepare_frames(frames, work_dir, crop_mode, max_width)
+            body_html = _inline_citations(body_html, prepared, slide_images)
+            frame_appendix = ""
+        else:
+            # Only the frames the document actually cites, and only if they carry
+            # a picture. Everything else in a three-hour manifest is unreferenced.
+            cited = set(_cited_frame_numbers(body_html))
+            prepared = ({} if mode == "none" or not cited else
+                        _prepare_frames(frames, work_dir, crop_mode,
+                                        _contact_max_width(), wanted=cited))
+            frame_appendix = _appendix_frames(prepared)
+
+        body_html = mathrender.restore(
+            body_html,
+            mathrender.render_all(math_exprs, size_pt=_font_size()))
+
+        source_line = ""
+        src = source or provenance.get("source")
+        if src:
+            source_line = (f'<p class="source"><b>Source:</b> '
+                           f'{html.escape(str(src))}</p>')
+
+        t_mode = transcript_mode()
+        document = (
+            f"<html><head><meta charset='utf-8'>"
+            f"<title>{html.escape(doc_title)}</title></head><body>"
+            f"{_meta_html(provenance, {'generated': date.today().isoformat()})}"
+            f"{source_line}"
+            f"{body_html}"
+            f"{frame_appendix}"
+            f"{_appendix_resources(resources, slide_images)}"
+            f"{_appendix_transcript(transcript) if t_mode == 'appendix' else ''}"
+            f"{_hidden_transcript(transcript) if t_mode == 'hidden' else ''}"
+            f"</body></html>"
+        )
+
+        try:
+            HTML(string=document, base_url=str(output_path.parent)).write_pdf(
+                str(output_path), stylesheets=[CSS(string=_css())])
+        finally:
+            # In a finally block so a failed render doesn't strand the directory
+            # either. Best-effort: a PDF that rendered must not be reported as
+            # failed because its scratch directory wouldn't delete.
+            if owned:
+                shutil.rmtree(work_dir, ignore_errors=True)
     finally:
-        # In a finally block so a failed render doesn't strand the directory
-        # either. Best-effort: a PDF that rendered must not be reported as
+        # Best-effort: a PDF that rendered must not be reported as
         # failed because its scratch directory wouldn't delete.
         if owned:
             shutil.rmtree(work_dir, ignore_errors=True)

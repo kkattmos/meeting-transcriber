@@ -220,6 +220,19 @@ explicitly, because operators following an older README will go looking for it.
 the generated files by hand — regenerate them (the command is in
 `requirements.in`'s header).
 
+**The compile command carries `--python-version 3.13 --python-platform
+x86_64-unknown-linux-gnu`.** Without them uv resolves for whatever interpreter
+is on the machine doing the compiling, which is not necessarily the box that
+installs the result — the pins in git are for the deployment target, not for
+someone's desktop.
+
+The heaviest entry is **matplotlib**, and it is there for exactly one thing:
+`mathtext`, the LaTeX typesetter behind `summarize/mathrender.py`. It brings
+numpy with it. If that ever needs justifying: WeasyPrint has no JS engine and
+no MathML, so without it the PDF prints the model's LaTeX as source. It is
+optional at runtime — a venv without it renders maths as text and still
+produces a PDF.
+
 Two files, not one, because `setup.sh --no-chrome` builds a box that never
 opens a browser and shouldn't carry playwright's bundled Node driver. The
 browser file is compiled with `-c requirements.txt` so shared transitive deps
@@ -355,7 +368,8 @@ Split across seven modules:
 - `chunking.py` — splitting long transcripts, assigning frames to chunks.
 - `mapreduce.py` — parallel chunk summarization + the merge call.
 - `document.py` — the course-note document wrapper and `--combine`.
-- `pdf.py` + `framecrop.py` — the PDF export and its frame cropping.
+- `pdf.py` + `framecrop.py` + `mathrender.py` — the PDF export, its frame
+  cropping and its LaTeX typesetting.
 
 Backends: `claude-cli` (default, aliases `claude`/`anthropic`/`cli`/`fcc`) and
 `gemini`. `SUMMARY_BACKEND=fallback` is the default mode and walks
@@ -524,19 +538,95 @@ WeasyPrint, markdown→HTML→PDF. Chosen over headless Chrome (which would coup
 stage 3 to the browser half) and over pandoc/LaTeX (a gigabyte of texlive, and
 Thai in LaTeX is genuinely painful).
 
-- **The first citation of each frame becomes the image; later ones stay text.**
-  The model cites frames as *(Frame 12 @ 410.0s)*; a lecture that refers back
-  to one diagram eight times should not print it eight times.
+Reworked 2026-09-08 after the operator read a real 39-page output. Four
+decisions came out of it, and each is load-bearing:
+
+- **Keyframes are an appendix, not illustrations.** `PDF_FRAMES=contact` (the
+  default) leaves every citation as the model wrote it and puts the frames it
+  names into a thumbnail contact sheet in Appendix A. Inline figures were the
+  export's worst feature: a keyframe is a screenshot of a video call, so most
+  of them are a face, a half-drawn slide, or solid black — and the
+  scene-change pass is *drawn to* the black ones, because black-to-content is
+  the largest scene change in the video. `inline` restores the old behaviour,
+  `none` drops frames entirely.
+- **Only cited frames are cropped, and blank ones are dropped.**
+  `_cited_frame_numbers` scans the rendered HTML with a looser regex than
+  `FRAME_CITE_RE` so the second and third number of a compound citation
+  ("Frame 33 @ ..., Frame 15 @ ...") count too, and `_prepare_frames` takes a
+  `wanted` set. A three-hour manifest is hundreds of frames and cropping is
+  the expensive part of this file; this made a real render 34s instead of
+  minutes. `framecrop.is_blank` is the black-frame filter.
+- **The transcript is an invisible layer, not an appendix.** White, 1pt,
+  between `BEGIN_TRANSCRIPT` and `END_TRANSCRIPT` markers, in normal flow —
+  *not* `display: none`, which would put nothing in the PDF at all. The reader
+  never sees it; `pdftotext` always finds it.
+  **It is cut into 40,000-character pieces on purpose.** Poppler silently
+  stops returning text after roughly 50,000 characters on a single page:
+  measured here, one 85k-character block came back 60% complete from
+  `pdftotext` while pypdf read all of it off the same page. Since this repo's
+  own `resources.py` shells out to `pdftotext`, a silent 40% loss was not an
+  option. The cost is a couple of blank-looking pages at the back.
+  `PDF_TRANSCRIPT=appendix` prints it as Appendix C; `none` omits it.
+- **Body text is Adwaita Sans at 8pt, and every other size is an `em`.**
+  `PDF_FONT_SIZE` therefore rescales headings, tables, captions and code
+  together instead of leaving them stranded at their old point sizes. Arial
+  and Liberation Sans sit behind Adwaita in the stack (Arial for a box that
+  has it; Liberation is what "Arial" resolves to on Debian), and **Noto Sans
+  Thai must stay in any custom stack** — Adwaita has no Thai glyphs, and a
+  Thai lecture then renders as tofu.
+
+The older decisions still hold:
+
+- **In `inline` mode, the first citation of each frame becomes the image** and
+  later ones stay text — a lecture that refers back to one diagram eight times
+  should not print it eight times.
 - **Figures are hoisted out of the block they were cited in** (`_end_of_block`)
   so a `<figure>` never lands inside a `<p>`, `<td>` or `<li>`, which produces
   invalid nesting and wrecks table layout.
-- **The transcript moves to Appendix A.** A PDF has no collapsed `<details>`,
-  and 80KB of ASR output at the top buries the summary.
 - **A PDF failure is a warning, not a failed stage.** The markdown is already
   written by then and is what everything downstream depends on. Turning off
   *both* outputs is an error rather than a run that writes nothing.
 - `run_one.sh` records whichever of the two files actually exists as the
   stage's artifacts — see the `--no-pdf` / `--no-markdown` paths.
+- **`render()` owns the crop scratch directory unless the caller names one**,
+  and everything after the `mkdir` runs inside the `try` whose `finally`
+  deletes it. `summarize.py` must *not* pass `work_dir`: it used to, which
+  made every run leave a `.frames` tree of cropped intermediates beside the
+  deliverable — re-uploaded on every run of a synced `PDF_DIR`, and read by
+  nothing, because WeasyPrint copies the image bytes into the PDF itself.
+  `test_media_e2e.sh` asserts both halves of this.
+
+### LaTeX in the PDF (`summarize/mathrender.py`)
+
+The model writes maths; markdown renderers show it and WeasyPrint printed the
+backslashes, because it has no JavaScript engine (so no KaTeX/MathJax) and no
+MathML support. matplotlib's `mathtext` closes that gap: a self-contained
+LaTeX-subset typesetter that ships **Computer Modern** (`fontset = "cm"`),
+needs no TeX installation, and renders to SVG which WeasyPrint embeds happily.
+That is the whole reason matplotlib is in `requirements.in`.
+
+Non-obvious parts, all of them regression-tested:
+
+- **Extraction runs on the markdown, before the HTML conversion.** Convert
+  first and python-markdown has already eaten `_{trans}` into emphasis and
+  dropped the backslashes. The maths comes out into opaque alphanumeric tokens
+  (`MTHX3Z`) that markdown has no reason to touch, and goes back in *after*
+  the citation passes so those never step over a base64 data: URI.
+- **Baseline alignment is computed, not guessed.** `MathTextParser` reports
+  width, height and depth; depth becomes a negative `vertical-align` in
+  points, so inline maths sits on the text baseline instead of floating.
+- **`\begin{aligned}` is split here.** mathtext has no environments at all —
+  `\begin` is an unknown symbol to it — so multi-row display maths is broken
+  on `\\` and rendered a row at a time, stacked.
+- **Digits are wrapped in `\mathrm{}` outside `\text{}` groups.** With
+  `mathtext.default = "it"` matplotlib italicises digits, which LaTeX does
+  not, so `2 \times 10^8` came out visibly wrong. The rewrite is cosmetic, so
+  a failed parse retries with the author's own spelling before falling back.
+- **Nothing here may fail the render.** matplotlib is optional and its parser
+  rejects real LaTeX (`\begin{cases}`, `\substack`); every failure degrades
+  to cleaned-up text in a serif face. Same rule as the rest of the export.
+- Identical expressions render once — a lecture writing `$L$` forty times pays
+  for one SVG.
 
 ### Frame cropping (`summarize/framecrop.py`)
 
@@ -554,9 +644,16 @@ a 2-pixel "crop" on every frame and re-encodes the lot for nothing. **A
 confidently wrong crop is worse than an uncropped frame** — that is the whole
 design rule here.
 
+`is_blank()` lives here too, and is the same idea one step blunter: a frame
+whose downscaled grayscale copy is within a few levels of one shade carries no
+picture, so it never reaches the PDF. Recordings are full of solid-black
+frames — a screen share stopping, a slide mid-fade — and the scene-change pass
+collects them preferentially, since black-to-content is the biggest scene
+change in the video.
+
 Analysis runs on a 200px-wide grayscale copy, so cost is a few milliseconds per
 frame regardless of source resolution. Pillow is optional: without it frames
-are copied through uncropped with one warning.
+are copied through uncropped with one warning, and nothing is blank.
 
 ## Cross-session queueing (`lib/slotqueue.py`)
 
@@ -713,6 +810,19 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **The document wrapper is built in code, not requested in the prompt.** See
   the output-format section above.
 - **A failed PDF render must not fail the run.** The markdown is the artifact.
+- **Unparseable LaTeX degrades to text; it never fails the render.** matplotlib
+  is optional and its parser rejects plenty of real LaTeX.
+- **Maths is extracted before the markdown→HTML conversion, not after.**
+  Convert first and there is no LaTeX left to typeset.
+- **The hidden transcript is chunked under poppler's per-page extraction
+  limit**, and is white text in normal flow rather than `display: none`.
+  Either mistake — one big block, or a display rule that emits nothing —
+  turns "the transcript travels with the PDF" into a silent half-truth.
+- **Keep a Thai face in `PDF_FONT_FAMILY`.** Adwaita Sans, Arial and
+  Liberation Sans all lack Thai glyphs.
+- **`summarize.py` must not pass `work_dir` to `pdf.render()`.** Naming one
+  transfers ownership and leaves the cropped intermediates beside the
+  deliverable.
 - **Frame cropping declines rather than guesses.** See the framecrop section.
 - **Reference material is escaped before it enters the prompt template**, and
   framed as data rather than instructions — it is untrusted input exactly like
@@ -746,10 +856,10 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
 | `summarize/test_summarize_units.py` | retry classification/backoff, chunking, map-reduce, document, the claude-cli command line + envelope parsing | 64 |
-| `summarize/test_pdf_units.py` | crop geometry, citation rewriting, real PDF render | 23 |
+| `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, real PDF render | 53 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources` | 106 |
-| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, and the real llm_client against a stub `claude` binary | 60 |
+| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, and the real llm_client against a stub `claude` binary | 62 |
 | `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 
 `test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs
@@ -832,8 +942,9 @@ own flags, which is everything about stage 1 except the call itself.
     ├── chunking.py
     ├── mapreduce.py
     ├── document.py
-    ├── pdf.py                    <- markdown -> PDF, frames inlined
-    ├── framecrop.py              <- slide-region detection
+    ├── pdf.py                    <- markdown -> PDF
+    ├── framecrop.py              <- slide-region detection, blank frames
+    ├── mathrender.py             <- LaTeX -> Computer Modern SVG
     ├── test_summarize_units.py
     ├── test_pdf_units.py
     └── prompts/

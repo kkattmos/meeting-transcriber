@@ -9,9 +9,17 @@
 #
 # Regenerate after editing (needs uv — see README's Install section):
 #
-#     uv pip compile --generate-hashes requirements.in -o requirements.txt
-#     uv pip compile --generate-hashes -c requirements.txt \
+#     uv pip compile --generate-hashes --python-version 3.13 \
+#         --python-platform x86_64-unknown-linux-gnu \
+#         requirements.in -o requirements.txt
+#     uv pip compile --generate-hashes --python-version 3.13 \
+#         --python-platform x86_64-unknown-linux-gnu -c requirements.txt \
 #         requirements-browser.in -o requirements-browser.txt
+#
+# The target flags are not optional: without them uv resolves for whatever
+# interpreter happens to be on the machine doing the compiling, and a pin
+# chosen for CPython 3.14 on a desktop is not necessarily installable on the
+# 3.13 box this actually runs on.
 #
 # The `-c requirements.txt` on the second one keeps shared transitive deps at
 # the same versions in both files.
@@ -35,3 +43,11 @@ assemblyai
 weasyprint
 markdown
 pillow
+# LaTeX in the summaries, typeset for the PDF. matplotlib is here for its
+# `mathtext` engine only — a self-contained LaTeX-subset typesetter that ships
+# Computer Modern, needs no TeX installation and renders straight to SVG.
+# WeasyPrint has no JS engine and no MathML, so this is what stands between
+# the reader and a page of raw backslashes. It pulls in numpy; without it
+# summarize/mathrender.py degrades to cleaned-up text and the run still ends
+# with a PDF.
+matplotlib

@@ -94,6 +94,14 @@ apt-get install -y --no-install-recommends \
   libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b libffi-dev \
   fonts-thai-tlwg fonts-liberation fonts-noto-core
 
+# Adwaita Sans is the PDF's body face (see summarize/pdf.py). It is a separate
+# package from the base set and not present on every Debian point release, so
+# a missing one must not abort a setup whose only consequence is that the PDF
+# falls back to Liberation Sans — which is already installed above.
+echo "==> Installing the PDF body font (optional)"
+apt-get install -y --no-install-recommends fonts-adwaita-sans || \
+  echo "    note: fonts-adwaita-sans unavailable — PDFs will use Liberation Sans"
+
 # Thai locale: Chrome is driven with locale th-TH so Thai participant names
 # render instead of boxes. See CLAUDE.md — this is deliberate, not cosmetic.
 echo "==> Generating locales (en_US.UTF-8, th_TH.UTF-8)"

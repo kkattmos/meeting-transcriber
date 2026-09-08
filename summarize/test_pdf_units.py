@@ -20,6 +20,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(SCRIPT_DIR.parent / "lib"))
 
 import framecrop  # noqa: E402
+import mathrender  # noqa: E402
 import pdf as pdf_export  # noqa: E402
 from llm_client import FrameMeta  # noqa: E402
 
@@ -256,6 +257,68 @@ class RenderTest(unittest.TestCase):
                                 self.dir / "plain.pdf")
         self.assertTrue(Path(out).read_bytes().startswith(b"%PDF"))
 
+    def _captured_document(self, markdown_text, **kwargs):
+        """Render with WeasyPrint stubbed out, returning the HTML it was given.
+
+        The assembly decisions — which appendix, inline figure or not, hidden
+        layer present — are visible in that string and invisible in the PDF
+        without a reader dependency.
+        """
+        captured = {}
+
+        class FakeHTML:
+            def __init__(self, string=None, base_url=None):
+                captured["doc"] = string
+
+            def write_pdf(self, path, stylesheets=None):
+                Path(path).write_bytes(b"%PDF-1.7 stub")
+
+        import weasyprint
+        with mock.patch.object(weasyprint, "HTML", FakeHTML):
+            pdf_export.render(markdown_text, self.dir / "captured.pdf",
+                              **kwargs)
+        return captured["doc"]
+
+    def test_contact_mode_puts_the_frames_in_an_appendix_not_the_body(self):
+        frame_path = make_frame(self.dir / "scene_00001.jpg",
+                                slide=((80, 40, 880, 500), (250, 250, 245)))
+        frames = [FrameMeta(timestamp_s=2.0, kind="scene_change",
+                            path=str(frame_path))]
+        doc = self._captured_document("# T\n\nA point *(Frame 1 @ 2.0s)*.",
+                                      frames=frames)
+        self.assertIn("Appendix A \u2014 Keyframes", doc)
+        self.assertIn('figure class="thumb"', doc)
+        self.assertNotIn('figure class="frame"', doc)
+        # The citation itself survives, so the appendix has something to
+        # resolve against.
+        self.assertIn("Frame 1", doc)
+
+    def test_inline_mode_still_puts_the_figure_in_the_body(self):
+        import os
+        frame_path = make_frame(self.dir / "scene_00001.jpg",
+                                slide=((80, 40, 880, 500), (250, 250, 245)))
+        frames = [FrameMeta(timestamp_s=2.0, kind="scene_change",
+                            path=str(frame_path))]
+        os.environ["PDF_FRAMES"] = "inline"
+        try:
+            doc = self._captured_document(
+                "# T\n\nA point *(Frame 1 @ 2.0s)*.", frames=frames)
+        finally:
+            os.environ.pop("PDF_FRAMES", None)
+        self.assertIn('figure class="frame"', doc)
+        self.assertNotIn("Appendix A", doc)
+
+    def test_the_transcript_goes_in_hidden_by_default(self):
+        doc = self._captured_document(DocumentSplitTest.DOC)
+        self.assertIn("hidden-transcript", doc)
+        self.assertIn("BEGIN_TRANSCRIPT", doc)
+        self.assertNotIn("Appendix C", doc)
+
+    def test_maths_reaches_the_page_as_an_image(self):
+        doc = self._captured_document("# T\n\nRate $R$ bits per second.")
+        self.assertIn("data:image/svg+xml;base64,", doc)
+        self.assertNotIn("$R$", doc)
+
     def test_a_missing_frame_file_is_skipped_not_fatal(self):
         frames = [FrameMeta(timestamp_s=1.0, kind="periodic",
                             path=str(self.dir / "gone.jpg"))]
@@ -286,23 +349,194 @@ class CropWorkDirLifetimeTest(unittest.TestCase):
         self.md = "# Title\n\nA point *(Frame 1 @ 2.0s)*.\n"
 
     def test_invented_work_dir_is_removed(self):
-        pdf.render(self.md, self.out, frames=[])
+        pdf_export.render(self.md, self.out, frames=[])
         self.assertTrue(self.out.exists())
         self.assertFalse((self.out.parent / ".pdf-frames").exists())
 
     def test_explicit_work_dir_is_kept(self):
         # The caller named it, so the caller owns it.
         work = Path(self.tmp.name) / "mycrops"
-        pdf.render(self.md, self.out, frames=[], work_dir=work)
+        pdf_export.render(self.md, self.out, frames=[], work_dir=work)
         self.assertTrue(work.is_dir())
 
     def test_work_dir_is_removed_even_when_rendering_fails(self):
         # `finally`, not a trailing statement — a crash must not strand it.
-        with mock.patch.object(pdf, "_split_document",
+        with mock.patch.object(pdf_export, "_split_document",
                                side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
-                pdf.render(self.md, self.out, frames=[])
+                pdf_export.render(self.md, self.out, frames=[])
         self.assertFalse((self.out.parent / ".pdf-frames").exists())
+
+
+class MathExtractionTest(unittest.TestCase):
+    """Lifting LaTeX out of the markdown before python-markdown eats it."""
+
+    def test_inline_and_display_are_both_taken(self):
+        text, exprs = mathrender.extract(
+            "Rate $R$ bits.\n\n$$d = \\frac{L}{R}$$\n")
+        self.assertEqual(len(exprs), 2)
+        self.assertTrue(any(e["display"] for e in exprs))
+        self.assertTrue(any(not e["display"] for e in exprs))
+        self.assertNotIn("$", text)
+
+    def test_maths_in_a_code_fence_is_left_alone(self):
+        src = "```\ncost=$5 per $GB\n```\n"
+        text, exprs = mathrender.extract(src)
+        self.assertEqual(exprs, [])
+        self.assertEqual(text, src)
+
+    def test_currency_is_not_mistaken_for_maths(self):
+        _, exprs = mathrender.extract("It costs $5 and change $ then.")
+        self.assertEqual(exprs, [])
+
+    def test_restore_puts_snippets_back_in_order(self):
+        text, exprs = mathrender.extract("a $x$ b $y$")
+        out = mathrender.restore(text, ["<X/>", "<Y/>"])
+        self.assertEqual(out, "a <X/> b <Y/>")
+
+    def test_a_display_token_alone_in_a_paragraph_replaces_it(self):
+        text, _ = mathrender.extract("$$x$$")
+        html_body = f"<p>{text.strip()}</p>"
+        out = mathrender.restore(html_body, ['<span class="math-block"></span>'])
+        self.assertNotIn("<p>", out)
+
+    def test_aligned_environment_becomes_rows(self):
+        rows = mathrender._rows(
+            r"\begin{aligned} a &= b \\[6pt] c &= d \end{aligned}")
+        self.assertEqual(len(rows), 2)
+        self.assertNotIn("&", rows[0])
+        self.assertNotIn("aligned", rows[0])
+
+    def test_digits_go_upright_outside_text_groups(self):
+        out = mathrender._upright_digits(r"2 \times 10^8 \text{ 1 Gbps}")
+        self.assertIn(r"\mathrm{2}", out)
+        self.assertIn(r"\mathrm{10}", out)
+        # Inside \text{} they were already upright; don't touch them.
+        self.assertIn(r"\text{ 1 Gbps}", out)
+
+    def test_unparseable_maths_degrades_to_text_not_an_exception(self):
+        html_out = mathrender._one(r"\begin{cases} a \\ b \end{cases}",
+                                   True, None, 8.0, "#000")
+        self.assertIn("math-fallback", html_out)
+        self.assertNotIn("<img", html_out)
+
+    def test_fallback_keeps_the_symbols_readable(self):
+        out = mathrender._fallback_html(r"L_{max} \times 10^6 \approx R")
+        self.assertIn("<sub>max</sub>", out)
+        self.assertIn("\u00d7", out)
+        self.assertNotIn("\\times", out)
+
+    def test_rendering_is_deduplicated(self):
+        calls = []
+
+        def engine(tex, size, color):
+            calls.append(tex)
+            return b"<svg/>", 10.0, 8.0, 2.0
+
+        exprs = [{"tex": "L", "display": False}] * 3
+        with mock.patch.object(mathrender, "_engine", return_value=engine):
+            out = mathrender.render_all(exprs, size_pt=8.0)
+        self.assertEqual(len(out), 3)
+        self.assertEqual(len(calls), 1)
+
+    def test_the_image_carries_its_own_baseline(self):
+        def engine(tex, size, color):
+            return b"<svg/>", 12.0, 9.0, 2.5
+
+        with mock.patch.object(mathrender, "_engine", return_value=engine):
+            out = mathrender.render_all([{"tex": "L", "display": False}])
+        self.assertIn("vertical-align:-2.50pt", out[0])
+        self.assertIn("data:image/svg+xml;base64,", out[0])
+
+
+class FrameSelectionTest(unittest.TestCase):
+    def test_compound_citations_yield_every_frame(self):
+        numbers = pdf_export._cited_frame_numbers(
+            "<p>(Frame 33 @ 0:34:40, Frame 15 @ 01:43:30)</p>")
+        self.assertEqual(numbers, [33, 15])
+
+    def test_each_frame_is_listed_once(self):
+        numbers = pdf_export._cited_frame_numbers("(Frame 2) x (Frame 2)")
+        self.assertEqual(numbers, [2])
+
+    def test_modes_fall_back_to_the_default_when_misspelt(self):
+        import os
+        os.environ["PDF_FRAMES"] = "sideways"
+        try:
+            self.assertEqual(pdf_export.frames_mode(), "contact")
+        finally:
+            os.environ.pop("PDF_FRAMES", None)
+
+    def test_font_size_rejects_nonsense(self):
+        import os
+        for value, expected in (("", 8.0), ("9.5", 9.5), ("abc", 8.0),
+                                ("400", 8.0)):
+            os.environ["PDF_FONT_SIZE"] = value
+            try:
+                self.assertEqual(pdf_export._font_size(), expected)
+            finally:
+                os.environ.pop("PDF_FONT_SIZE", None)
+
+
+class HiddenTranscriptTest(unittest.TestCase):
+    def test_markers_delimit_the_layer(self):
+        out = pdf_export._hidden_transcript("hello there")
+        self.assertIn("BEGIN_TRANSCRIPT", out)
+        self.assertIn("END_TRANSCRIPT", out)
+        self.assertIn("hello there", out)
+
+    def test_it_is_chunked_under_popplers_per_page_limit(self):
+        # One block of 85k characters is complete in the PDF but comes back
+        # truncated from pdftotext, which stops at ~50k per page.
+        out = pdf_export._hidden_transcript("x" * 100000)
+        self.assertEqual(out.count("hidden-next"), 2)
+        self.assertEqual(out.count("BEGIN_TRANSCRIPT"), 1)
+        self.assertEqual(out.count("END_TRANSCRIPT"), 1)
+
+    def test_an_empty_transcript_adds_nothing(self):
+        self.assertEqual(pdf_export._hidden_transcript("   "), "")
+
+    def test_html_in_the_transcript_cannot_break_out(self):
+        out = pdf_export._hidden_transcript("</div><script>x</script>")
+        self.assertNotIn("<script>", out)
+
+
+@unittest.skipIf(Image is None, "Pillow is not installed")
+class BlankFrameTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def test_a_solid_black_frame_is_blank(self):
+        path = make_frame(self.dir / "black.jpg", bg=(0, 0, 0))
+        self.assertTrue(framecrop.is_blank(path))
+
+    def test_a_frame_with_a_slide_on_it_is_not(self):
+        path = make_frame(self.dir / "slide.jpg",
+                          slide=((100, 60, 800, 460), (245, 245, 240)))
+        self.assertFalse(framecrop.is_blank(path))
+
+    def test_blank_frames_are_dropped_from_the_selection(self):
+        black = make_frame(self.dir / "b.jpg", bg=(0, 0, 0))
+        good = make_frame(self.dir / "g.jpg",
+                          slide=((100, 60, 800, 460), (245, 245, 240)))
+        frames = [FrameMeta(timestamp_s=1.0, kind="scene_change",
+                            path=str(black)),
+                  FrameMeta(timestamp_s=2.0, kind="periodic", path=str(good))]
+        prepared = pdf_export._prepare_frames(frames, self.dir / "work")
+        self.assertNotIn(1, prepared)
+        self.assertIn(2, prepared)
+
+    def test_only_the_wanted_frames_are_cropped(self):
+        paths = [make_frame(self.dir / f"f{i}.jpg",
+                            slide=((100, 60, 800, 460), (245, 245, 240)))
+                 for i in range(3)]
+        frames = [FrameMeta(timestamp_s=float(i), kind="periodic",
+                            path=str(p)) for i, p in enumerate(paths)]
+        prepared = pdf_export._prepare_frames(frames, self.dir / "work",
+                                              wanted={2})
+        self.assertEqual(list(prepared), [2])
 
 
 if __name__ == "__main__":

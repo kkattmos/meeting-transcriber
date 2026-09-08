@@ -52,13 +52,22 @@ Configuration (env vars):
   SUMMARY_PROMPT         name of file in prompts/ to use (no .md needed);
                          overridden by --prompt; default: summarize.md
 
-  PDF export — summarize/pdf.py and summarize/framecrop.py:
+  PDF export — summarize/pdf.py, framecrop.py and mathrender.py:
   SUMMARY_WRITE_PDF      default 1
   SUMMARY_WRITE_MARKDOWN default 1
+  PDF_FRAMES             contact (default) | inline | none
   PDF_FRAME_CROP         slide (default) | border | none
-  PDF_FRAME_MAX_WIDTH    default 1280
+  PDF_FRAME_MAX_WIDTH    default 1280 (inline figures)
+  PDF_CONTACT_MAX_WIDTH  default 640 (contact-sheet thumbnails)
+  PDF_TRANSCRIPT         hidden (default) | appendix | none
+  PDF_HIDDEN_CHUNK_CHARS default 40000
   PDF_PAGE_SIZE          default A4
-  PDF_FONT_FAMILY        default "Noto Sans Thai, Noto Sans, DejaVu Sans"
+  PDF_FONT_FAMILY        default "Adwaita Sans, Arial, Liberation Sans,
+                         Noto Sans Thai, Noto Sans, DejaVu Sans"
+  PDF_FONT_SIZE          default 8 (points)
+  PDF_MATH               1 (default) typesets LaTeX; 0 leaves it as text
+  PDF_MATH_SCALE         default 1.15 (maths size relative to the body)
+  PDF_MATH_FONTSET       default cm (Computer Modern)
 
   Reference material — lib/resources.py:
   RESOURCES              default --resources specs (comma/newline separated)
@@ -513,10 +522,14 @@ def write_outputs(summary, output_path, *, write_markdown, write_pdf,
 
     if write_pdf:
         try:
+            # No work_dir: naming one makes render() treat it as the
+            # caller's and leave it behind, which put a .frames tree of
+            # cropped intermediates next to the deliverable — re-uploaded on
+            # every run of a synced PDF_DIR, and read by nothing, since
+            # WeasyPrint copies the image bytes into the PDF itself.
             out = pdf_export.render(
                 summary, pdf_path,
                 frames=frames,
-                work_dir=Path(pdf_path).parent / ".frames" / Path(pdf_path).stem,
                 resources=resources,
                 title=title,
                 source=source,

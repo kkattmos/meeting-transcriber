@@ -608,11 +608,26 @@ Available prompts: `ls summarize/prompts/`. Pick one with `--prompt <name>`
 
 The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint:
 
-- **Cited frames become pictures.** The model cites keyframes inline as
-  *(Frame 12 @ 410.0s)*; in the PDF the first citation of each frame is
-  replaced by the image itself, captioned with its timestamp. Later citations
-  of the same frame stay as text, so a lecture that keeps referring back to one
-  diagram doesn't print it eight times.
+- **LaTeX is typeset, in Computer Modern.** The model writes maths as `$L/R$`
+  and `$$...$$`; markdown readers render that, and a PDF renderer with no
+  JavaScript engine and no MathML would print the backslashes. So
+  `summarize/mathrender.py` lifts every expression out before the HTML
+  conversion and hands it to matplotlib's `mathtext` — a LaTeX-subset
+  typesetter that ships Computer Modern and needs no TeX installation —
+  inlining the result as SVG, baseline-aligned to the text around it.
+  `\begin{aligned}` blocks are split into rows first, since mathtext has no
+  environments. Anything it still can't parse degrades to cleaned-up text
+  rather than failing the render. `PDF_MATH=0` turns the whole pass off;
+  `PDF_MATH_SCALE` sizes the maths against the body text.
+- **Keyframes go to Appendix A, not into the argument.** A keyframe is a
+  screenshot of a video call: mostly a participant's face, a half-drawn slide,
+  or — the scene-change pass being drawn to exactly this — solid black.
+  Printed full width mid-paragraph they were noise, so the citations stay as
+  the model wrote them and the frames they name are collected into a thumbnail
+  contact sheet at the back: each frame once, blank ones dropped, and only the
+  cited ones cropped at all. `PDF_FRAMES=inline` restores the old behaviour of
+  replacing the first citation of each frame with the picture; `none` drops
+  frames from the PDF entirely.
 - **Frames are cropped to the slide.** A raw 1920×1080 Meet frame is mostly
   dark UI chrome and participant tiles. `summarize/framecrop.py` finds the
   largest bright rectangle — slides are overwhelmingly light on dark UI — and
@@ -621,11 +636,22 @@ The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint:
   to the untouched frame: a confidently wrong crop (half a slide, one
   participant's face) is worse than no crop. Tune with `PDF_FRAME_CROP`
   (`slide` | `border` | `none`).
-- **The transcript moves to Appendix A**, on its own page in a smaller face —
-  a PDF has no collapsed `<details>`, and 80KB of ASR output at the top would
-  bury the summary. Reference slides get Appendix B.
-- Thai renders correctly (`fonts-thai-tlwg` plus Noto, requested by
-  `PDF_FONT_FAMILY`).
+- **The transcript is present but invisible.** It goes in as white 1pt text
+  between `BEGIN_TRANSCRIPT` and `END_TRANSCRIPT` markers: nobody reading the
+  PDF sees it, and `pdftotext` — or any other extractor — hands an agent the
+  summary followed by the labelled transcript. It is written in ~40,000-
+  character pieces because poppler silently stops extracting text after about
+  50,000 characters on one page, so a single block would come back truncated
+  with no warning; the cost is a couple of blank-looking pages at the back of
+  a long lecture. `PDF_TRANSCRIPT=appendix` prints it as Appendix C instead,
+  `none` leaves it out. Reference slides get Appendix B either way.
+- **Body text is Adwaita Sans at 8pt** (`PDF_FONT_FAMILY`, `PDF_FONT_SIZE`),
+  with Arial and Liberation Sans behind it and Noto Sans Thai for the Thai —
+  every other size in the document is relative to `PDF_FONT_SIZE`, so changing
+  it rescales headings, tables and captions together. `setup.sh` installs
+  `fonts-adwaita-sans`; if it isn't available the stack falls through to
+  Liberation Sans. Keep a Thai face in any custom stack or a Thai lecture
+  renders as tofu boxes.
 
 A PDF that fails to render logs a warning and leaves the run successful — the
 Markdown is the artifact everything downstream depends on. Turn either output
@@ -758,10 +784,18 @@ way. Which backend answered is recorded in the document's provenance header
 |---|---|---|
 | `SUMMARY_WRITE_PDF` | 1 | `0` = markdown only (same as `--no-pdf`) |
 | `SUMMARY_WRITE_MARKDOWN` | 1 | `0` = PDF only (same as `--no-markdown`) |
+| `PDF_FRAMES` | `contact` | `contact` (thumbnail appendix), `inline` (figures in the body), or `none` |
 | `PDF_FRAME_CROP` | `slide` | `slide`, `border`, or `none` |
-| `PDF_FRAME_MAX_WIDTH` | 1280 | Frames are downscaled to this before embedding |
+| `PDF_FRAME_MAX_WIDTH` | 1280 | Inline figures are downscaled to this |
+| `PDF_CONTACT_MAX_WIDTH` | 640 | Contact-sheet thumbnails are downscaled to this |
+| `PDF_TRANSCRIPT` | `hidden` | `hidden` (white 1pt layer), `appendix`, or `none` |
+| `PDF_HIDDEN_CHUNK_CHARS` | 40000 | Characters of hidden transcript per page; above ~50k poppler stops extracting |
 | `PDF_PAGE_SIZE` | `A4` | Any WeasyPrint page size |
-| `PDF_FONT_FAMILY` | `Noto Sans Thai, Noto Sans, DejaVu Sans, sans-serif` | |
+| `PDF_FONT_FAMILY` | `Adwaita Sans, Arial, Liberation Sans, Noto Sans Thai, Noto Sans, DejaVu Sans, sans-serif` | Keep a Thai face in the stack |
+| `PDF_FONT_SIZE` | 8 | Body size in points; everything else scales with it |
+| `PDF_MATH` | 1 | 0 leaves LaTeX as text instead of typesetting it |
+| `PDF_MATH_SCALE` | 1.15 | Maths size relative to the body text |
+| `PDF_MATH_FONTSET` | `cm` | matplotlib mathtext font set (`cm` is Computer Modern) |
 
 ### Reference material
 
@@ -952,6 +986,14 @@ with `sudo apt-get install libpango-1.0-0 libpangoft2-1.0-0`, then re-run
 individual packages by hand with `/opt/meeting-bot-venv/bin/pip install
 weasyprint` works too, but leaves the venv out of step with
 `requirements.txt`.)
+
+**The PDF prints raw LaTeX instead of formulas**
+matplotlib isn't installed in the venv, so `summarize/mathrender.py` fell back
+to plain text. Re-run `sudo -H ./setup.sh` to restore the venv from the
+lockfile. If a *particular* expression is the only one showing as text, it is
+one mathtext can't parse (environments other than `aligned`-style ones,
+`\substack`, and similar) — the fallback is deliberate, and the formula is
+intact in the `.md`.
 
 **Frames in the PDF are uncropped**
 Pillow isn't installed, or the slide detector declined on every frame (a

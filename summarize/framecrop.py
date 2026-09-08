@@ -281,6 +281,44 @@ def crop_frame(src, dst, mode="slide", max_width=1280):
     return dst
 
 
+BLANK_STDDEV = 6.0
+
+
+def is_blank(path, threshold=None):
+    """True when a frame carries no picture worth printing.
+
+    Recordings routinely contain solid-black frames — the moment a screen
+    share stops, a slide transition caught mid-fade, the seconds before the
+    presenter's window paints. The scene-change pass is *especially* good at
+    catching them, because black-to-content is the biggest scene change there
+    is, so they arrive in the manifest looking like the most interesting
+    frames in the video and land in the PDF as full-width black rectangles.
+
+    The test is deliberately blunt: analyse the same downscaled grayscale copy
+    the crop uses, and call it blank if the whole thing is within a few levels
+    of one shade. A real slide, even a dark-themed one, has text on it and
+    fails that immediately. Without Pillow nothing is blank — the same
+    "degrade, don't guess" rule crop_frame() follows.
+    """
+    if Image is None:
+        return False
+    limit = BLANK_STDDEV if threshold is None else threshold
+    try:
+        with Image.open(path) as img:
+            gray = img.convert("L")
+            width = ANALYSIS_WIDTH
+            height = max(1, int(gray.height * (width / gray.width)))
+            gray = gray.resize((width, height))
+            values = list(gray.getdata())
+    except (OSError, ValueError):
+        return False
+    if not values:
+        return False
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    return variance ** 0.5 <= limit
+
+
 def crop_mode_from_env():
     """PDF_FRAME_CROP: slide (default), border, or none."""
     value = (os.environ.get("PDF_FRAME_CROP") or "slide").strip().lower()
