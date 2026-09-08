@@ -253,11 +253,42 @@ echo "$ARGV" | grep -q "\"--add-dir\", \"$FRAME_OUT\"" \
   && ok "--add-dir scopes file access to this run's frame directory" \
   || bad "--add-dir does not name $FRAME_OUT"
 # extract_frames.py names them scene_NNNNN.jpg / periodic_NNNNN.jpg; -F keeps
-# a test root containing a space (and any regex metacharacter) literal.
+# a test root containing a space (and any regex metacharacter) literal. The
+# copies the model is pointed at keep those names inside an llm-<px>/
+# subdirectory (FRAME_MAX_DIMENSION), so the segment is optional here.
 echo "$PROMPT" | grep -qF "$FRAME_OUT/" \
   && ok "absolute frame paths are in the prompt" || bad "no frame paths sent"
-echo "$PROMPT" | grep -qE "$(basename "$FRAME_OUT")/(scene|periodic)_[0-9]+\.jpg" \
+echo "$PROMPT" | grep -qE "(llm-[0-9]+/)?(scene|periodic)_[0-9]+\.jpg" \
   && ok "the paths name real extracted frames" || bad "frame filenames look wrong"
+
+echo "--- frames are downscaled for the model, not on disk"
+# A 1920x1080 keyframe costs ~1,844 tokens every time the model opens it.
+# FRAME_MAX_DIMENSION caps the copy; the saved frame pdf.py crops must not move.
+echo "$PROMPT" | grep -qE "llm-1024/(scene|periodic)_[0-9]+\.jpg" \
+  && ok "the model is pointed at the downscaled copies" \
+  || bad "no downscaled frame copies in the prompt"
+"$PY" - "$FRAME_OUT" <<'PYEOF'
+import sys
+from pathlib import Path
+out = Path(sys.argv[1])
+try:
+    from PIL import Image
+except ImportError:
+    sys.exit(0)          # Pillow is optional; the fallback is the original.
+copies = sorted((out / "llm-1024").glob("*.jpg"))
+if not copies:
+    sys.exit(1)
+for c in copies:
+    with Image.open(c) as img:
+        if max(img.size) > 1024:
+            sys.exit(1)
+    with Image.open(out / c.name) as img:   # the original, still full size
+        if max(img.size) <= 1024:
+            sys.exit(1)
+sys.exit(0)
+PYEOF
+[ $? -eq 0 ] && ok "copies are <=1024px and the originals are untouched" \
+  || bad "downscaled copies wrong, or the originals were modified"
 echo "$PROMPT" | grep -q "Dijkstra" \
   && ok "transcript text included in the prompt" || bad "transcript not sent"
 
@@ -284,6 +315,64 @@ grep -qi "not logged in" "$TESTROOT/noauth.log" \
 grep -qi "unavailable" "$TESTROOT/noauth.log" \
   && ok "classified as BackendUnavailable, so the chain advances" \
   || bad "not classified as unavailable — the chain would retry pointlessly"
+
+echo "--- the unchanging instructions go in as a cacheable system prompt"
+# Claude caches an exact prefix. summarize-v2.md fences the half that never
+# varies; llm_client passes it as --append-system-prompt-file so the prefix is
+# byte-identical across runs and across the chunks of one run. Anything that
+# varies leaking into that file makes the cache silently never hit.
+V2_MD="$SUMMARIES_DIR/v2.md"
+V2_RECORD="$TESTROOT/claude_cli_v2.jsonl"
+FAKE_CLAUDE_RECORD="$V2_RECORD" \
+  "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$V2_MD" \
+    --frames-manifest "$FRAME_OUT/manifest.json" --no-pdf \
+    --prompt summarize-v2 --run-id v2_test > "$TESTROOT/v2.log" 2>&1
+check "summarize.py --prompt summarize-v2 exits 0" "$?" "0"
+
+V2_ARGV=$("$PY" - "$V2_RECORD" <<'PYEOF'
+import json, sys
+print(json.dumps(json.loads(open(sys.argv[1]).readline())["argv"]))
+PYEOF
+)
+V2_PROMPT=$("$PY" - "$V2_RECORD" <<'PYEOF'
+import json, sys
+sys.stdout.write(json.loads(open(sys.argv[1]).readline())["prompt"])
+PYEOF
+)
+echo "$V2_ARGV" | grep -q '"--append-system-prompt-file"' \
+  && ok "the static half is passed as a system prompt file" \
+  || bad "--append-system-prompt-file not passed"
+echo "$V2_ARGV" | grep -q '"--exclude-dynamic-system-prompt-sections"' \
+  && ok "the CLI's own per-machine sections move out of the system prompt" \
+  || bad "--exclude-dynamic-system-prompt-sections not passed"
+
+SYSFILE=$("$PY" - "$V2_RECORD" <<'PYEOF'
+import json, sys
+argv = json.loads(open(sys.argv[1]).readline())["argv"]
+print(argv[argv.index("--append-system-prompt-file") + 1]
+      if "--append-system-prompt-file" in argv else "")
+PYEOF
+)
+[ -s "$SYSFILE" ] && ok "the system prompt file exists on disk" \
+  || bad "system prompt file missing: $SYSFILE"
+grep -q "output_format" "$SYSFILE" \
+  && ok "it carries the output format" || bad "no output format in it"
+grep -q "Dijkstra" "$SYSFILE" \
+  && bad "the transcript leaked into the cacheable prefix" \
+  || ok "no transcript in the cacheable prefix"
+grep -qF "$FRAME_OUT" "$SYSFILE" \
+  && bad "per-run frame paths leaked into the cacheable prefix" \
+  || ok "no per-run paths in the cacheable prefix"
+grep -q "static-prompt:" "$SYSFILE" \
+  && bad "the delimiter markers reached the model" \
+  || ok "the delimiter markers are stripped"
+echo "$V2_PROMPT" | grep -q "Dijkstra" \
+  && ok "the transcript is in the piped user turn, where it belongs" \
+  || bad "transcript missing from the user turn"
+echo "$V2_PROMPT" | grep -q "output_format>" \
+  && echo "$V2_PROMPT" | grep -q "Bullet list of concrete decisions" \
+  && bad "the instructions were sent twice" \
+  || ok "the instructions are not duplicated in the user turn"
 
 echo "--- the document wrapper"
 grep -q "meeting-transcriber" "$SUMMARY_MD" && ok "provenance comment present" \

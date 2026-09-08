@@ -42,6 +42,20 @@ the images itself. Set CLAUDE_CLI_FRAME_VISION=0 to send the manifest as text
 only - faster and cheaper against a subscription's rate limit, but then the
 model cites frames it has never seen.
 
+A CACHE-STABLE PREFIX. A prompt template may fence the half that never varies
+between runs (role, instructions, output format, worked example) with
+`<!-- static-prompt: begin -->` / `<!-- static-prompt: end -->`. This backend
+lifts that half out and passes it to the CLI as
+`--append-system-prompt-file <content-addressed path>`, adding
+`--exclude-dynamic-system-prompt-sections` so the CLI's own per-machine
+sections (cwd, date, git status) move out of the system prompt too. Everything
+that varies - the chunk label mapreduce prepends, the reference material, the
+transcript, the frame paths - stays in the piped user turn. The result is a
+byte-identical prefix across runs and across the chunks of one run, which is
+what Claude's automatic prompt caching needs. There is no manual cache_control
+flag on the CLI; caching is automatic, and this is the only lever we have.
+A template without the markers is sent exactly as it always was.
+
 EFFORT, NOT A TOKEN BUDGET. SUMMARY_EFFORT maps onto the CLI's `--effort`
 (low | medium | high | xhigh | max), the same scale the Messages API exposes as
 `output_config.effort`. Thinking is adaptive: the model decides when to use it.
@@ -68,19 +82,24 @@ Env vars:
   CLAUDE_CLI_MODEL      default "opus" (ANTHROPIC_MODEL also accepted)
   CLAUDE_CLI_TIMEOUT_SECONDS  default 1800
   CLAUDE_CLI_FRAME_VISION  1 (default) lets the model Read the frame images
+  CLAUDE_CLI_STATIC_PROMPT 1 (default) hands the unchanging instructions to
+                        the CLI as a system prompt file; 0 sends them inline
+  FRAME_MAX_DIMENSION   long edge, px, of the frame copies sent to the CLI
+                        (default 1024; 0 sends the originals)
   SUMMARY_EFFORT        low | medium | high (default) | xhigh | max
   GEMINI_API_KEY_1..3   required for gemini (GOOGLE_API_KEY also accepted)
   GEMINI_MODEL          default gemini-3.6-flash
   SUMMARY_MAX_TOKENS    default 16000 (gemini only; the CLI has no such flag)
 """
 import base64
+import hashlib
 import json
 import mimetypes
 import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List
 
@@ -121,8 +140,28 @@ _NOT_LOGGED_IN_MARKERS = (
     "invalid api key",
     "authentication_error",
     "oauth token has expired",
+    "oauth session expired",
+    "failed to authenticate",
     "credit balance is too low",
 )
+
+# Delimiters a prompt template may use to mark the block that never varies
+# between runs (role, instructions, output format, worked example). The
+# claude-cli backend lifts that block out of the piped prompt and passes it as
+# a system prompt instead, so the reusable prefix stays byte-identical across
+# runs and chunks and Claude's automatic prompt caching can hit it. A template
+# without the markers is sent exactly as it always was.
+STATIC_PROMPT_BEGIN = "<!-- static-prompt: begin -->"
+STATIC_PROMPT_END = "<!-- static-prompt: end -->"
+
+# Long edge, in pixels, of the frame copies handed to the CLI. A 1920x1080
+# keyframe costs roughly 1,844 tokens once the model rescales it; 1024px is
+# about 790, and a slide is still legible. 0 disables the downscale.
+DEFAULT_FRAME_MAX_DIMENSION = 1024
+# Where the downscaled copies go, relative to the directory the originals are
+# in. Inside FRAMES_DIR on purpose: those are the disposable artifacts, and
+# keeping the copies under the same parent means --add-dir already covers them.
+LLM_FRAME_SUBDIR = "llm-{max_dim}"
 
 # Which backend and model actually produced the last successful summary. The
 # document header records this, and on a fallback chain it's the only way to
@@ -252,7 +291,46 @@ def _render(frames, transcript, prompt_template, with_paths=False):
     manifest = "\n".join(lines)
     user_text = prompt_template.format(transcript=transcript,
                                        frame_manifest=manifest)
-    return sorted_frames, user_text
+    return sorted_frames, strip_static_markers(user_text)
+
+
+def strip_static_markers(text):
+    """Drop the static-prompt delimiter lines from a rendered prompt.
+
+    They are structure for us, noise for the model. The claude-cli backend has
+    already split on them by the time it renders; every other backend renders
+    the template whole and simply shouldn't see them.
+    """
+    if STATIC_PROMPT_BEGIN not in text and STATIC_PROMPT_END not in text:
+        return text
+    kept = [line for line in text.splitlines()
+            if line.strip() not in (STATIC_PROMPT_BEGIN, STATIC_PROMPT_END)]
+    return "\n".join(kept)
+
+
+def split_static_prompt(prompt_template):
+    """Split a template into (static_instructions, dynamic_rest).
+
+    A template that marks its unchanging half with STATIC_PROMPT_BEGIN /
+    STATIC_PROMPT_END gets that half lifted out; everything else — the chunk
+    preamble mapreduce prepends, the reference material summarize.py appends,
+    the transcript and the frame manifest — stays in `dynamic_rest` and so
+    stays in the piped user turn.
+
+    Returns (None, prompt_template) when the markers are absent or malformed,
+    which is what every prompt file older than summarize-v2.md gets: the
+    template is then sent exactly as it always was.
+    """
+    start = prompt_template.find(STATIC_PROMPT_BEGIN)
+    end = prompt_template.find(STATIC_PROMPT_END)
+    if start < 0 or end < start:
+        return None, prompt_template
+    static = prompt_template[start + len(STATIC_PROMPT_BEGIN):end].strip()
+    if not static:
+        return None, prompt_template
+    dynamic = (prompt_template[:start]
+               + prompt_template[end + len(STATIC_PROMPT_END):])
+    return static, dynamic.strip() + "\n\n" 
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +397,122 @@ def _cli_timeout():
 def _frame_vision_enabled():
     return (os.environ.get("CLAUDE_CLI_FRAME_VISION", "1").strip().lower()
             not in ("0", "false", "no", "off"))
+
+
+def _static_prompt_enabled():
+    """Whether to hand the unchanging instructions over as a system prompt.
+
+    On by default. Turn it off (CLAUDE_CLI_STATIC_PROMPT=0) for a CLI too old
+    to know --append-system-prompt-file or
+    --exclude-dynamic-system-prompt-sections; the instructions then travel
+    inline in the piped prompt exactly as they used to, and the only thing lost
+    is prompt-cache reuse.
+    """
+    return (os.environ.get("CLAUDE_CLI_STATIC_PROMPT", "1").strip().lower()
+            not in ("0", "false", "no", "off"))
+
+
+def _static_prompt_file(text):
+    """Write `text` to a stable, content-addressed file and return its path.
+
+    Content-addressed so the file is byte-identical for byte-identical
+    instructions: the same template always lands on the same path with the same
+    bytes, and an edited template gets a new one rather than a rewritten one.
+    Returns None if it can't be written, in which case the caller falls back to
+    sending the instructions inline.
+    """
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    root = Path(os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot"))
+    path = root / "tmp" / "claude-cli-prompts" / f"{digest}.md"
+    try:
+        if path.is_file() and path.read_text() == text:
+            return path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Write-then-rename: several chunks summarize in parallel and would
+        # otherwise race on a half-written file.
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(text)
+        os.replace(tmp, path)
+        return path
+    except OSError as exc:
+        print(f"  warning: could not cache the static prompt ({exc}) — "
+              f"sending it inline", file=sys.stderr)
+        return None
+
+
+def _frame_max_dimension():
+    """Long edge, in pixels, for the frame copies the CLI is pointed at."""
+    raw = os.environ.get("FRAME_MAX_DIMENSION", DEFAULT_FRAME_MAX_DIMENSION)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        print(f"  warning: FRAME_MAX_DIMENSION={raw!r} is not a number — "
+              f"using {DEFAULT_FRAME_MAX_DIMENSION}", file=sys.stderr)
+        return DEFAULT_FRAME_MAX_DIMENSION
+    return max(0, value)
+
+
+_warned_no_pillow_downscale = False
+
+
+def _downscale_one(src, max_dim):
+    """Return a path to a copy of `src` whose long edge is <= max_dim.
+
+    Returns `src` itself when the image is already small enough, when Pillow
+    isn't installed, or when anything at all goes wrong — a slightly expensive
+    frame beats a missing one.
+    """
+    global _warned_no_pillow_downscale
+    try:
+        from PIL import Image
+    except ImportError:
+        if not _warned_no_pillow_downscale:
+            _warned_no_pillow_downscale = True
+            print("  warning: Pillow is not installed — frames are sent at "
+                  "full resolution", file=sys.stderr)
+        return src
+
+    source = Path(src)
+    dest = source.parent / LLM_FRAME_SUBDIR.format(max_dim=max_dim) / source.name
+    try:
+        if dest.is_file() and dest.stat().st_mtime >= source.stat().st_mtime:
+            return str(dest)
+        with Image.open(source) as img:
+            if max(img.size) <= max_dim:
+                return str(source)
+            img = img.convert("RGB")
+            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_suffix(f".{os.getpid()}.tmp")
+            img.save(tmp, "JPEG", quality=85, optimize=True)
+        os.replace(tmp, dest)
+        return str(dest)
+    except (OSError, ValueError) as exc:
+        print(f"  warning: could not downscale {source.name} ({exc}) — "
+              f"sending it at full resolution", file=sys.stderr)
+        return str(source)
+
+
+def _downscale_frames(frames):
+    """Frame copies pointed at downscaled images, for the CLI to Read.
+
+    The originals are left exactly where they are: pdf.py crops and embeds
+    them, so it needs the full-resolution files. Only the paths the model is
+    shown change, and only for this backend.
+    """
+    max_dim = _frame_max_dimension()
+    if max_dim <= 0 or not frames:
+        return frames, 0
+    resized = 0
+    out = []
+    for frame in frames:
+        path = _downscale_one(frame.path, max_dim)
+        if path != frame.path:
+            resized += 1
+            out.append(replace(frame, path=path))
+        else:
+            out.append(frame)
+    return out, resized
 
 
 _VISION_PREAMBLE = """\
@@ -420,10 +614,36 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
     effort = effort_level()
     vision = _frame_vision_enabled() and bool(frames)
 
-    sorted_frames, user_text = _render(frames, transcript, prompt_template,
+    # Downscaled copies, so a 1920x1080 keyframe doesn't cost ~1,844 tokens
+    # every time the model opens it. Only the paths the CLI is given change —
+    # pdf.py still crops and embeds the full-resolution originals.
+    resized = 0
+    llm_frames = frames
+    if vision:
+        llm_frames, resized = _downscale_frames(frames)
+
+    # The half of the template that never varies goes to the CLI as a system
+    # prompt read from a stable file, so the prefix is byte-identical across
+    # runs and across the chunks of one run. Everything that does vary — the
+    # chunk label, the reference material, the transcript, the frame paths —
+    # stays in the piped user turn. A template with no markers splits to
+    # (None, itself) and behaves exactly as it did before.
+    static_prompt = None
+    if _static_prompt_enabled():
+        static_prompt, prompt_template = split_static_prompt(prompt_template)
+
+    sorted_frames, user_text = _render(llm_frames, transcript, prompt_template,
                                        with_paths=vision)
     if vision:
         user_text = _VISION_PREAMBLE + user_text
+
+    static_prompt_path = None
+    if static_prompt:
+        static_prompt_path = _static_prompt_file(static_prompt)
+        if static_prompt_path is None:
+            # Couldn't cache it; put it back where it has always been rather
+            # than summarizing without any instructions at all.
+            user_text = static_prompt + "\n\n" + user_text
 
     argv = [
         binary, "-p",
@@ -438,11 +658,22 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
         "--no-session-persistence",
     ]
 
+    if static_prompt_path is not None:
+        argv += ["--append-system-prompt-file", str(static_prompt_path),
+                 # Moves cwd / env info / date / git status out of the system
+                 # prompt and into the first user message. Without it the
+                 # built-in prompt sits in front of ours and changes daily,
+                 # which puts a moving target ahead of everything we just made
+                 # stable.
+                 "--exclude-dynamic-system-prompt-sections"]
+
     if vision:
-        # Read only, and only inside the frame directories. The frames of one
-        # run all live in $FRAMES_DIR/<run_id>/, so this is normally one entry.
+        # Read only, and only inside the frame directories: both the
+        # originals' and whatever directory the downscaled copies landed in.
+        # The copies live in a subdirectory of the originals', and the frames
+        # of one run share a directory, so this is normally one entry.
         frame_dirs = sorted({str(Path(f.path).resolve().parent)
-                             for f in sorted_frames})
+                             for f in list(frames) + list(sorted_frames)})
         argv += ["--tools", "Read", "--allowedTools", "Read"]
         for directory in frame_dirs:
             argv += ["--add-dir", directory]
@@ -451,8 +682,12 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
         argv += ["--tools", ""]
 
     label = f"claude-cli/{model} (effort={effort})"
-    print(f"     {label}: {len(sorted_frames)} frame(s), "
-          f"vision={'on' if vision else 'off'}")
+    detail = "vision=on" if vision else "vision=off"
+    if resized:
+        detail += f", {resized} downscaled to {_frame_max_dimension()}px"
+    if static_prompt_path is not None:
+        detail += ", cacheable system prompt"
+    print(f"     {label}: {len(sorted_frames)} frame(s), {detail}")
 
     text = with_retries(
         _run_claude_cli, argv, user_text, _claude_cli_env(), _claude_cli_cwd(),

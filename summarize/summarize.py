@@ -46,6 +46,11 @@ Configuration (env vars):
   CLAUDE_CLI_BIN         path to the claude binary (default: found on PATH)
   CLAUDE_CLI_MODEL       default "opus"; needs `claude auth login`, no API key
   CLAUDE_CLI_FRAME_VISION  1 (default) lets the CLI Read the frame images
+  CLAUDE_CLI_STATIC_PROMPT 1 (default) passes the unchanging instructions as a
+                         system prompt file, so the prefix is cache-eligible
+  FRAME_MAX_DIMENSION    long edge, px, of the frame copies sent to the CLI
+                         (default 1024; 0 sends them at full resolution).
+                         The saved frames themselves are never touched.
   SUMMARY_EFFORT         low | medium | high (default) | xhigh | max
   GEMINI_API_KEY_1..3    required when backend=gemini
   GEMINI_MODEL           default gemini-3.6-flash
@@ -284,14 +289,22 @@ def resolve_prompt_path(prompt_name):
 
 
 def load_prompt_template(prompt_path=PROMPT_PATH):
-    """Load the prompt and return the user-prompt skeleton.
+    """Load the prompt and return the template llm_client.summarize fills in.
 
-    The file contains both the system prompt (everything before # Input)
-    and the user-prompt skeleton (the # Input section). We return the
-    skeleton since it has the {transcript} and {frame_manifest} placeholders
-    that llm_client.summarize fills in."""
+    A template that fences its unchanging half with llm_client's
+    `<!-- static-prompt: begin/end -->` markers is returned whole: the split
+    that matters is the one the claude-cli backend makes on those markers, and
+    cutting the file here would throw the instructions away before it got the
+    chance.
+
+    Otherwise the historical behaviour applies — the file is cut at its first
+    `# Input` and only the tail (which carries the {transcript} and
+    {frame_manifest} placeholders) is returned.
+    """
     text = Path(prompt_path).read_text()
-    if "# Input" in text:
+    if llm_client.STATIC_PROMPT_BEGIN in text:
+        skeleton = text
+    elif "# Input" in text:
         skeleton = text.split("# Input", 1)[1]
     else:
         skeleton = text

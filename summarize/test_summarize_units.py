@@ -809,5 +809,226 @@ class FrameNumberingTest(unittest.TestCase):
         self.assertIn("[frame 1 @ 5.0s", text)
 
 
+# ---------------------------------------------------------------------------
+# The cache-stable prefix
+#
+# Claude caches an exact prefix. The claude-cli backend therefore has to send
+# the unchanging instructions as a system prompt read from a stable file, and
+# keep everything that varies — the chunk label, the reference material, the
+# transcript, the frame paths — in the piped user turn. These tests are what
+# stop something varying from drifting back into the static half, which fails
+# silently: the summary is fine, the cache simply never hits.
+# ---------------------------------------------------------------------------
+
+BEGIN = llm_client.STATIC_PROMPT_BEGIN
+END = llm_client.STATIC_PROMPT_END
+
+MARKED_TEMPLATE = (
+    f"{BEGIN}\n<instructions>\nAlways cite frames.\n</instructions>\n{END}\n\n"
+    "# Input\n\n<transcript>\n{transcript}\n</transcript>\n"
+    "<frames>\n{frame_manifest}\n</frames>\n"
+)
+
+
+class StaticPromptSplitTest(unittest.TestCase):
+    def test_an_unmarked_template_is_returned_untouched(self):
+        # Every prompt file older than summarize-v2.md takes this path, and
+        # must behave exactly as it did before.
+        template = "Do the thing.\n{transcript}\n{frame_manifest}"
+        static, dynamic = llm_client.split_static_prompt(template)
+        self.assertIsNone(static)
+        self.assertEqual(dynamic, template)
+
+    def test_the_marked_block_is_lifted_out(self):
+        static, dynamic = llm_client.split_static_prompt(MARKED_TEMPLATE)
+        self.assertIn("Always cite frames.", static)
+        self.assertNotIn("Always cite frames.", dynamic)
+        self.assertIn("{transcript}", dynamic)
+        self.assertIn("{frame_manifest}", dynamic)
+
+    def test_a_prepended_chunk_label_stays_dynamic(self):
+        # mapreduce prepends the part label to the template. If that landed in
+        # the static half, every chunk would write a different system prompt
+        # file and nothing would ever be cached.
+        template = "You are summarizing PART 2 OF 5.\n\n" + MARKED_TEMPLATE
+        static, dynamic = llm_client.split_static_prompt(template)
+        self.assertNotIn("PART 2 OF 5", static)
+        self.assertIn("PART 2 OF 5", dynamic)
+
+    def test_appended_reference_material_stays_dynamic(self):
+        # summarize.py appends the lecturer's slides to the template; they
+        # differ per run.
+        template = MARKED_TEMPLATE + "\n## Reference material\nWeek 4 slides."
+        static, dynamic = llm_client.split_static_prompt(template)
+        self.assertNotIn("Week 4 slides.", static)
+        self.assertIn("Week 4 slides.", dynamic)
+
+    def test_an_empty_marked_block_falls_back(self):
+        template = f"{BEGIN}\n\n{END}\n{{transcript}}{{frame_manifest}}"
+        static, _ = llm_client.split_static_prompt(template)
+        self.assertIsNone(static)
+
+    def test_markers_never_reach_a_model(self):
+        # gemini renders the template whole; the delimiters are structure for
+        # us and noise for the model.
+        _, text = llm_client._render([], "T", MARKED_TEMPLATE)
+        self.assertNotIn(BEGIN, text)
+        self.assertNotIn(END, text)
+        self.assertIn("Always cite frames.", text)
+
+
+class StaticPromptInvocationTest(unittest.TestCase):
+    """What the CLI is actually handed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.calls = []
+
+    def _run(self, transcript="Dijkstra.", template=MARKED_TEMPLATE, env=None):
+        def fake_run(argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return FakeCompleted(stdout=_envelope("BODY"))
+        environ = {"MEETING_BOT_ROOT": self.tmp.name,
+                   "CLAUDE_CLI_BIN": sys.executable}
+        environ.update(env or {})
+        with mock.patch.dict(os.environ, environ), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            llm_client.summarize_claude_cli([], transcript, template)
+        return self.calls[-1]
+
+    def _flag(self, argv, flag):
+        return argv[argv.index(flag) + 1] if flag in argv else None
+
+    def test_the_static_half_goes_in_as_a_system_prompt_file(self):
+        argv, kwargs = self._run()
+        path = self._flag(argv, "--append-system-prompt-file")
+        self.assertIsNotNone(path)
+        self.assertIn("Always cite frames.", Path(path).read_text())
+        # ...and out of the piped prompt, or it would be sent twice.
+        self.assertNotIn("Always cite frames.", kwargs["input"])
+
+    def test_dynamic_system_prompt_sections_are_excluded(self):
+        # The CLI's own system prompt carries cwd, env info and the date. Left
+        # in front of ours it changes daily and nothing behind it can cache.
+        argv, _ = self._run()
+        self.assertIn("--exclude-dynamic-system-prompt-sections", argv)
+
+    def test_the_path_is_stable_across_calls_that_differ(self):
+        first, _ = self._run(transcript="lecture one")
+        second, _ = self._run(transcript="a completely different lecture")
+        self.assertEqual(self._flag(first, "--append-system-prompt-file"),
+                         self._flag(second, "--append-system-prompt-file"))
+
+    def test_a_different_template_gets_a_different_file(self):
+        first, _ = self._run()
+        other = MARKED_TEMPLATE.replace("Always cite frames.", "Never guess.")
+        second, _ = self._run(template=other)
+        self.assertNotEqual(self._flag(first, "--append-system-prompt-file"),
+                            self._flag(second, "--append-system-prompt-file"))
+
+    def test_the_transcript_still_travels_on_stdin(self):
+        argv, kwargs = self._run(transcript="Dijkstra runs in O(E log V).")
+        self.assertIn("Dijkstra runs in O(E log V).", kwargs["input"])
+        self.assertNotIn("Dijkstra", " ".join(argv))
+
+    def test_the_toggle_reverts_to_the_inline_prompt(self):
+        argv, kwargs = self._run(env={"CLAUDE_CLI_STATIC_PROMPT": "0"})
+        self.assertNotIn("--append-system-prompt-file", argv)
+        self.assertNotIn("--exclude-dynamic-system-prompt-sections", argv)
+        self.assertIn("Always cite frames.", kwargs["input"])
+
+    def test_an_unmarked_template_adds_no_flags(self):
+        argv, kwargs = self._run(template="Old style.\n{transcript}{frame_manifest}")
+        self.assertNotIn("--append-system-prompt-file", argv)
+        self.assertIn("Old style.", kwargs["input"])
+
+
+class FrameDownscaleTest(unittest.TestCase):
+    """A 1920x1080 keyframe costs ~1,844 tokens every time the model opens it."""
+
+    def setUp(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.frame_dir = Path(self.tmp.name) / "frames" / "run_1"
+        self.frame_dir.mkdir(parents=True)
+        self.original = self.frame_dir / "scene_00001.jpg"
+        Image.new("RGB", (1920, 1080), "white").save(self.original)
+        self.before = self.original.read_bytes()
+        self.frames = [FrameMeta(timestamp_s=1.0, kind="scene_change",
+                                 path=str(self.original), number=1)]
+        self.calls = []
+
+    def _run(self, env=None):
+        def fake_run(argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return FakeCompleted(stdout=_envelope("BODY"))
+        environ = {"MEETING_BOT_ROOT": self.tmp.name,
+                   "CLAUDE_CLI_BIN": sys.executable}
+        environ.update(env or {})
+        with mock.patch.dict(os.environ, environ), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            llm_client.summarize_claude_cli(
+                self.frames, "t", "{transcript}\n{frame_manifest}")
+        return self.calls[-1]
+
+    def _sent_path(self, kwargs):
+        for token in kwargs["input"].split():
+            if token.endswith(".jpg"):
+                return Path(token)
+        return None
+
+    def test_the_model_is_pointed_at_a_downscaled_copy(self):
+        from PIL import Image
+        _, kwargs = self._run()
+        sent = self._sent_path(kwargs)
+        self.assertNotEqual(sent, self.original)
+        with Image.open(sent) as img:
+            self.assertEqual(max(img.size), 1024)
+
+    def test_the_saved_frame_is_left_alone(self):
+        # pdf.py crops and embeds the original; it needs the full resolution.
+        self._run()
+        self.assertEqual(self.original.read_bytes(), self.before)
+
+    def test_the_dimension_is_configurable(self):
+        from PIL import Image
+        _, kwargs = self._run(env={"FRAME_MAX_DIMENSION": "512"})
+        with Image.open(self._sent_path(kwargs)) as img:
+            self.assertEqual(max(img.size), 512)
+
+    def test_zero_disables_the_downscale(self):
+        _, kwargs = self._run(env={"FRAME_MAX_DIMENSION": "0"})
+        self.assertEqual(self._sent_path(kwargs), self.original)
+
+    def test_a_frame_already_small_enough_is_sent_as_is(self):
+        from PIL import Image
+        small = self.frame_dir / "scene_00002.jpg"
+        Image.new("RGB", (640, 360), "white").save(small)
+        self.frames = [FrameMeta(timestamp_s=1.0, kind="periodic",
+                                 path=str(small), number=1)]
+        _, kwargs = self._run()
+        self.assertEqual(self._sent_path(kwargs), small)
+
+    def test_add_dir_still_covers_the_original_frame_directory(self):
+        argv, _ = self._run()
+        dirs = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
+        self.assertIn(str(self.frame_dir), dirs)
+        for directory in dirs:
+            self.assertTrue(str(directory).startswith(str(self.frame_dir)))
+
+    def test_a_second_run_reuses_the_copy(self):
+        _, first = self._run()
+        sent = self._sent_path(first)
+        stamp = sent.stat().st_mtime_ns
+        _, second = self._run()
+        self.assertEqual(self._sent_path(second), sent)
+        self.assertEqual(sent.stat().st_mtime_ns, stamp)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

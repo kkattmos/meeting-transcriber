@@ -725,6 +725,7 @@ end the scan.
 | `CLAUDE_CLI_MODEL` | `opus` | A CLI model alias (`opus`, `sonnet`) or a full id |
 | `CLAUDE_CLI_TIMEOUT_SECONDS` | 1800 | How long one summary may take before it counts as hung |
 | `CLAUDE_CLI_FRAME_VISION` | 1 | `0` sends the frame list as text and never opens the images |
+| `CLAUDE_CLI_STATIC_PROMPT` | 1 | Pass the prompt's unchanging half as a system prompt file, so the prefix is cache-eligible. `0` sends it inline (for a `claude` too old to know the flags) |
 | `SUMMARY_EFFORT` | `high` | `low`, `medium`, `high`, `xhigh`, `max` |
 | `GEMINI_API_KEY_1..3` | — | For the `gemini` fallback |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | Google retires model names; pin a real version, not a `-latest` alias |
@@ -737,6 +738,8 @@ end the scan.
 ```
 claude -p --output-format json --model opus --effort high \
        --safe-mode --no-session-persistence \
+       --append-system-prompt-file "$MEETING_BOT_ROOT/tmp/claude-cli-prompts/<sha>.md" \
+       --exclude-dynamic-system-prompt-sections \
        --tools Read --allowedTools Read --add-dir "$FRAMES_DIR/<run_id>"
 ```
 
@@ -745,6 +748,33 @@ transcript would not fit in a command-line argument. `--safe-mode` and a
 scratch working directory keep this repo's own `CLAUDE.md`, hooks and plugins
 out of the summarizer's context, and `--no-session-persistence` stops every
 lecture leaving a full transcript in `~/.claude`.
+
+**The instructions are sent as a system prompt so they can be cached.** Claude
+caches an exact prefix, and the CLI exposes no caching flag of its own —
+caching is automatic, so the only thing you control is whether the prefix stays
+still. A prompt file may fence the half that never changes between runs:
+
+```markdown
+<!-- static-prompt: begin -->
+...role, instructions, output format, worked example...
+<!-- static-prompt: end -->
+
+# Input
+<transcript>{transcript}</transcript>
+<frames>{frame_manifest}</frames>
+```
+
+That block is written once to a content-addressed file and passed with
+`--append-system-prompt-file`; `--exclude-dynamic-system-prompt-sections`
+moves the CLI's own per-machine sections (cwd, date, git status) out of the
+system prompt too. Everything that varies — the chunk label, your slides, the
+transcript, the frame paths — stays on stdin. On a long lecture split into
+several chunks, every chunk after the first reuses the same cached prefix.
+
+`prompts/summarize-v2.md` is the shipped example. Any other prompt file has no
+markers, is sent exactly as before, and gets no caching benefit — copy the
+fences into your own prompt if you want it. `CLAUDE_CLI_STATIC_PROMPT=0` turns
+it off entirely.
 
 **Frames are read from disk, not uploaded.** The Messages API took inline
 images; the CLI takes a string. So the frame list carries absolute paths and
@@ -853,9 +883,21 @@ another key would fail identically.
 |---|---|---|
 | `SCENE_THRESHOLD` | 0.3 | ffmpeg scene-change score cutoff |
 | `FRAME_PERIOD_SECONDS` | 30 | Periodic safety-net sample; `0` disables |
+| `FRAME_MAX_DIMENSION` | 1024 | Long edge, in pixels, of the frame *copies* sent to the LLM; `0` sends the originals |
 
 Aggressive: `FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2`.
 Slides only: `FRAME_PERIOD_SECONDS=300 SCENE_THRESHOLD=0.6`.
+
+**`FRAME_MAX_DIMENSION` never touches the frames you keep.** A 1920x1080
+keyframe costs the model roughly 1,844 tokens every time it opens one, and
+about 790 at 1024px — on a three-hour lecture with 360 frames that is the
+difference between ~660k and ~280k tokens. So a downscaled *copy* is written to
+`<frame dir>/llm-1024/` and the model is pointed at that; the full-resolution
+original stays where it is, because the PDF crops and embeds it. The copies are
+reused on a resume and are as disposable as the rest of `FRAMES_DIR`. Needs
+Pillow — without it the originals are sent, with a warning. Raising
+`FRAME_PERIOD_SECONDS` is still the bigger lever for a long lecture: this
+changes how much each frame costs, not how many there are.
 
 ### Meeting behaviour
 

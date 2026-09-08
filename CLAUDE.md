@@ -441,11 +441,74 @@ sends the manifest as text only — cheaper against a subscription's rate limit,
 but then the model cites frames it has never seen and the pictures in the PDF
 may not match the text.
 
+**The static half of the prompt is a system prompt file, so the prefix can
+cache.** Claude's prompt caching keys on a byte-identical prefix; the CLI has
+no `cache_control` flag and no caching flag of any kind (checked against
+`claude -p --help`, v2.1.259) — caching is automatic, and the only lever we
+have is keeping the prefix still. Before this, nothing was still: `mapreduce`
+prepends the part label ("Part 2 of 5, 0:12:00-0:24:00") to the *front* of the
+template, so three parallel chunks of one lecture shared no prefix at all, and
+the CLI's own system prompt carries the date and cwd, which move on their own.
+
+A prompt template may now fence the half that never varies between runs with
+
+```
+<!-- static-prompt: begin -->   ... role, instructions, output format, example
+<!-- static-prompt: end -->
+```
+
+`llm_client.split_static_prompt` lifts that block out, writes it to a
+**content-addressed** file (`$MEETING_BOT_ROOT/tmp/claude-cli-prompts/<sha>.md`
+— same instructions, same path, same bytes), and passes
+`--append-system-prompt-file` plus `--exclude-dynamic-system-prompt-sections`,
+which moves the CLI's cwd/env/date/git sections out of the system prompt and
+into the first user message. Everything that varies — the chunk label, the
+reference material, the transcript, the frame paths — stays in the piped user
+turn. Both flags exist but are undocumented in `--help`; they were verified by
+invocation (an unknown flag errors immediately, these don't).
+
+The split is **opt-in per prompt file**. Only `prompts/summarize-v2.md` carries
+the markers today; every other template splits to `(None, itself)` and is sent
+exactly as it always was. `CLAUDE_CLI_STATIC_PROMPT=0` turns the whole thing
+off for a CLI too old to know the flags. The markers are stripped in `_render`
+so they never reach any model, gemini included.
+
+Note the trap this design avoids: if the varying part label ended up inside the
+static block, every chunk would write a *different* system prompt file, the
+cache would never hit, and **nothing would look wrong** — the summaries would
+be identical. `test_a_prepended_chunk_label_stays_dynamic` is what holds it.
+
+**`load_prompt_template` cuts a template at its first `# Input`** and returns
+only the tail — unless the static-prompt markers are present, in which case the
+file is returned whole. Two things to know about the legacy path: it is why
+`lecture-claude.md` works at all (its first match is the *"# Input Data"*
+heading on line 3, so nothing is actually cut), and it is why the unused
+default `prompts/summarize.md` silently loses its entire role/format/rules
+section (its first match is the real `# Input` at line 46). `summarize-v2.md`
+takes the marker path and keeps everything.
+
+**Frames sent to the CLI are downscaled; the saved frames are not.**
+`FRAME_MAX_DIMENSION` (default 1024, 0 disables) caps the long edge of a
+*copy*, written to `<frame dir>/llm-<px>/<same name>.jpg` and reused on the
+next run. A 1920x1080 keyframe is ~1,844 tokens every time the model opens it
+and ~790 at 1024px; measured here, six real frames went 442KB → 152KB. The
+originals never move, because `pdf.py` crops and embeds them and needs the
+resolution — `_downscale_frames` builds new `FrameMeta` objects with
+`dataclasses.replace` rather than touching the ones `summarize.py` passes on to
+the PDF. `--add-dir` names both directories. Pillow is optional: without it the
+originals are sent with one warning. `SCENE_THRESHOLD` and
+`FRAME_PERIOD_SECONDS` are untouched — this changes resolution, never which
+frames exist.
+
 **The CLI exits 0 when it is not logged in.** The only signal is the body:
 `is_error: true` with `result: "Not logged in · Please run /login"`. So
 `_run_claude_cli` parses the JSON rather than trusting the status, and maps
 auth wording to `BackendUnavailable` so the chain advances to Gemini
-immediately. Everything else becomes `ClaudeCliError` carrying the CLI's own
+immediately. The marker list has to keep up with the CLI's wording: an expired
+OAuth session says *"Failed to authenticate: OAuth session expired and could
+not be refreshed"*, which matched none of the original markers and so burned
+the full retry schedule before falling through. `failed to authenticate` and
+`oauth session expired` were added 2026-09-08 after seeing it live. Everything else becomes `ClaudeCliError` carrying the CLI's own
 words, because the CLI has no HTTP status and `retry.py` classifies on wording.
 
 **Gemini key rotation happens outside `with_retries`.** retry.py handles "the
@@ -858,6 +921,14 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   one breaks auth in a way that looks like a broken subscription.
 - **The CLI runs with `--safe-mode` in a scratch cwd.** Otherwise this file
   gets loaded into the context of every summary.
+- **Nothing that varies per run may enter the static prompt block.** The chunk
+  label, the reference material, the transcript and the frame paths all belong
+  in the piped user turn. A leak costs the cache and reports nothing.
+- **The static-prompt markers are opt-in and stripped before send.** A template
+  without them must be sent byte-for-byte as it was before the split existed.
+- **`FRAME_MAX_DIMENSION` downscales a copy, never the saved frame.** `pdf.py`
+  crops and embeds the original; overwriting it degrades every PDF and is not
+  recoverable without re-running ffmpeg.
 - **The CLI's JSON body decides success, not its exit code.** It exits 0 when
   signed out. Parsing the envelope is the only way to tell.
 - **`BackendUnavailable.retryable = False` stays.** Without it a signed-out CLI
@@ -916,11 +987,11 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
-| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the claude-cli command line + envelope parsing | 76 |
+| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 99 |
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, real PDF render | 54 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources` | 106 |
-| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, and the real llm_client against a stub `claude` binary | 62 |
+| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, and the real llm_client against a stub `claude` binary | 75 |
 | `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 
 `test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs
@@ -1009,7 +1080,8 @@ own flags, which is everything about stage 1 except the call itself.
     ├── test_summarize_units.py
     ├── test_pdf_units.py
     └── prompts/
-        ├── summarize.md          <- default
+        ├── summarize.md          <- default (see the load_prompt_template note)
+        ├── summarize-v2.md       <- XML-tagged, worked example, cacheable prefix
         ├── lecture-{claude,gemini}.md
         ├── tutorial-{claude,gemini}.md
         ├── meeting-{claude,gemini}.md
