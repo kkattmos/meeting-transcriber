@@ -144,7 +144,7 @@ ROOT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(ROOT_DIR / "lib"))
 
 import llm_client  # noqa: E402
-from llm_client import FrameMeta, summarize  # noqa: E402
+from llm_client import FrameMeta, assign_numbers, summarize  # noqa: E402
 import document  # noqa: E402
 import pdf as pdf_export  # noqa: E402
 from chunking import build_chunks  # noqa: E402
@@ -320,7 +320,12 @@ def extract_frames(video_path, meeting_name, frames_dir):
 
 
 def load_manifest(manifest_path):
-    """Read manifest.json and return list[FrameMeta]."""
+    """Read manifest.json and return list[FrameMeta], numbered and in order.
+
+    The numbering happens here, once, because this is the only place that sees
+    the whole manifest: everything downstream gets slices of it. See
+    llm_client.assign_numbers.
+    """
     with open(manifest_path) as f:
         data = json.load(f)
     frames = []
@@ -330,7 +335,7 @@ def load_manifest(manifest_path):
             kind=entry["kind"],
             path=entry["path"],
         ))
-    return frames
+    return assign_numbers(frames)
 
 
 def _sweep_stale_yt_tmpdirs():

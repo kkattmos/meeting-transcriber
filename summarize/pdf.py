@@ -216,7 +216,11 @@ def _prepare_frames(frames, work_dir, crop_mode=None, max_width=None,
     work_dir = Path(work_dir)
     prepared = {}
     ordered = sorted(frames, key=lambda f: f.timestamp_s)
-    for index, frame in enumerate(ordered, start=1):
+    for position, frame in enumerate(ordered, start=1):
+        # The frame's own global number is what the model was shown and so
+        # what the citations name; the position in this list is only the same
+        # thing when this list is the whole manifest.
+        index = getattr(frame, "number", 0) or position
         if wanted is not None and index not in wanted:
             continue
         src = Path(frame.path)
@@ -694,8 +698,10 @@ def _main(argv):
     if manifest:
         from llm_client import FrameMeta
         data = json.loads(Path(manifest).read_text())
-        frames = [FrameMeta(timestamp_s=e["timestamp_s"], kind=e["kind"],
-                            path=e["path"]) for e in data.get("frames", [])]
+        from llm_client import assign_numbers
+        frames = assign_numbers(
+            [FrameMeta(timestamp_s=e["timestamp_s"], kind=e["kind"],
+                       path=e["path"]) for e in data.get("frames", [])])
     try:
         out = render(Path(args[0]).read_text(), args[1], frames=frames,
                      work_dir=work_dir)

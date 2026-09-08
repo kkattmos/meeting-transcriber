@@ -164,13 +164,38 @@ class ClaudeCliError(RuntimeError):
 
 @dataclass
 class FrameMeta:
-    """A single extracted frame from the recording."""
+    """A single extracted frame from the recording.
+
+    `number` is the frame's position in the *whole* recording, 1-based, and it
+    is the number the model is shown and the number the PDF resolves a
+    citation against. It has to be assigned once, from the full manifest, by
+    assign_numbers() — see the warning there.
+    """
     timestamp_s: float
     kind: str  # "scene_change" or "periodic"
     path: str
+    number: int = 0
 
     def label(self, idx):
         return f"[frame {idx} @ {self.timestamp_s:.1f}s ({self.kind})]"
+
+
+def assign_numbers(frames):
+    """Number every frame by its place in the recording. Returns them sorted.
+
+    This must happen once, over the entire manifest, before chunking — never
+    per chunk. _render() below numbers whatever list it is handed, and it is
+    called once per chunk, so without a number assigned up front chunk 3's
+    fifth frame was announced to the model as "frame 5" and so was chunk 1's.
+    The model cited them faithfully; the PDF, which numbers across the whole
+    recording, then resolved half the citations to a picture of a completely
+    different moment. Found 2026-09-08 in a real lecture summary, where
+    "Frame 4" was cited at both 219s and 5484s.
+    """
+    ordered = sorted(frames, key=lambda f: f.timestamp_s)
+    for index, frame in enumerate(ordered, start=1):
+        frame.number = index
+    return ordered
 
 
 def _max_tokens():
@@ -216,7 +241,11 @@ def _render(frames, transcript, prompt_template, with_paths=False):
     sorted_frames = sorted(frames, key=lambda f: f.timestamp_s)
     lines = []
     for i, frame in enumerate(sorted_frames):
-        line = frame.label(i + 1)
+        # The frame's own number when it has one, so a chunk announces the
+        # numbers the whole recording uses. Falling back to the position in
+        # this list is what a caller that never called assign_numbers() gets,
+        # and is only correct when the list is the entire manifest.
+        line = frame.label(frame.number or (i + 1))
         if with_paths:
             line = f"{line} {Path(frame.path).resolve()}"
         lines.append(line)

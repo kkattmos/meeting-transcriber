@@ -596,6 +596,34 @@ The older decisions still hold:
   nothing, because WeasyPrint copies the image bytes into the PDF itself.
   `test_media_e2e.sh` asserts both halves of this.
 
+### Frame numbers are global, and assigned exactly once
+
+`llm_client.assign_numbers()` numbers every frame by its position in the whole
+recording, and `summarize.load_manifest()` is the only caller — because it is
+the only place that sees the entire manifest. Everything downstream gets
+slices.
+
+This is not a style preference. `_render()` numbers whatever list it is handed
+and is called **once per chunk**, so before the fix chunk 3's fifth frame was
+announced to the model as "frame 5" and so was chunk 1's. The model cited what
+it was shown, faithfully; `pdf.py` numbers across the whole recording, so it
+resolved half the citations to a picture of a completely different moment —
+which is what the operator saw as "the image is completely unrelated to the
+content". The tell, in a finished summary, is the same frame number carrying
+two timestamps:
+
+```
+$ grep -o 'Frame 4 @ [0-9:]*' Week01.md
+Frame 4 @ 0:03:39      <- chunk 1's fourth frame
+Frame 4 @ 1:31:24      <- chunk 2's fourth frame
+```
+
+Found 2026-09-08 in `Week01_20260907_230838.md`: 10 of 40 cited numbers named
+two different moments. `_render` still falls back to the position in its list
+when a frame has no number, which is only correct when that list is the whole
+manifest — that fallback exists for direct callers and the unit tests, not for
+the pipeline.
+
 ### LaTeX in the PDF (`summarize/mathrender.py`)
 
 The model writes maths; markdown renderers show it and WeasyPrint printed the
@@ -823,6 +851,10 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **`summarize.py` must not pass `work_dir` to `pdf.render()`.** Naming one
   transfers ownership and leaves the cropped intermediates beside the
   deliverable.
+- **Frame numbers come from `assign_numbers()` over the whole manifest, never
+  from a per-chunk enumeration.** See the section above: the failure mode is
+  silent, survives every unit test that looks at one chunk, and produces a PDF
+  full of confidently mislabelled pictures.
 - **Frame cropping declines rather than guesses.** See the framecrop section.
 - **Reference material is escaped before it enters the prompt template**, and
   framed as data rather than instructions — it is untrusted input exactly like
@@ -855,8 +887,8 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
-| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, map-reduce, document, the claude-cli command line + envelope parsing | 64 |
-| `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, real PDF render | 53 |
+| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, map-reduce, global frame numbering, document, the claude-cli command line + envelope parsing | 67 |
+| `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, real PDF render | 54 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources` | 106 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, and the real llm_client against a stub `claude` binary | 62 |

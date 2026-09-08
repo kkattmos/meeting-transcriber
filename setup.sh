@@ -94,13 +94,17 @@ apt-get install -y --no-install-recommends \
   libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b libffi-dev \
   fonts-thai-tlwg fonts-liberation fonts-noto-core
 
-# Adwaita Sans is the PDF's body face (see summarize/pdf.py). It is a separate
-# package from the base set and not present on every Debian point release, so
-# a missing one must not abort a setup whose only consequence is that the PDF
-# falls back to Liberation Sans — which is already installed above.
+# Adwaita Sans is the first face in the PDF's font stack (see summarize/pdf.py).
+# Debian 13 packages no Adwaita font at all — verified on the target box, where
+# both fonts-adwaita-sans and fonts-adwaita are unknown to apt — so this is a
+# genuine optional: without it the stack falls through Arial to Liberation Sans,
+# which is metric-compatible Arial and installed above. Try both spellings
+# anyway, so a box that does carry it (Ubuntu, or a later Debian) gets it.
 echo "==> Installing the PDF body font (optional)"
-apt-get install -y --no-install-recommends fonts-adwaita-sans || \
-  echo "    note: fonts-adwaita-sans unavailable — PDFs will use Liberation Sans"
+apt-get install -y --no-install-recommends fonts-adwaita-sans 2>/dev/null \
+  || apt-get install -y --no-install-recommends fonts-adwaita 2>/dev/null \
+  || echo "    note: no Adwaita font in this distro — the PDF will use" \
+          "Liberation Sans (Arial metrics), which is the next face in the stack"
 
 # Thai locale: Chrome is driven with locale th-TH so Thai participant names
 # render instead of boxes. See CLAUDE.md — this is deliberate, not cosmetic.

@@ -528,6 +528,22 @@ class BlankFrameTest(unittest.TestCase):
         self.assertNotIn(1, prepared)
         self.assertIn(2, prepared)
 
+    def test_a_frame_keeps_its_recording_number_in_a_subset(self):
+        """The PDF must resolve citations by the number the model was shown.
+
+        Passing pdf.render() a subset of the manifest used to renumber it from
+        1, so "Frame 3" printed whatever happened to be third in the subset.
+        """
+        import llm_client
+        paths = [make_frame(self.dir / f"f{i}.jpg",
+                            slide=((100, 60, 800, 460), (245, 245, 240)))
+                 for i in range(4)]
+        frames = llm_client.assign_numbers(
+            [FrameMeta(timestamp_s=float(i), kind="periodic", path=str(p))
+             for i, p in enumerate(paths)])
+        prepared = pdf_export._prepare_frames(frames[2:], self.dir / "work")
+        self.assertEqual(sorted(prepared), [3, 4])
+
     def test_only_the_wanted_frames_are_cropped(self):
         paths = [make_frame(self.dir / f"f{i}.jpg",
                             slide=((100, 60, 800, 460), (245, 245, 240)))

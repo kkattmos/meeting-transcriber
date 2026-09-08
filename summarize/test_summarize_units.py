@@ -667,5 +667,40 @@ class BackendChainTest(unittest.TestCase):
         self.assertEqual(out, "FROM GEMINI")
 
 
+class FrameNumberingTest(unittest.TestCase):
+    """Frame numbers must mean the same thing to the model and to the PDF.
+
+    Regression: _render numbers whatever list it is given and is called once
+    per chunk, so every chunk announced its own frames as 1..N. The model
+    cited them correctly; the PDF resolved them against the whole recording
+    and printed unrelated pictures. Seen in a real summary as "Frame 4" cited
+    at both 219s and 5484s.
+    """
+
+    def frames(self, *stamps):
+        return [llm_client.FrameMeta(timestamp_s=t, kind="periodic",
+                                     path=f"/f/{t}.jpg") for t in stamps]
+
+    def test_numbers_are_assigned_across_the_whole_manifest(self):
+        frames = llm_client.assign_numbers(self.frames(30.0, 10.0, 20.0))
+        self.assertEqual([f.number for f in frames], [1, 2, 3])
+        self.assertEqual([f.timestamp_s for f in frames], [10.0, 20.0, 30.0])
+
+    def test_a_later_chunk_keeps_the_recordings_numbers(self):
+        all_frames = llm_client.assign_numbers(
+            self.frames(10.0, 20.0, 30.0, 40.0))
+        tail = all_frames[2:]          # what chunk 2 would be handed
+        _, text = llm_client._render(tail, "transcript", "{frame_manifest}")
+        self.assertIn("[frame 3 @ 30.0s", text)
+        self.assertIn("[frame 4 @ 40.0s", text)
+        self.assertNotIn("[frame 1 @", text)
+
+    def test_unnumbered_frames_still_number_from_one(self):
+        # A caller that never called assign_numbers (the older behaviour, and
+        # what the unit tests below rely on) must be unaffected.
+        _, text = llm_client._render(self.frames(5.0), "t", "{frame_manifest}")
+        self.assertIn("[frame 1 @ 5.0s", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
