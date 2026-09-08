@@ -771,8 +771,10 @@ system prompt too. Everything that varies — the chunk label, your slides, the
 transcript, the frame paths — stays on stdin. On a long lecture split into
 several chunks, every chunk after the first reuses the same cached prefix.
 
-`prompts/summarize-v2.md` is the shipped example. Any other prompt file has no
-markers, is sent exactly as before, and gets no caching benefit — copy the
+`prompts/lecture-claude.md` (the default in `.env.example`) and
+`prompts/summarize-v2.md` both carry the fences — for `lecture-claude` that is
+5,473 cached characters against 346 sent per call. Any other prompt file has no
+markers, is sent exactly as before, and gets no caching benefit; copy the
 fences into your own prompt if you want it. `CLAUDE_CLI_STATIC_PROMPT=0` turns
 it off entirely.
 

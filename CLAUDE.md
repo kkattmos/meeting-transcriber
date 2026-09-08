@@ -467,11 +467,16 @@ reference material, the transcript, the frame paths — stays in the piped user
 turn. Both flags exist but are undocumented in `--help`; they were verified by
 invocation (an unknown flag errors immediately, these don't).
 
-The split is **opt-in per prompt file**. Only `prompts/summarize-v2.md` carries
-the markers today; every other template splits to `(None, itself)` and is sent
-exactly as it always was. `CLAUDE_CLI_STATIC_PROMPT=0` turns the whole thing
-off for a CLI too old to know the flags. The markers are stripped in `_render`
-so they never reach any model, gemini included.
+The split is **opt-in per prompt file**. `prompts/summarize-v2.md` and
+`prompts/lecture-claude.md` (the configured default) carry the markers; every
+other template splits to `(None, itself)` and is sent exactly as it always was.
+`CLAUDE_CLI_STATIC_PROMPT=0` turns the whole thing off for a CLI too old to
+know the flags. The markers are stripped in `_render` so they never reach any
+model, gemini included.
+
+For `lecture-claude.md` the split is 5,473 static characters against 346
+dynamic ones, so on a chunked lecture every chunk after the first reuses the
+whole instruction set.
 
 Note the trap this design avoids: if the varying part label ended up inside the
 static block, every chunk would write a *different* system prompt file, the
@@ -480,12 +485,21 @@ be identical. `test_a_prepended_chunk_label_stays_dynamic` is what holds it.
 
 **`load_prompt_template` cuts a template at its first `# Input`** and returns
 only the tail — unless the static-prompt markers are present, in which case the
-file is returned whole. Two things to know about the legacy path: it is why
-`lecture-claude.md` works at all (its first match is the *"# Input Data"*
-heading on line 3, so nothing is actually cut), and it is why the unused
-default `prompts/summarize.md` silently loses its entire role/format/rules
-section (its first match is the real `# Input` at line 46). `summarize-v2.md`
-takes the marker path and keeps everything.
+file is returned whole. That legacy path is a trap, because the cut lands on
+the first *substring* match rather than on a heading:
+
+- `prompts/summarize.md` (the unused fallback default) loses its entire
+  role/format/rules section — its first match is the real `# Input` at line 46.
+- `prompts/lecture-claude.md` used to lose its opening role sentence and start
+  the prompt with the orphaned word `Data`, because its first match was the
+  *"# Input Data"* heading near the top. Adding the static-prompt markers
+  fixed that as a side effect: the marker path returns the file whole, so
+  "You are an expert academic tutor and note-taker…" now actually reaches the
+  model for the first time. Verified 2026-09-08 by diffing what the old split
+  produced against the new one.
+
+Prefer the markers over relying on the cut. If you write a new prompt file
+without them, check what `load_prompt_template` actually returns.
 
 **Frames sent to the CLI are downscaled; the saved frames are not.**
 `FRAME_MAX_DIMENSION` (default 1024, 0 disables) caps the long edge of a
@@ -987,7 +1001,7 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
-| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 99 |
+| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 103 |
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, real PDF render | 54 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources` | 106 |

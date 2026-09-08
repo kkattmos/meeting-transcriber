@@ -877,6 +877,58 @@ class StaticPromptSplitTest(unittest.TestCase):
         self.assertIn("Always cite frames.", text)
 
 
+class ShippedMarkedPromptsTest(unittest.TestCase):
+    """The real prompt files that carry the markers, split correctly.
+
+    A placeholder drifting above the `end` marker would put the transcript in
+    the cached prefix — a KeyError at best, a cache that never hits at worst.
+    """
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def _marked(self):
+        found = []
+        for path in sorted(self.PROMPTS_DIR.glob("*.md")):
+            text = path.read_text()
+            if llm_client.STATIC_PROMPT_BEGIN in text:
+                found.append((path, text))
+        return found
+
+    def test_the_expected_files_carry_the_markers(self):
+        names = {path.name for path, _ in self._marked()}
+        self.assertIn("summarize-v2.md", names)
+        self.assertIn("lecture-claude.md", names)
+
+    def test_each_splits_cleanly(self):
+        for path, text in self._marked():
+            with self.subTest(prompt=path.name):
+                static, dynamic = llm_client.split_static_prompt(text)
+                self.assertIsNotNone(static, "markers present but split failed")
+                # The placeholders belong to the per-call half, always.
+                for placeholder in ("{transcript}", "{frame_manifest}"):
+                    self.assertNotIn(placeholder, static)
+                    self.assertIn(placeholder, dynamic)
+                # And the static half must survive not being .format()ed: any
+                # other brace in it would have raised before the split existed.
+                self.assertGreater(len(static), 200)
+
+    def test_the_role_line_is_in_the_cached_half(self):
+        # lecture-claude.md used to lose it: load_prompt_template cut at the
+        # first "# Input", which matched the "# Input Data" heading near the
+        # top, so the prompt began with the orphaned word "Data".
+        text = (self.PROMPTS_DIR / "lecture-claude.md").read_text()
+        static, _ = llm_client.split_static_prompt(text)
+        self.assertTrue(static.startswith("You are an expert academic tutor"))
+
+    def test_load_prompt_template_keeps_a_marked_file_whole(self):
+        import summarize as summarize_main
+        template = summarize_main.load_prompt_template(
+            self.PROMPTS_DIR / "lecture-claude.md")
+        self.assertIn("You are an expert academic tutor", template)
+        self.assertIn("# Execution Rules", template)
+        self.assertIn("{transcript}", template)
+
+
 class StaticPromptInvocationTest(unittest.TestCase):
     """What the CLI is actually handed."""
 
