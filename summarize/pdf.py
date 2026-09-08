@@ -39,6 +39,7 @@ when the toolchain is missing, and summarize.py turns that into a warning: the
 markdown has already been written by then, and a missing PDF is an
 inconvenience, not a lost lecture.
 """
+import dataclasses
 import html
 import os
 import re
@@ -78,6 +79,13 @@ SLIDE_CITE_RE = re.compile(
     r"[\(\[]\s*slide\s*#?\s*(\d+)[^)\]\n]*[\)\]]", re.IGNORECASE)
 PROVENANCE_RE = re.compile(r"<!--\s*meeting-transcriber(.*?)-->", re.DOTALL)
 DETAILS_RE = re.compile(r"<details>(.*?)</details>", re.DOTALL | re.IGNORECASE)
+# The same block plus the <br> build_document emits right after it. A combined
+# document holds one of these per source, so they are stripped by iteration
+# rather than by a count=1 sub followed by removing "the first <br>" — which in
+# a combined document was not the one belonging to that block.
+DETAILS_BLOCK_RE = re.compile(
+    r"<details>(.*?)</details>[ \t]*\n?[ \t]*(?:<br\s*/?>)?",
+    re.DOTALL | re.IGNORECASE)
 
 
 def _font_stack():
@@ -184,20 +192,25 @@ def _split_document(text):
             provenance[key.strip()] = value.strip()
         text = PROVENANCE_RE.sub("", text, count=1)
 
-    transcript = ""
-    d = DETAILS_RE.search(text)
-    if d:
-        inner = d.group(1)
-        inner = re.sub(r"<summary>.*?</summary>", "", inner,
+    # Every transcript block, not just the first: a --combine document carries
+    # one per source, and leaving the others in the body printed raw <details>
+    # markup into the middle of the PDF.
+    transcripts = []
+
+    def _take(match):
+        inner = re.sub(r"<summary>.*?</summary>", "", match.group(1),
                        flags=re.DOTALL | re.IGNORECASE)
         # The markdown wrapper indents the transcript four spaces so most
         # renderers show it as a code block; undo that here.
-        transcript = "\n".join(line[4:] if line.startswith("    ") else line
-                               for line in inner.splitlines()).strip()
-        text = DETAILS_RE.sub("", text, count=1)
-        text = text.replace("<br>", "", 1)
+        block = "\n".join(line[4:] if line.startswith("    ") else line
+                          for line in inner.splitlines()).strip()
+        if block:
+            transcripts.append(block)
+        return ""
 
-    return text.strip(), transcript, provenance
+    text = DETAILS_BLOCK_RE.sub(_take, text)
+
+    return text.strip(), "\n\n".join(transcripts), provenance
 
 
 def _prepare_frames(frames, work_dir, crop_mode=None, max_width=None,
@@ -650,6 +663,49 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
     return output_path
 
 
+def load_manifest_frames(manifest_path):
+    """Read one frames manifest into numbered FrameMeta objects.
+
+    Numbering is global *within that recording*, exactly as the summarize run
+    that produced the citations saw it — see llm_client.assign_numbers.
+    """
+    import json
+    from llm_client import FrameMeta, assign_numbers
+
+    data = json.loads(Path(manifest_path).read_text())
+    return assign_numbers(
+        [FrameMeta(timestamp_s=e["timestamp_s"], kind=e["kind"],
+                   path=e["path"]) for e in data.get("frames", [])])
+
+
+def merge_manifests(manifest_paths):
+    """Merge several recordings' manifests for one combined document.
+
+    Returns ``(frames, offsets)``. Frame numbers are only unique inside the
+    recording they came from, so document B's "Frame 4" and document A's
+    "Frame 4" are different pictures. Rendering them into one PDF without
+    renumbering is the silent-mislabelling failure assign_numbers exists to
+    prevent, one level up: nothing errors, and half the pictures are wrong.
+
+    So each manifest's numbers are shifted past every manifest before it, and
+    the parallel `offsets` list is handed back for
+    `document.shift_frame_citations` to apply the same shift to the prose.
+    An entry may be None or "" for a source with no frames, which still
+    consumes a slot so the offsets stay aligned with the summaries.
+    """
+    frames, offsets, next_offset = [], [], 0
+    for path in manifest_paths:
+        offsets.append(next_offset)
+        if not path:
+            continue
+        section = load_manifest_frames(path)
+        for frame in section:
+            frames.append(dataclasses.replace(
+                frame, number=frame.number + next_offset))
+        next_offset += len(section)
+    return frames, offsets
+
+
 def want_pdf():
     return (os.environ.get("SUMMARY_WRITE_PDF", "1").strip().lower()
             not in ("0", "false", "no"))
@@ -668,7 +724,6 @@ def _main(argv):
     deleted once the PDF is written, because the crops are intermediates the
     PDF has already absorbed.
     """
-    import json
     _VALUED = ("--frames-manifest", "--work-dir")
     opts, positional, skip = {}, [], False
     for i, a in enumerate(argv[1:]):
@@ -694,14 +749,7 @@ def _main(argv):
               "[--work-dir DIR]", file=sys.stderr)
         return 2
 
-    frames = []
-    if manifest:
-        from llm_client import FrameMeta
-        data = json.loads(Path(manifest).read_text())
-        from llm_client import assign_numbers
-        frames = assign_numbers(
-            [FrameMeta(timestamp_s=e["timestamp_s"], kind=e["kind"],
-                       path=e["path"]) for e in data.get("frames", [])])
+    frames = load_manifest_frames(manifest) if manifest else []
     try:
         out = render(Path(args[0]).read_text(), args[1], frames=frames,
                      work_dir=work_dir)

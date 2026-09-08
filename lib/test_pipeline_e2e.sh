@@ -128,8 +128,12 @@ with open(os.environ["STUB_SUMMARIZE_ARGS"], "w") as fh:
 out = args[2]
 os.makedirs(os.path.dirname(out), exist_ok=True)
 if os.environ.get("STUB_SUMMARIZE_NO_MARKDOWN") != "1":
+    # The citation is what makes --combine's frame renumbering observable:
+    # the stub frames manifest has 2 frames per run, so section N's "Frame 1"
+    # must come out as Frame 1, 3, 5, ... in the combined document.
     open(out, "w").write(f"<!-- meeting-transcriber\n     source: x\n-->\n\n"
-                         f"Chapter N — <topic> (<date>)\n\n# Stub\n\nsummary of {args[0]}\n\n<br><br>\n")
+                         f"Chapter N — <topic> (<date>)\n\n# Stub\n\nsummary of {args[0]}\n\n"
+                         f"See (Frame 1 @ 0:00:01).\n\n<br><br>\n")
     print(f"stub: summary -> {out}")
 pdf = flags["--pdf-out"][0]
 if os.environ.get("STUB_SUMMARIZE_NO_PDF") != "1":
@@ -239,6 +243,71 @@ done
 check "multi: one Chapter line in combined file" \
   "$(grep -c 'Chapter N' "$TESTROOT/chapter.md")" "1"
 echo "$out" | grep -q "3 run(s), up to 3 at a time" && ok "multi: honored --jobs 3" || bad "multi: --jobs not honored"
+
+# --- The combined PDF -------------------------------------------------------
+# Every section's summary cites "Frame 1", and every run's stub manifest holds
+# 2 frames. Frame numbers are unique only inside one recording, so the combined
+# document has to renumber them 1 / 3 / 5 — otherwise the PDF resolves all
+# three citations to the first lecture's first frame and nothing errors.
+check "multi: section 1 keeps Frame 1" \
+  "$(grep -c 'Frame 1 @' "$TESTROOT/chapter.md")" "1"
+check "multi: section 2 renumbered to Frame 3" \
+  "$(grep -c 'Frame 3 @' "$TESTROOT/chapter.md")" "1"
+check "multi: section 3 renumbered to Frame 5" \
+  "$(grep -c 'Frame 5 @' "$TESTROOT/chapter.md")" "1"
+# Default PDF path is the combined markdown's, with a .pdf extension. The
+# render itself needs weasyprint; without it the run must still succeed and say
+# so, because the markdown is the artifact.
+# Ask the interpreter pipeline.sh will actually use, not this shell's python3.
+if "${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3" \
+     -c "import weasyprint, markdown" 2>/dev/null; then
+  [ -f "$TESTROOT/chapter.pdf" ] && ok "multi: combined pdf written" \
+    || bad "multi: no combined pdf"
+else
+  echo "$out" | grep -qi "combined PDF" \
+    && ok "multi: combined pdf degraded to a warning (no weasyprint)" \
+    || bad "multi: no word about the combined pdf"
+fi
+# pipeline.sh defers run_one.sh's frame sweep so the combined render can still
+# see them, then sweeps them itself. Either way nothing is left behind.
+leftover=0
+for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
+  for d in "$FRAMES_DIR/yt_${vid}_"*; do
+    [ -d "$d" ] && leftover=$((leftover + 1))
+  done
+done
+check "multi: frames swept after the combined render" "$leftover" "0"
+
+echo "--- --no-combine-pdf writes only the markdown"
+out=$(pipeline "https://www.youtube.com/watch?v=ddddddddddd" \
+               "https://youtu.be/eeeeeeeeeee" \
+               --combine "$TESTROOT/nopdf.md" --no-combine-pdf 2>&1)
+check "no-combine-pdf: exits 0" "$?" "0"
+[ -f "$TESTROOT/nopdf.md" ] && ok "no-combine-pdf: markdown written" \
+  || bad "no-combine-pdf: no markdown"
+[ -f "$TESTROOT/nopdf.pdf" ] && bad "no-combine-pdf: wrote a pdf anyway" \
+  || ok "no-combine-pdf: no pdf written"
+# No PDF means no renumbering: a reader of the .md resolves "Frame 1" against
+# that section's own recording, so both sections keep their own numbering.
+check "no-combine-pdf: citations left alone" \
+  "$(grep -c 'Frame 1 @' "$TESTROOT/nopdf.md")" "2"
+
+echo "--- --combine-pdf names the file"
+out=$(pipeline "https://www.youtube.com/watch?v=fffffffffff" \
+               --combine "$TESTROOT/named.md" \
+               --combine-pdf "$TESTROOT/somewhere else.pdf" 2>&1)
+check "combine-pdf: exits 0" "$?" "0"
+echo "$out" | grep -q "somewhere else.pdf" \
+  && ok "combine-pdf: honored the path (with a space in it)" \
+  || bad "combine-pdf: path not used"
+
+echo "--- KEEP_FRAMES=1 survives a combined render"
+out=$(KEEP_FRAMES=1 pipeline "https://youtu.be/ggggggggggg" \
+               --combine "$TESTROOT/keep.md" 2>&1)
+check "keep-frames: exits 0" "$?" "0"
+kept=0
+for d in "$FRAMES_DIR/yt_ggggggggggg_"*; do [ -d "$d" ] && kept=1; done
+check "keep-frames: frames kept" "$kept" "1"
 
 echo "--- --from-file"
 cat > "$TESTROOT/links.txt" <<EOF

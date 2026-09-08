@@ -633,7 +633,58 @@ Shaped to match the user's course files (`2_Transcripts/chapter1.md`,
   `meeting-*` keeps the plain executive format. Override with
   `--format always|never`.
 - `--combine` concatenates several documents with one Chapter line at the top,
-  in **input** order — runs finish out of order when several go at once.
+  in **input** order — runs finish out of order when several go at once — and
+  renders them as one PDF too. See below.
+
+### The combined PDF (`--combine`, `--combine-pdf`, `--no-combine-pdf`)
+
+`--combine` writes `chapter3.md` and `chapter3.pdf`. The markdown half is the
+old `document.py combine`; the PDF half goes through the same `pdf.render()` a
+single run uses, over the concatenated text. Three things had to change for
+that to be correct rather than merely produce a file:
+
+- **Frame numbers are renumbered per section, and this is the whole problem.**
+  `assign_numbers()` makes numbers unique *within one recording*. Two lectures
+  in one document both have a "Frame 2", and they are different pictures.
+  Rendering the concatenation as-is resolves every citation against the first
+  manifest, produces a perfectly plausible PDF, and gets half the pictures
+  wrong with nothing to show for it — the same silent failure documented under
+  "Frame numbers are global, and assigned exactly once", one level up.
+  So `pdf.merge_manifests()` shifts each manifest past the ones before it and
+  returns the parallel `offsets`, and `document.shift_frame_citations()`
+  applies the identical shift to the prose. **The manifest list must have one
+  entry per summary**, `None` included, or every later section shifts by the
+  wrong amount; `document.py combine` refuses a mismatched pair rather than
+  guessing, and `pipeline.sh` passes `-` for a run with no frames.
+  `shift_frame_citations` steps over the `<details>` transcript on purpose: a
+  lecturer saying "frame 3" is speech, and rewriting it would both corrupt the
+  transcript the PDF carries and invent a citation.
+  The two "Frame N" regexes (`document.FRAME_MENTION_RE`,
+  `pdf.FRAME_MENTION_RE`) are separate copies held together by
+  `test_shift_agrees_with_the_pdf_matcher` — drift means a citation shifted
+  here and resolved there under its old number.
+- **`_split_document` lifts out *every* transcript, not the first.** It used to
+  `sub(..., count=1)` and then remove "the first `<br>`", which in a combined
+  document was not the `<br>` belonging to that block. The other sections'
+  `<details>` markup then printed raw into the middle of the PDF.
+  `DETAILS_BLOCK_RE` swallows the block and its trailing `<br>` together, and
+  the transcripts are joined into the one hidden layer.
+- **The frame sweep moved up a level.** `run_one.sh` deletes a run's frames as
+  soon as *that run's* PDF is written. The combined PDF renders at the end of
+  `pipeline.sh`, out of every run's frames at once, so they would all be gone
+  and the combined PDF would silently have no pictures. `pipeline.sh` therefore
+  exports `KEEP_FRAMES=1` to the children when it is going to render one, and
+  does the sweep itself afterwards — respecting an operator-set `KEEP_FRAMES`.
+
+Renumbering happens **only** when a PDF is being rendered. `--no-combine-pdf`
+leaves the markdown byte-for-byte as it always was, because a reader of the
+`.md` alone resolves "Frame 4" against that section's own recording. The
+consequence is that the combined and per-run markdown cite different numbers
+for the same picture; that is correct, and the alternative (renumbering always)
+would make the standalone `.md` wrong instead.
+
+A failed combined render is a warning naming the path, never a failed run —
+same rule as a single run's PDF.
 
 ### The PDF (`summarize/pdf.py`)
 
@@ -965,6 +1016,13 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **`summarize.py` must not pass `work_dir` to `pdf.render()`.** Naming one
   transfers ownership and leaves the cropped intermediates beside the
   deliverable.
+- **A combined PDF renumbers frame citations; the combined markdown alone does
+  not.** One entry per summary in the manifest list, always — a dropped slot
+  shifts every later section by the wrong amount and reports nothing. See the
+  combined-PDF section.
+- **`pipeline.sh` owns the frame sweep whenever it renders a combined PDF.**
+  Letting `run_one.sh` sweep as usual leaves the combined render with no
+  frames and no error.
 - **Frame numbers come from `assign_numbers()` over the whole manifest, never
   from a per-chunk enumeration.** See the section above: the failure mode is
   silent, survives every unit test that looks at one chunk, and produces a PDF
@@ -1001,10 +1059,10 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
-| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 103 |
-| `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, real PDF render | 54 |
+| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, `--combine` citation shifting, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 109 |
+| `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, manifest merging for `--combine`, real PDF render | 60 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources` | 106 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combined PDF and its frame sweep | 119 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, and the real llm_client against a stub `claude` binary | 75 |
 | `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 

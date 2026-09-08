@@ -168,6 +168,164 @@ Body text citing *(Frame 2 @ 30.0s)* and again (Frame 2).
         self.assertEqual(prov, {})
 
 
+class CombinedDocumentTest(unittest.TestCase):
+    """--combine: several recordings rendered into one PDF.
+
+    The hazard here is the one assign_numbers exists to prevent, one level up.
+    Frame numbers are unique only inside the recording they came from, so two
+    sections both citing "Frame 2" mean two different pictures — and rendering
+    them without renumbering produces a PDF that looks perfectly fine and has
+    half its pictures wrong.
+    """
+
+    def _manifest(self, directory, count, start_at=0.0):
+        import json
+        directory.mkdir(parents=True, exist_ok=True)
+        frames = []
+        for i in range(count):
+            path = directory / f"f{i}.jpg"
+            if Image is not None:
+                make_frame(path, slide=((100, 60, 800, 480), (240, 240, 240)))
+            else:
+                path.write_bytes(b"not a jpeg")
+            frames.append({"timestamp_s": start_at + i * 30.0,
+                           "kind": "periodic", "path": str(path)})
+        out = directory / "manifest.json"
+        out.write_text(json.dumps({"frames": frames}))
+        return out
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_merge_shifts_each_manifest_past_the_ones_before_it(self):
+        a = self._manifest(self.dir / "a", 3)
+        b = self._manifest(self.dir / "b", 2)
+        c = self._manifest(self.dir / "c", 4)
+        frames, offsets = pdf_export.merge_manifests([a, b, c])
+        self.assertEqual(offsets, [0, 3, 5])
+        self.assertEqual([f.number for f in frames],
+                         [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        # Every number resolves to a file from the right recording.
+        by_number = {f.number: f.path for f in frames}
+        self.assertIn("/a/", by_number[1])
+        self.assertIn("/b/", by_number[4])
+        self.assertIn("/c/", by_number[6])
+
+    def test_a_source_with_no_frames_still_takes_its_slot(self):
+        # Drop the empty slot and every later section shifts by the wrong
+        # amount — with no error and no visible symptom but wrong pictures.
+        a = self._manifest(self.dir / "a", 2)
+        c = self._manifest(self.dir / "c", 2)
+        frames, offsets = pdf_export.merge_manifests([a, None, c])
+        self.assertEqual(offsets, [0, 2, 2])
+        self.assertEqual([f.number for f in frames], [1, 2, 3, 4])
+
+    def test_merging_does_not_mutate_the_loaded_frames(self):
+        # dataclasses.replace, not in-place: pdf.py crops the originals and a
+        # renumber that reached back into them would corrupt a later render.
+        a = self._manifest(self.dir / "a", 2)
+        b = self._manifest(self.dir / "b", 2)
+        pdf_export.merge_manifests([a, b])
+        again = pdf_export.load_manifest_frames(b)
+        self.assertEqual([f.number for f in again], [1, 2])
+
+    @unittest.skipIf(Image is None, "Pillow not installed")
+    def test_citations_resolve_to_the_right_recording_end_to_end(self):
+        """The whole point, from two summaries to prepared pictures."""
+        sys.path.insert(0, str(SCRIPT_DIR))
+        import document
+
+        a = self._manifest(self.dir / "a", 3)
+        b = self._manifest(self.dir / "b", 3)
+        paths = []
+        for i, name in enumerate(("A", "B")):
+            doc = self.dir / f"{name}.md"
+            doc.write_text(document.build_document(
+                f"Lecture {name} shows (Frame 2 @ 0:00:30).",
+                source=f"https://youtu.be/{name}", source_kind="youtube",
+                title=f"Lecture {name}", transcript=f"words for {name}"))
+            paths.append(doc)
+
+        frames, offsets = pdf_export.merge_manifests([a, b])
+        combined = document.combine_documents(paths, frame_offsets=offsets)
+
+        # Section A keeps Frame 2; section B's became Frame 5.
+        self.assertIn("Lecture A shows (Frame 2 @ 0:00:30)", combined)
+        self.assertIn("Lecture B shows (Frame 5 @ 0:00:30)", combined)
+
+        body, transcript, _ = pdf_export._split_document(combined)
+        cited = pdf_export._cited_frame_numbers(body)
+        self.assertEqual(sorted(cited), [2, 5])
+
+        prepared = pdf_export._prepare_frames(
+            frames, self.dir / "work", wanted=set(cited))
+        self.assertEqual(sorted(prepared), [2, 5])
+        # And each one is a picture from its own lecture, not the other's.
+        self.assertIn("/a/", pdf_export.load_manifest_frames(a)[1].path)
+        self.assertIn(str(self.dir / "a"), str(
+            [f.path for f in frames if f.number == 2][0]))
+        self.assertIn(str(self.dir / "b"), str(
+            [f.path for f in frames if f.number == 5][0]))
+
+    def test_every_transcript_is_lifted_out_not_just_the_first(self):
+        sys.path.insert(0, str(SCRIPT_DIR))
+        import document
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for name in ("A", "B", "C"):
+                doc = Path(tmp) / f"{name}.md"
+                doc.write_text(document.build_document(
+                    f"body {name}", source=f"https://youtu.be/{name}",
+                    source_kind="youtube", title=f"Lecture {name}",
+                    transcript=f"transcript of {name}"))
+                paths.append(doc)
+            combined = document.combine_documents(paths)
+
+        body, transcript, _ = pdf_export._split_document(combined)
+        for name in ("A", "B", "C"):
+            self.assertIn(f"transcript of {name}", transcript)
+            self.assertIn(f"# Lecture {name}", body)
+        # None of the markup leaks into the visible body.
+        self.assertNotIn("<details>", body)
+        self.assertNotIn("View Transcript", body)
+        # ...and neither do the <br> separators that followed each block.
+        # What is left is exactly the two-<br> section separator per lecture:
+        # a stray third would be the one build_document puts after <details>,
+        # which the count=1 sub used to strip from only the first section.
+        self.assertEqual(body.count("<br>"), 6)
+
+    @unittest.skipUnless(HAVE_RENDERER and Image is not None,
+                         "weasyprint/markdown/Pillow not installed")
+    def test_a_combined_document_renders_to_one_pdf(self):
+        sys.path.insert(0, str(SCRIPT_DIR))
+        import document
+
+        a = self._manifest(self.dir / "a", 3)
+        b = self._manifest(self.dir / "b", 3)
+        paths = []
+        for name in ("A", "B"):
+            doc = self.dir / f"{name}.md"
+            doc.write_text(document.build_document(
+                f"Lecture {name} shows (Frame 2 @ 0:00:30).",
+                source=f"https://youtu.be/{name}", source_kind="youtube",
+                title=f"Lecture {name}", transcript=f"words for {name}"))
+            paths.append(doc)
+        frames, offsets = pdf_export.merge_manifests([a, b])
+        combined = document.combine_documents(paths, frame_offsets=offsets)
+
+        out = self.dir / "chapter.pdf"
+        pdf_export.render(combined, out, frames=frames, title="chapter")
+        self.assertTrue(out.is_file())
+        self.assertGreater(out.stat().st_size, 1000)
+        # The scratch directory render() invented is its own to remove.
+        self.assertFalse((self.dir / ".pdf-frames").exists())
+
+
 class CitationTest(unittest.TestCase):
     def prepared(self, *numbers):
         return {n: {"path": f"/frames/frame_{n}.jpg", "timestamp": 30.0 * n,

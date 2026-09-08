@@ -330,6 +330,29 @@ Write one combined chapter-shaped file as well as the per-run summaries:
   --combine ~/courses/2_Transcripts/chapter3.md
 ```
 
+That writes `chapter3.md` **and** `chapter3.pdf` — one PDF holding every
+lecture, with a single keyframe appendix and every source transcript in the
+hidden text layer. Name the PDF somewhere else with `--combine-pdf`, or skip it
+with `--no-combine-pdf`:
+
+```bash
+./pipeline.sh --from-file chapter3_links.txt \
+  --combine ~/courses/2_Transcripts/chapter3.md \
+  --combine-pdf ~/courses/pdf/chapter3.pdf
+```
+
+Frame numbers are unique only within one recording, so the combined document
+renumbers each section's citations — lecture B's "Frame 2" becomes "Frame 5"
+if lecture A contributed three frames. That means **the combined `.md` and the
+per-run `.md` cite different numbers for the same picture**, which is the point:
+in the combined PDF each number resolves to the right lecture's frame. With
+`--no-combine-pdf` nothing is renumbered, because there is no combined
+appendix to resolve against.
+
+Because the combined PDF is rendered after every run has finished, `pipeline.sh`
+tells the runs to keep their frames and sweeps them itself once the render is
+done. `KEEP_FRAMES=1` still keeps them.
+
 ### Options
 
 | Flag | Meaning |
@@ -343,6 +366,8 @@ Write one combined chapter-shaped file as well as the per-run summaries:
 | `--from-file F` | Read inputs from a file, one per line |
 | `--playlist` | Expand YouTube playlist URLs |
 | `--combine F` | Also write every summary into one file, in input order |
+| `--combine-pdf F` | Where the combined PDF goes (default: `--combine`'s path with `.pdf`) |
+| `--no-combine-pdf` | Write only the combined markdown |
 | `--force` | Ignore prior state, start clean |
 | `--run-id ID` / `--resume-last` / `--resume-all` | Resume (see below) |
 | `--list` / `--status ID` | Inspect runs |
@@ -598,6 +623,8 @@ Youtube Link: `https://www.youtube.com/watch?v=5GAfjAjLKYk`
 - `--combine` concatenates several of these with one Chapter line at the top,
   in **input order** (runs finish out of order when several go at once). It
   works on the `.md` files, so it has nothing to do if `--no-markdown` is set.
+  It also renders a combined PDF from the same text — see above for the frame
+  renumbering that makes its pictures line up.
 
 `meeting-*` prompts keep the plain executive-summary format — no wrapper.
 

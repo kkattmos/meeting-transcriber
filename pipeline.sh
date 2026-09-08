@@ -42,7 +42,11 @@
 #   --combine F         also write every summary into one file, in input order,
 #                       shaped like a course chapter file (one Chapter line at
 #                       the top, then each video's section). Per-run summaries
-#                       are still written individually.
+#                       are still written individually. A combined PDF is
+#                       written alongside it unless PDFs are switched off.
+#   --combine-pdf F     where the combined PDF goes (default: --combine's path
+#                       with a .pdf extension)
+#   --no-combine-pdf    write only the combined markdown
 #
 # The legacy positional form still works:
 #   ./pipeline.sh <input> [name] [display_name] [language] [prompt]
@@ -74,6 +78,8 @@ RESUME_ALL=0
 EXPLICIT_RUN_ID=""
 FROM_FILE=""
 COMBINE_FILE=""
+COMBINE_PDF=""
+COMBINE_WANT_PDF=1
 declare -a POSITIONAL=()
 declare -a RESOURCE_SPECS=()
 # RESOURCES in .env is the default for every run; --resources adds to it.
@@ -95,6 +101,8 @@ while [ "$#" -gt 0 ]; do
     --jobs)         JOBS="${2:-2}"; shift 2 ;;
     --from-file)    FROM_FILE="${2:-}"; shift 2 ;;
     --combine)      COMBINE_FILE="${2:-}"; shift 2 ;;
+    --combine-pdf)  COMBINE_PDF="${2:-}"; shift 2 ;;
+    --no-combine-pdf) COMBINE_WANT_PDF=0; shift ;;
     --run-id)       EXPLICIT_RUN_ID="${2:-}"; shift 2 ;;
     --resources)
       [ -n "${2:-}" ] || { echo "--resources needs a value" >&2; exit 1; }
@@ -343,6 +351,34 @@ else
   done
 fi
 
+# --- Combined output: settled before any run starts --------------------------
+# It has to be decided here rather than at the end, because it changes how the
+# child runs behave. run_one.sh sweeps a run's frames the moment that run's own
+# PDF is written — they are the bulkiest thing a run leaves behind, and nothing
+# reads them once WeasyPrint has absorbed the pixels. The combined PDF breaks
+# that assumption: it is rendered down at the bottom of this script, out of
+# every run's frames at once, so by then they would all be gone and the
+# combined PDF would silently have no pictures in it. So the children are told
+# to keep them, and this script sweeps them itself once the render is done.
+COMBINE_RENDER_PDF=0
+COMBINE_SWEEP_FRAMES=0
+if [ -n "$COMBINE_FILE" ] && [ "$COMBINE_WANT_PDF" -eq 1 ]; then
+  case "$(printf '%s' "${SUMMARY_WRITE_PDF:-1}" | tr 'A-Z' 'a-z')" in
+    0|false|no) ;;
+    *) COMBINE_RENDER_PDF=1 ;;
+  esac
+fi
+if [ "$COMBINE_RENDER_PDF" -eq 1 ]; then
+  [ -n "$COMBINE_PDF" ] || COMBINE_PDF="${COMBINE_FILE%.md}.pdf"
+  # An operator who asked for the frames keeps them; otherwise the sweep the
+  # children were told to skip becomes ours.
+  case "$(printf '%s' "${KEEP_FRAMES:-0}" | tr 'A-Z' 'a-z')" in
+    1|true|yes|on) ;;
+    *) COMBINE_SWEEP_FRAMES=1 ;;
+  esac
+  export KEEP_FRAMES=1
+fi
+
 # --- Execute -----------------------------------------------------------------
 mkdir -p "$RUNS_DIR"
 TOTAL="${#RUN_DIRS[@]}"
@@ -410,9 +446,24 @@ done
 # when several run at once, and a chapter file has to follow the lecture order.
 if [ -n "$COMBINE_FILE" ]; then
   declare -a SUMMARY_PATHS=()
+  declare -a MANIFEST_ARGS=()
   for run_dir in "${RUN_DIRS[@]}"; do
     md="$(rs get --run-dir "$run_dir" --key stages.summarize.artifacts.md 2>/dev/null || true)"
-    [ -n "$md" ] && [ -f "$md" ] && SUMMARY_PATHS+=("$md")
+    [ -n "$md" ] && [ -f "$md" ] || continue
+    SUMMARY_PATHS+=("$md")
+    # One --frames-manifest per summary, in the same order, because the Nth
+    # manifest is what the Nth section's frame citations are renumbered
+    # against. A run with no frames still takes its slot as "-": drop it and
+    # every later section is shifted by the wrong amount, and the only symptom
+    # is a PDF whose pictures belong to a different lecture.
+    if [ "$COMBINE_RENDER_PDF" -eq 1 ]; then
+      manifest="$(rs get --run-dir "$run_dir" --key stages.frames.artifacts.manifest 2>/dev/null || true)"
+      if [ -n "$manifest" ] && [ -f "$manifest" ]; then
+        MANIFEST_ARGS+=(--frames-manifest "$manifest")
+      else
+        MANIFEST_ARGS+=(--frames-manifest "-")
+      fi
+    fi
   done
   if [ "${#SUMMARY_PATHS[@]}" -eq 0 ]; then
     echo ""
@@ -421,8 +472,30 @@ if [ -n "$COMBINE_FILE" ]; then
     echo "    if SUMMARY_WRITE_MARKDOWN=0 / --no-markdown is in effect.)"
   else
     mkdir -p "$(dirname "$COMBINE_FILE")"
+    declare -a COMBINE_ARGS=(--output "$COMBINE_FILE")
+    if [ "$COMBINE_RENDER_PDF" -eq 1 ]; then
+      mkdir -p "$(dirname "$COMBINE_PDF")"
+      COMBINE_ARGS+=(--pdf-out "$COMBINE_PDF" "${MANIFEST_ARGS[@]}")
+    fi
     "$PYTHON_BIN" "$SCRIPT_DIR/summarize/document.py" combine \
-      --output "$COMBINE_FILE" "${SUMMARY_PATHS[@]}"
+      "${COMBINE_ARGS[@]}" "${SUMMARY_PATHS[@]}"
+  fi
+
+  # The sweep the children were told to skip. Only ever the subdirectory each
+  # run created, and only once the combined PDF has had its chance at them.
+  if [ "$COMBINE_SWEEP_FRAMES" -eq 1 ] && [ -n "${FRAMES_DIR:-}" ]; then
+    for run_dir in "${RUN_DIRS[@]}"; do
+      run_id="$(basename "$run_dir")"
+      run_frames="$FRAMES_DIR/$run_id"
+      [ -n "$run_id" ] && [ "$run_frames" != "$FRAMES_DIR" ] || continue
+      [ -d "$run_frames" ] || continue
+      rm -rf "$run_frames"
+      # Tell runstate the paths went on purpose, or its artifact check
+      # downgrades a finished frames stage and every later --status makes a
+      # completed run look half-broken.
+      rs cleaned --run-dir "$run_dir" --stage frames || true
+    done
+    echo "==> frames swept (KEEP_FRAMES=1 to keep them)"
   fi
 fi
 

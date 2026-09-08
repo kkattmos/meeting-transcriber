@@ -370,6 +370,72 @@ class DocumentTest(unittest.TestCase):
         self.assertLess(combined.index("# Video 1"), combined.index("# Video 2"))
 
 
+    def test_combine_shifts_frame_citations_by_their_offset(self):
+        # Two sections that both cite "Frame 2" cite different pictures. The
+        # combined document has to say so, or the PDF resolves both to one.
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for i in range(2):
+                p = Path(tmp) / f"{i}.md"
+                p.write_text(document.build_document(
+                    f"See (Frame 2 @ 0:01:00) in part {i}.",
+                    source=f"https://youtu.be/v{i}", source_kind="youtube",
+                    title=f"Video {i}", transcript="t"))
+                paths.append(p)
+            combined = document.combine_documents(paths, frame_offsets=[0, 7])
+        self.assertIn("(Frame 2 @ 0:01:00) in part 0", combined)
+        self.assertIn("(Frame 9 @ 0:01:00) in part 1", combined)
+
+    def test_combine_without_offsets_is_byte_for_byte_unchanged(self):
+        # No PDF means no renumbering: a reader of the .md resolves "Frame 4"
+        # against that section's own recording.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "a.md"
+            p.write_text(document.build_document(
+                "See (Frame 4 @ 0:01:00).", source="https://youtu.be/v",
+                source_kind="youtube", title="V", transcript="t"))
+            plain = document.combine_documents([p])
+            zeroed = document.combine_documents([p], frame_offsets=[0])
+        self.assertIn("(Frame 4 @ 0:01:00)", plain)
+        self.assertEqual(plain, zeroed)
+
+    def test_combine_rejects_misaligned_offsets(self):
+        # Renumbering some sections and not others is silent in the output and
+        # wrong in the PDF. Refuse instead.
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for i in range(3):
+                p = Path(tmp) / f"{i}.md"
+                p.write_text(f"# V{i}\n\nbody\n")
+                paths.append(p)
+            with self.assertRaises(ValueError):
+                document.combine_documents(paths, frame_offsets=[0, 4])
+
+    def test_shift_steps_over_the_transcript(self):
+        # A lecturer saying "frame 3" is speech, not a citation. Rewriting it
+        # would corrupt the transcript the PDF carries and invent a citation.
+        doc = document.build_document(
+            "Body cites (Frame 3 @ 0:00:10).", source="s",
+            source_kind="local_file", title="T",
+            transcript="and then the frame 3 collapsed")
+        shifted = document.shift_frame_citations(doc, 10)
+        self.assertIn("(Frame 13 @ 0:00:10)", shifted)
+        self.assertIn("the frame 3 collapsed", shifted)
+
+    def test_shift_agrees_with_the_pdf_matcher(self):
+        # The two regexes are separate copies; if they ever drift, a citation
+        # is shifted here and resolved there under its old number.
+        import pdf
+        sample = ("(Frame 12 @ 0:01:00), [frame 3], Frames 7 and 8, "
+                  "Frame#42, frame 5")
+        self.assertEqual(
+            [int(m) for m in document.FRAME_MENTION_RE.findall(sample)],
+            pdf._cited_frame_numbers(sample))
+
+    def test_shift_by_zero_changes_nothing(self):
+        text = "(Frame 2) and Frame 30"
+        self.assertEqual(document.shift_frame_citations(text, 0), text)
+
 
 # ---------------------------------------------------------------------------
 # The claude-cli backend
