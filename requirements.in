@@ -19,8 +19,11 @@
 # Resolved for the deployment target: CPython 3.13 on linux-x86_64 (Debian 13).
 # A different target needs its own recompile.
 
-# The default summary backend.
-anthropic
+# No anthropic SDK: the default summary backend runs the `claude` CLI as a
+# subprocess so the summary is billed to the operator's Claude subscription
+# rather than to a metered API key. The CLI is installed by claude.ai/install.sh,
+# not by pip — see README's Install section.
+#
 # The fallback summary backend.
 google-genai
 # youtube-transcript.io client. urllib gets rate-limited on that endpoint where

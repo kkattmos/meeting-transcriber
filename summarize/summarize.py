@@ -41,10 +41,11 @@ Configuration (env vars):
   SUMMARIES_DIR / PDF_DIR / FRAMES_DIR   required output directories (lib/paths.py)
   SCENE_THRESHOLD        default 0.3   (passed to extract_frames.py)
   FRAME_PERIOD_SECONDS   default 30    (set to 0 to disable periodic pass)
-  SUMMARY_BACKEND        "fallback" (default), "anthropic", "gemini"
-  SUMMARY_FALLBACK_CHAIN default anthropic,gemini
-  ANTHROPIC_API_KEY      required when backend=anthropic
-  ANTHROPIC_MODEL        default claude-opus-5
+  SUMMARY_BACKEND        "fallback" (default), "claude-cli", "gemini"
+  SUMMARY_FALLBACK_CHAIN default claude-cli,gemini
+  CLAUDE_CLI_BIN         path to the claude binary (default: found on PATH)
+  CLAUDE_CLI_MODEL       default "opus"; needs `claude auth login`, no API key
+  CLAUDE_CLI_FRAME_VISION  1 (default) lets the CLI Read the frame images
   SUMMARY_EFFORT         low | medium | high (default) | xhigh | max
   GEMINI_API_KEY_1..3    required when backend=gemini
   GEMINI_MODEL           default gemini-3.6-flash

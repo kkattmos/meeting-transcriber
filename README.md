@@ -54,7 +54,7 @@ flowchart LR
     TR["transcribe<br/>(AssemblyAI / youtube-transcript.io)"]
     FR["frames<br/>(ffmpeg scene-change + periodic)"]
     RES["resources<br/>(GitHub repo / folder)"]
-    SUM["summarize<br/>(Claude, falling back to Gemini)"]
+    SUM["summarize<br/>(claude CLI, falling back to Gemini)"]
     OUTMD([summaries/&lt;run_id&gt;.md])
     OUTPDF([pdf/&lt;run_id&gt;.pdf])
 
@@ -85,7 +85,7 @@ video exists, so they execute concurrently and `summarize` joins them.
 | `fetch_video` | Downloads a YouTube video (for frames only) | yt-dlp |
 | `transcribe` | Local file → AssemblyAI; YouTube → youtube-transcript.io captions | `ASSEMBLYAI_API_KEY_1..3` / `YT_TRANSCRIPT_KEY_1..10` |
 | `frames` | Scene-change + periodic keyframes → `manifest.json` | ffmpeg |
-| `summarize` | Transcript + frames (+ slides) → Markdown + PDF | `ANTHROPIC_API_KEY` / `GEMINI_API_KEY_1..3` |
+| `summarize` | Transcript + frames (+ slides) → Markdown + PDF | the `claude` CLI signed into your Claude subscription / `GEMINI_API_KEY_1..3` |
 
 Where the outputs go is **configured, not assumed** — the five directories are
 independent variables, so summaries can sit on a NAS while recordings stay on
@@ -122,7 +122,7 @@ so **that split is gone** and everything runs natively.
 | Docker | Required | Not used at all |
 | Per-run isolation | Container namespaces (`:99`, `meeting_sink` hardcoded) | Display + PulseAudio sink allocated per run (`lib/xsession.sh`) |
 | Init system | OpenRC (no systemd) | systemd — `setup.sh --with-trigger` installs the trigger unit |
-| Summarizer | Gemini first | **Claude (Opus 5) first**, Gemini as fallback |
+| Summarizer | Gemini first, API key | **Claude first, on your subscription** via the `claude` CLI; Gemini as fallback |
 | Keys | One each; YouTube tokens in a JSON file | **Numbered slots in `.env`**, round-robin (3 Gemini, 3 AssemblyAI, 10 YouTube) |
 | Output | Markdown, fixed layout under `/opt/meeting-bot` | Markdown **+ PDF**, five independently configured directories |
 | Slides | — | `--resources` pulls a GitHub repo or folder into the prompt and the PDF |
@@ -190,6 +190,41 @@ sudo -H ./setup.sh --with-libreoffice   # so .pptx slides can be rendered into t
 sudo -H ./setup.sh --with-trigger       # install + enable the systemd trigger service
 ```
 
+### Sign the summarizer in
+
+The summarizer spends **your Claude subscription**, not a metered API key —
+there is no `ANTHROPIC_API_KEY` anywhere in this project. It does that by
+running the `claude` CLI, so the CLI has to be installed and signed in once:
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+```
+
+```bash
+claude auth login
+```
+
+`claude auth login` opens a browser flow. On this box there is no browser you
+can see, so either run it through the same noVNC session
+[`first_time_login.sh`](#first-time-login-you-cant-see-a-window) sets up, or
+generate a long-lived token on a machine you *can* see and paste it in:
+
+```bash
+claude setup-token
+```
+
+`setup.sh` does not install the CLI: it comes from Anthropic's own installer
+rather than apt, and it is per-user state (the login lives in `~/.claude`),
+so it is not part of a root system bootstrap. Check it any time with:
+
+```bash
+claude auth status
+```
+
+If the CLI is missing or signed out, the summarize stage says so and falls
+through to Gemini rather than failing the run — but the summaries you get are
+Gemini's, so it is worth checking. `./verify_e2e.sh --preflight` reports it.
+
 Then configure:
 
 ```bash
@@ -197,7 +232,8 @@ cp .env.example .env && chmod 600 .env
 $EDITOR .env
 ```
 
-Fill in the API keys and the five output directories. Check both with:
+Fill in the API keys (Gemini, AssemblyAI, youtube-transcript.io — Claude
+needs none) and the five output directories. Check them with:
 
 ```bash
 /opt/meeting-bot-venv/bin/python3 lib/paths.py show
@@ -527,7 +563,7 @@ course-note document, shaped to drop straight into a chapter file:
 <!-- meeting-transcriber
      source: https://www.youtube.com/watch?v=5GAfjAjLKYk
      source_type: youtube
-     model: anthropic/claude-opus-5
+     model: claude-cli/opus
      prompt: lecture-claude.md
      run_id: yt_5GAfjAjLKYk_20260904_120000
      generated: 2026-09-04
@@ -633,7 +669,7 @@ unnumbered name is accepted as slot 1:
 
 | Variable | Slots | Used by |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | 1 | The default summarizer |
+| *(none — the `claude` CLI's own login)* | — | The default summarizer |
 | `GEMINI_API_KEY_1..3` (or `GOOGLE_API_KEY`) | 3 | The fallback summarizer |
 | `ASSEMBLYAI_API_KEY_1..3` | 3 | Transcribing local recordings |
 | `YT_TRANSCRIPT_KEY_1..10` | 10 | YouTube captions |
@@ -657,11 +693,12 @@ end the scan.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SUMMARY_BACKEND` | `fallback` | `fallback`, `anthropic`, `gemini` |
-| `SUMMARY_FALLBACK_CHAIN` | `anthropic,gemini` | Tried in order; first success wins. `disabled` short-circuits a slot |
-| `ANTHROPIC_API_KEY` | — | Required for the default backend |
-| `ANTHROPIC_MODEL` | `claude-opus-5` | Any current Claude model |
-| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Point at a Messages-API-compatible proxy if you use one |
+| `SUMMARY_BACKEND` | `fallback` | `fallback`, `claude-cli`, `gemini` |
+| `SUMMARY_FALLBACK_CHAIN` | `claude-cli,gemini` | Tried in order; first success wins. `disabled` short-circuits a slot |
+| `CLAUDE_CLI_BIN` | found on `PATH`, then `~/.local/bin/claude` | Where the `claude` binary is |
+| `CLAUDE_CLI_MODEL` | `opus` | A CLI model alias (`opus`, `sonnet`) or a full id |
+| `CLAUDE_CLI_TIMEOUT_SECONDS` | 1800 | How long one summary may take before it counts as hung |
+| `CLAUDE_CLI_FRAME_VISION` | 1 | `0` sends the frame list as text and never opens the images |
 | `SUMMARY_EFFORT` | `high` | `low`, `medium`, `high`, `xhigh`, `max` |
 | `GEMINI_API_KEY_1..3` | — | For the `gemini` fallback |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | Google retires model names; pin a real version, not a `-latest` alias |
@@ -669,17 +706,51 @@ end the scan.
 | `SUMMARY_MAX_TOKENS` | 16000 | |
 | `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture-*`/`tutorial-*` output; `always`/`never` override |
 
-**About `SUMMARY_EFFORT`.** It maps directly onto the Messages API's
-`output_config.effort`, which is how current Claude models are told how hard to
-think; thinking itself is adaptive, so the model decides when to use it. There
-is deliberately no "thinking budget" setting: the older `budget_tokens`
-parameter is rejected outright by Opus 5. `high` is the sweet spot for lecture
-notes; `max` costs meaningfully more for a marginal gain on this kind of task,
-and `low` is fine for short standups.
+**How the Claude backend runs.** `summarize/llm_client.py` shells out to:
+
+```
+claude -p --output-format json --model opus --effort high \
+       --safe-mode --no-session-persistence \
+       --tools Read --allowedTools Read --add-dir "$FRAMES_DIR/<run_id>"
+```
+
+The prompt (transcript, frame list, slides) goes in on stdin — an 80KB
+transcript would not fit in a command-line argument. `--safe-mode` and a
+scratch working directory keep this repo's own `CLAUDE.md`, hooks and plugins
+out of the summarizer's context, and `--no-session-persistence` stops every
+lecture leaving a full transcript in `~/.claude`.
+
+**Frames are read from disk, not uploaded.** The Messages API took inline
+images; the CLI takes a string. So the frame list carries absolute paths and
+the CLI is given the `Read` tool, scoped by `--add-dir` to that run's frame
+directory and nothing else. Set `CLAUDE_CLI_FRAME_VISION=0` to skip that: it is
+faster and lighter on your rate limit, but the model then cites frames it has
+never seen, so the pictures in the PDF may not match what the text says about
+them.
+
+**Any `ANTHROPIC_API_KEY` in your environment is stripped before the CLI runs.**
+If it survived, the CLI would quietly bill a metered console account instead of
+your subscription, and nothing about the output would tell you.
+
+**About `SUMMARY_EFFORT`.** It maps onto the CLI's `--effort`, the same scale
+the API spells `output_config.effort`: how hard the model is told to think.
+Thinking itself is adaptive, so the model decides when to use it, and there is
+no "thinking budget" setting. `high` is the sweet spot for lecture notes; `max`
+costs meaningfully more for a marginal gain on this kind of task, and `low` is
+fine for short standups.
+
+**Watch your subscription's rate limit.** A metered API key soaks up
+concurrency; a subscription does not. `SUMMARY_MAX_PARALLEL` (default 3) fires
+that many `claude` processes at once for a long transcript, and `--jobs`
+multiplies it across inputs. On a Pro plan, `SUMMARY_MAX_PARALLEL=1` with
+`--jobs 1` is the safe setting for a batch of lectures; the chain falls through
+to Gemini when you run out, so a limit shows up as Gemini-authored summaries
+rather than as an error.
 
 Missing credentials for one backend are not fatal — the chain skips it and
-moves on. Which backend answered is recorded in the document's provenance
-header.
+moves on. A `claude` CLI that is missing or signed out is treated exactly that
+way. Which backend answered is recorded in the document's provenance header
+(`model: claude-cli/opus`).
 
 ### PDF export
 
@@ -777,11 +848,11 @@ python3 lib/test_runstate.py                 # run state, resume, concurrency (1
 python3 lib/test_slotqueue.py                # cross-session component queue (23)
 python3 lib/test_keyring.py                  # numbered keys + rotation cursor (22)
 python3 lib/test_resources.py                # resource specs, extraction, GitHub (27)
-python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, document (31)
+python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, document, claude-cli (64)
 python3 summarize/test_pdf_units.py          # frame cropping, citations, PDF render (23)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
 bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (106)
-bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (49)
+bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (60)
 ```
 
 Two of those are worth understanding:
@@ -793,14 +864,19 @@ Two of those are worth understanding:
   same contract.
 - **`test_media_e2e.sh`** does the opposite: it builds a real MP4 with ffmpeg
   and runs the *actual* stages against local stub servers
-  (`lib/fake_api_server.py`) that speak the providers' HTTP protocols. The real
-  AssemblyAI and Anthropic SDKs make real requests, so it verifies things a
-  mock never could — that `output_config.effort` and adaptive thinking are on
-  the wire, that `budget_tokens` is not, that frames are attached as image
-  blocks, that the key cursor advances, that the PDF comes out with cropped
-  frames in it.
+  (`lib/fake_api_server.py`) that speak the providers' HTTP protocols, and —
+  for the summarizer — against a stub `claude` binary (`lib/fake_claude_cli.py`)
+  that records exactly how it was invoked. The real AssemblyAI SDK and the real
+  `llm_client` do the work, so it verifies things a mock never could: that
+  `--effort` carries `SUMMARY_EFFORT`, that `--add-dir` scopes file access to
+  the run's own frame directory, that the frame paths and the transcript reach
+  the prompt, that an `ANTHROPIC_API_KEY` the test deliberately exports does
+  *not* reach the CLI, that a signed-out CLI falls through to the next backend
+  instead of being retried, that the key cursor advances, and that the PDF comes
+  out with cropped frames in it.
 
-Neither proves Chrome can join a live Meet call, or that your real keys work.
+Neither proves Chrome can join a live Meet call, that your real keys work, or
+that your Claude subscription still has quota.
 That is what `verify_e2e.sh` is for:
 
 ```bash
@@ -881,6 +957,21 @@ weasyprint` works too, but leaves the venv out of step with
 Pillow isn't installed, or the slide detector declined on every frame (a
 full-screen camera shot has no slide to find). `PDF_FRAME_CROP=border` gives
 you the plain border trim instead.
+
+**Every summary is coming out of Gemini**
+The Claude backend is being skipped. `claude auth status` — if it says
+`"loggedIn": false`, run `claude auth login` (or `claude setup-token` on a
+headless box) *as the user the pipeline runs as*; the login lives in that
+user's `~/.claude`, so a login as yourself doesn't help a systemd unit running
+as root. `./verify_e2e.sh --preflight` checks this. The summarize log names the
+reason on the `!! claude-cli unavailable:` line, and the finished document's
+provenance header records which backend actually answered.
+
+**`claude CLI is not logged in` in the middle of a batch**
+The subscription hit its rate limit, or the OAuth token expired. The chain
+falls through to Gemini, so the run still completes. For a long batch, drop
+`SUMMARY_MAX_PARALLEL` to 1 and `--jobs` to 1 — three concurrent `claude`
+processes per input is an API-key-shaped setting, not a subscription-shaped one.
 
 **A YouTube transcript comes back as `[เสียงพากย์ไทย]`**
 That's a re-voiced video whose only captions are a placeholder. Every API key

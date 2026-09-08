@@ -97,7 +97,15 @@ CHROME_PID=""
 SHOT_PID=""
 WEBSOCKIFY_PID=""
 
+CLEANED=0
 cleanup() {
+  # Trapped on INT/TERM *and* EXIT, so a Ctrl+C runs this twice: once for the
+  # signal, once as the shell exits. Everything below is idempotent, but the
+  # second pass reprints the banner and — if another run had already claimed
+  # the display number we just released — would stop that one's Xvfb instead
+  # of ours.
+  [ "$CLEANED" -eq 1 ] && return 0
+  CLEANED=1
   # `|| true` everywhere: EXIT trap under `set -e`, and every one of these can
   # legitimately fail (already-dead pid, nothing matching pkill).
   echo ""

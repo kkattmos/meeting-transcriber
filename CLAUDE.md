@@ -14,11 +14,16 @@ Before writing AssemblyAI code, read https://www.assemblyai.com/docs/agent-instr
 and https://www.assemblyai.com/docs/llms.txt. The API has changed — do not rely on
 memorized parameter names.
 
-### Note on the Anthropic API
-Before writing Anthropic code, load the `claude-api` skill. The request surface
-moved twice in 2025-2026 and memorized patterns are wrong: `budget_tokens` is
-**rejected** by current models, effort is `output_config.effort`, and thinking
-is `{"type": "adaptive"}`. See the summarize section below.
+### Note on Claude: this project does NOT use the Anthropic API
+The summarizer spends the operator's **Claude subscription** by running the
+`claude` CLI as a subprocess. There is no `ANTHROPIC_API_KEY`, no `anthropic`
+SDK in `requirements.in`, and no Messages-API call anywhere in the tree — so
+`output_config`, `thinking`, `budget_tokens` and the rest of that surface are
+not this project's problem. If you are about to reach for the SDK, read the
+summarize section below first: removing it was deliberate and recent.
+
+If you ever *do* add an API-key path back, load the `claude-api` skill first —
+that request surface moved twice in 2025-2026 and memorized patterns are wrong.
 
 ## Branches
 
@@ -35,8 +40,8 @@ A meeting/lecture bot for a **Debian 13** guest on Proxmox. It joins a Google
 Meet or Zoom call in a persistent real-Chrome profile (so Google's sign-in flow
 doesn't get blocked by automation-detection heuristics), records both the screen
 and the meeting audio into an MP4, transcribes the audio with the AssemblyAI
-pre-recorded API (or youtube-transcript.io for YouTube URLs), and produces an AI
-summary — Markdown plus a PDF with the cited keyframes cropped to the slide and
+pre-recorded API (or youtube-transcript.io for YouTube URLs), and produces a
+Claude summary (through the `claude` CLI, on a subscription — no API key) — Markdown plus a PDF with the cited keyframes cropped to the slide and
 inlined — combining the transcript with keyframes extracted from the recording
 and, optionally, the lecturer's own slides from a GitHub repo or a folder. It
 accepts several inputs per invocation, runs them concurrently, and resumes
@@ -98,11 +103,102 @@ error, it silently writes the deliverable somewhere the operator will never
 look. Any of them may contain spaces — the test suites use a root with a space
 in it precisely so quoting regressions fail loudly.
 
+### Which directories are disposable, and where they should live
+
+Settled 2026-09-07 by inspection of this box. Two separate questions get
+confused here, so keep them apart.
+
+**The directories themselves are recreated on every run.** `lib/run_one.sh`
+calls `paths_mkdir` on all five before the DAG starts, and `summarize.py`
+resolves `SUMMARIES_DIR`/`PDF_DIR`/`FRAMES_DIR` with `create=True`. Deleting an
+empty output directory is a no-op; the next run makes it again. `paths_require`
+only checks that the *variable* is set, never that the path is sane.
+
+**Their contents are not equally disposable.** This is the table that matters
+when deciding what to put on which disk:
+
+| Directory | Regenerating it costs | Safe to wipe? |
+|---|---|---|
+| `RECORDINGS_DIR` | **impossible** — the meeting is over | No. This is the irreplaceable one |
+| `TRANSCRIPTS_DIR` | an AssemblyAI charge, per file | Only if you'll pay again |
+| `FRAMES_DIR` | CPU only — ffmpeg re-reads the MP4 | **Yes** |
+| `SUMMARIES_DIR` | a summarize run (subscription quota) | Prefer not |
+| `PDF_DIR` | free, from the `.md` + the frames | Yes, *if* the frames still exist |
+
+Frames are the one genuinely disposable set, because the source video always
+outlives them: a recording sits in `RECORDINGS_DIR`, and a YouTube download
+sits in `runs/<run_id>/video.mp4`. Losing frames costs one ffmpeg pass, and
+`runstate.py status` already re-runs the stage when the artifacts are gone.
+
+**Don't put `FRAMES_DIR` on `/tmp` here** — though the reason is durability,
+not size. `/tmp` on this host is **tmpfs**: 3.9GB of RAM, no disk behind it.
+Measured against real runs on this box (`$FRAMES_DIR/*/manifest.json`), frames
+are 27-113KB each and `FRAME_PERIOD_SECONDS=30` yields ~120/hour, so a 3-hour
+lecture is only 10-40MB. RAM pressure is therefore **not** the problem for one
+run; it only becomes one if runs accumulate and nothing sweeps them. The real
+costs are:
+
+- tmpfs is empty after a reboot. Re-rendering a PDF from a summary you already
+  have (`summarize/pdf.py summary.md out.pdf --frames-manifest ...`) then has
+  no manifest and no images, and silently produces a PDF with no pictures in
+  it — the run itself already succeeded, so nothing flags it.
+- A pipeline resume after a reboot re-extracts frames it had already paid for
+  (~14 min of CPU for a 3-hour video, measured; see the capacity notes below).
+
+Put it on the local disk instead — `/opt/meeting-bot/frames` is the default and
+is correct. Keeping frames *off* a network mount is right; tmpfs is the wrong
+way to do it. If RAM-backed frames are ever wanted deliberately, size the tmpfs
+and say so in `.env`, don't inherit the host's `/tmp`.
+
+### Measured capacity of this box (4 vCPU QEMU, 7.8GB RAM, 15GB disk)
+
+Benchmarked 2026-09-07 at the recorder's real settings (1920x1080, 15fps,
+`libx264 -preset ultrafast -crf 28`, `aac 128k`), so a future session can size
+a job without re-measuring:
+
+| | Measured | A 3-hour lecture |
+|---|---|---|
+| Encoding | 120s of video in 53s wall = **2.3x realtime** | fits live, but two concurrent recordings leave almost no margin |
+| Frame extraction | 120s of video in 9s = **13x realtime** | ~14 min of CPU, and it is the CPU-bound stage |
+| Recorded bitrate | 342 kbps on static slides | ~0.5GB of slides; 1-3GB with a live camera |
+| Frame size | 27-113KB per 1920x1080 JPEG | 360 frames = 10-40MB |
+| Transcript | median **40,000 Thai chars/hour** across 31 past runs | ~120,000 chars = ~5 chunks + 1 merge |
+
+The frame count is what drives summarize cost, because
+`CLAUDE_CLI_FRAME_VISION=1` lets the model open each one: a 1920x1080 image is
+about 1,844 tokens after Claude's downscale, so **360 frames is ~660k tokens if
+the model reads all of them**. It does not have to — with the CLI it chooses —
+but nothing caps it, and one chunk covering 36 minutes carries ~72 frames
+(~133k tokens) which alone crowds a 200k context. For long lectures raise
+`FRAME_PERIOD_SECONDS` (60-90 is plenty for slides) rather than relying on the
+model to be sparing. `SCENE_THRESHOLD=0.3` contributes very little here — real
+runs show 0-5 scene-change frames per video, so the periodic pass is
+effectively the whole budget.
+
+**A network mount under an output directory needs the mount checked, not just
+the path.** This box points four of the five at `/mnt/My Libraries/...`, a
+SeaDrive FUSE mount. Writes there are locally cached and fast (measured
+328 MB/s), so ffmpeg writing a recording straight to it is fine. The hazard is
+different: if seadrive is *not* mounted when a run starts, `/mnt` is an
+ordinary empty directory on the root filesystem, `paths_mkdir` happily creates
+the tree inside it, and the run writes a real recording and a real summary to
+local disk — which the mount then hides the moment it comes back. Nothing
+errors. Nothing is reported. The operator looks in the library and the lecture
+isn't there. If this bites, the fix is a liveness check (a marker file that
+must already exist inside each configured directory) rather than a `mkdir`.
+
 ### API keys are numbered slots with a persisted cursor
 
-`lib/keyring.py`. `GEMINI_API_KEY_1..3`, `ASSEMBLYAI_API_KEY_1..3`,
-`YT_TRANSCRIPT_KEY_1..10`, and a single `ANTHROPIC_API_KEY`; the unnumbered name
-is accepted as slot 1 so older `.env` files keep working.
+`lib/keyring.py`. `GEMINI_API_KEY_1..3`, `ASSEMBLYAI_API_KEY_1..3` and
+`YT_TRANSCRIPT_KEY_1..10`; the unnumbered name is accepted as slot 1 so older
+`.env` files keep working.
+
+**There is no Anthropic row in the ring, deliberately.** The primary summarizer
+authenticates as a Claude subscription through the `claude` CLI's own OAuth
+login, which lives in `~/.claude`, not in `.env`. `keyring.py status` used to
+list `ANTHROPIC_API_KEY` and that invited operators to set one — a set
+`ANTHROPIC_API_KEY` silently moves the spend to a metered console account.
+`./verify_e2e.sh --preflight` checks `claude auth status` in its place.
 
 **The rotation cursor is on disk** (`$MEETING_BOT_ROOT/state/keycursor.json`,
 written under an flock), not per-process. Rotation only spreads quota if
@@ -261,25 +357,86 @@ Split across seven modules:
 - `document.py` — the course-note document wrapper and `--combine`.
 - `pdf.py` + `framecrop.py` — the PDF export and its frame cropping.
 
-Backends: `anthropic` (default, aliases `claude`/`fcc`) and `gemini`.
-`SUMMARY_BACKEND=fallback` is the default mode and walks
-`SUMMARY_FALLBACK_CHAIN` (default `anthropic,gemini`). **NVIDIA NIM and Ollama
+Backends: `claude-cli` (default, aliases `claude`/`anthropic`/`cli`/`fcc`) and
+`gemini`. `SUMMARY_BACKEND=fallback` is the default mode and walks
+`SUMMARY_FALLBACK_CHAIN` (default `claude-cli,gemini`). **NVIDIA NIM and Ollama
 were removed** in the Debian 13 port — neither had been on a configured path,
-and both carried env surface and untested code.
+and both carried env surface and untested code. **The API-key `anthropic`
+backend was removed** when the summarizer moved to the subscription; the name
+survives only as an alias of `claude-cli`, so an existing `.env` whose chain
+reads `anthropic,gemini` keeps working.
 
-**Anthropic request shape.** `ANTHROPIC_MODEL` defaults to `claude-opus-5`.
-`SUMMARY_EFFORT` maps onto `output_config.effort` (low|medium|high|xhigh|max),
-and thinking is `{"type": "adaptive"}`. There is deliberately **no thinking-
-budget setting**: `thinking.budget_tokens` is rejected with a 400 by every
-current model. Both parameters are passed as normal keyword arguments and
-retried inside `extra_body` if the installed SDK is too old to know them
-(`_call_with_kwarg_fallback`) — a stale `pip install anthropic` on the box
-should degrade, not fail the stage.
+### The summarizer spends a subscription, not an API key
+
+`summarize_claude_cli` runs `claude -p` as a subprocess and reads the JSON
+envelope back. A Claude Pro/Max subscription has no API key — `api.anthropic.com`
+bills a separate console account — and the CLI is the supported way to spend a
+subscription non-interactively. That is the whole reason for the subprocess.
+
+The invocation is fixed in one place and asserted in two test suites:
+
+```
+claude -p --output-format json --model <CLAUDE_CLI_MODEL> --effort <SUMMARY_EFFORT>
+       --safe-mode --no-session-persistence
+       [--tools Read --allowedTools Read --add-dir <frames dir>]
+```
+
+- **The prompt goes in on stdin, never in argv.** An 80KB transcript in an
+  argument is over `ARG_MAX` on any normal box.
+- **`--effort` is where `SUMMARY_EFFORT` lands.** Same scale the Messages API
+  spells `output_config.effort`. There is no token-budget knob and no CLI
+  spelling for one, which is a more durable fix than remembering not to send
+  `budget_tokens`.
+- **`--model` defaults to the alias `opus`, not a pinned id.** The CLI resolves
+  aliases to the current model, so a rename doesn't 404 a box nobody has
+  touched in a year. `ANTHROPIC_MODEL` is still read as a fallback name.
+- **`--safe-mode` plus a scratch cwd** (`$MEETING_BOT_ROOT/tmp/claude-cli-cwd`).
+  Either alone would do it; both are cheap. The CLI auto-discovers `CLAUDE.md`
+  from its working directory, and *this* file is 38KB of architecture notes
+  that have nothing to do with summarizing a lecture — it would be pulled into
+  the context of every single summary. Controlling the cwd doesn't depend on a
+  flag name staying put; `--safe-mode` also drops hooks, plugins and MCP
+  servers.
+- **`--no-session-persistence`**, or every summary leaves a full transcript in
+  `~/.claude/projects` on a 15GB disk.
+
+**The subprocess environment is scrubbed** (`_claude_cli_env`): `ANTHROPIC_API_KEY`,
+`ANTHROPIC_API_KEY_1`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` are
+removed before launch. This is the most important line in the file. If any of
+them survives, the CLI switches from subscription auth to API-key billing and
+*says nothing* — the summary is identical and the charge lands on an account
+the operator thought was unused. An empty `ANTHROPIC_API_KEY` is worse: it fails
+auth in a way that reads like a broken subscription. `lib/fake_claude_cli.py`
+records what reached the child process precisely so this regression is visible.
+
+**Frames are read from disk, not inlined.** The Messages API took base64 image
+blocks; the CLI takes a string. So the manifest carries absolute paths, the CLI
+gets `--tools Read --allowedTools Read` scoped by `--add-dir` to the run's frame
+directory, and the model opens the images itself. `--allowedTools` is required
+because `-p` mode cannot answer a permission prompt. `CLAUDE_CLI_FRAME_VISION=0`
+sends the manifest as text only — cheaper against a subscription's rate limit,
+but then the model cites frames it has never seen and the pictures in the PDF
+may not match the text.
+
+**The CLI exits 0 when it is not logged in.** The only signal is the body:
+`is_error: true` with `result: "Not logged in · Please run /login"`. So
+`_run_claude_cli` parses the JSON rather than trusting the status, and maps
+auth wording to `BackendUnavailable` so the chain advances to Gemini
+immediately. Everything else becomes `ClaudeCliError` carrying the CLI's own
+words, because the CLI has no HTTP status and `retry.py` classifies on wording.
 
 **Gemini key rotation happens outside `with_retries`.** retry.py handles "the
 provider is busy"; the rotation loop handles "this key is exhausted or
 revoked". Inside the retry wrapper, a dead key would burn the full backoff
 schedule before the chain ever advanced.
+
+**`BackendUnavailable` carries `retryable = False`, and `retry.is_retryable`
+honours that before every other check.** It is raised from *inside*
+`with_retries` (the CLI only reveals "not logged in" once it has run), and
+`is_retryable`'s type-name heuristic reads the "Unavailable" in the class name
+as a busy server. Without the opt-out, a signed-out CLI sat through the full
+backoff schedule before the chain ever reached Gemini. Caught by
+`test_not_logged_in_is_never_retried`.
 
 **Retry policy.** Every backend's network call goes through
 `retry.with_retries`. Retryable: 408/409/425/429/500/502/503/504, connection and
@@ -537,8 +694,22 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   catch it and one unset key killed the whole run. Keep it a normal exception.
 - **Retry jitter is full, not proportional.** Parallel chunk requests must not
   retry in lockstep.
-- **No `thinking.budget_tokens`, ever.** Current Claude models reject it with a
-  400. Effort is `output_config.effort`; thinking is adaptive.
+- **The summarizer runs the `claude` CLI; it does not call the Messages API.**
+  No `ANTHROPIC_API_KEY`, no `anthropic` package. Adding one back moves the
+  spend off the subscription the operator is paying for. If a run has to be
+  billed to a console account, that is a new backend beside `claude-cli`, not a
+  change to it.
+- **`ANTHROPIC_*` must stay scrubbed from the CLI's environment.** See the
+  summarize section: leaving one set redirects billing silently, and an empty
+  one breaks auth in a way that looks like a broken subscription.
+- **The CLI runs with `--safe-mode` in a scratch cwd.** Otherwise this file
+  gets loaded into the context of every summary.
+- **The CLI's JSON body decides success, not its exit code.** It exits 0 when
+  signed out. Parsing the envelope is the only way to tell.
+- **`BackendUnavailable.retryable = False` stays.** Without it a signed-out CLI
+  burns the whole retry schedule before falling back to Gemini.
+- **No `thinking.budget_tokens`, ever** — and now no CLI spelling for one
+  either. Effort is `--effort`; thinking is adaptive.
 - **The document wrapper is built in code, not requested in the prompt.** See
   the output-format section above.
 - **A failed PDF render must not fail the run.** The markdown is the artifact.
@@ -574,11 +745,11 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
-| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, map-reduce, document | 31 |
+| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, map-reduce, document, the claude-cli command line + envelope parsing | 64 |
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting, real PDF render | 23 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources` | 106 |
-| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers | 49 |
+| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, and the real llm_client against a stub `claude` binary | 60 |
 | `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 
 `test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs
@@ -590,13 +761,20 @@ artifacts). Add to it when you touch orchestration.
 
 `test_media_e2e.sh` is the counterpart: real media, real SDKs, stub servers
 (`lib/fake_api_server.py`) speaking the providers' HTTP protocols. It is the
-only place that can assert on **what we actually send** — that
-`output_config.effort` carries `SUMMARY_EFFORT`, that thinking is adaptive,
-that `budget_tokens` is absent, that frames are attached as image blocks. When
-you change the request shape, assert it here.
+only place that can assert on **what we actually send**. For the summarizer
+that seam is no longer HTTP — it is `lib/fake_claude_cli.py`, a stub
+*executable* that `CLAUDE_CLI_BIN` points at. It records the argv, the piped
+prompt and the auth vars that reached the child, so the test asserts that
+`--effort` carries `SUMMARY_EFFORT`, that `--add-dir` scopes Read to the run's
+frame directory, that absolute frame paths are in the prompt, and that
+`ANTHROPIC_API_KEY` — deliberately exported by the test — did *not* reach the
+CLI. It also drives `FAKE_CLAUDE_MODE=not-logged-in` to prove a signed-out CLI
+fails as `BackendUnavailable` rather than being retried. When you change the
+invocation, assert it here.
 
 **What no test here covers:** Chrome actually joining a live Meet/Zoom call, and
-real AssemblyAI/Anthropic/Gemini/youtube-transcript.io round-trips.
+real AssemblyAI/Claude/Gemini/youtube-transcript.io round-trips — including
+whether the subscription behind `claude auth` has quota left.
 `./verify_e2e.sh` runs those on the real box. Its `--preflight` and
 `--browser-smoke` need no keys and no meeting: between them they cover the
 display/audio/capture chain and Chrome rendering under Xvfb with the recorder's
@@ -629,7 +807,8 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── xsession.sh               <- per-run Xvfb display + PulseAudio sink
 │   ├── resources.py              <- slides/notes from GitHub or a folder
 │   ├── run_one.sh                <- the per-run stage DAG
-│   ├── fake_api_server.py        <- stub Anthropic/AssemblyAI/YouTube servers
+│   ├── fake_api_server.py        <- stub AssemblyAI/YouTube servers
+│   ├── fake_claude_cli.py        <- stub `claude` binary for the media test
 │   ├── test_runstate.py
 │   ├── test_slotqueue.py
 │   ├── test_keyring.py

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Unit tests for the parts of the summarize stage that don't need an API key:
-retry classification/backoff, transcript chunking, map-reduce, and the document
-wrapper.
+retry classification/backoff, transcript chunking, map-reduce, the document
+wrapper, and how the claude-cli backend builds and reads its subprocess call.
 
     python3 summarize/test_summarize_units.py
 
@@ -10,19 +10,24 @@ The LLM itself is stubbed, so this exercises our logic (what counts as
 retryable, how chunks are cut, what the final markdown looks like) rather than
 any provider's behaviour.
 """
+import io
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import chunking  # noqa: E402
 import document  # noqa: E402
+import llm_client  # noqa: E402
 import retry  # noqa: E402
 from chunking import Chunk, Segment  # noqa: E402
-from llm_client import FrameMeta  # noqa: E402
+from llm_client import BackendUnavailable, ClaudeCliError, FrameMeta  # noqa: E402
 from mapreduce import summarize_chunked  # noqa: E402
 
 
@@ -363,6 +368,303 @@ class DocumentTest(unittest.TestCase):
         # Input order is preserved, which is what makes it drop-in.
         self.assertLess(combined.index("# Video 0"), combined.index("# Video 1"))
         self.assertLess(combined.index("# Video 1"), combined.index("# Video 2"))
+
+
+
+# ---------------------------------------------------------------------------
+# The claude-cli backend
+#
+# The summarizer spends a Claude subscription by running `claude -p`, so the
+# things that can break are the command line it builds, the environment it
+# hands the child, and how it reads the CLI's JSON envelope back. None of that
+# needs a network or a login, so all of it is tested here; lib/test_media_e2e.sh
+# covers the same ground against a stub binary in a real run.
+# ---------------------------------------------------------------------------
+
+def _envelope(result, is_error=False, denials=()):
+    """The shape `claude -p --output-format json` prints."""
+    return json.dumps({
+        "type": "result",
+        "subtype": "error" if is_error else "success",
+        "is_error": is_error,
+        "result": result,
+        "permission_denials": list(denials),
+    })
+
+
+class FakeCompleted:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+class ClaudeCliEnvironmentTest(unittest.TestCase):
+    """The subprocess environment decides which account pays."""
+
+    def test_api_key_vars_are_stripped(self):
+        # A set ANTHROPIC_API_KEY silently moves the spend from the
+        # subscription to a metered account, and the summary looks identical —
+        # so this is the only place the mistake is visible.
+        with mock.patch.dict(os.environ, {
+                "ANTHROPIC_API_KEY": "sk-ant-live",
+                "ANTHROPIC_AUTH_TOKEN": "tok",
+                "ANTHROPIC_BASE_URL": "https://proxy.example",
+                "PATH": os.environ.get("PATH", "")}):
+            env = llm_client._claude_cli_env()
+        for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                    "ANTHROPIC_BASE_URL"):
+            self.assertNotIn(var, env)
+
+    def test_unrelated_vars_survive(self):
+        with mock.patch.dict(os.environ, {"HOME": "/root", "LANG": "th_TH.UTF-8"}):
+            env = llm_client._claude_cli_env()
+        self.assertEqual(env["LANG"], "th_TH.UTF-8")
+
+    def test_cwd_is_not_the_repo(self):
+        # The CLI auto-discovers CLAUDE.md from its cwd, and this repo's is
+        # 38KB of architecture notes with nothing to do with the lecture.
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"MEETING_BOT_ROOT": tmp}):
+                cwd = Path(llm_client._claude_cli_cwd())
+        self.assertTrue(str(cwd).startswith(tmp))
+        self.assertNotEqual(cwd.resolve(),
+                            Path(__file__).resolve().parent.parent)
+
+
+class ClaudeCliCommandLineTest(unittest.TestCase):
+    """What ends up in argv, and what ends up in the prompt."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        frame_dir = Path(self.tmp.name) / "frames"
+        frame_dir.mkdir()
+        self.frames = []
+        for i, ts in enumerate((30.0, 5.0), start=1):   # deliberately unsorted
+            fp = frame_dir / f"frame_{i:04d}.jpg"
+            fp.write_bytes(b"\xff\xd8\xff\xe0stub")
+            self.frames.append(FrameMeta(timestamp_s=ts, kind="periodic",
+                                         path=str(fp)))
+        self.frame_dir = frame_dir
+        self.calls = []
+
+    def _run(self, env_overrides=None, frames=None, result=None):
+        """Drive summarize_claude_cli with subprocess.run intercepted."""
+        def fake_run(argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return FakeCompleted(stdout=result or _envelope("SUMMARY BODY"))
+
+        env = {"MEETING_BOT_ROOT": self.tmp.name,
+               "CLAUDE_CLI_BIN": sys.executable}
+        env.update(env_overrides or {})
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            out = llm_client.summarize_claude_cli(
+                self.frames if frames is None else frames,
+                "Dijkstra runs in O(E log V).",
+                "Notes:\n{transcript}\nFrames:\n{frame_manifest}")
+        return out
+
+    def _argv(self):
+        return self.calls[0][0]
+
+    def _prompt(self):
+        return self.calls[0][1]["input"]
+
+    def test_effort_is_passed_through(self):
+        self._run({"SUMMARY_EFFORT": "xhigh"})
+        argv = self._argv()
+        self.assertIn("--effort", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
+
+    def test_invalid_effort_falls_back_to_high(self):
+        # A typo reaching the CLI comes back as an opaque usage error mid-run.
+        self._run({"SUMMARY_EFFORT": "maximum"})
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+
+    def test_model_defaults_to_the_opus_alias(self):
+        # An alias, not a pinned id: a model rename must not 404 a box nobody
+        # has touched in a year.
+        self._run()
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--model") + 1], "opus")
+
+    def test_anthropic_model_is_accepted_as_an_alias(self):
+        self._run({"ANTHROPIC_MODEL": "claude-opus-5"})
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-5")
+
+    def test_print_mode_and_json_output(self):
+        self._run()
+        argv = self._argv()
+        self.assertIn("-p", argv)
+        self.assertEqual(argv[argv.index("--output-format") + 1], "json")
+
+    def test_context_is_isolated(self):
+        self._run()
+        argv = self._argv()
+        self.assertIn("--safe-mode", argv)
+        self.assertIn("--no-session-persistence", argv)
+
+    def test_no_budget_tokens_anywhere(self):
+        # The parameter current models reject has no CLI spelling at all now.
+        self._run()
+        self.assertNotIn("budget_tokens", " ".join(self._argv()))
+        self.assertNotIn("budget_tokens", self._prompt())
+
+    def test_vision_grants_read_scoped_to_the_frame_dir(self):
+        self._run()
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read")
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "Read")
+        self.assertEqual(argv[argv.index("--add-dir") + 1], str(self.frame_dir))
+
+    def test_vision_puts_absolute_frame_paths_in_the_prompt(self):
+        self._run()
+        prompt = self._prompt()
+        for frame in self.frames:
+            self.assertIn(str(Path(frame.path).resolve()), prompt)
+        self.assertIn("Read tool", prompt)
+
+    def test_frames_are_listed_in_timestamp_order(self):
+        # The manifest numbering is what the model cites, and pdf.py matches
+        # those citations back to files — an out-of-order manifest mislabels
+        # every picture in the PDF.
+        prompt = self._prompt() if self.calls else None
+        self._run()
+        prompt = self._prompt()
+        self.assertLess(prompt.index("@ 5.0s"), prompt.index("@ 30.0s"))
+
+    def test_vision_off_offers_no_tools_and_no_paths(self):
+        self._run({"CLAUDE_CLI_FRAME_VISION": "0"})
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertNotIn("--add-dir", argv)
+        self.assertNotIn(str(self.frame_dir), self._prompt())
+
+    def test_no_frames_means_no_tools(self):
+        self._run(frames=[])
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+
+    def test_transcript_reaches_the_prompt_on_stdin(self):
+        # Not argv: an 80KB transcript would blow past ARG_MAX.
+        self._run()
+        self.assertIn("Dijkstra runs in O(E log V).", self._prompt())
+        self.assertNotIn("Dijkstra", " ".join(self._argv()))
+
+    def test_provenance_records_the_backend_that_answered(self):
+        self._run({"CLAUDE_CLI_MODEL": "sonnet"})
+        self.assertEqual(llm_client.LAST_BACKEND, "claude-cli")
+        self.assertEqual(llm_client.LAST_MODEL, "sonnet")
+
+    def test_returns_the_result_text(self):
+        self.assertEqual(self._run(), "SUMMARY BODY")
+
+
+class ClaudeCliResponseTest(unittest.TestCase):
+    """Reading the envelope back — the CLI exits 0 even when it failed."""
+
+    def _run(self, stdout="", stderr="", returncode=0):
+        def fake_run(argv, **kwargs):
+            return FakeCompleted(stdout, stderr, returncode)
+        with mock.patch.object(llm_client.subprocess, "run", fake_run):
+            return llm_client._run_claude_cli(["claude"], "p", {}, ".", 60)
+
+    def test_not_logged_in_is_unavailable_not_a_failure(self):
+        # Exit code 0, is_error true. If this were classified as a transient
+        # failure the chain would burn the whole retry schedule on something
+        # no retry can fix, instead of falling through to Gemini.
+        with self.assertRaises(BackendUnavailable) as ctx:
+            self._run(stdout=_envelope("Not logged in · Please run /login",
+                                       is_error=True))
+        self.assertIn("not logged in", str(ctx.exception).lower())
+
+    def test_not_logged_in_is_never_retried(self):
+        exc = BackendUnavailable("claude CLI is not logged in")
+        self.assertFalse(retry.is_retryable(exc))
+
+    def test_overloaded_is_retryable(self):
+        with self.assertRaises(ClaudeCliError) as ctx:
+            self._run(stdout=_envelope("API Error: 503 upstream is overloaded",
+                                       is_error=True))
+        self.assertTrue(retry.is_retryable(ctx.exception))
+
+    def test_empty_result_is_an_error(self):
+        with self.assertRaises(ClaudeCliError):
+            self._run(stdout=_envelope("   "))
+
+    def test_non_json_output_is_an_error(self):
+        with self.assertRaises(ClaudeCliError):
+            self._run(stdout="Usage: claude [options]")
+
+    def test_non_json_login_message_is_still_unavailable(self):
+        # An older CLI prints this as bare text before it reaches --output-format.
+        with self.assertRaises(BackendUnavailable):
+            self._run(stdout="Not logged in · Please run /login")
+
+    def test_no_output_at_all_is_an_error(self):
+        with self.assertRaises(ClaudeCliError):
+            self._run(stdout="", stderr="segfault", returncode=139)
+
+    def test_permission_denial_warns_but_returns_the_summary(self):
+        # The summary exists; it was just written without the frames. Worth a
+        # warning, not worth discarding.
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            out = self._run(stdout=_envelope(
+                "BODY", denials=[{"tool_name": "Read"}]))
+        self.assertEqual(out, "BODY")
+        self.assertIn("denied", err.getvalue())
+
+    def test_a_timeout_is_retryable(self):
+        def fake_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="claude", timeout=60)
+        with mock.patch.object(llm_client.subprocess, "run", fake_run):
+            with self.assertRaises(ClaudeCliError) as ctx:
+                llm_client._run_claude_cli(["claude"], "p", {}, ".", 60)
+        self.assertTrue(retry.is_retryable(ctx.exception))
+
+    def test_a_missing_binary_is_unavailable(self):
+        def fake_run(argv, **kwargs):
+            raise OSError(2, "No such file or directory")
+        with mock.patch.object(llm_client.subprocess, "run", fake_run):
+            with self.assertRaises(BackendUnavailable):
+                llm_client._run_claude_cli(["claude"], "p", {}, ".", 60)
+
+
+class ClaudeCliDiscoveryTest(unittest.TestCase):
+    def test_missing_cli_is_unavailable_with_install_instructions(self):
+        with mock.patch.object(llm_client, "_claude_cli_bin", lambda: None):
+            with self.assertRaises(BackendUnavailable) as ctx:
+                llm_client.summarize_claude_cli([], "t", "{transcript}{frame_manifest}")
+        self.assertIn("install.sh", str(ctx.exception))
+
+    def test_configured_bin_that_does_not_exist_is_ignored(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CLI_BIN": "/nope/claude"}):
+            self.assertIsNone(llm_client._claude_cli_bin())
+
+
+class BackendChainTest(unittest.TestCase):
+    def test_legacy_anthropic_name_still_resolves(self):
+        # An existing .env whose chain reads `anthropic,gemini` must keep
+        # working — there is just no API-key backend behind the name now.
+        for alias in ("anthropic", "claude", "claude-cli", "fcc"):
+            self.assertIs(llm_client._BACKENDS[alias],
+                          llm_client.summarize_claude_cli)
+
+    def test_default_chain_is_cli_then_gemini(self):
+        self.assertEqual(llm_client.DEFAULT_FALLBACK_CHAIN, "claude-cli,gemini")
+
+    def test_unavailable_backend_advances_the_chain(self):
+        def unavailable(*a, **k):
+            raise BackendUnavailable("not logged in")
+        with mock.patch.dict(llm_client._BACKENDS,
+                             {"claude-cli": unavailable,
+                              "gemini": lambda *a, **k: "FROM GEMINI"}), \
+             mock.patch.dict(os.environ,
+                             {"SUMMARY_FALLBACK_CHAIN": "claude-cli,gemini"}):
+            out = llm_client.summarize_with_fallback([], "t", "{transcript}{frame_manifest}")
+        self.assertEqual(out, "FROM GEMINI")
 
 
 if __name__ == "__main__":

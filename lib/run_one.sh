@@ -378,6 +378,47 @@ if [ "$RC_T" -ne 0 ] || [ "$RC_F" -ne 0 ]; then
   exit 1
 fi
 
+# Frames are the one artifact set that is free to regenerate: the source video
+# always outlives them (a recording in RECORDINGS_DIR, a YouTube download in
+# runs/<id>/video.mp4), and nothing downstream reads them once the PDF exists —
+# WeasyPrint embeds the image bytes into the file itself. They are also the
+# bulkiest thing a run leaves behind, so they are swept by default.
+#
+# Timing is the whole point: this runs *after* the PDF has rendered, never
+# before. If a PDF was asked for and isn't there, the render failed, and the
+# cheap fix is `summarize/pdf.py <md> <pdf> --frames-manifest ...` — which needs
+# exactly these frames. So that case keeps them.
+#
+# KEEP_FRAMES=1 opts out entirely.
+cleanup_frames() {
+  case "$(printf '%s' "${KEEP_FRAMES:-0}" | tr 'A-Z' 'a-z')" in
+    1|true|yes|on) return 0 ;;
+  esac
+  # Never let an unset variable turn this into `rm -rf /` or wipe the whole
+  # FRAMES_DIR: only ever the one subdirectory this run created.
+  if [ -z "${FRAMES_DIR:-}" ] || [ -z "${RUN_ID:-}" ] \
+     || [ "$RUN_FRAMES_DIR" = "$FRAMES_DIR" ]; then
+    return 0
+  fi
+  [ -d "$RUN_FRAMES_DIR" ] || return 0
+
+  local want_pdf=1
+  case "$(printf '%s' "${SUMMARY_WRITE_PDF:-1}" | tr 'A-Z' 'a-z')" in
+    0|false|no) want_pdf=0 ;;
+  esac
+  if [ "$want_pdf" -eq 1 ] && [ ! -f "$SUMMARY_PDF" ]; then
+    echo "[frames] kept — the PDF did not render, and re-rendering it needs them"
+    return 0
+  fi
+
+  rm -rf "$RUN_FRAMES_DIR"
+  # Tell the state file the paths went on purpose. Otherwise runstate's
+  # artifact check downgrades a finished `frames` stage to `pending` and every
+  # later --status makes a completed run look half-broken.
+  rs cleaned --run-dir "$RUN_DIR" --stage frames || true
+  echo "[frames] removed $RUN_FRAMES_DIR (KEEP_FRAMES=1 to keep them)"
+}
+
 # --- Stage 3: summarize ------------------------------------------------------
 resolve_video
 echo ""
@@ -399,6 +440,10 @@ if [ "${#SUMMARY_ARTIFACTS[@]}" -eq 0 ]; then
   exit 1
 fi
 mark_done summarize "${SUMMARY_ARTIFACTS[@]}" || exit 1
+
+# Only ever after summarize is recorded as done — a run that dies here has to
+# stay resumable against the frames it already paid for.
+cleanup_frames
 
 echo ""
 echo "=================================================================="

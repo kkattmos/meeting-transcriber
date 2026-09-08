@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-Stub servers for the three paid APIs, so the media pipeline can be run
+Stub servers for the paid HTTP APIs, so the media pipeline can be run
 end-to-end without keys, network, or spend.
 
 These are NOT mocks inside the process under test: they speak the real HTTP
-protocols, and the real SDKs (anthropic, assemblyai) and the real requests
-client talk to them. That is the point — it exercises the request we actually
-build, including the Messages API's `output_config.effort` and adaptive
-thinking, which a monkeypatched function would never see.
+protocols, and the real assemblyai SDK and the real requests client talk to
+them. That is the point — it exercises the request we actually build, which a
+monkeypatched function would never see.
 
-    python3 lib/fake_api_server.py --which anthropic --port 8801 \
+    python3 lib/fake_api_server.py --which assemblyai --port 8802 \
         --record /tmp/requests.jsonl
 
-Endpoints implemented:
+There is no Anthropic server here any more. The summarizer spends a Claude
+subscription by running `claude -p`, so its seam is a stub *executable* —
+lib/fake_claude_cli.py — which asserts on argv, on the piped prompt, and on
+the auth vars that reach the child process. SUMMARY_TEXT below is shared with
+it, so both halves of the suite summarize the same canned lecture.
 
-  anthropic   POST /v1/messages
-              Returns one text block. Every request body is appended to the
-              --record file so the test can assert on what was sent.
+Endpoints implemented:
 
   assemblyai  POST /v2/upload, POST /v2/transcript,
               GET  /v2/transcript/<id>, GET /v2/transcript/<id>/sentences
@@ -73,35 +74,6 @@ class BaseHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass  # quiet: the test's own output is what matters
-
-
-class AnthropicHandler(BaseHandler):
-    def do_POST(self):
-        body = self._read_json()
-        # Images are megabytes of base64; keep a summary rather than the bytes,
-        # so the recording file stays greppable.
-        summarized = dict(body)
-        for message in summarized.get("messages", []):
-            content = message.get("content")
-            if isinstance(content, list):
-                message["content"] = [
-                    {"type": b.get("type"),
-                     "text": b.get("text") if b.get("type") == "text" else None,
-                     "bytes": len(b.get("source", {}).get("data", ""))
-                     if b.get("type") == "image" else None}
-                    for b in content
-                ]
-        _record("anthropic", summarized)
-        self._send({
-            "id": "msg_stub",
-            "type": "message",
-            "role": "assistant",
-            "model": body.get("model", "claude-opus-5"),
-            "content": [{"type": "text", "text": SUMMARY_TEXT}],
-            "stop_reason": "end_turn",
-            "stop_sequence": None,
-            "usage": {"input_tokens": 1000, "output_tokens": 500},
-        })
 
 
 class AssemblyAIHandler(BaseHandler):
@@ -182,7 +154,6 @@ class YouTubeHandler(BaseHandler):
 
 
 HANDLERS = {
-    "anthropic": AnthropicHandler,
     "assemblyai": AssemblyAIHandler,
     "youtube": YouTubeHandler,
 }

@@ -188,6 +188,29 @@ class RunState:
                 st.setdefault("artifacts", {}).update(artifacts)
         return self._mutate(_fn)
 
+    def cleaned(self, name):
+        """Record that a done stage's artifacts were deliberately deleted.
+
+        `status()` downgrades a done stage to pending the moment one of its
+        recorded artifacts is missing — which is exactly right for a file that
+        vanished unexpectedly, and exactly wrong for one we removed on purpose.
+        Frames are swept after the PDF is rendered (see run_one.sh), and
+        without this a finished run would report `frames pending` forever and
+        look like it had failed.
+
+        Dropping the artifact paths is the mechanism: there is nothing left to
+        verify, so the stage stays done. The `cleaned` flag is what lets
+        `status` say *why* the paths are gone rather than just omitting them.
+        """
+        def _fn(data):
+            st = data.setdefault("stages", {}).setdefault(name, {})
+            if st.get("status") != DONE:
+                return
+            st["artifacts"] = {}
+            st["cleaned"] = True
+            st["cleaned_at"] = _now()
+        return self._mutate(_fn)
+
     def fail(self, name, error=None):
         def _fn(data):
             st = data.setdefault("stages", {}).setdefault(name, {})
@@ -277,6 +300,9 @@ def main():
     p = with_run_dir(sub.add_parser("done"))
     p.add_argument("--stage", required=True)
     p.add_argument("--artifact", action="append", metavar="KEY=VALUE")
+
+    p = with_run_dir(sub.add_parser("cleaned"))
+    p.add_argument("--stage", required=True)
 
     p = with_run_dir(sub.add_parser("fail"))
     p.add_argument("--stage", required=True)
@@ -382,6 +408,10 @@ def main():
         state.done(args.stage, _parse_artifacts(args.artifact))
         return 0
 
+    if args.cmd == "cleaned":
+        state.cleaned(args.stage)
+        return 0
+
     if args.cmd == "fail":
         state.fail(args.stage, args.error)
         return 0
@@ -421,6 +451,9 @@ def main():
             st = data.get("stages", {}).get(stage, {})
             line = f"  {stage:<12} {st.get('status', PENDING):<8} attempts={st.get('attempts', 0)}"
             print(line)
+            if st.get("cleaned"):
+                print(f"      artifacts deleted after use "
+                      f"({st.get('cleaned_at', 'unknown time')})")
             for key, value in (st.get("artifacts") or {}).items():
                 exists = "" if Path(value).exists() else "   [MISSING]"
                 print(f"      {key}: {value}{exists}")

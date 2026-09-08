@@ -14,7 +14,8 @@ Policy:
     wording that some SDKs raise without a usable status code.
   * NOT retryable: 400, 401, 403, 404, 422 — a bad key or a malformed request
     fails the same way forever, and retrying just delays the fallback to a
-    backend that would have worked.
+    backend that would have worked. An exception carrying `retryable = False`
+    (BackendUnavailable does) is never retried whatever it looks like.
   * Backoff: exponential from SUMMARY_RETRY_BASE_SECONDS, doubling, with full
     jitter, capped at SUMMARY_RETRY_MAX_SECONDS. Jitter matters when several
     chunks are summarized in parallel — without it they all retry in lockstep
@@ -95,6 +96,16 @@ def _retry_after(exc):
 
 def is_retryable(exc):
     """True when retrying the same backend could plausibly succeed."""
+    # An exception may declare itself permanently fatal, and that beats every
+    # heuristic below. BackendUnavailable is the case that matters: it means
+    # "this backend cannot work at all" (not signed in, no key, SDK missing),
+    # yet its *type name* contains "unavailable", which the name heuristic
+    # reads as a busy server. Without this opt-out a signed-out CLI burned the
+    # whole backoff schedule before the chain ever reached Gemini.
+    declared = getattr(exc, "retryable", None)
+    if declared is not None:
+        return bool(declared)
+
     status = _status_of(exc)
     if status in NON_RETRYABLE_STATUS:
         return False

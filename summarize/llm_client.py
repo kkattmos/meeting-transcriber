@@ -5,59 +5,80 @@ Pluggable LLM client for the meeting-summary agent.
 Two backends plus an auto-fallback chain, all selected by env var:
 
   Auto-fallback (`SUMMARY_BACKEND=fallback`, the default) - walks
-  `SUMMARY_FALLBACK_CHAIN` in order. Each entry is one of: `anthropic`
-  (aliases: `claude`, `fcc`) or `gemini`. A backend is only abandoned after
-  its own retries are exhausted; the first to return wins. If every backend
-  fails, the accumulated history is raised. Default chain:
-  `anthropic,gemini`.
+  `SUMMARY_FALLBACK_CHAIN` in order. Each entry is one of: `claude-cli`
+  (aliases: `claude`, `anthropic`, `fcc`) or `gemini`. A backend is only
+  abandoned after its own retries are exhausted; the first to return wins. If
+  every backend fails, the accumulated history is raised. Default chain:
+  `claude-cli,gemini`.
 
-  Anthropic Claude (`SUMMARY_BACKEND=anthropic`) - the default and primary
-  backend. Reads ANTHROPIC_MODEL (default claude-opus-5), SUMMARY_EFFORT, and
-  a single ANTHROPIC_API_KEY. Works against api.anthropic.com or any proxy
-  that speaks the Messages API, because the SDK honors ANTHROPIC_BASE_URL.
+  Claude via the Claude Code CLI (`SUMMARY_BACKEND=claude-cli`) - the default
+  and primary backend. Runs `claude -p` as a subprocess, so the summary is
+  billed to the operator's **Claude subscription** (the account `claude auth`
+  is logged into), not to a metered API key. Reads CLAUDE_CLI_MODEL (default
+  `opus`) and SUMMARY_EFFORT.
 
   Google Gemini (`SUMMARY_BACKEND=gemini`) - the google-genai SDK, with up to
   three keys rotated round-robin (GEMINI_API_KEY_1..3).
 
-EFFORT, NOT A TOKEN BUDGET. SUMMARY_EFFORT maps straight onto the Messages
-API's `output_config.effort` (low | medium | high | xhigh | max), which is how
-current Claude models are told how hard to think. The older
-`thinking.budget_tokens` knob is rejected outright by Opus 5, so there is
-deliberately no token-budget setting here. Thinking itself is adaptive: the
-model decides when to use it.
+WHY A SUBPROCESS AND NOT THE MESSAGES API. A Claude Pro/Max subscription has
+no API key; api.anthropic.com bills per token against a separate console
+account. The CLI is the supported way to spend a subscription
+non-interactively, so the backend shells out to it rather than importing the
+`anthropic` SDK. There is deliberately no ANTHROPIC_API_KEY path left in this
+file - see CLAUDE.md.
 
-SDK-VERSION TOLERANCE. `output_config` and `thinking` are passed as normal
-keyword arguments and, if the installed SDK is too old to know them, retried
-inside `extra_body`. That keeps a stale `pip install anthropic` from turning
-into a hard failure of the whole summarize stage on a box nobody has updated.
+THE SUBPROCESS ENVIRONMENT IS SCRUBBED. ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN
+and ANTHROPIC_BASE_URL are removed before the CLI is launched. If any of them
+survives, the CLI silently switches from subscription auth to API-key billing -
+the summary still appears, and the charge lands on an account the operator
+thought was unused. An *empty* ANTHROPIC_API_KEY is worse still: it fails
+authentication outright, which looks like a broken subscription.
+
+FRAMES ARE READ FROM DISK, NOT INLINED. The Messages API takes base64 image
+blocks; `claude -p` takes a prompt string. So the frame manifest carries
+absolute paths, the CLI is given the Read tool restricted to the frame
+directories (--tools Read --allowedTools Read --add-dir), and the model opens
+the images itself. Set CLAUDE_CLI_FRAME_VISION=0 to send the manifest as text
+only - faster and cheaper against a subscription's rate limit, but then the
+model cites frames it has never seen.
+
+EFFORT, NOT A TOKEN BUDGET. SUMMARY_EFFORT maps onto the CLI's `--effort`
+(low | medium | high | xhigh | max), the same scale the Messages API exposes as
+`output_config.effort`. Thinking is adaptive: the model decides when to use it.
+There is no token-budget knob, deliberately.
 
 TRANSIENT FAILURES. Every backend's network call goes through
 summarize/retry.py: 503 "server is busy", 429, 5xx and connection errors are
 retried with exponential backoff and full jitter (honoring Retry-After), and
-only a backend that keeps failing hands over to the next in the chain. See
-retry.py for the policy and its env vars.
+only a backend that keeps failing hands over to the next in the chain. The CLI
+reports these as text rather than as HTTP status codes, so ClaudeCliError
+carries the CLI's own wording and retry.py's pattern matcher classifies it.
 
 MISSING CREDENTIALS raise BackendUnavailable, which the chain treats as "skip
 this one" rather than a fatal error - a chain of two backends shouldn't die
-because the first one's key isn't configured.
+because the first one isn't logged in.
 
 Both backends take the same extracted frames; the prompt and frame-list shape
 don't vary by provider.
 
 Env vars:
-  SUMMARY_BACKEND       "fallback" (default), "anthropic", or "gemini"
-  SUMMARY_FALLBACK_CHAIN  default "anthropic,gemini"
-  ANTHROPIC_API_KEY     required for anthropic (ANTHROPIC_API_KEY_1 also read)
-  ANTHROPIC_MODEL       default claude-opus-5 (SUMMARY_MODEL also accepted)
-  ANTHROPIC_BASE_URL    default https://api.anthropic.com
+  SUMMARY_BACKEND       "fallback" (default), "claude-cli", or "gemini"
+  SUMMARY_FALLBACK_CHAIN  default "claude-cli,gemini"
+  CLAUDE_CLI_BIN        path to the claude binary (default: found on PATH)
+  CLAUDE_CLI_MODEL      default "opus" (ANTHROPIC_MODEL also accepted)
+  CLAUDE_CLI_TIMEOUT_SECONDS  default 1800
+  CLAUDE_CLI_FRAME_VISION  1 (default) lets the model Read the frame images
   SUMMARY_EFFORT        low | medium | high (default) | xhigh | max
   GEMINI_API_KEY_1..3   required for gemini (GOOGLE_API_KEY also accepted)
   GEMINI_MODEL          default gemini-3.6-flash
-  SUMMARY_MAX_TOKENS    default 16000
+  SUMMARY_MAX_TOKENS    default 16000 (gemini only; the CLI has no such flag)
 """
 import base64
+import json
 import mimetypes
 import os
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,17 +91,38 @@ from retry import with_retries  # noqa: E402
 from keyring import KeyRing, missing_keys_message  # noqa: E402
 
 DEFAULT_BACKEND = "fallback"
-DEFAULT_FALLBACK_CHAIN = "anthropic,gemini"
+DEFAULT_FALLBACK_CHAIN = "claude-cli,gemini"
 
-DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
+# An alias, not a pinned id: the CLI resolves "opus" to the current Opus, so a
+# model rename doesn't turn into a 404 on a box nobody has touched in a year.
+DEFAULT_CLAUDE_CLI_MODEL = "opus"
+DEFAULT_CLAUDE_CLI_TIMEOUT = 1800
 DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 
-# The Messages API's effort levels, in order. Anything else is a typo, and a
-# typo that reaches the API comes back as an opaque 400 mid-run.
+# The effort levels the CLI's --effort accepts, in order. Anything else is a
+# typo, and a typo that reaches the CLI comes back as an opaque usage error.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_EFFORT = "high"
 
 GEMINI_MAX_KEYS = 3
+
+# Env vars that would flip the CLI from subscription auth to API-key billing.
+# Scrubbed from the subprocess environment, never from our own.
+_API_KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_1",
+                 "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
+
+# Wording the CLI uses when it has no usable subscription. These mean "this
+# backend cannot work at all", not "the service is busy" — so they become
+# BackendUnavailable and the chain advances immediately instead of burning the
+# full retry schedule on something no retry can fix.
+_NOT_LOGGED_IN_MARKERS = (
+    "not logged in",
+    "please run /login",
+    "invalid api key",
+    "authentication_error",
+    "oauth token has expired",
+    "credit balance is too low",
+)
 
 # Which backend and model actually produced the last successful summary. The
 # document header records this, and on a fallback chain it's the only way to
@@ -95,12 +137,28 @@ def _record_used(backend, model):
 
 
 class BackendUnavailable(RuntimeError):
-    """This backend can't be used at all (no API key, missing SDK).
+    """This backend can't be used at all (not logged in, CLI missing, no key).
 
     Deliberately a normal exception rather than SystemExit: the fallback chain
-    catches Exception, and SystemExit doesn't inherit from it. A missing key on
-    the first backend used to kill the whole chain instead of advancing to the
-    next one.
+    catches Exception, and SystemExit doesn't inherit from it. A missing
+    credential on the first backend used to kill the whole chain instead of
+    advancing to the next one.
+
+    `retryable = False` is load-bearing. This is raised from inside
+    with_retries (the CLI only reveals "not logged in" once it has run), and
+    retry.py's type-name heuristic would otherwise read "Unavailable" as a busy
+    server and sit through the full backoff schedule before advancing.
+    """
+
+    retryable = False
+
+
+class ClaudeCliError(RuntimeError):
+    """The CLI ran but reported a failure.
+
+    The message is the CLI's own text, kept verbatim so retry.is_retryable can
+    classify it — the CLI has no HTTP status to expose, so its wording
+    ("overloaded", "rate limit") is the only signal available.
     """
 
 
@@ -144,96 +202,241 @@ def _read_image_b64(path):
     return base64.standard_b64encode(data).decode("ascii"), mime
 
 
-def _render(frames, transcript, prompt_template):
+def _render(frames, transcript, prompt_template, with_paths=False):
     """Sort frames chronologically and fill in the prompt.
 
     Returns (sorted_frames, user_text). Every backend needs exactly this, and
     the frame order has to match the order the images are attached in.
+
+    `with_paths` appends each frame's absolute path to its manifest line. The
+    CLI backend needs that (the model opens the file itself); the SDK backends
+    must not have it, because they attach the bytes and a stray filesystem
+    path in the prompt only invites the model to talk about paths.
     """
     sorted_frames = sorted(frames, key=lambda f: f.timestamp_s)
-    manifest = "\n".join(f.label(i + 1) for i, f in enumerate(sorted_frames))
+    lines = []
+    for i, frame in enumerate(sorted_frames):
+        line = frame.label(i + 1)
+        if with_paths:
+            line = f"{line} {Path(frame.path).resolve()}"
+        lines.append(line)
+    manifest = "\n".join(lines)
     user_text = prompt_template.format(transcript=transcript,
                                        frame_manifest=manifest)
     return sorted_frames, user_text
 
 
-def _call_with_kwarg_fallback(func, label, base_kwargs, modern_kwargs):
-    """Call `func`, moving `modern_kwargs` into extra_body on an old SDK.
+# ---------------------------------------------------------------------------
+# Claude via the Claude Code CLI (subscription auth)
+# ---------------------------------------------------------------------------
 
-    `output_config` and `thinking` are recent additions. An SDK that predates
-    them raises TypeError for the unexpected keyword before any request is
-    made, and `extra_body` passes them through on the wire unchanged — so the
-    same code works on both without pinning a version.
+def _claude_cli_bin():
+    """Absolute path to the claude binary, or None.
+
+    ~/.local/bin is checked explicitly because that is where the official
+    installer puts it, and a systemd unit or a cron job runs with a PATH that
+    usually doesn't include it.
+    """
+    configured = (os.environ.get("CLAUDE_CLI_BIN") or "").strip()
+    if configured:
+        return configured if Path(configured).exists() else None
+    found = shutil.which("claude")
+    if found:
+        return found
+    fallback = Path.home() / ".local" / "bin" / "claude"
+    return str(fallback) if fallback.exists() else None
+
+
+def _claude_cli_env():
+    """The subprocess environment, with API-key auth stripped out.
+
+    See the module docstring: leaving ANTHROPIC_API_KEY set moves the spend
+    from the subscription to a metered account without saying so, and leaving
+    it set-but-empty fails auth in a way that reads like a broken login.
+    """
+    env = dict(os.environ)
+    for var in _API_KEY_VARS:
+        env.pop(var, None)
+    # The CLI is not a terminal here; keep its output machine-readable.
+    env["CI"] = "1"
+    return env
+
+
+def _claude_cli_cwd():
+    """An empty scratch directory to run the CLI in.
+
+    Not the repo root: the CLI auto-discovers CLAUDE.md from its working
+    directory, and this project's CLAUDE.md is 38KB of architecture notes that
+    have nothing to do with summarizing a lecture. --safe-mode also suppresses
+    that, but controlling the cwd doesn't depend on a flag name staying put.
+    """
+    root = Path(os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot"))
+    cwd = root / "tmp" / "claude-cli-cwd"
+    try:
+        cwd.mkdir(parents=True, exist_ok=True)
+        return str(cwd)
+    except OSError:
+        return str(Path.home())
+
+
+def _cli_timeout():
+    try:
+        return max(60, int(os.environ.get("CLAUDE_CLI_TIMEOUT_SECONDS",
+                                          DEFAULT_CLAUDE_CLI_TIMEOUT)))
+    except ValueError:
+        return DEFAULT_CLAUDE_CLI_TIMEOUT
+
+
+def _frame_vision_enabled():
+    return (os.environ.get("CLAUDE_CLI_FRAME_VISION", "1").strip().lower()
+            not in ("0", "false", "no", "off"))
+
+
+_VISION_PREAMBLE = """\
+The frame manifest below lists keyframes extracted from the recording, each
+with its timestamp and the absolute path to the image on this machine. Use the
+Read tool to open the frames you need before writing the summary — cite a frame
+only after you have looked at it. Read tool access is the only tool you have;
+do not attempt anything else.
+
+"""
+
+
+def _looks_unauthenticated(text):
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _NOT_LOGGED_IN_MARKERS)
+
+
+def _run_claude_cli(argv, prompt, env, cwd, timeout):
+    """One `claude -p` invocation. Raises on anything that isn't a summary.
+
+    Split out from summarize_claude_cli so with_retries wraps exactly the
+    fallible part, and so the unit tests can drive it against a stub binary.
     """
     try:
-        return with_retries(func, label=label, **base_kwargs, **modern_kwargs)
-    except TypeError as exc:
-        if "unexpected keyword" not in str(exc):
-            raise
-        print(f"  note: installed SDK doesn't accept "
-              f"{', '.join(modern_kwargs)} directly — passing via extra_body",
-              file=sys.stderr)
-        return with_retries(func, label=label, **base_kwargs,
-                            extra_body=dict(modern_kwargs))
+        proc = subprocess.run(argv, input=prompt, env=env, cwd=cwd,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        # "timed out" is in retry.py's retryable wording, so a CLI that hangs
+        # once gets another attempt rather than failing the stage.
+        raise ClaudeCliError(
+            f"claude CLI timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise BackendUnavailable(f"could not run the claude CLI: {exc}") from exc
 
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
 
-def summarize_anthropic(frames: List[FrameMeta], transcript: str,
-                        prompt_template: str) -> str:
-    """Anthropic Messages API — the default backend."""
+    # The CLI exits 0 even when it could not authenticate, so the exit code is
+    # never the whole story — the JSON body is.
+    if not stdout:
+        detail = stderr or f"no output (exit {proc.returncode})"
+        if _looks_unauthenticated(detail):
+            raise BackendUnavailable(f"claude CLI is not logged in: {detail}")
+        raise ClaudeCliError(f"claude CLI produced no output: {detail}")
+
     try:
-        import anthropic
-    except ImportError as exc:
-        raise BackendUnavailable(f"anthropic SDK not installed: {exc}") from exc
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        # --output-format json should always give us JSON. Anything else is
+        # the CLI refusing before it got that far.
+        if _looks_unauthenticated(stdout):
+            raise BackendUnavailable(f"claude CLI is not logged in: {stdout}")
+        raise ClaudeCliError(
+            f"claude CLI returned non-JSON output: {stdout[:400]}")
 
-    base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-    model = (os.environ.get("ANTHROPIC_MODEL")
-             or os.environ.get("SUMMARY_MODEL")
-             or DEFAULT_ANTHROPIC_MODEL)
+    result = payload.get("result")
+    if not isinstance(result, str):
+        result = ""
 
-    # One key only — this is the account the operator pays for. The ring is
-    # still used so ANTHROPIC_API_KEY_1 reads the same as ANTHROPIC_API_KEY.
-    ring = KeyRing.from_env("ANTHROPIC_API_KEY", max_slots=1)
-    if not ring:
-        raise BackendUnavailable(missing_keys_message(
-            "ANTHROPIC_API_KEY", 1,
-            extra=("\nOnly one Anthropic key is used. Get one at "
-                   "https://console.anthropic.com, or select a different "
-                   "SUMMARY_BACKEND."),
-        ))
+    if payload.get("is_error") or payload.get("subtype") == "error":
+        detail = result or payload.get("error") or stderr or "unknown error"
+        if _looks_unauthenticated(detail):
+            raise BackendUnavailable(
+                f"claude CLI is not logged in: {detail}\n"
+                f"  Run `claude auth login` (or `claude setup-token` for an "
+                f"unattended box) as the user this pipeline runs as.")
+        raise ClaudeCliError(f"claude CLI failed: {detail}")
 
-    client = anthropic.Anthropic(base_url=base_url, api_key=ring.keys[0])
-    sorted_frames, user_text = _render(frames, transcript, prompt_template)
+    denials = payload.get("permission_denials") or []
+    if denials:
+        # Not fatal: the summary still exists, but it was written without the
+        # frames the model asked for, so say so rather than shipping it as if
+        # the pictures had been seen.
+        print(f"  warning: the CLI was denied {len(denials)} tool call(s) — "
+              f"frames may not have been read", file=sys.stderr)
 
-    content = []
-    for frame in sorted_frames:
-        b64, mime = _read_image_b64(frame.path)
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": mime, "data": b64},
-        })
-    content.append({"type": "text", "text": user_text})
+    if not result.strip():
+        raise ClaudeCliError("claude CLI returned an empty summary")
+    return result.strip()
 
+
+def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
+                         prompt_template: str) -> str:
+    """Claude Code CLI in print mode — the default backend.
+
+    Spends the operator's Claude subscription rather than a metered API key.
+    """
+    binary = _claude_cli_bin()
+    if binary is None:
+        raise BackendUnavailable(
+            "the claude CLI was not found.\n"
+            "  Install it with:  curl -fsSL https://claude.ai/install.sh | bash\n"
+            "  then log in once: claude auth login\n"
+            "  If it lives somewhere unusual, set CLAUDE_CLI_BIN to its path.")
+
+    model = (os.environ.get("CLAUDE_CLI_MODEL")
+             or os.environ.get("ANTHROPIC_MODEL")
+             or DEFAULT_CLAUDE_CLI_MODEL)
     effort = effort_level()
-    message = _call_with_kwarg_fallback(
-        client.messages.create,
-        f"anthropic/{model} (effort={effort})",
-        {
-            "model": model,
-            "max_tokens": _max_tokens(),
-            "messages": [{"role": "user", "content": content}],
-        },
-        {
-            # Adaptive thinking: the model decides how much reasoning the
-            # summary needs. budget_tokens is rejected by current models.
-            "thinking": {"type": "adaptive"},
-            "output_config": {"effort": effort},
-        },
+    vision = _frame_vision_enabled() and bool(frames)
+
+    sorted_frames, user_text = _render(frames, transcript, prompt_template,
+                                       with_paths=vision)
+    if vision:
+        user_text = _VISION_PREAMBLE + user_text
+
+    argv = [
+        binary, "-p",
+        "--output-format", "json",
+        "--model", model,
+        "--effort", effort,
+        # Deterministic context: no CLAUDE.md, no hooks, no plugins, no MCP
+        # servers, no custom agents. Auth and the built-in tools still work.
+        "--safe-mode",
+        # Every run would otherwise leave a full transcript in ~/.claude —
+        # this box summarizes hour-long lectures on a 15GB disk.
+        "--no-session-persistence",
+    ]
+
+    if vision:
+        # Read only, and only inside the frame directories. The frames of one
+        # run all live in $FRAMES_DIR/<run_id>/, so this is normally one entry.
+        frame_dirs = sorted({str(Path(f.path).resolve().parent)
+                             for f in sorted_frames})
+        argv += ["--tools", "Read", "--allowedTools", "Read"]
+        for directory in frame_dirs:
+            argv += ["--add-dir", directory]
+    else:
+        # No tools at all: the model has nothing to open and nothing to touch.
+        argv += ["--tools", ""]
+
+    label = f"claude-cli/{model} (effort={effort})"
+    print(f"     {label}: {len(sorted_frames)} frame(s), "
+          f"vision={'on' if vision else 'off'}")
+
+    text = with_retries(
+        _run_claude_cli, argv, user_text, _claude_cli_env(), _claude_cli_cwd(),
+        _cli_timeout(), label=label,
     )
 
-    _record_used("anthropic", model)
-    parts = [b.text for b in message.content if getattr(b, "type", None) == "text"]
-    return "\n".join(parts).strip()
+    _record_used("claude-cli", model)
+    return text
 
+
+# ---------------------------------------------------------------------------
+# Google Gemini
+# ---------------------------------------------------------------------------
 
 def summarize_gemini(frames: List[FrameMeta], transcript: str,
                      prompt_template: str) -> str:
@@ -295,11 +498,19 @@ def summarize_gemini(frames: List[FrameMeta], transcript: str,
         f"All {len(ring)} Gemini key(s) failed. Last error: {last_error}")
 
 
-# chain-name -> backend function
+# chain-name -> backend function.
+#
+# `anthropic`, `claude` and `fcc` are kept as aliases of the CLI backend so an
+# existing .env whose chain reads `anthropic,gemini` keeps working. There is no
+# separate API-key backend behind those names any more — the subscription is
+# the only Anthropic path this project has.
 _BACKENDS = {
-    "anthropic": summarize_anthropic,
-    "claude": summarize_anthropic,
-    "fcc": summarize_anthropic,   # alias kept for the user's older configs
+    "claude-cli": summarize_claude_cli,
+    "claude_cli": summarize_claude_cli,
+    "claude": summarize_claude_cli,
+    "cli": summarize_claude_cli,
+    "anthropic": summarize_claude_cli,
+    "fcc": summarize_claude_cli,   # alias kept for the user's older configs
     "gemini": summarize_gemini,
 }
 
@@ -312,7 +523,7 @@ def summarize_with_fallback(frames: List[FrameMeta], transcript: str,
     raises here, so reaching the next entry means that provider is genuinely
     unusable right now — not merely busy.
 
-    Chain syntax: comma-separated names, e.g. "anthropic,gemini". Unknown
+    Chain syntax: comma-separated names, e.g. "claude-cli,gemini". Unknown
     entries are skipped with a warning; `disabled` is a sentinel for
     short-circuiting a chain without editing the env var.
     """
@@ -355,6 +566,6 @@ def summarize(frames: List[FrameMeta], transcript: str,
     if func is None:
         raise SystemExit(
             f"Unknown SUMMARY_BACKEND: {backend!r} "
-            f"(expected anthropic, gemini, or fallback)"
+            f"(expected claude-cli, gemini, or fallback)"
         )
     return func(frames, transcript, prompt_template)

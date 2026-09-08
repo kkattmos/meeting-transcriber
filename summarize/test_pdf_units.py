@@ -12,6 +12,7 @@ condition under which the pipeline degrades to markdown-only.
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -261,6 +262,47 @@ class RenderTest(unittest.TestCase):
         out = pdf_export.render("# T\n\n(Frame 1)", self.dir / "missing.pdf",
                                 frames=frames)
         self.assertTrue(Path(out).is_file())
+
+
+
+class CropWorkDirLifetimeTest(unittest.TestCase):
+    """Who owns the cropped-frame scratch directory.
+
+    The cropped copies are intermediates: WeasyPrint embeds the image bytes
+    into the PDF, so nothing reads them after render() returns. Left behind,
+    they put a .pdf-frames directory of run-independent filenames next to the
+    deliverable — which on a synced PDF_DIR meant re-uploading a directory
+    nobody would ever open.
+    """
+
+    def setUp(self):
+        try:
+            import weasyprint  # noqa: F401
+        except ImportError:
+            self.skipTest("weasyprint not installed")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = Path(self.tmp.name) / "out" / "summary.pdf"
+        self.md = "# Title\n\nA point *(Frame 1 @ 2.0s)*.\n"
+
+    def test_invented_work_dir_is_removed(self):
+        pdf.render(self.md, self.out, frames=[])
+        self.assertTrue(self.out.exists())
+        self.assertFalse((self.out.parent / ".pdf-frames").exists())
+
+    def test_explicit_work_dir_is_kept(self):
+        # The caller named it, so the caller owns it.
+        work = Path(self.tmp.name) / "mycrops"
+        pdf.render(self.md, self.out, frames=[], work_dir=work)
+        self.assertTrue(work.is_dir())
+
+    def test_work_dir_is_removed_even_when_rendering_fails(self):
+        # `finally`, not a trailing statement — a crash must not strand it.
+        with mock.patch.object(pdf, "_split_document",
+                               side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                pdf.render(self.md, self.out, frames=[])
+        self.assertFalse((self.out.parent / ".pdf-frames").exists())
 
 
 if __name__ == "__main__":

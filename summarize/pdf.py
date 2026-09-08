@@ -34,6 +34,7 @@ inconvenience, not a lost lecture.
 import html
 import os
 import re
+import shutil
 import sys
 from datetime import date
 from pathlib import Path
@@ -346,6 +347,14 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # A caller that names a work_dir owns it and gets it left behind (the tests
+    # inspect the cropped copies that way). One we invent is ours to remove:
+    # the cropped frames are pure intermediates — WeasyPrint embeds the image
+    # bytes into the PDF, so nothing reads them again after write_pdf returns.
+    # Leaving them behind put a .pdf-frames directory of run-independent
+    # filenames next to the deliverable, which on a synced PDF_DIR meant every
+    # run re-uploading a directory nobody would ever open.
+    owned = work_dir is None
     work_dir = Path(work_dir) if work_dir else output_path.parent / ".pdf-frames"
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -381,8 +390,15 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
         f"</body></html>"
     )
 
-    HTML(string=document, base_url=str(output_path.parent)).write_pdf(
-        str(output_path), stylesheets=[CSS(string=_css())])
+    try:
+        HTML(string=document, base_url=str(output_path.parent)).write_pdf(
+            str(output_path), stylesheets=[CSS(string=_css())])
+    finally:
+        # In a finally block so a failed render doesn't strand the directory
+        # either. Best-effort: a PDF that rendered must not be reported as
+        # failed because its scratch directory wouldn't delete.
+        if owned:
+            shutil.rmtree(work_dir, ignore_errors=True)
     return output_path
 
 
@@ -397,18 +413,37 @@ def want_markdown():
 
 
 def _main(argv):
-    """CLI: `pdf.py <summary.md> <out.pdf> [--frames-manifest PATH]`."""
+    """CLI: `pdf.py <summary.md> <out.pdf> [--frames-manifest P] [--work-dir D]`.
+
+    --work-dir names the directory the cropped frames are written to. Naming
+    it also means keeping it: a directory render() invents for itself is
+    deleted once the PDF is written, because the crops are intermediates the
+    PDF has already absorbed.
+    """
     import json
-    args = [a for a in argv[1:] if not a.startswith("--")]
-    manifest = None
-    for i, a in enumerate(argv):
-        if a == "--frames-manifest" and i + 1 < len(argv):
-            manifest = argv[i + 1]
-        elif a.startswith("--frames-manifest="):
-            manifest = a.split("=", 1)[1]
+    _VALUED = ("--frames-manifest", "--work-dir")
+    opts, positional, skip = {}, [], False
+    for i, a in enumerate(argv[1:]):
+        if skip:
+            skip = False
+            continue
+        if a in _VALUED:
+            # Consume the value, or it lands in `positional` and shifts the
+            # output path — the previous parser did exactly that and got away
+            # with it only because it read just the first two entries.
+            opts[a] = argv[i + 2] if i + 2 < len(argv) else None
+            skip = True
+        elif any(a.startswith(v + "=") for v in _VALUED):
+            k, v = a.split("=", 1)
+            opts[k] = v
+        elif not a.startswith("--"):
+            positional.append(a)
+    manifest = opts.get("--frames-manifest")
+    work_dir = opts.get("--work-dir")
+    args = positional
     if len(args) < 2:
-        print("Usage: pdf.py <summary.md> <out.pdf> [--frames-manifest PATH]",
-              file=sys.stderr)
+        print("Usage: pdf.py <summary.md> <out.pdf> [--frames-manifest PATH] "
+              "[--work-dir DIR]", file=sys.stderr)
         return 2
 
     frames = []
@@ -418,7 +453,8 @@ def _main(argv):
         frames = [FrameMeta(timestamp_s=e["timestamp_s"], kind=e["kind"],
                             path=e["path"]) for e in data.get("frames", [])]
     try:
-        out = render(Path(args[0]).read_text(), args[1], frames=frames)
+        out = render(Path(args[0]).read_text(), args[1], frames=frames,
+                     work_dir=work_dir)
     except PdfUnavailable as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

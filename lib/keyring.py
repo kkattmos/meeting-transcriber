@@ -228,8 +228,12 @@ def _main(argv):
     Prints counts and the current slot, never the keys themselves, so it is
     safe to paste into a bug report.
     """
+    # No ANTHROPIC_API_KEY row: the summarizer spends a Claude subscription
+    # through the `claude` CLI, which holds its own OAuth login. Listing an
+    # Anthropic key here would invite an operator to set one, and a set
+    # ANTHROPIC_API_KEY silently moves the spend to a metered account.
+    # `./verify_e2e.sh --preflight` checks `claude auth status` instead.
     rings = [
-        ("ANTHROPIC_API_KEY", (), 1),
         ("GEMINI_API_KEY", ("GOOGLE_API_KEY",), 3),
         ("ASSEMBLYAI_API_KEY", (), 3),
         ("YT_TRANSCRIPT_KEY", (), 10),

@@ -52,7 +52,6 @@ trap cleanup EXIT
 missing=""
 command -v ffmpeg >/dev/null 2>&1 || missing="$missing ffmpeg"
 "$PY" -c "import assemblyai" 2>/dev/null || missing="$missing assemblyai"
-"$PY" -c "import anthropic" 2>/dev/null || missing="$missing anthropic"
 "$PY" -c "import requests" 2>/dev/null || missing="$missing requests"
 if [ -n "$missing" ]; then
   echo "SKIP: missing dependencies:$missing"
@@ -74,15 +73,26 @@ mkdir -p "$RECORDINGS_DIR" "$TRANSCRIPTS_DIR" "$FRAMES_DIR" "$SUMMARIES_DIR" \
          "$PDF_DIR" "$RESOURCE_CACHE_DIR" "$MEETING_BOT_ROOT/state"
 
 # Three keys each, so rotation has something to rotate.
-export ANTHROPIC_API_KEY="stub-anthropic-key"
 export ASSEMBLYAI_API_KEY_1="stub-aai-1"
 export ASSEMBLYAI_API_KEY_2="stub-aai-2"
 export ASSEMBLYAI_API_KEY_3="stub-aai-3"
 export YT_TRANSCRIPT_KEY_1="stub-yt-1"
 export YT_TRANSCRIPT_KEY_2="stub-yt-2"
-export SUMMARY_BACKEND=anthropic
+export SUMMARY_BACKEND=claude-cli
 export SUMMARY_EFFORT=medium
-export ANTHROPIC_MODEL=claude-opus-5
+export CLAUDE_CLI_MODEL=opus
+
+# The summarizer spends a Claude subscription through `claude -p`, so this
+# seam is a stub executable rather than a stub HTTP server. See
+# lib/fake_claude_cli.py for what it records and why.
+CLI_RECORD="$TESTROOT/claude_cli.jsonl"
+export FAKE_CLAUDE_RECORD="$CLI_RECORD"
+export CLAUDE_CLI_BIN="$REPO/lib/fake_claude_cli.py"
+
+# Deliberately set here, and deliberately expected to be absent from the
+# child's environment: llm_client has to strip it, or a run silently bills a
+# metered API account instead of the subscription. Asserted in section 4.
+export ANTHROPIC_API_KEY="must-not-reach-the-cli"
 export ASSEMBLYAI_LANGUAGE=th
 export ASSEMBLYAI_POLL_SECONDS=0.2
 export FRAME_PERIOD_SECONDS=5
@@ -111,10 +121,8 @@ PYEOF
   return 1
 }
 
-start_stub anthropic 8801 || exit 1
 start_stub assemblyai 8802 || exit 1
 start_stub youtube 8803 || exit 1
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8801"
 export ASSEMBLYAI_BASE_URL="http://127.0.0.1:8802"
 export YT_TRANSCRIPT_API_URL="http://127.0.0.1:8803/api/transcripts"
 
@@ -181,9 +189,10 @@ check "AssemblyAI cursor advanced to key 2" \
 
 echo ""
 echo "=================================================================="
-echo "4. Summarize (real anthropic SDK -> stub server) + PDF"
+echo "4. Summarize (real llm_client -> stub claude CLI) + PDF"
 echo "=================================================================="
 : > "$RECORD_FILE"
+: > "$CLI_RECORD"
 SUMMARY_MD="$SUMMARIES_DIR/week4.md"
 SUMMARY_PDF="$PDF_DIR/week4.pdf"
 "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$SUMMARY_MD" \
@@ -194,34 +203,92 @@ SUMMARY_PDF="$PDF_DIR/week4.pdf"
 check "summarize.py exits 0" "$?" "0"
 [ -s "$SUMMARY_MD" ] && ok "markdown written" || bad "no markdown"
 
-echo "--- what actually went over the wire"
-REQ=$("$PY" - "$RECORD_FILE" <<'PYEOF'
+echo "--- how the CLI was actually invoked"
+# One JSON line per invocation: the argv llm_client built, the prompt it piped
+# in, and the auth vars that survived into the child environment.
+ARGV=$("$PY" - "$CLI_RECORD" <<'PYEOF'
 import json, sys
-for line in open(sys.argv[1]):
-    entry = json.loads(line)
-    if entry["api"] == "anthropic":
-        print(json.dumps(entry["body"]))
-        break
+print(json.dumps(json.loads(open(sys.argv[1]).readline())["argv"]))
 PYEOF
 )
-echo "$REQ" | grep -q '"effort": "medium"' \
-  && ok "output_config.effort carried SUMMARY_EFFORT" || bad "effort not sent"
-echo "$REQ" | grep -q '"type": "adaptive"' \
-  && ok "adaptive thinking requested" || bad "thinking not sent"
-echo "$REQ" | grep -q '"budget_tokens"' \
-  && bad "budget_tokens was sent (current models reject it)" \
-  || ok "no budget_tokens (rejected by current models)"
-echo "$REQ" | grep -q '"model": "claude-opus-5"' \
-  && ok "model is claude-opus-5" || bad "wrong model"
-echo "$REQ" | grep -q '"type": "image"' \
-  && ok "frames attached as image blocks" || bad "no images attached"
-echo "$REQ" | grep -q "Dijkstra" \
+PROMPT=$("$PY" - "$CLI_RECORD" <<'PYEOF'
+import json, sys
+sys.stdout.write(json.loads(open(sys.argv[1]).readline())["prompt"])
+PYEOF
+)
+LEAKED=$("$PY" - "$CLI_RECORD" <<'PYEOF'
+import json, sys
+env = json.loads(open(sys.argv[1]).readline())["env"]
+print(",".join(k for k, v in env.items() if v is not None) or "none")
+PYEOF
+)
+
+echo "$ARGV" | grep -q '"--effort", "medium"' \
+  && ok "--effort carried SUMMARY_EFFORT" || bad "effort not passed"
+echo "$ARGV" | grep -q '"--model", "opus"' \
+  && ok "--model carried CLAUDE_CLI_MODEL" || bad "wrong model"
+echo "$ARGV" | grep -q '"-p"' \
+  && ok "print mode (non-interactive)" || bad "-p not passed"
+echo "$ARGV" | grep -q '"--output-format", "json"' \
+  && ok "json output format, so errors are parseable" || bad "output format not set"
+echo "$ARGV" | grep -q '"--safe-mode"' \
+  && ok "--safe-mode: no CLAUDE.md, hooks or plugins bleed in" \
+  || bad "--safe-mode not passed"
+echo "$ARGV" | grep -q '"--no-session-persistence"' \
+  && ok "sessions not persisted (they would fill the disk)" \
+  || bad "--no-session-persistence not passed"
+# budget_tokens has no CLI spelling at all now, which is the durable fix for
+# the parameter current models reject.
+echo "$ARGV$PROMPT" | grep -q 'budget_tokens' \
+  && bad "budget_tokens appeared (current models reject it)" \
+  || ok "no budget_tokens anywhere in the invocation"
+
+echo "--- frames reach the model as files, not as image blocks"
+echo "$ARGV" | grep -q '"--tools", "Read"' \
+  && ok "Read is the only tool offered" || bad "--tools Read not passed"
+echo "$ARGV" | grep -q '"--allowedTools", "Read"' \
+  && ok "Read is pre-approved (-p mode cannot answer a prompt)" \
+  || bad "--allowedTools Read not passed"
+echo "$ARGV" | grep -q "\"--add-dir\", \"$FRAME_OUT\"" \
+  && ok "--add-dir scopes file access to this run's frame directory" \
+  || bad "--add-dir does not name $FRAME_OUT"
+# extract_frames.py names them scene_NNNNN.jpg / periodic_NNNNN.jpg; -F keeps
+# a test root containing a space (and any regex metacharacter) literal.
+echo "$PROMPT" | grep -qF "$FRAME_OUT/" \
+  && ok "absolute frame paths are in the prompt" || bad "no frame paths sent"
+echo "$PROMPT" | grep -qE "$(basename "$FRAME_OUT")/(scene|periodic)_[0-9]+\.jpg" \
+  && ok "the paths name real extracted frames" || bad "frame filenames look wrong"
+echo "$PROMPT" | grep -q "Dijkstra" \
   && ok "transcript text included in the prompt" || bad "transcript not sent"
+
+echo "--- the subscription, not a metered API key"
+[ "$LEAKED" = "none" ] \
+  && ok "ANTHROPIC_* scrubbed from the CLI environment" \
+  || bad "these reached the CLI and would redirect billing: $LEAKED"
+
+echo "--- a signed-out CLI degrades instead of failing the run"
+# The CLI exits 0 when it is not logged in, so the only signal is the body.
+# This must read as BackendUnavailable and advance the chain, not as a
+# transient error worth five retries.
+NOAUTH_MD="$SUMMARIES_DIR/noauth.md"
+FAKE_CLAUDE_MODE=not-logged-in SUMMARY_BACKEND=fallback \
+  SUMMARY_FALLBACK_CHAIN=claude-cli GEMINI_API_KEY_1= \
+  "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$NOAUTH_MD" \
+    --frames-manifest "$FRAME_OUT/manifest.json" --no-pdf \
+    --run-id noauth_test > "$TESTROOT/noauth.log" 2>&1
+NOAUTH_RC=$?
+[ "$NOAUTH_RC" -ne 0 ] && ok "a signed-out CLI fails the stage (rc=$NOAUTH_RC)" \
+  || bad "a signed-out CLI was treated as success"
+grep -qi "not logged in" "$TESTROOT/noauth.log" \
+  && ok "the error names the real cause" || bad "cause not reported"
+grep -qi "unavailable" "$TESTROOT/noauth.log" \
+  && ok "classified as BackendUnavailable, so the chain advances" \
+  || bad "not classified as unavailable — the chain would retry pointlessly"
 
 echo "--- the document wrapper"
 grep -q "meeting-transcriber" "$SUMMARY_MD" && ok "provenance comment present" \
   || bad "no provenance comment"
-grep -q "anthropic/claude-opus-5" "$SUMMARY_MD" \
+grep -q "claude-cli/opus" "$SUMMARY_MD" \
   && ok "provenance names the backend that answered" || bad "backend not recorded"
 grep -q "View Transcript" "$SUMMARY_MD" && ok "transcript embedded in <details>" \
   || bad "transcript block missing"
@@ -236,10 +303,23 @@ if [ "$HAVE_PDF" -eq 1 ]; then
   [ "$PDF_BYTES" -gt 8000 ] \
     && ok "PDF is $PDF_BYTES bytes — frames were embedded" \
     || bad "PDF is only $PDF_BYTES bytes; frames probably missing"
-  # The cropped copies are what get embedded; confirm cropping actually ran.
-  CROPPED=$(find "$PDF_DIR" -name 'frame_*.jpg' | wc -l)
+  # render() deletes the crop directory it invents, so nothing should be left
+  # beside the deliverable — on a synced PDF_DIR that scratch dir was pure
+  # noise re-uploaded on every run.
+  LEFTOVER=$(find "$PDF_DIR" -name '.pdf-frames' -o -name 'frame_*.jpg' | wc -l)
+  [ "$LEFTOVER" -eq 0 ] && ok "no crop scratch directory left in PDF_DIR" \
+    || bad "$LEFTOVER leftover crop file(s)/dir(s) in PDF_DIR"
+  # A caller that names its own work_dir still owns it — that is how the
+  # cropped copies stay inspectable, so cropping is still asserted directly.
+  CROPDIR="$TESTROOT/crops"
+  "$PY" "$REPO/summarize/pdf.py" "$SUMMARY_MD" "$TESTROOT/crop_probe.pdf" \
+        --frames-manifest "$FRAME_OUT/manifest.json" \
+        --work-dir "$CROPDIR" > "$TESTROOT/crop_probe.log" 2>&1
+  CROPPED=$(find "$CROPDIR" -name 'frame_*.jpg' 2>/dev/null | wc -l)
   [ "$CROPPED" -ge 1 ] && ok "$CROPPED frame(s) cropped for the PDF" \
     || bad "no cropped frames were produced"
+  [ -d "$CROPDIR" ] && ok "an explicit --work-dir is left for the caller" \
+    || bad "an explicit --work-dir was deleted; the caller owns it"
   "$PY" - "$FRAME_OUT" <<'PYEOF' && ok "slide region detected in a real frame" \
     || bad "crop declined on every frame (slide detection regressed)"
 import sys, glob
@@ -261,7 +341,7 @@ cat > "$TESTROOT/course notes/week4.md" <<'EOF'
 # Week 4 — Shortest paths
 The correct spelling is Bellman-Ford, and the bound is O(VE).
 EOF
-: > "$RECORD_FILE"
+: > "$CLI_RECORD"
 "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" \
       "$SUMMARIES_DIR/week4_res.md" \
       --frames-manifest "$FRAME_OUT/manifest.json" \
@@ -269,9 +349,11 @@ EOF
       --prompt lecture-claude \
       --resources "$TESTROOT/course notes" > "$TESTROOT/resources.log" 2>&1
 check "summarize with --resources exits 0" "$?" "0"
-grep -q "Bellman-Ford" "$RECORD_FILE" \
+# The prompt is what the CLI is handed on stdin, so that is where the slides
+# have to show up now — not in an HTTP request body.
+grep -q "Bellman-Ford" "$CLI_RECORD" \
   && ok "reference material reached the model" || bad "resources not sent"
-grep -q "Reference material" "$RECORD_FILE" \
+grep -q "Reference material" "$CLI_RECORD" \
   && ok "material is framed as reference data" || bad "no reference framing"
 
 echo "--- a missing local resource path is a typo, and fails fast"

@@ -157,7 +157,7 @@ command -v soffice >/dev/null 2>&1 || command -v libreoffice >/dev/null 2>&1 \
   || warn "no libreoffice — .pptx resources contribute text but no slide images"
 
 echo "--- python packages"
-for mod in anthropic google.genai assemblyai requests playwright weasyprint markdown PIL; do
+for mod in google.genai assemblyai requests playwright weasyprint markdown PIL; do
   "$PY" -c "import $mod" 2>/dev/null && ok "$mod" || bad "$mod not importable by $PY"
 done
 
@@ -178,7 +178,7 @@ fi
 
 echo "--- API keys (counted, never printed)"
 "$PY" "$SCRIPT_DIR/lib/keyring.py" status | sed 's/^/  /'
-for spec in "ANTHROPIC_API_KEY:1" "ASSEMBLYAI_API_KEY:3" "YT_TRANSCRIPT_KEY:10"; do
+for spec in "ASSEMBLYAI_API_KEY:3" "YT_TRANSCRIPT_KEY:10"; do
   name="${spec%%:*}"; cap="${spec##*:}"
   count="$("$PY" - "$name" "$cap" <<'PYEOF'
 import sys
@@ -191,6 +191,33 @@ PYEOF
   [ "${count:-0}" -ge 1 ] && ok "$name: $count key(s) configured" \
     || bad "$name: none configured"
 done
+
+echo "--- Claude Code CLI (the summarizer's subscription login)"
+# The summarize stage spends a Claude subscription through `claude -p`, not a
+# metered API key. `claude auth status` is a local, free check — it never
+# reaches the API, so preflight can run it on every invocation.
+CLAUDE_BIN="${CLAUDE_CLI_BIN:-}"
+if [ -z "$CLAUDE_BIN" ]; then
+  CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+fi
+# The official installer targets ~/.local/bin, which is not on a systemd or
+# cron PATH — look there before declaring it missing.
+if [ -z "$CLAUDE_BIN" ] && [ -x "$HOME/.local/bin/claude" ]; then
+  CLAUDE_BIN="$HOME/.local/bin/claude"
+fi
+if [ -z "$CLAUDE_BIN" ]; then
+  bad "claude CLI not found — install it with: curl -fsSL https://claude.ai/install.sh | bash"
+  warn "  (without it the chain falls back to Gemini for every summary)"
+else
+  ok "claude CLI at $CLAUDE_BIN ($("$CLAUDE_BIN" --version 2>/dev/null | head -1))"
+  if "$CLAUDE_BIN" auth status 2>/dev/null | grep -q '"loggedIn": *true'; then
+    ok "claude CLI is signed in ($("$CLAUDE_BIN" auth status 2>/dev/null \
+        | sed -n 's/.*"authMethod": *"\([^"]*\)".*/\1/p'))"
+  else
+    bad "claude CLI is not signed in — run: $CLAUDE_BIN auth login"
+    warn "  (on a headless box use: $CLAUDE_BIN setup-token)"
+  fi
+fi
 
 echo "--- Chrome + the persistent login profile"
 CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-$MEETING_BOT_ROOT/chrome-profile}"

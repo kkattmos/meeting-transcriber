@@ -30,3 +30,6 @@ __pycache__/
 .seadrive-cli/
 .ssh/
 seadrive-cli/
+scripts/
+.env*
+!.env.example
