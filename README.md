@@ -1000,7 +1000,7 @@ python3 lib/test_runstate.py                 # run state, resume, concurrency (1
 python3 lib/test_slotqueue.py                # cross-session component queue (23)
 python3 lib/test_keyring.py                  # numbered keys + rotation cursor (22)
 python3 lib/test_resources.py                # resource specs, extraction, GitHub (27)
-python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions (46)
+python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions, retries (51)
 python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli (109)
 python3 summarize/test_pdf_units.py          # frame cropping, citations, PDF render (60)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)

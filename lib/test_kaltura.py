@@ -431,6 +431,108 @@ class TestDownload(unittest.TestCase):
             self.assertFalse(dest.with_suffix(".mp4.part").exists())
 
 
+# --- Transient failures ------------------------------------------------------
+
+class FlakySession(FakeSession):
+    """Fails the first `fail_times` calls the way a busy CDN does."""
+
+    def __init__(self, routes, fail_times, exception=None):
+        super().__init__(routes)
+        self.remaining = fail_times
+        self.exception = exception
+        self.attempts = 0
+
+    def post(self, url, **kwargs):
+        self.attempts += 1
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise self.exception
+        return super().post(url, **kwargs)
+
+
+class TestRetries(unittest.TestCase):
+    """A 60s read timeout on getPlaybackContext failed a whole live run on the
+    deployment box seconds after the same host had answered fine. Every other
+    client in this project retries; this one now does too."""
+
+    def setUp(self):
+        # Full jitter over a 0s base makes the backoff instant.
+        self._saved = kaltura.os.environ.get("SUMMARY_RETRY_BASE_SECONDS")
+        kaltura.os.environ["SUMMARY_RETRY_BASE_SECONDS"] = "0"
+
+    def tearDown(self):
+        if self._saved is None:
+            kaltura.os.environ.pop("SUMMARY_RETRY_BASE_SECONDS", None)
+        else:
+            kaltura.os.environ["SUMMARY_RETRY_BASE_SECONDS"] = self._saved
+
+    def _timeout(self):
+        import requests
+        return requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)")
+
+    def test_a_read_timeout_is_retried_and_can_succeed(self):
+        session = FlakySession({"startWidgetSession": WIDGET_SESSION,
+                                "baseentry": ENTRY}, 2, self._timeout())
+        ref = kaltura.KalturaRef("2910381", "1_y9jay9sw", session=session)
+        self.assertEqual(ref.title(),
+                         "2110322 (2025/2) Online Session on 06-Jan-2026")
+        self.assertGreater(session.attempts, 2)
+
+    def test_a_persistent_timeout_still_becomes_a_kaltura_error(self):
+        session = FlakySession({"startWidgetSession": WIDGET_SESSION}, 99,
+                               self._timeout())
+        ref = kaltura.KalturaRef("2910381", "1_y9jay9sw", session=session)
+        with self.assertRaises(kaltura.KalturaError):
+            ref.ks()
+
+    def test_a_503_is_retried(self):
+        calls = {"n": 0}
+
+        def flaky(_data):
+            calls["n"] += 1
+            return WIDGET_SESSION if calls["n"] > 1 else FakeResponse(
+                {"x": 1}, status_code=503)
+
+        ref = kaltura.KalturaRef("2910381", "1_y9jay9sw",
+                                 session=FakeSession({"startWidgetSession": flaky}))
+        self.assertEqual(ref.ks(), "KS-TOKEN")
+        self.assertEqual(calls["n"], 2)
+
+    def test_a_404_is_never_retried(self):
+        """A bad Referer fails identically forever; retrying only wastes time."""
+        calls = {"n": 0}
+
+        def always_404(_data):
+            calls["n"] += 1
+            return FakeResponse({"x": 1}, status_code=404)
+
+        ref = kaltura.KalturaRef("2910381", "1_y9jay9sw",
+                                 session=FakeSession({"startWidgetSession": always_404}))
+        with self.assertRaises(kaltura.KalturaError):
+            ref.ks()
+        self.assertEqual(calls["n"], 1)
+
+    def test_a_truncated_download_is_a_failure_not_a_short_file(self):
+        """Without this a dropped connection leaves a valid-looking MP4 that
+        ffmpeg only fails on two stages later."""
+        import tempfile
+
+        class ShortResponse(StreamingResponse):
+            def __init__(self):
+                super().__init__([b"abc"])
+                self.headers = {"Content-Length": "999"}
+
+        routes = {"startWidgetSession": WIDGET_SESSION,
+                  "getPlaybackContext": playback_context([MP4_SOURCE]),
+                  "playManifest": ShortResponse()}
+        ref = kaltura.KalturaRef("2910381", "1_y9jay9sw", session=FakeSession(routes))
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "video.mp4"
+            with self.assertRaises(kaltura.KalturaError):
+                ref.download(dest, progress=False)
+            self.assertFalse(dest.exists())
+
+
 # --- The CLI contract the shell scripts depend on ----------------------------
 
 class TestCli(unittest.TestCase):

@@ -79,6 +79,37 @@ def _requests():
         requests = _module
     return requests
 
+
+# summarize/retry.py, imported lazily for the same reason as requests: the
+# offline `parse` path must not depend on it. Reused rather than reimplemented
+# because the project's retry policy is a settled, documented thing —
+# exponential backoff with *full* jitter, Retry-After when it is short enough,
+# and a status/wording classifier — and a second copy here would drift from it.
+# It is pure stdlib, so the lib -> summarize direction costs nothing at import
+# time; if that layering is ever tidied up, retry.py is the file to move down
+# into lib/.
+retry = None
+
+
+def _retry():
+    global retry
+    if retry is None:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "summarize"))
+        try:
+            import retry as _module
+        except ImportError as exc:  # pragma: no cover - a broken checkout
+            raise KalturaError(
+                "summarize/retry.py could not be imported, so Kaltura requests "
+                "cannot be retried. Is the checkout complete?"
+            ) from exc
+        retry = _module
+    return retry
+
+
+def _with_retries(func, label):
+    """Run one HTTP attempt under the project's retry policy."""
+    return _retry().with_retries(func, label=label)
+
 # Kaltura's public SaaS CDN. Self-hosted tenants serve api_v3 from their own
 # host, which is why the base is taken from the embed URL when there is one and
 # this is only the fallback.
@@ -89,6 +120,13 @@ DEFAULT_SERVICE_BASE = "https://cdnapisec.kaltura.com"
 DEFAULT_REFERER = "https://cdnapisec.kaltura.com/"
 
 HTTP_TIMEOUT_SECONDS = 60
+# Statuses worth another attempt. Kaltura's CDN answers a busy moment with a
+# 5xx or simply drops the read — seen live on the deployment box 2026-09-09,
+# where a 60s read timeout on getPlaybackContext failed a whole run seconds
+# after the same host had answered baseEntry.get fine. They are raised as
+# HTTPError so retry.is_retryable sees the status rather than a KalturaError
+# it would have to classify by wording.
+TRANSIENT_STATUS = {408, 425, 429, 500, 502, 503, 504}
 # Media, not JSON: a 90-minute lecture is ~470MB and the connection can stall.
 DOWNLOAD_TIMEOUT_SECONDS = 600
 DOWNLOAD_CHUNK_BYTES = 1 << 20
@@ -286,9 +324,18 @@ class KalturaRef:
         payload = dict(params)
         payload["format"] = "1"  # JSON
         errors = _requests().exceptions
-        try:
+
+        def attempt():
             response = self._http.post(url, data=payload, headers=self._headers(),
                                        timeout=HTTP_TIMEOUT_SECONDS)
+            if response.status_code in TRANSIENT_STATUS:
+                raise errors.HTTPError(
+                    f"{service}.{action} returned HTTP {response.status_code}",
+                    response=response)
+            return response
+
+        try:
+            response = _with_retries(attempt, f"kaltura {service}.{action}")
         except errors.RequestException as exc:
             raise KalturaError(f"{service}.{action} request failed: {exc}") from exc
         if response.status_code != 200:
@@ -417,10 +464,18 @@ class KalturaRef:
         url = (f"{self.service_base}/api_v3/service/caption_captionasset/"
                f"action/serve")
         errors = _requests().exceptions
-        try:
+
+        def attempt():
             response = self._http.get(
                 url, params={"captionAssetId": asset_id, "ks": self.ks()},
                 headers=self._headers(), timeout=HTTP_TIMEOUT_SECONDS)
+            if response.status_code in TRANSIENT_STATUS:
+                raise errors.HTTPError(f"caption {asset_id} returned HTTP "
+                                       f"{response.status_code}", response=response)
+            return response
+
+        try:
+            response = _with_retries(attempt, "kaltura captionAsset.serve")
         except errors.RequestException as exc:
             raise KalturaError(f"caption download failed: {exc}") from exc
         if response.status_code != 200:
@@ -442,10 +497,19 @@ class KalturaRef:
         partial = dest.with_name(dest.name + ".part")
         url = url or self.media_url()
         errors = _requests().exceptions
-        try:
+
+        # A retry restarts the transfer from zero — there is no Range resume
+        # here, because the CDN hands out a signed, time-limited redirect and a
+        # half-file is worse than a slow one. Re-downloading ~450MB costs about
+        # 30s on this box; failing the stage costs the operator a resume.
+        def attempt():
             with self._http.get(url, headers=self._headers(), stream=True,
                                 allow_redirects=True,
                                 timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+                if response.status_code in TRANSIENT_STATUS:
+                    raise errors.HTTPError(
+                        f"media download returned HTTP {response.status_code}",
+                        response=response)
                 if response.status_code != 200:
                     raise KalturaError(
                         f"media download returned HTTP {response.status_code} "
@@ -464,9 +528,22 @@ class KalturaRef:
                             pct = f" ({written * 100 // total}%)" if total else ""
                             print(f"    {written >> 20} MB{pct}", file=sys.stderr)
                             next_report += 50 << 20
+                # A truncated transfer is a retryable failure, not a short file:
+                # without this a dropped connection produces a valid-looking
+                # MP4 that ffmpeg then fails on two stages later.
+                if total and written < total:
+                    raise errors.ConnectionError(
+                        f"media download ended early: {written} of {total} bytes")
+                return written
+
+        try:
+            written = _with_retries(attempt, "kaltura media download")
         except errors.RequestException as exc:
             partial.unlink(missing_ok=True)
             raise KalturaError(f"media download failed: {exc}") from exc
+        except KalturaError:
+            partial.unlink(missing_ok=True)
+            raise
         if written == 0:
             partial.unlink(missing_ok=True)
             raise KalturaError("media download produced an empty file")

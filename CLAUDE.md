@@ -415,8 +415,20 @@ Non-obvious details:
   them and an outage becomes three silent uploads to AssemblyAI. Only SRT and
   WebVTT assets are used; a DFXP/TTML track is skipped rather than half-parsed,
   because a mangled transcript is worse than paying for a good one.
-- **The download writes `<dest>.part` and renames.** An interrupted download
-  must never look like a finished artifact to the resume logic.
+- **The download writes `<dest>.part` and renames**, and a transfer that ends
+  short of `Content-Length` is an error rather than a short file. An
+  interrupted download must never look like a finished artifact to the resume
+  logic, and a truncated MP4 would otherwise only fail two stages later, in
+  ffmpeg.
+- **Every request is retried through `summarize/retry.py`**, not a local copy —
+  the project's backoff policy (exponential, full jitter, `Retry-After`) is
+  documented and shouldn't drift. Transient statuses are re-raised as
+  `HTTPError` so `is_retryable` classifies on the status rather than on the
+  wording of a `KalturaError`. This was added 2026-09-09 after the first live
+  run on the deployment box died on a single 60s read timeout on
+  `getPlaybackContext`, seconds after the same host had answered `baseEntry.get`
+  fine. It is the one place `lib/` imports from `summarize/`; that import is
+  lazy, so the offline `parse` path is unaffected.
 - **The `<iframe>` blob never reaches summarize.** `run_one.sh` normalises it to
   a canonical embed URL (`SOURCE_URL`) first; otherwise 900 characters of HTML
   would land in the document's provenance comment and its link line.
@@ -1152,7 +1164,7 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
-| `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download | 46 |
+| `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, `--combine` citation shifting, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 109 |
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, manifest merging for `--combine`, real PDF render | 60 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
