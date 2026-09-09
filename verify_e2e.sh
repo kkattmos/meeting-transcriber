@@ -18,9 +18,15 @@
 #                                                   but no meeting and no spend
 #   ./verify_e2e.sh --mp4 /path/to/recording.mp4    real transcribe + summarize
 #   ./verify_e2e.sh --youtube "<url>"               real captions + summarize
+#   ./verify_e2e.sh --kaltura "<iframe or src url>" real Kaltura download +
+#                                                   transcribe + summarize
 #   ./verify_e2e.sh --meet "<meet url>" --minutes 3
 #   ./verify_e2e.sh --zoom "<zoom url>" --minutes 3
 #   ./verify_e2e.sh --all --mp4 f --youtube u --meet m --zoom z
+#
+# --kaltura is the only live check that needs no key of its own: the entry is
+# reached with an anonymous widget session. It does spend AssemblyAI when the
+# entry has no captions, which is the usual case.
 #
 # The meeting checks record for --minutes (default 3) and then ask the bot to
 # leave through the normal kill path, so they also verify the kill switch.
@@ -43,7 +49,7 @@ warn() { WARN=$((WARN + 1)); echo "  warn  — $1"; }
 
 DO_PREFLIGHT=0
 DO_BROWSER=0
-MP4=""; YOUTUBE=""; MEET=""; ZOOM=""; MINUTES=3
+MP4=""; YOUTUBE=""; KALTURA=""; MEET=""; ZOOM=""; MINUTES=3
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -51,17 +57,18 @@ while [ "$#" -gt 0 ]; do
     --browser-smoke) DO_BROWSER=1; shift ;;
     --mp4)       MP4="${2:-}"; shift 2 ;;
     --youtube)   YOUTUBE="${2:-}"; shift 2 ;;
+    --kaltura)   KALTURA="${2:-}"; shift 2 ;;
     --meet)      MEET="${2:-}"; shift 2 ;;
     --zoom)      ZOOM="${2:-}"; shift 2 ;;
     --minutes)   MINUTES="${2:-3}"; shift 2 ;;
     --all)       DO_PREFLIGHT=1; DO_BROWSER=1; shift ;;
-    -h|--help)   sed -n '2,28p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,33p' "$0"; exit 0 ;;
     *) echo "Unknown argument: $1 (try --help)" >&2; exit 1 ;;
   esac
 done
 
 if [ "$DO_PREFLIGHT" -eq 0 ] && [ "$DO_BROWSER" -eq 0 ] \
-   && [ -z "$MP4$YOUTUBE$MEET$ZOOM" ]; then
+   && [ -z "$MP4$YOUTUBE$KALTURA$MEET$ZOOM" ]; then
   DO_PREFLIGHT=1
 fi
 
@@ -416,6 +423,31 @@ echo "=================================================================="
 echo "  input: $YOUTUBE"
 bash "$SCRIPT_DIR/pipeline.sh" "$YOUTUBE" 2>&1 | tail -n 25
 check_run_artifacts "youtube" "$YOUTUBE" "no"
+fi
+
+if [ -n "$KALTURA" ]; then
+echo ""
+echo "=================================================================="
+echo "Kaltura — real entry download + transcribe + summarizer"
+echo "=================================================================="
+# Reachability first, separately: an entry that needs an LMS login fails here
+# in a second, rather than after the pipeline has built a run for it.
+if info=$("$PY" "$SCRIPT_DIR/lib/kaltura.py" info "$KALTURA" 2>&1); then
+  ok "entry is reachable without a login"
+  echo "  $info" | head -c 400; echo ""
+  bash "$SCRIPT_DIR/pipeline.sh" "$KALTURA" 2>&1 | tail -n 25
+  check_run_artifacts "kaltura" "$KALTURA" "no"
+else
+  bad "could not read the Kaltura entry"
+  echo "  $info"
+  # Only the hint that fits the failure. Printing the access-control advice for
+  # a missing dependency sends the operator to edit .env for no reason.
+  case "$info" in
+    *404*|*"no playable source"*)
+      echo "  The tenant's access-control may not allow the default Referer —"
+      echo "  set KALTURA_REFERER in .env to your LMS domain and retry." ;;
+  esac
+fi
 fi
 
 record_meeting() {

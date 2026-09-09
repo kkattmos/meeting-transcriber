@@ -1,9 +1,15 @@
 #!/bin/bash
 # The orchestrator: record -> transcribe -> summarize, for one input or many.
 #
-# Accepts Google Meet / Zoom URLs, YouTube URLs, and local media files, in any
-# mix, in a single invocation. Each input becomes its own *run* with its own
-# state, and runs execute concurrently up to --jobs.
+# Accepts Google Meet / Zoom URLs, YouTube URLs, Kaltura embeds and local media
+# files, in any mix, in a single invocation. Each input becomes its own *run*
+# with its own state, and runs execute concurrently up to --jobs.
+#
+# A Kaltura lecture can be given either as the whole <iframe> tag copied out of
+# the LMS or as just its src URL — quote it, since the tag contains spaces:
+#
+#   ./pipeline.sh '<iframe id="kaltura_player" src="https://cdnapisec.kaltura.com/p/123/...entry_id=1_abcdefgh"></iframe>'
+#   ./pipeline.sh "https://cdnapisec.kaltura.com/p/123/embedPlaykitJs/uiconf_id/456?entry_id=1_abcdefgh"
 #
 #   ./pipeline.sh "https://www.youtube.com/watch?v=aaa" \
 #                 "https://youtu.be/bbb" \
@@ -130,6 +136,19 @@ while [ "$#" -gt 0 ]; do
 done
 
 # --- Input classification ----------------------------------------------------
+# Kaltura inputs are recognised by lib/kaltura.py rather than by a regex here:
+# an input may be a bare embed URL *or* a whole pasted <iframe> tag, and the
+# same parser has to agree with the one run_one.sh and transcribe.sh use, or a
+# blob accepted here fails two stages later. `parse` makes no network call.
+is_kaltura_input() {
+  "$PYTHON_BIN" "$SCRIPT_DIR/lib/kaltura.py" parse "$1" >/dev/null 2>&1
+}
+
+kaltura_safe_name() {
+  "$PYTHON_BIN" "$SCRIPT_DIR/lib/kaltura.py" parse "$1" 2>/dev/null \
+    | sed -nE 's/.*"safe_name": "([^"]*)".*/\1/p'
+}
+
 classify_input() {
   local value="$1"
   if [ -f "$value" ]; then
@@ -138,6 +157,8 @@ classify_input() {
     echo "meeting"
   elif echo "$value" | grep -qE '(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/playlist\?list=)'; then
     echo "youtube"
+  elif is_kaltura_input "$value"; then
+    echo "kaltura"
   else
     echo "unknown"
   fi
@@ -147,9 +168,14 @@ classify_input() {
 # positional form (<input> <name> <display> <lang> <prompt>) working alongside
 # the new multi-input form. A URL or an existing path is an input; a bare word
 # like "Weekly Standup" is not.
+#
+# A pasted Kaltura <iframe> is neither a URL nor a path, so it needs its own
+# arm here — without it the blob would be filed as a legacy name positional and
+# the run would be created with no input at all.
 looks_like_input() {
   case "$1" in
     http://*|https://*) return 0 ;;
+    *"<iframe"*) return 0 ;;
   esac
   [ -f "$1" ]
 }
@@ -252,6 +278,15 @@ derive_safe_name() {
       [ -z "$vid" ] && vid="video"
       echo "yt_${vid}"
       ;;
+    kaltura)
+      # kal_<entry id>. The entry id is the only stable handle on a Kaltura
+      # lecture — the title is often a date string shared by every session of
+      # the course, and would collide.
+      local kal
+      kal="$(kaltura_safe_name "$input")"
+      [ -z "$kal" ] && kal="kaltura"
+      echo "$kal"
+      ;;
     local_file)
       local base
       base="$(basename "$input")"
@@ -296,8 +331,9 @@ else
     done
     if [ "${#UNRECOGNIZED[@]}" -gt 0 ]; then
       echo "ERROR: unrecognized input: ${UNRECOGNIZED[0]}" >&2
-      echo "  Expected a Google Meet or Zoom URL, a YouTube URL, or a path to" >&2
-      echo "  a local media file that exists on disk." >&2
+      echo "  Expected a Google Meet or Zoom URL, a YouTube URL, a Kaltura" >&2
+      echo "  embed (the <iframe> tag or just its src URL), or a path to a" >&2
+      echo "  local media file that exists on disk." >&2
       echo "  (A local path is only recognized if the file is actually there —" >&2
       echo "   check for a typo in the path.)" >&2
       exit 1
@@ -309,8 +345,9 @@ else
     kind="$(classify_input "$input")"
     if [ "$kind" = "unknown" ]; then
       echo "ERROR: unrecognized input: $input" >&2
-      echo "  Expected a Google Meet or Zoom URL, a YouTube URL, or a path to" >&2
-      echo "  a local media file that exists." >&2
+      echo "  Expected a Google Meet or Zoom URL, a YouTube URL, a Kaltura" >&2
+      echo "  embed (the <iframe> tag or just its src URL), or a path to a" >&2
+      echo "  local media file that exists." >&2
       exit 1
     fi
 

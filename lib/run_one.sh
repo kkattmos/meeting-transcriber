@@ -21,6 +21,15 @@
 # transcribe and fetch_video+frames are independent once a video exists, so
 # they run concurrently. summarize joins them. Each stage records its artifacts
 # in state.json, so a rerun skips whatever already finished.
+#
+# Kaltura is the one input type where they are NOT independent. A YouTube
+# transcript comes from captions, so transcribe never needs the download; a
+# Kaltura entry usually has no captions at all, and then AssemblyAI needs the
+# media file. So for kaltura, fetch_video runs first, on its own, and the two
+# branches start after it:
+#
+#     input ──> fetch_video ──┬─> transcribe ─┐
+#                             └─> frames ─────┴─> summarize
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,6 +86,17 @@ while IFS= read -r _spec; do
   [ -n "$_spec" ] && RESOURCE_SPECS+=("$_spec")
 done < <(rs get --run-dir "$RUN_DIR" --key resources 2>/dev/null || true)
 [ -n "$DISPLAY_NAME" ] || DISPLAY_NAME="Meeting Bot"
+
+# What the summary document cites as its source. For every other input type
+# that is the input itself; a Kaltura input may be a 900-character <iframe>
+# tag, which would land verbatim in the provenance comment and the link line,
+# so it is normalised to a plain embed URL for the same entry.
+SOURCE_URL="$INPUT"
+if [ "$INPUT_TYPE" = "kaltura" ]; then
+  _canon="$("$PYTHON_BIN" "$SCRIPT_DIR/kaltura.py" parse "$INPUT" 2>/dev/null \
+             | sed -nE 's/.*"url": "([^"]*)".*/\1/p')"
+  [ -n "$_canon" ] && SOURCE_URL="$_canon"
+fi
 [ -n "$LANGUAGE" ] || LANGUAGE="${ASSEMBLYAI_LANGUAGE:-th}"
 
 # --- Single-writer lock ------------------------------------------------------
@@ -228,6 +248,10 @@ do_record() {
 }
 
 do_fetch_video() {
+  if [ "$INPUT_TYPE" = "kaltura" ]; then
+    do_fetch_kaltura
+    return $?
+  fi
   # Downloads to the run dir rather than a tempdir: on a resume, frames can be
   # re-extracted without paying for the download again, and the sweep in
   # runstate.py reclaims the space later.
@@ -245,10 +269,29 @@ do_fetch_video() {
     -o "$RUN_DIR/video.%(ext)s" "$INPUT"
 }
 
+# Kaltura: not yt-dlp. Its Kaltura extractor sends no Referer, which a
+# university tenant's access-control answers with a bare 404 — see lib/kaltura.py.
+# Unlike the YouTube path this download is on the critical path for transcribe
+# too, because Kaltura entries rarely carry captions.
+do_fetch_kaltura() {
+  # Entry facts (title, duration, caption tracks) alongside the media, so
+  # summarize can name the lecture without a second round trip and a resume
+  # doesn't need one at all.
+  if ! "$PYTHON_BIN" "$SCRIPT_DIR/kaltura.py" info "$INPUT" > "$RUN_DIR/kaltura.json"; then
+    rm -f "$RUN_DIR/kaltura.json"
+    echo "[fetch_video] could not read the Kaltura entry" >&2
+    return 1
+  fi
+  "$PYTHON_BIN" "$SCRIPT_DIR/kaltura.py" download "$INPUT" "$RUN_DIR/video.mp4"
+}
+
 do_transcribe() {
   local src="$1"
-  bash "$ROOT_DIR/transcribe/transcribe.sh" \
-    "$src" "$SAFE_NAME" "$LANGUAGE" --out-base "$TRANSCRIPT_BASE"
+  local args=("$src" "$SAFE_NAME" "$LANGUAGE" --out-base "$TRANSCRIPT_BASE")
+  # On the Kaltura path the *input* is passed so free captions can be tried
+  # first, with the downloaded MP4 behind --media as the AssemblyAI fallback.
+  [ -n "${2:-}" ] && args+=(--media "$2")
+  bash "$ROOT_DIR/transcribe/transcribe.sh" "${args[@]}"
 }
 
 do_frames() {
@@ -271,12 +314,21 @@ do_summarize() {
     # On the YouTube path $video is the local download, so the original URL has
     # to be threaded through separately — it's what the document header cites
     # and what the video title is looked up from.
-    --source-url "$INPUT"
+    --source-url "$SOURCE_URL"
     # So the document's provenance comment names the run dir the
     # artifacts actually live in, not just the meeting name.
     --run-id "$RUN_ID"
   )
   [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
+  # Kaltura has no yt-dlp to ask for a title, so the entry's own name (read at
+  # fetch time into kaltura.json) is passed explicitly. Best-effort: a run
+  # whose fetch predates this file just falls back to the meeting name.
+  if [ "$INPUT_TYPE" = "kaltura" ] && [ -f "$RUN_DIR/kaltura.json" ]; then
+    local kal_title
+    kal_title="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("title") or "")' \
+                  "$RUN_DIR/kaltura.json" 2>/dev/null || true)"
+    [ -n "$kal_title" ] && args+=(--title "$kal_title")
+  fi
   local spec
   for spec in "${RESOURCE_SPECS[@]:-}"; do
     [ -n "$spec" ] && args+=(--resources "$spec")
@@ -290,7 +342,7 @@ resolve_video() {
   case "$INPUT_TYPE" in
     local_file) VIDEO_FILE="$INPUT" ;;
     meeting)    VIDEO_FILE="$MP4_FILE" ;;
-    youtube)
+    youtube|kaltura)
       VIDEO_FILE="$(rs get --run-dir "$RUN_DIR" --key stages.fetch_video.artifacts.video 2>/dev/null || true)"
       if [ -z "$VIDEO_FILE" ]; then
         VIDEO_FILE="$(ls -1 "$RUN_DIR"/video.* 2>/dev/null | head -n 1)"
@@ -319,34 +371,47 @@ fi
 # Branch A transcribes; branch B makes sure a video exists and extracts frames.
 # They share nothing but the run's state file, whose writes are flock'd.
 
+# The download, shared by both callers below. Idempotent: a fetch that is
+# already `done` is skipped, so running it ahead of the branches (kaltura) and
+# inside the frames branch (youtube) can't download twice.
+ensure_video_fetched() {
+  if [ "$(stage_status fetch_video)" = "done" ]; then
+    echo "[fetch_video] already done — skipping"
+    return 0
+  fi
+  run_stage fetch_video do_fetch_video || return 1
+  local got
+  got="$(ls -1 "$RUN_DIR"/video.* 2>/dev/null | grep -v '\.part$' | head -n 1)"
+  if [ -z "$got" ]; then
+    rs fail --run-dir "$RUN_DIR" --stage fetch_video \
+      --error "the download reported success but produced no file in $RUN_DIR"
+    echo "[fetch_video] produced no file" >&2
+    return 1
+  fi
+  mark_done fetch_video "video=$got" || return 1
+}
+
 branch_transcribe() {
   # YouTube goes to youtube-transcript.io with the URL itself (captions, no
-  # download); everything else sends the media file to AssemblyAI.
+  # download); Kaltura passes the input too — free captions when the entry has
+  # them — but also hands over the downloaded MP4 for the usual AssemblyAI
+  # fallback. Everything else just sends the media file.
   local src="$INPUT"
-  if [ "$INPUT_TYPE" != "youtube" ]; then
+  local media=""
+  if [ "$INPUT_TYPE" = "kaltura" ]; then
+    resolve_video
+    media="$VIDEO_FILE"
+  elif [ "$INPUT_TYPE" != "youtube" ]; then
     resolve_video
     src="$VIDEO_FILE"
   fi
-  run_stage transcribe do_transcribe "$src" || return 1
+  run_stage transcribe do_transcribe "$src" "$media" || return 1
   mark_done transcribe "txt=${TRANSCRIPT_BASE}.txt" "srt=${TRANSCRIPT_BASE}.srt"
 }
 
 branch_frames() {
   if [ "$INPUT_TYPE" = "youtube" ]; then
-    if [ "$(stage_status fetch_video)" != "done" ]; then
-      run_stage fetch_video do_fetch_video || return 1
-      local got
-      got="$(ls -1 "$RUN_DIR"/video.* 2>/dev/null | head -n 1)"
-      if [ -z "$got" ]; then
-        rs fail --run-dir "$RUN_DIR" --stage fetch_video \
-          --error "yt-dlp reported success but produced no file in $RUN_DIR"
-        echo "[fetch_video] yt-dlp produced no file" >&2
-        return 1
-      fi
-      mark_done fetch_video "video=$got" || return 1
-    else
-      echo "[fetch_video] already done — skipping"
-    fi
+    ensure_video_fetched || return 1
   fi
 
   resolve_video
@@ -357,6 +422,18 @@ branch_frames() {
   run_stage frames do_frames "$VIDEO_FILE" || return 1
   mark_done frames "manifest=$RUN_FRAMES_DIR/manifest.json"
 }
+
+# Kaltura's transcribe branch needs the media file (the entry usually has no
+# captions), so the download can't sit inside the frames branch the way
+# YouTube's does — it runs here, ahead of both.
+if [ "$INPUT_TYPE" = "kaltura" ]; then
+  echo ""
+  echo "==> Fetching the Kaltura entry before transcribe and frames"
+  if ! ensure_video_fetched; then
+    echo "    Resume with:  ./pipeline.sh --run-id $RUN_ID" >&2
+    exit 1
+  fi
+fi
 
 echo ""
 echo "==> Running transcribe and frame-extraction in parallel"

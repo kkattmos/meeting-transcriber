@@ -141,6 +141,10 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
 
     if source_kind == "youtube":
         parts.append(f"Youtube Link: `{source}`")
+    elif source_kind == "kaltura":
+        # Not "Source File" — a Kaltura lecture is a link like the YouTube one,
+        # and the reader needs to be able to click it.
+        parts.append(f"Video Link: `{source}`")
     elif source:
         parts.append(f"Source File: `{source}`")
 

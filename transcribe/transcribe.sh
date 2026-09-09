@@ -7,6 +7,10 @@
 #                     round-robin via yt_transcript_client.py). The argument
 #                     is the URL itself; the client extracts the video id.
 #                     No audio is downloaded, no AssemblyAI is run.
+#   * Kaltura embed-> the entry's own caption track when it has one (free and
+#                     instant, same reasoning as the YouTube path), otherwise
+#                     AssemblyAI on the MP4 given behind --media. The input is
+#                     the <iframe> tag or its src URL; lib/kaltura.py parses it.
 #   * Local file   -> AssemblyAI pre-recorded transcription API
 #                     (transcribe/assemblyai_client.py). MP4/M4A/WAV are
 #                     sent directly; WEBM/OGG are first demuxed to MP3 with
@@ -20,7 +24,11 @@
 # (region, login state, captions availability, audio quality) and re-run.
 #
 # Usage:
-#   ./transcribe/transcribe.sh <file_or_youtube_url> "<name>" [language] [--out-base PATH]
+#   ./transcribe/transcribe.sh <file_or_url> "<name>" [language] [--out-base PATH] [--media PATH]
+#
+# --media PATH is the already-downloaded media file to fall back to when a URL
+# input turns out to have no captions. The pipeline passes it on the Kaltura
+# path, where the download has happened before this stage runs anyway.
 #
 # Language is an ISO-639-1 code AssemblyAI recognises: "th" (Thai, default),
 # "en", "auto", or any AssemblyAI language code. Ignored on the YouTube path
@@ -46,17 +54,19 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 . "$ROOT_DIR/lib/paths.sh"
 
 OUT_BASE=""
+MEDIA_FALLBACK=""
 declare -a ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --out-base) OUT_BASE="${2:-}"; shift 2 ;;
+    --media)    MEDIA_FALLBACK="${2:-}"; shift 2 ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
 set -- "${ARGS[@]:-}"
 
 if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
-  echo "Usage: $0 <file_or_youtube_url> <name> [language] [--out-base PATH]"
+  echo "Usage: $0 <file_or_url> <name> [language] [--out-base PATH] [--media PATH]"
   echo "  language: th (default), en, auto, or any AssemblyAI language code"
   exit 1
 fi
@@ -96,6 +106,16 @@ if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="python3"
 fi
 
+# Kaltura is recognised by the same parser the pipeline classifies with, so an
+# input accepted there can't be rejected here. Checked after YouTube (the two
+# never overlap) and with $PYTHON_BIN, because kaltura.py imports requests and
+# only the venv is guaranteed to have it.
+IS_KALTURA=0
+if [ "$IS_YOUTUBE" -eq 0 ] && [ ! -f "$INPUT" ] \
+   && "$PYTHON_BIN" "$ROOT_DIR/lib/kaltura.py" parse "$INPUT" >/dev/null 2>&1; then
+  IS_KALTURA=1
+fi
+
 SEGMENTS_FILE=""
 
 # --- YouTube path: youtube-transcript.io API -------------------------------
@@ -120,51 +140,103 @@ if [ "$IS_YOUTUBE" -eq 1 ]; then
     exit 2
   fi
 else
-  # --- Local file path: AssemblyAI pre-recorded API ------------------------
-  # AssemblyAI accepts mp3, mp4, m4a, wav directly. WEBM and OGG need to be
-  # demuxed to mp3 first because the SDK's upload helper occasionally chokes
-  # on those containers. ffmpeg is available because setup.sh installs it.
-  if [ ! -f "$INPUT" ]; then
-    echo "Input file not found: $INPUT"
-    rm -rf "$WORK_DIR"
-    exit 1
+  # The file AssemblyAI will be given. Normally the input itself; on the
+  # Kaltura path the input is a URL and this becomes --media instead.
+  MEDIA_INPUT="$INPUT"
+  HAVE_SEGMENTS=0
+
+  # --- Kaltura path: the entry's own captions, when it has any -------------
+  # Free and instant, so it is always tried before paying AssemblyAI. Most
+  # lecture-capture entries have no caption track at all, and exit code 3 says
+  # exactly that — anything else is a real failure and must not be swallowed
+  # into an expensive fallback.
+  if [ "$IS_KALTURA" -eq 1 ]; then
+    echo "==> Checking the Kaltura entry for captions"
+    SEGMENTS_FILE="$WORK_DIR/segments.json"
+    set +e
+    "$PYTHON_BIN" "$ROOT_DIR/lib/kaltura.py" captions "$INPUT" "$LANGUAGE" \
+      > "$SEGMENTS_FILE" 2>"$WORK_DIR/kaltura-client.log"
+    KAL_RC=$?
+    set -e
+    case "$KAL_RC" in
+      0)
+        echo "    using the entry's caption track — skipping AssemblyAI"
+        HAVE_SEGMENTS=1
+        ;;
+      3)
+        echo "    no caption track on this entry — transcribing the audio instead"
+        rm -f "$SEGMENTS_FILE"
+        SEGMENTS_FILE=""
+        if [ -z "$MEDIA_FALLBACK" ]; then
+          cat "$WORK_DIR/kaltura-client.log"
+          echo "ERROR: this Kaltura entry has no captions and no --media file was"
+          echo "       given, so there is nothing to send to AssemblyAI."
+          echo "       The pipeline passes the downloaded MP4; if you are calling"
+          echo "       this script directly, download it first:"
+          echo "         lib/kaltura.py download '<input>' /tmp/lecture.mp4"
+          rm -rf "$WORK_DIR"
+          exit 1
+        fi
+        MEDIA_INPUT="$MEDIA_FALLBACK"
+        ;;
+      *)
+        cat "$WORK_DIR/kaltura-client.log"
+        echo "ERROR: could not read the Kaltura entry (see $WORK_DIR/kaltura-client.log)"
+        rm -rf "$WORK_DIR"
+        exit "$KAL_RC"
+        ;;
+    esac
   fi
-  EXT="${INPUT##*.}"
-  EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
-  case "$EXT_LOWER" in
-    mp3|mp4|m4a|wav)
-      AUDIO_FILE="$INPUT"
-      ;;
-    webm|ogg)
-      echo "==> Demuxing $EXT_LOWER -> MP3 for AssemblyAI"
-      AUDIO_FILE="$WORK_DIR/audio.mp3"
-      ffmpeg -y -i "$INPUT" -vn -acodec libmp3lame -b:a 128k "$AUDIO_FILE" \
-        > "$WORK_DIR/ffmpeg.log" 2>&1
-      ;;
-    *)
-      echo "Unsupported input extension: .$EXT_LOWER"
-      echo "Supported: .wav, .mp3, .mp4, .m4a, .webm, .ogg, or a YouTube URL"
+
+  # Skipped entirely when those captions came back: the entry's own transcript
+  # makes this whole half free.
+  if [ "$HAVE_SEGMENTS" -eq 0 ]; then
+    # --- Local file path: AssemblyAI pre-recorded API ------------------------
+    # AssemblyAI accepts mp3, mp4, m4a, wav directly. WEBM and OGG need to be
+    # demuxed to mp3 first because the SDK's upload helper occasionally chokes
+    # on those containers. ffmpeg is available because setup.sh installs it.
+    if [ ! -f "$MEDIA_INPUT" ]; then
+      echo "Input file not found: $MEDIA_INPUT"
       rm -rf "$WORK_DIR"
       exit 1
-      ;;
-  esac
+    fi
+    EXT="${MEDIA_INPUT##*.}"
+    EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+    case "$EXT_LOWER" in
+      mp3|mp4|m4a|wav)
+        AUDIO_FILE="$MEDIA_INPUT"
+        ;;
+      webm|ogg)
+        echo "==> Demuxing $EXT_LOWER -> MP3 for AssemblyAI"
+        AUDIO_FILE="$WORK_DIR/audio.mp3"
+        ffmpeg -y -i "$MEDIA_INPUT" -vn -acodec libmp3lame -b:a 128k "$AUDIO_FILE" \
+          > "$WORK_DIR/ffmpeg.log" 2>&1
+        ;;
+      *)
+        echo "Unsupported input extension: .$EXT_LOWER"
+        echo "Supported: .wav, .mp3, .mp4, .m4a, .webm, .ogg, or a YouTube URL"
+        rm -rf "$WORK_DIR"
+        exit 1
+        ;;
+    esac
 
-  echo "==> Transcribing with AssemblyAI (language: $LANGUAGE)"
-  SEGMENTS_FILE="$WORK_DIR/segments.json"
-  # Run it plainly and capture $? on the next line. Inside `if ! cmd; then`,
-  # $? is the status of the *negated* condition — i.e. always 0 — so the old
-  # `exit "$EXIT_CODE"` here exited 0 on failure. transcribe.sh then looked
-  # successful, run_one.sh marked the stage done, and it recorded .txt/.srt
-  # artifacts that had never been written. (runstate's on-disk artifact check
-  # caught it after the fact, but only on the next resume.)
-  "$PYTHON_BIN" "$SCRIPT_DIR/assemblyai_client.py" "$AUDIO_FILE" "$LANGUAGE" \
-        > "$SEGMENTS_FILE" 2>"$WORK_DIR/assemblyai-client.log"
-  EXIT_CODE=$?
-  if [ "$EXIT_CODE" -ne 0 ]; then
-    cat "$WORK_DIR/assemblyai-client.log"
-    echo "ERROR: AssemblyAI transcription failed (see $WORK_DIR/assemblyai-client.log)"
-    rm -rf "$WORK_DIR"
-    exit "$EXIT_CODE"
+    echo "==> Transcribing with AssemblyAI (language: $LANGUAGE)"
+    SEGMENTS_FILE="$WORK_DIR/segments.json"
+    # Run it plainly and capture $? on the next line. Inside `if ! cmd; then`,
+    # $? is the status of the *negated* condition — i.e. always 0 — so the old
+    # `exit "$EXIT_CODE"` here exited 0 on failure. transcribe.sh then looked
+    # successful, run_one.sh marked the stage done, and it recorded .txt/.srt
+    # artifacts that had never been written. (runstate's on-disk artifact check
+    # caught it after the fact, but only on the next resume.)
+    "$PYTHON_BIN" "$SCRIPT_DIR/assemblyai_client.py" "$AUDIO_FILE" "$LANGUAGE" \
+          > "$SEGMENTS_FILE" 2>"$WORK_DIR/assemblyai-client.log"
+    EXIT_CODE=$?
+    if [ "$EXIT_CODE" -ne 0 ]; then
+      cat "$WORK_DIR/assemblyai-client.log"
+      echo "ERROR: AssemblyAI transcription failed (see $WORK_DIR/assemblyai-client.log)"
+      rm -rf "$WORK_DIR"
+      exit "$EXIT_CODE"
+    fi
   fi
 fi
 

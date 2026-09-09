@@ -69,6 +69,10 @@ cat > "$STAGING/transcribe/transcribe.sh" <<'STUB'
 # condition and so always 0), and run_one.sh recorded artifacts that were
 # never created.
 [ -f "$STUB_LIE_TRANSCRIBE" ] && { echo "stub: transcribe claiming success without output"; exit 0; }
+# Record what the orchestrator handed us, before the loop below shifts it
+# away, so a test can assert on the routing (--media on the Kaltura path, the
+# input itself on the YouTube one).
+[ -n "${STUB_TRANSCRIBE_ARGS:-}" ] && printf '%s\n' "$@" > "$STUB_TRANSCRIBE_ARGS"
 out=""
 while [ "$#" -gt 0 ]; do
   case "$1" in --out-base) out="$2"; shift 2 ;; *) args+=("$1"); shift ;; esac
@@ -142,6 +146,41 @@ if os.environ.get("STUB_SUMMARIZE_NO_PDF") != "1":
     print(f"stub: pdf -> {pdf}")
 STUB
 
+# Kaltura: only the network half is stubbed. `parse` is delegated to the real
+# module, because the orchestration under test depends on what it returns —
+# the run id (kal_<entry>) and the canonical URL that replaces a pasted
+# <iframe> in the summary's source line. lib/test_kaltura.py covers the parser
+# itself; this covers the wiring around it.
+cp "$STAGING/lib/kaltura.py" "$STAGING/lib/kaltura_real.py"
+cat > "$STAGING/lib/kaltura.py" <<'STUB'
+#!/usr/bin/env python3
+import json, os, subprocess, sys
+REAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kaltura_real.py")
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+if cmd == "parse":
+    sys.exit(subprocess.call([sys.executable, REAL] + sys.argv[1:]))
+if os.path.exists(os.environ.get("STUB_FAIL_KALTURA", "/nonexistent")):
+    sys.stderr.write("stub: kaltura failing on purpose\n"); sys.exit(1)
+if cmd == "info":
+    print(json.dumps({"partner_id": "2910381", "entry_id": "1_y9jay9sw",
+                      "title": os.environ.get("STUB_KALTURA_TITLE", "Stub Kaltura Lecture"),
+                      "duration": 60, "captions": []}))
+    sys.exit(0)
+if cmd == "download":
+    path = sys.argv[3]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").write("fake kaltura video\n")
+    print(path); sys.exit(0)
+if cmd == "captions":
+    if os.environ.get("STUB_KALTURA_CAPTIONS") == "1":
+        json.dump([{"text": "stub caption", "offset_ms": 0, "duration_ms": 1000}],
+                  sys.stdout)
+        sys.exit(0)
+    sys.stderr.write("stub: no usable caption track\n"); sys.exit(3)
+sys.stderr.write(f"stub: unknown command {cmd}\n"); sys.exit(1)
+STUB
+chmod +x "$STAGING/lib/kaltura.py"
+
 chmod +x "$STAGING/screen/record_screen.sh" "$STAGING/transcribe/transcribe.sh" \
          "$STAGING/screen/extract_frames.py" "$STAGING/summarize/summarize.py"
 
@@ -166,6 +205,8 @@ export STUB_FAIL_FRAMES="$TESTROOT/fail_frames"
 export STUB_FAIL_SUMMARIZE="$TESTROOT/fail_summarize"
 export STUB_FAIL_FETCH="$TESTROOT/fail_fetch"
 export STUB_SUMMARIZE_ARGS="$TESTROOT/summarize_args.txt"
+export STUB_TRANSCRIBE_ARGS="$TESTROOT/transcribe_args.txt"
+export STUB_FAIL_KALTURA="$TESTROOT/fail_kaltura"
 
 RUNS="$MEETING_BOT_ROOT/runs"
 pipeline() { ( cd "$STAGING" && bash ./pipeline.sh "$@" ) ; }
@@ -174,7 +215,7 @@ latest_run() { python3 "$STAGING/lib/runstate.py" latest --root "$RUNS"; }
 
 echo ""
 echo "=================================================================="
-echo "1. Input routing — all four input types"
+echo "1. Input routing — all five input types"
 echo "=================================================================="
 
 echo "--- Google Meet URL"
@@ -218,6 +259,76 @@ check "youtube: record skipped" "$(state status --run-dir "$RUNS/$run" --stage r
 check "youtube: video fetched" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
 check "youtube: summarized" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
 echo "$out" | grep -q -- "--no-playlist" && ok "youtube: &list= did not expand" || ok "youtube: &list= did not expand (single run)"
+
+echo "--- Kaltura embed, pasted as the whole <iframe> tag"
+KAL_IFRAME='<iframe id="kaltura_player" src='"'"'https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/52668182?iframeembed=true&amp;entry_id=1_y9jay9sw&amp;config%5Bplayback%5D=%7B%22startTime%22%3A0%7D'"'"' style="width: 608px;height: 402px;border: 0;" allowfullscreen title="2110322 Online Session"></iframe>'
+out=$(pipeline "$KAL_IFRAME" 2>&1); rc=$?
+check "kaltura: exits 0" "$rc" "0"
+run=$(latest_run)
+check "kaltura: run id is the entry id" "${run%_*_*}" "kal_1_y9jay9sw"
+check "kaltura: record skipped" "$(state status --run-dir "$RUNS/$run" --stage record)" "pending"
+check "kaltura: video fetched" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
+check "kaltura: transcribed" "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "done"
+check "kaltura: frames extracted" "$(state status --run-dir "$RUNS/$run" --stage frames)" "done"
+check "kaltura: summarized" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+[ -f "$SUMMARIES_DIR/$run.md" ] && ok "kaltura: summary written" || bad "kaltura: no summary"
+# The download is on the critical path for transcribe here, unlike YouTube:
+# without captions AssemblyAI needs the media file.
+grep -q -- "--media" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "kaltura: transcribe was given the downloaded media" \
+  || bad "kaltura: transcribe got no --media"
+grep -q "video.mp4" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "kaltura: --media points at the run's download" \
+  || bad "kaltura: --media is not the download"
+# The <iframe> blob must not end up in the document's source line.
+grep -q -- "--source-url" "$STUB_SUMMARIZE_ARGS" \
+  && ok "kaltura: summarize got a source url" || bad "kaltura: no --source-url"
+grep -q "<iframe" "$STUB_SUMMARIZE_ARGS" \
+  && bad "kaltura: the raw iframe blob reached summarize" \
+  || ok "kaltura: the iframe blob was normalised to a URL"
+grep -q "entry_id=1_y9jay9sw" "$STUB_SUMMARIZE_ARGS" \
+  && ok "kaltura: the source url names the entry" || bad "kaltura: source url lost the entry id"
+# The entry's own name, read at fetch time — there is no yt-dlp to ask.
+grep -q -- "--title" "$STUB_SUMMARIZE_ARGS" \
+  && ok "kaltura: summarize got the entry title" || bad "kaltura: no --title"
+grep -q "Stub Kaltura Lecture" "$STUB_SUMMARIZE_ARGS" \
+  && ok "kaltura: the title is the entry's own name" || bad "kaltura: wrong title"
+[ -f "$RUNS/$run/kaltura.json" ] \
+  && ok "kaltura: entry facts cached in the run dir" || bad "kaltura: no kaltura.json"
+
+echo "--- Kaltura embed, given as just the src URL"
+KAL_URL="https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/52668182?iframeembed=true&entry_id=1_y9jay9sw"
+out=$(pipeline "$KAL_URL" --force 2>&1)
+check "kaltura url: exits 0" "$?" "0"
+run=$(latest_run)
+check "kaltura url: same run id as the iframe form" "${run%_*_*}" "kal_1_y9jay9sw"
+check "kaltura url: summarized" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+
+echo "--- Kaltura entry that has its own captions"
+STUB_KALTURA_CAPTIONS=1 out=$(STUB_KALTURA_CAPTIONS=1 pipeline "$KAL_URL" --force 2>&1)
+check "kaltura captions: exits 0" "$?" "0"
+run=$(latest_run)
+check "kaltura captions: transcribed" "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "done"
+# The video is still fetched — frames need it either way.
+check "kaltura captions: video still fetched" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
+
+echo "--- Kaltura entry that cannot be reached (needs an LMS login)"
+touch "$STUB_FAIL_KALTURA"
+out=$(pipeline "$KAL_URL" --force 2>&1); rc=$?
+rm -f "$STUB_FAIL_KALTURA"
+check "kaltura unreachable: exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+run=$(latest_run)
+check "kaltura unreachable: fetch_video failed" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "failed"
+# Fail before anything expensive: no transcript was paid for.
+check "kaltura unreachable: transcribe never ran" "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "pending"
+check "kaltura unreachable: summarize never ran" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "pending"
+echo "$out" | grep -q "Resume with" && ok "kaltura unreachable: says how to resume" || bad "kaltura unreachable: no resume hint"
+
+echo "--- Kaltura resume picks up the finished download"
+rm -f "$STUB_FAIL_KALTURA"
+out=$(pipeline --run-id "$run" 2>&1)
+check "kaltura resume: exits 0" "$?" "0"
+check "kaltura resume: completes" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
 
 echo "--- Unrecognized input"
 out=$(pipeline "not-a-real-thing" 2>&1); rc=$?

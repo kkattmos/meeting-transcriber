@@ -158,6 +158,7 @@ from chunking import build_chunks  # noqa: E402
 from mapreduce import summarize_chunked  # noqa: E402
 import paths as botpaths  # noqa: E402
 import resources as botresources  # noqa: E402
+import kaltura  # noqa: E402
 
 SCREEN_DIR = ROOT_DIR / "screen"
 
@@ -390,11 +391,18 @@ def _wrap_document(body, *, original_input, source_url, video_path, transcript,
     # YouTube path, video_path is a local download, so --source-url carries the
     # original link through.
     source = source_url or original_input
-    source_kind = "youtube" if is_youtube_url(str(source)) else "local_file"
+    if is_youtube_url(str(source)):
+        source_kind = "youtube"
+    elif kaltura.looks_like_kaltura(str(source)):
+        source_kind = "kaltura"
+    else:
+        source_kind = "local_file"
 
     title = title_override
     if not title and source_kind == "youtube":
         title, _upload = document.youtube_metadata(source)
+    # No lookup for kaltura: the pipeline reads the entry's name at fetch time
+    # and passes it as --title, so this stage makes no network call of its own.
     if not title:
         title = meeting_name
 
@@ -620,6 +628,15 @@ def main():
         YT_TMP_ROOT.mkdir(parents=True, exist_ok=True)
         yt_tmpdir = tempfile.mkdtemp(prefix="meeting-bot-yt-", dir=str(YT_TMP_ROOT))
         video_arg = str(download_youtube_video(video_arg, yt_tmpdir))
+    elif kaltura.looks_like_kaltura(video_arg) and not manifest_arg:
+        # Same rule as YouTube above: only when nobody has extracted frames
+        # yet. The pipeline always passes a manifest, so this is the
+        # direct-invocation path only.
+        YT_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        yt_tmpdir = tempfile.mkdtemp(prefix="meeting-bot-kal-", dir=str(YT_TMP_ROOT))
+        ref = kaltura.parse_input(video_arg)
+        print(f"==> Downloading Kaltura entry {ref.entry_id}")
+        video_arg = str(ref.download(Path(yt_tmpdir) / "video.mp4"))
 
     meeting_name = derive_meeting_name(video_arg, transcript_path)
 

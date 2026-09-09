@@ -4,7 +4,8 @@ A meeting/lecture bot for a Proxmox box running **Debian 13 (trixie)**. It joins
 a Google Meet or Zoom call in a real signed-in Chrome, records the screen and
 audio to MP4, transcribes it, and writes an AI summary — as Markdown **and as a
 PDF with the slides from the video inlined** — combining the transcript with
-keyframes pulled from the recording. It also works on YouTube links and on video
+keyframes pulled from the recording. It also works on YouTube links, on Kaltura
+lecture-capture embeds (paste the `<iframe>` from your LMS), and on video
 files you already have, and it can read the lecturer's own slides from a GitHub
 repo or a folder and use them as reference material.
 
@@ -46,12 +47,13 @@ flowchart LR
         GM[Google Meet]
         ZOOM[Zoom]
         YT[YouTube link]
+        KAL["Kaltura &lt;iframe&gt;"]
         MP4[".mp4 on disk"]
     end
 
     REC["record<br/>(Chrome + Xvfb + PulseAudio + ffmpeg)"]
-    FETCH["fetch_video<br/>(yt-dlp)"]
-    TR["transcribe<br/>(AssemblyAI / youtube-transcript.io)"]
+    FETCH["fetch_video<br/>(yt-dlp / Kaltura API)"]
+    TR["transcribe<br/>(AssemblyAI / youtube-transcript.io / Kaltura captions)"]
     FR["frames<br/>(ffmpeg scene-change + periodic)"]
     RES["resources<br/>(GitHub repo / folder)"]
     SUM["summarize<br/>(claude CLI, falling back to Gemini)"]
@@ -64,6 +66,8 @@ flowchart LR
     REC --> FR
     YT --> FETCH
     YT --> TR
+    KAL --> FETCH
+    FETCH --> TR
     FETCH --> FR
     MP4 --> TR
     MP4 --> FR
@@ -77,13 +81,15 @@ flowchart LR
 Each input becomes a **run**, with its own directory under
 `$MEETING_BOT_ROOT/runs/<run_id>/` holding its state, logs, and sentinels.
 Within a run, `transcribe` and `fetch_video → frames` are independent once a
-video exists, so they execute concurrently and `summarize` joins them.
+video exists, so they execute concurrently and `summarize` joins them. Kaltura
+is the exception: its entries rarely carry captions, so `transcribe` needs the
+downloaded file and `fetch_video` runs first, ahead of both branches.
 
 | Stage | Does | Needs |
 |---|---|---|
 | `record` | Joins the call, records screen + audio to MP4 | Chrome, Xvfb, PulseAudio, a signed-in profile |
-| `fetch_video` | Downloads a YouTube video (for frames only) | yt-dlp |
-| `transcribe` | Local file → AssemblyAI; YouTube → youtube-transcript.io captions | `ASSEMBLYAI_API_KEY_1..3` / `YT_TRANSCRIPT_KEY_1..10` |
+| `fetch_video` | Downloads a YouTube video (for frames only) or a Kaltura entry (for frames *and* audio) | yt-dlp / nothing (Kaltura needs no key) |
+| `transcribe` | Local file → AssemblyAI; YouTube → youtube-transcript.io captions; Kaltura → its own captions if it has any, else AssemblyAI | `ASSEMBLYAI_API_KEY_1..3` / `YT_TRANSCRIPT_KEY_1..10` |
 | `frames` | Scene-change + periodic keyframes → `manifest.json` | ffmpeg |
 | `summarize` | Transcript + frames (+ slides) → Markdown + PDF | the `claude` CLI signed into your Claude subscription / `GEMINI_API_KEY_1..3` |
 
@@ -299,6 +305,21 @@ rejects with "This browser or app may not be secure".
 ./pipeline.sh /srv/recordings/existing.mp4
 ```
 
+A Kaltura lecture can be given either way — paste the whole `<iframe>` your LMS
+shows you, or just its `src`. Quote it: the tag contains spaces.
+
+```bash
+./pipeline.sh '<iframe id="kaltura_player" src="https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/52668182?iframeembed=true&entry_id=1_y9jay9sw"></iframe>'
+./pipeline.sh "https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/52668182?iframeembed=true&entry_id=1_y9jay9sw"
+```
+
+Both produce the same run (`kal_1_y9jay9sw_<timestamp>`), so pasting the tag
+once and the URL later resumes rather than duplicates. No key and no login are
+involved — the entry is reached with an anonymous Kaltura widget session, the
+same one the embedded player uses. An entry that *does* need a logged-in LMS
+session fails immediately and says so; recording one through the browser is not
+implemented.
+
 Each of those writes both `$SUMMARIES_DIR/<run_id>.md` and
 `$PDF_DIR/<run_id>.pdf`.
 
@@ -381,8 +402,13 @@ The legacy positional form still works when unambiguous:
 # 1 — record only
 ./screen/record_screen.sh "<meeting_url>" "Meeting Name" ["Display Name"] [out.mp4]
 
-# 2 — transcribe only  (local file → AssemblyAI, YouTube URL → captions)
-./transcribe/transcribe.sh <file_or_youtube_url> "<name>" [language] [--out-base PATH]
+# 2 — transcribe only  (local file → AssemblyAI, YouTube URL → captions,
+#     Kaltura embed → its captions, else AssemblyAI on the file behind --media)
+./transcribe/transcribe.sh <file_or_url> "<name>" [language] [--out-base PATH] [--media PATH]
+
+# Kaltura on its own: inspect an entry, or pull the MP4 down by hand
+python3 lib/kaltura.py info "<iframe or src url>"
+python3 lib/kaltura.py download "<iframe or src url>" /tmp/lecture.mp4
 
 # 3 — summarize only
 /opt/meeting-bot-venv/bin/python3 ./summarize/summarize.py \
@@ -902,6 +928,25 @@ immediately rather than burning the full retry schedule first.
 | `YT_TRANSCRIPT_KEY_1..10` | — | Required for YouTube inputs |
 | `TRANSCRIBE_BACKEND` | `assemblyai` | YouTube URLs always use captions regardless |
 
+Kaltura entries need no key at all. When the entry carries a caption track in
+the requested language it is used and AssemblyAI is skipped; most
+lecture-capture entries have none, and then the downloaded MP4 goes to
+AssemblyAI like any other file.
+
+### Kaltura
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `KALTURA_REFERER` | `https://cdnapisec.kaltura.com/` | The `Referer` sent with every Kaltura request |
+
+Kaltura entries usually sit behind an access-control profile that checks the
+referring domain, and a request without an allowed `Referer` is answered with a
+bare `404` and no explanation. The default — Kaltura's own CDN domain — is
+accepted by every tenant tested so far and needs no configuration. Set this to
+your LMS's origin (e.g. `https://www.mycourseville.com/`) if your institution
+whitelists only that; a `404` during the download is the symptom, and the error
+message names this variable.
+
 A key rejected for auth or quota reasons hands over to the next key; a failure
 that is about the *audio* (silent file, unsupported language) does not, because
 another key would fail identically.
@@ -955,10 +1000,11 @@ python3 lib/test_runstate.py                 # run state, resume, concurrency (1
 python3 lib/test_slotqueue.py                # cross-session component queue (23)
 python3 lib/test_keyring.py                  # numbered keys + rotation cursor (22)
 python3 lib/test_resources.py                # resource specs, extraction, GitHub (27)
-python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli (76)
-python3 summarize/test_pdf_units.py          # frame cropping, citations, PDF render (54)
+python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions (46)
+python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli (109)
+python3 summarize/test_pdf_units.py          # frame cropping, citations, PDF render (60)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
-bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (106)
+bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (148)
 bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (62)
 ```
 
@@ -992,6 +1038,7 @@ That is what `verify_e2e.sh` is for:
 ./verify_e2e.sh --browser-smoke                # real Chrome on Xvfb, recorded — no meeting, no spend
 ./verify_e2e.sh --mp4 /path/to/recording.mp4   # real AssemblyAI + real summarizer
 ./verify_e2e.sh --youtube "<url>"              # real captions + real summarizer
+./verify_e2e.sh --kaltura "<iframe or url>"    # real Kaltura download + summarizer
 ./verify_e2e.sh --meet "<url>" --minutes 3     # real Chrome joins, records, leaves
 ./verify_e2e.sh --zoom "<url>" --minutes 3
 ```
@@ -1067,6 +1114,25 @@ lockfile. If a *particular* expression is the only one showing as text, it is
 one mathtext can't parse (environments other than `aligned`-style ones,
 `\substack`, and similar) — the fallback is deliberate, and the formula is
 intact in the `.md`.
+
+**A Kaltura entry fails with a 404, or "exposes no playable source"**
+Two different problems with the same look.
+
+A `404` on the *download* is access-control refusing the `Referer`. The default
+is Kaltura's own CDN domain, which most tenants allow; if yours whitelists only
+your LMS, set `KALTURA_REFERER` to that origin in `.env` (e.g.
+`https://www.mycourseville.com/`). Check it in one second without running the
+pipeline:
+
+```bash
+python3 lib/kaltura.py info "<iframe or src url>"
+```
+
+"exposes no playable source" is the other case: the entry is not playable
+without a logged-in LMS session. There is no fallback for that — the Chrome
+profile is not involved on this path, so signing it in would not help, and
+browser-recording a private entry is not implemented. Download the file from
+the LMS yourself and feed the pipeline the local `.mp4`.
 
 **Frames in the PDF are uncropped**
 Pillow isn't installed, or the slide detector declined on every frame (a

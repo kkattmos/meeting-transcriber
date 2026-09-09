@@ -40,7 +40,8 @@ A meeting/lecture bot for a **Debian 13** guest on Proxmox. It joins a Google
 Meet or Zoom call in a persistent real-Chrome profile (so Google's sign-in flow
 doesn't get blocked by automation-detection heuristics), records both the screen
 and the meeting audio into an MP4, transcribes the audio with the AssemblyAI
-pre-recorded API (or youtube-transcript.io for YouTube URLs), and produces a
+pre-recorded API (or youtube-transcript.io for YouTube URLs, or the entry's own
+captions for a Kaltura embed), and produces a
 Claude summary (through the `claude` CLI, on a subscription — no API key) — Markdown plus a PDF with the cited keyframes cropped to the slide and
 inlined — combining the transcript with keyframes extracted from the recording
 and, optionally, the lecturer's own slides from a GitHub repo or a folder. It
@@ -283,6 +284,20 @@ input ──┤                    ├─> summarize
 write state through the flock'd `runstate.py`, so their writes can't clobber
 each other.
 
+**Kaltura is the one input type where they are not independent.** A YouTube
+transcript comes from captions, so transcribe never needs the download; a
+Kaltura entry usually has no captions, and then AssemblyAI needs the media
+file. So `ensure_video_fetched` runs ahead of both branches for `kaltura`:
+
+```
+input ──> fetch_video ──┬─> transcribe ─┐
+                        └─> frames ─────┴─> summarize
+```
+
+`ensure_video_fetched` is idempotent (it returns early on a `done` stage), which
+is what lets the same function be called ahead of the branches here and from
+inside the frames branch on the YouTube path without ever downloading twice.
+
 ### Resume semantics
 
 - Re-running the same command **resumes by default**: `runstate.py find` looks
@@ -357,6 +372,67 @@ One script now, not a host wrapper plus an in-container body.
   `lib/test_media_e2e.sh` can run the real clients against local stub servers.
   They are test seams, not features — but they are also the only way to
   exercise these clients without spending money, so don't remove them.
+
+### Kaltura embeds (`lib/kaltura.py`)
+
+Lecture-capture entries pasted out of an LMS, as either the whole `<iframe>`
+tag or just its `src`. Both forms are accepted and **both must produce the same
+run id** (`kal_<entry id>`), or pasting the tag once and the URL later would
+duplicate the run instead of resuming it.
+
+**Not yt-dlp.** yt-dlp ships a Kaltura extractor and it fails on these entries:
+it sends no `Referer`, and a university tenant's access-control answers a
+referer-less `playManifest` with a bare 404 — `No video formats found!`.
+Verified 2026-09-09 against partner 2910381 / entry `1_y9jay9sw`, which
+downloads fine through the api_v3 calls this module makes. Don't "simplify"
+this back to yt-dlp.
+
+**The `Referer` is the whole trick**, and it is the thing that will break for
+someone else's tenant. Measured on that entry: no referer → 404,
+`https://example.com/` → 404, the LMS's own domain → 302, and the *Kaltura CDN's
+own domain* → 302. The CDN domain is therefore the default, because it needs no
+per-institution configuration; `KALTURA_REFERER` overrides it. A 404 during the
+download names that variable in the error, because nothing else about the
+failure suggests a header.
+
+The sequence: `session.startWidgetSession` for an anonymous KS (what the
+embedded player itself does), then `baseEntry.getPlaybackContext` for the
+sources — take the progressive `format=url` MP4, not HLS, since both downstream
+stages want a file — with the KS appended to the URL, which access-control also
+requires. `baseEntry.get` supplies the title, since there is no yt-dlp to ask.
+
+Non-obvious details:
+
+- **`requests` is imported lazily.** `pipeline.sh` runs `kaltura.py parse` on
+  every input it classifies; an `ImportError` there would silently reclassify a
+  perfectly good embed as "unrecognized input" rather than failing loudly.
+  `test_parse_does_not_even_import_requests` holds it.
+- **Kaltura reports failures inside a 200 body** (`KalturaAPIException`), so the
+  status code proves nothing — same shape as the claude CLI's exit code.
+- **Captions are tried before AssemblyAI**, exactly like the YouTube path, and
+  "no usable track" is exit code **3**, not 1: `transcribe.sh` reads 3 as
+  "fall through to the media file" and anything else as a real failure. Collapse
+  them and an outage becomes three silent uploads to AssemblyAI. Only SRT and
+  WebVTT assets are used; a DFXP/TTML track is skipped rather than half-parsed,
+  because a mangled transcript is worse than paying for a good one.
+- **The download writes `<dest>.part` and renames.** An interrupted download
+  must never look like a finished artifact to the resume logic.
+- **The `<iframe>` blob never reaches summarize.** `run_one.sh` normalises it to
+  a canonical embed URL (`SOURCE_URL`) first; otherwise 900 characters of HTML
+  would land in the document's provenance comment and its link line.
+  `document.py` prints that as `Video Link:` under a `kaltura` source kind.
+- Entry facts are cached in `runs/<id>/kaltura.json` at fetch time, so summarize
+  makes no network call of its own and a resume makes none either.
+
+**An entry that needs a real LMS login fails loudly** — `getPlaybackContext`
+returns no sources, and the error names the partner and entry id. Browser
+recording it is deliberately NOT implemented: the login lives on the LMS page,
+not on the iframe src, so opening the embed in the persistent Chrome profile
+would hit the same access-control refusal. Settled with the operator
+2026-09-09; if it is ever built, the decision taken then was to reuse
+`record_screen.sh` as-is (a Kaltura-specific capture driver in place of the
+Meet/Zoom join logic), taking a `record` queue slot, and to require the *LMS
+page* URL rather than the iframe src.
 
 ### Stage 3 — Summarize (`summarize/`)
 
@@ -953,6 +1029,23 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   runtime-agnostic rather than re-enabling the merge.
   The same string appears in `lib/run_one.sh` and `summarize/summarize.py` —
   change both.
+- **Kaltura is reached through `lib/kaltura.py`, never yt-dlp.** Its extractor
+  sends no `Referer` and 404s on exactly the entries this project exists for.
+- **Every Kaltura request carries a `Referer`.** Dropping it turns a working
+  entry into a bare 404 with nothing to explain it. The default is the CDN's own
+  domain so no tenant-specific configuration is needed; `KALTURA_REFERER`
+  overrides it.
+- **`kaltura.py parse` stays offline and dependency-free.** `classify_input`
+  runs it on every pipeline input; an import error or a network call there
+  breaks classification for inputs that have nothing to do with Kaltura.
+- **"No captions" is exit code 3, distinct from failure.** `transcribe.sh`
+  routes on it. Merging it into 1 turns a Kaltura outage into three paid
+  AssemblyAI uploads of a video whose captions were fine.
+- **`fetch_video` runs before both branches on the Kaltura path.** Its
+  transcribe branch needs the media file; leaving the download inside the frames
+  branch races it.
+- **The pasted `<iframe>` is normalised before it reaches summarize.** The raw
+  tag in the provenance comment and the link line is not a document.
 - **`summarize.py` does not download the video when `--frames-manifest` is
   given.** The video exists only to produce frames; once a manifest exists
   there's nothing to download. The pipeline always passes one, so re-adding the
@@ -1059,10 +1152,11 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
+| `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download | 46 |
 | `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, `--combine` citation shifting, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 109 |
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, manifest merging for `--combine`, real PDF render | 60 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combined PDF and its frame sweep | 119 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combined PDF and its frame sweep, the Kaltura DAG | 148 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, and the real llm_client against a stub `claude` binary | 75 |
 | `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 
@@ -1072,6 +1166,14 @@ caught five real bugs so far (`--from-file` with no positionals, an unhelpful
 unrecognized-input error, the double YouTube download, the
 `$BASHPID`-in-substitution queue bug, and a stage exiting 0 without writing its
 artifacts). Add to it when you touch orchestration.
+
+The Kaltura network seam is **not** in `test_media_e2e.sh`. `lib/test_kaltura.py`
+drives a fake `requests.Session` instead, which asserts on what we send — the
+`Referer`, the `widgetId`, the KS on the media URL — without needing a stub HTTP
+server, and is the place to add assertions when the invocation changes.
+`test_pipeline_e2e.sh` stubs only `kaltura.py`'s network half and delegates
+`parse` to the real module, because the orchestration under test depends on what
+the parser returns (the run id, and the canonical URL that replaces the blob).
 
 `test_media_e2e.sh` is the counterpart: real media, real SDKs, stub servers
 (`lib/fake_api_server.py`) speaking the providers' HTTP protocols. It is the
@@ -1086,7 +1188,9 @@ CLI. It also drives `FAKE_CLAUDE_MODE=not-logged-in` to prove a signed-out CLI
 fails as `BackendUnavailable` rather than being retried. When you change the
 invocation, assert it here.
 
-**What no test here covers:** Chrome actually joining a live Meet/Zoom call, and
+**What no test here covers:** Chrome actually joining a live Meet/Zoom call, a
+real Kaltura tenant's access-control (`./verify_e2e.sh --kaltura` is the live
+check, and needs no key), and
 real AssemblyAI/Claude/Gemini/youtube-transcript.io round-trips — including
 whether the subscription behind `claude auth` has quota left.
 `./verify_e2e.sh` runs those on the real box. Its `--preflight` and
@@ -1110,7 +1214,7 @@ own flags, which is everything about stage 1 except the call itself.
 ├── first_time_login.sh           <- noVNC login, native Chrome
 ├── kill_meeting.sh               <- per-run or global, pid-file based
 ├── pipeline.sh                   <- multi-input orchestrator
-├── verify_e2e.sh                 <- live checks: preflight + mp4/YouTube/Meet/Zoom
+├── verify_e2e.sh                 <- live checks: preflight + mp4/YouTube/Kaltura/Meet/Zoom
 ├── trigger_server.py
 ├── meeting-bot-trigger.service   <- systemd unit (setup.sh --with-trigger)
 ├── lib/
@@ -1120,6 +1224,7 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── paths.py / paths.sh       <- the five required output directories
 │   ├── xsession.sh               <- per-run Xvfb display + PulseAudio sink
 │   ├── resources.py              <- slides/notes from GitHub or a folder
+│   ├── kaltura.py                <- Kaltura embeds: parse, media URL, captions
 │   ├── run_one.sh                <- the per-run stage DAG
 │   ├── fake_api_server.py        <- stub AssemblyAI/YouTube servers
 │   ├── fake_claude_cli.py        <- stub `claude` binary for the media test
@@ -1127,6 +1232,7 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── test_slotqueue.py
 │   ├── test_keyring.py
 │   ├── test_resources.py
+│   ├── test_kaltura.py
 │   ├── test_pipeline_e2e.sh
 │   └── test_media_e2e.sh
 ├── screen/
