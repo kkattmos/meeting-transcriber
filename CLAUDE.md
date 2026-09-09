@@ -436,6 +436,23 @@ Non-obvious details:
 - Entry facts are cached in `runs/<id>/kaltura.json` at fetch time, so summarize
   makes no network call of its own and a resume makes none either.
 
+**Measured on the deployment box, 2026-09-09**, on the entry above (1h29m,
+1920x1080, no captions), as a live `./verify_e2e.sh --kaltura` run:
+
+| Stage | Wall | Note |
+|---|---|---|
+| `fetch_video` | ~10s | 446MB, ~45MB/s from the CDN |
+| `transcribe` | ~3 min | AssemblyAI, 132,488 Thai chars in **19** cues |
+| `frames` | ~25 min | 149 keyframes; slower than the 13x-realtime benchmark because transcribe and summarize were competing for the same 4 vCPU |
+| `summarize` | ~9 min | claude-cli/opus, chunked |
+
+Two things that table is worth keeping for: the transcript arrives as 19 cues
+for 89 minutes, so this input type leans hard on
+`chunking.split_long_segments` (the AssemblyAI-Thai problem documented under
+Stage 3), and the 446MB download stays in the run dir after the frames are
+swept — it is the resume's cheap path back to frames, and the disk cost of a
+Kaltura run is therefore the video, not the frames.
+
 **An entry that needs a real LMS login fails loudly** — `getPlaybackContext`
 returns no sources, and the error names the partner and entry id. Browser
 recording it is deliberately NOT implemented: the login lives on the LMS page,
