@@ -52,6 +52,12 @@
 #                       it never overwrites a full summary of the same input.
 #                       Not accepted for a live meeting URL: there is no source
 #                       to clip.
+#                       For one window per input, append #t=W to that input
+#                       instead — it overrides --clip for that one:
+#                         ./pipeline.sh "https://youtu.be/aaa#t=00:05:00-01:30:00" \
+#                                       "https://youtu.be/bbb"
+#                       which keeps everything in one invocation, and so in one
+#                       --combine document.
 #   --jobs N            how many inputs to process at once (default 2)
 #   --from-file F       read inputs from a file, one per line, # for comments
 #   --playlist          expand YouTube playlist URLs into their videos
@@ -107,7 +113,7 @@ if [ -n "${RESOURCES:-}" ]; then
   done < <(printf '%s\n' "$RESOURCES" | tr ',' '\n')
 fi
 
-usage() { sed -n '2,57p' "$0"; }
+usage() { sed -n '2,64p' "$0"; }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -211,7 +217,63 @@ looks_like_input() {
   [ -f "$1" ]
 }
 
+# Per-input clip window: "<input>#t=00:05:00-01:30:00".
+#
+# --clip is one window for the whole invocation, which is the wrong shape when
+# several lectures are being summarized together and only some of them want
+# trimming — the combined document is per-invocation, so splitting into one
+# invocation per window would split the document too. This suffix overrides
+# --clip for one input; --clip remains the default for the rest.
+#
+# Sets SPLIT_INPUT / SPLIT_CLIP_LABEL / SPLIT_CLIP_TOKEN. The suffix is only
+# taken as a window when what is LEFT of it still looks like an input, so a URL
+# that genuinely ends in some other "#t=" fragment is left alone rather than
+# being silently truncated. Once it is taken as a window it must parse, and a
+# window that doesn't is fatal here — before classification, before any
+# download, before anything is billed.
+SPLIT_INPUT=""
+SPLIT_CLIP_LABEL=""
+SPLIT_CLIP_TOKEN=""
+split_clip_suffix() {
+  SPLIT_INPUT="$1"
+  SPLIT_CLIP_LABEL="$CLIP_LABEL"
+  SPLIT_CLIP_TOKEN="$CLIP_TOKEN"
+  case "$1" in
+    *"#t="*) ;;
+    *) return 0 ;;
+  esac
+  # Both expansions cut at the LAST "#t=", so they agree with each other.
+  local spec="${1##*#t=}"
+  local rest="${1%#t=*}"
+  [ -n "$spec" ] || return 0
+  looks_like_input "$rest" || return 0
+
+  local json
+  if ! json="$("$PYTHON_BIN" "$SCRIPT_DIR/lib/clip.py" parse "$spec" 2>&1)"; then
+    echo "ERROR: unusable #t= window on this input: #t=$spec" >&2
+    echo "  ${json#clip: }" >&2
+    echo "  Expected #t=START-END, e.g. #t=00:05:00-01:30:00" >&2
+    exit 1
+  fi
+  SPLIT_INPUT="$rest"
+  SPLIT_CLIP_LABEL="$(printf '%s' "$json" | sed -nE 's/.*"label": "([^"]*)".*/\1/p')"
+  SPLIT_CLIP_TOKEN="$(printf '%s' "$json" | sed -nE 's/.*"token": "([^"]*)".*/\1/p')"
+}
+
 declare -a INPUTS=()
+# Parallel to INPUTS, one entry each, always — an empty string for an input
+# with no window. They are read by index further down, so a push to one without
+# a push to the other would silently attach the wrong window to the wrong
+# lecture.
+declare -a INPUT_CLIP_LABELS=()
+declare -a INPUT_CLIP_TOKENS=()
+add_input() {
+  split_clip_suffix "$1"
+  INPUTS+=("$SPLIT_INPUT")
+  INPUT_CLIP_LABELS+=("$SPLIT_CLIP_LABEL")
+  INPUT_CLIP_TOKENS+=("$SPLIT_CLIP_TOKEN")
+}
+
 declare -a LEGACY_EXTRAS=()
 # Guard the empty case explicitly: "${POSITIONAL[@]:-}" on an empty array
 # expands to a single empty string, which would be counted as a legacy
@@ -222,10 +284,20 @@ if [ "${#POSITIONAL[@]}" -gt 0 ]; then
     # (`pipeline.sh <url> "" "" en`), so they hold their slot.
     if [ -z "$arg" ]; then
       LEGACY_EXTRAS+=("")
-    elif looks_like_input "$arg"; then
-      INPUTS+=("$arg")
     else
-      LEGACY_EXTRAS+=("$arg")
+      # Split BEFORE the test, not after: "https://…#t=5:00-10:00" already
+      # looks like an input with the suffix still attached, so testing first
+      # would take the whole string as the URL and the window would vanish
+      # without a word. split_clip_suffix is a no-op on an input that has no
+      # window, so this is the same decision as before for everything else.
+      split_clip_suffix "$arg"
+      if looks_like_input "$SPLIT_INPUT"; then
+        INPUTS+=("$SPLIT_INPUT")
+        INPUT_CLIP_LABELS+=("$SPLIT_CLIP_LABEL")
+        INPUT_CLIP_TOKENS+=("$SPLIT_CLIP_TOKEN")
+      else
+        LEGACY_EXTRAS+=("$arg")
+      fi
     fi
   done
 fi
@@ -238,10 +310,15 @@ if [ -n "$FROM_FILE" ]; then
     exit 1
   fi
   while IFS= read -r line || [ -n "$line" ]; do
-    line="${line%%#*}"
-    line="$(echo "$line" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    # A comment is a "#" at the start of the line or one preceded by
+    # whitespace. NOT any "#" at all: that ate the "#t=" window suffix — and
+    # every URL fragment before it — leaving a link that still worked and a
+    # window that had silently gone.
+    line="$(echo "$line" | tr -d '\r' \
+            | sed 's/^[[:space:]]*#.*$//; s/[[:space:]]\+#.*$//' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     [ -z "$line" ] && continue
-    INPUTS+=("$line")
+    add_input "$line"
   done < "$FROM_FILE"
 fi
 
@@ -276,7 +353,13 @@ fi
 # parameter, and silently transcribing 200 videos because of it would be rude.
 if [ "$EXPAND_PLAYLIST" -eq 1 ]; then
   declare -a EXPANDED=()
-  for input in "${INPUTS[@]:-}"; do
+  # Rebuilt alongside EXPANDED. A playlist's window applies to each video it
+  # expands into — the alternative is dropping it, and a window the operator
+  # typed must never be quietly discarded.
+  declare -a EXPANDED_LABELS=()
+  declare -a EXPANDED_TOKENS=()
+  for idx in "${!INPUTS[@]}"; do
+    input="${INPUTS[$idx]}"
     if echo "$input" | grep -qE '[?&]list='; then
       echo "==> Expanding playlist: $input"
       if ! command -v yt-dlp >/dev/null 2>&1; then
@@ -284,13 +367,20 @@ if [ "$EXPAND_PLAYLIST" -eq 1 ]; then
         exit 1
       fi
       while IFS= read -r vid; do
-        [ -n "$vid" ] && EXPANDED+=("https://www.youtube.com/watch?v=$vid")
+        [ -n "$vid" ] || continue
+        EXPANDED+=("https://www.youtube.com/watch?v=$vid")
+        EXPANDED_LABELS+=("${INPUT_CLIP_LABELS[$idx]}")
+        EXPANDED_TOKENS+=("${INPUT_CLIP_TOKENS[$idx]}")
       done < <(yt-dlp --flat-playlist --print id "$input" 2>/dev/null)
     else
       EXPANDED+=("$input")
+      EXPANDED_LABELS+=("${INPUT_CLIP_LABELS[$idx]}")
+      EXPANDED_TOKENS+=("${INPUT_CLIP_TOKENS[$idx]}")
     fi
   done
   INPUTS=("${EXPANDED[@]:-}")
+  INPUT_CLIP_LABELS=("${EXPANDED_LABELS[@]:-}")
+  INPUT_CLIP_TOKENS=("${EXPANDED_TOKENS[@]:-}")
   echo "==> ${#INPUTS[@]} video(s) after expansion"
 fi
 
@@ -372,13 +462,20 @@ else
     usage
     exit 1
   fi
-  for input in "${INPUTS[@]}"; do
+  for input_idx in "${!INPUTS[@]}"; do
+    input="${INPUTS[$input_idx]}"
+    # This input's own window: its #t= suffix if it had one, otherwise the
+    # invocation-wide --clip. Read by index rather than carried in $input,
+    # because the input string is also the auto-resume key and the provenance
+    # link — a window smuggled inside it would end up in both.
+    this_clip_label="${INPUT_CLIP_LABELS[$input_idx]:-}"
+    this_clip_token="${INPUT_CLIP_TOKENS[$input_idx]:-}"
     kind="$(classify_input "$input")"
-    if [ "$kind" = "meeting" ] && [ -n "$CLIP_LABEL" ]; then
-      echo "ERROR: --clip does not apply to a live meeting: $input" >&2
+    if [ "$kind" = "meeting" ] && [ -n "$this_clip_label" ]; then
+      echo "ERROR: a clip window does not apply to a live meeting: $input" >&2
       echo "  The window is cut out of an existing recording, and this input" >&2
       echo "  has none yet. Record it first, then clip the MP4:" >&2
-      echo "    ./pipeline.sh \"\$RECORDINGS_DIR/<run_id>.mp4\" --clip $CLIP_LABEL" >&2
+      echo "    ./pipeline.sh \"\$RECORDINGS_DIR/<run_id>.mp4\" --clip $this_clip_label" >&2
       exit 1
     fi
     if [ "$kind" = "unknown" ]; then
@@ -393,7 +490,7 @@ else
     # than duplicated. --force always starts a clean run instead.
     existing=""
     if [ "$FORCE" -eq 0 ]; then
-      existing="$(rs find --root "$RUNS_DIR" --input "$input" --clip "$CLIP_LABEL" --incomplete 2>/dev/null || true)"
+      existing="$(rs find --root "$RUNS_DIR" --input "$input" --clip "$this_clip_label" --incomplete 2>/dev/null || true)"
     fi
 
     if [ -n "$existing" ]; then
@@ -403,7 +500,7 @@ else
     else
       safe="$(derive_safe_name "$input" "$kind")"
       [ -z "$safe" ] && safe="meeting"
-      [ -n "$CLIP_TOKEN" ] && safe="${safe}_${CLIP_TOKEN}"
+      [ -n "$this_clip_token" ] && safe="${safe}_${this_clip_token}"
       run_dir="$RUNS_DIR/${safe}_$(date +%Y%m%d_%H%M%S)"
       # Two inputs starting in the same second would otherwise share a run dir.
       suffix=1
@@ -418,7 +515,9 @@ else
         --language "$LANGUAGE" --prompt "$PROMPT_NAME"
         --display-name "$DISPLAY_NAME"
       )
-      [ -n "$CLIP_LABEL" ] && init_args+=(--clip "$CLIP_LABEL")
+      [ -n "$this_clip_label" ] && init_args+=(--clip "$this_clip_label")
+      [ -n "$this_clip_label" ] \
+        && echo "==> $input" && echo "    clip: $this_clip_label"
       for spec in "${RESOURCE_SPECS[@]:-}"; do
         [ -n "$spec" ] && init_args+=(--resources "$spec")
       done

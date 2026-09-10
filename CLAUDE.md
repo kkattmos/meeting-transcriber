@@ -312,8 +312,13 @@ Settled with the operator 2026-09-10. Four decisions, all of them deliberate:
    ffmpeg before transcription, so AssemblyAI bills the window and not the
    lecture, and frame extraction only walks the window. Filtering afterwards
    would have been less code and would have paid full price on every clip.
-2. **`--clip` is one flag for the whole invocation**, not a per-input suffix.
-   Several windows means several invocations.
+2. **`--clip` is one flag for the whole invocation**, with a per-input
+   `#t=WINDOW` suffix on top of it (added 2026-09-11, after the first real use
+   showed why). The global flag alone could not express "these five lectures,
+   two of them trimmed, one combined document" — and `--combine` is
+   per-invocation, so splitting by window would have split the document too.
+   `#t=` overrides `--clip` for its own input; an input without one falls back
+   to `--clip`.
 3. **Output timestamps are clip-relative.** Because the cut happens first,
    nothing after it knows a window existed: no offset is threaded through
    transcribe → chunking → frames → pdf, and there is no way for one stage to
@@ -383,6 +388,30 @@ Non-obvious details:
 - **A window that leaves no transcript is exit 2**, not an empty summary.
 - **`--clip` on a live meeting URL is refused** in `pipeline.sh`, with the
   command to clip the recording afterwards. There is no source to cut.
+
+#### The `#t=` suffix
+
+`split_clip_suffix` in `pipeline.sh`, and three details that are easy to undo:
+
+- **The split runs BEFORE `looks_like_input`, not after.** A URL still looks
+  like a URL with the suffix attached, so testing first takes the whole string
+  as the input and the window disappears without a word. (A local path is the
+  opposite case — `lecture.mp4#t=1:00-2:00` is not a file that exists, so it
+  would be filed as a legacy positional.) One ordering handles both.
+- **The suffix is only taken as a window when what is left of it still looks
+  like an input, and then it must parse.** That is what keeps a URL ending in
+  some other `#t=` fragment from being silently truncated, while a typo'd
+  window is a hard error at second zero rather than a mangled link.
+- **`INPUTS`, `INPUT_CLIP_LABELS` and `INPUT_CLIP_TOKENS` are parallel arrays,
+  read by index.** Every push site must push to all three — playlist expansion
+  included, which rebuilds all three in lockstep. A missed push doesn't error;
+  it shifts every later input's window onto the wrong lecture. The window is
+  deliberately NOT carried inside the input string, because that string is the
+  auto-resume key and the document's link line.
+- **`--from-file` strips a `#` comment only at the start of a line or after
+  whitespace.** It used to cut at any `#`, which ate the suffix — and any URL
+  fragment — leaving a link that still worked and a window that had silently
+  gone.
 
 ### Resume semantics
 
@@ -1170,6 +1199,8 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   download would make every YouTube run fetch the same video twice.
 - **Artifact paths derive from the run id, not the clock.** Resume depends on
   it. This is why `--out-base` and `--pdf-out` exist.
+- **The `#t=` suffix never reaches the stored input.** It is the auto-resume
+  key and the document's link line; a window left inside it breaks both.
 - **A clipped run gets its own run id.** Dropping the window from the run id
   makes a clip overwrite the full summary of the same lecture, and two windows
   overwrite each other — silently, because every artifact path is a function of
@@ -1295,7 +1326,7 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, `--combine` citation shifting, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 111 |
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, manifest merging for `--combine`, real PDF render | 60 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combined PDF and its frame sweep, the Kaltura DAG, the `--clip` DAG and run-id separation | 191 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combined PDF and its frame sweep, the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix | 220 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary, and a real ffmpeg clip probed for duration and rebased timestamps | 82 |
 | `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 

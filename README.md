@@ -384,6 +384,7 @@ done. `KEEP_FRAMES=1` still keeps them.
 | `--language L` | `th` (default), `en`, `auto`, or any AssemblyAI code |
 | `--prompt P` | A file in `summarize/prompts/`, e.g. `--prompt lecture-claude` |
 | `--clip W` | Summarize only part of the video, e.g. `--clip 00:05:00-01:30:00` (see below) |
+| `<input>#t=W` | Not a flag: a per-input window, overriding `--clip` for that input |
 | `--resources SPEC` | Slides / notes for this session; repeatable (see below) |
 | `--jobs N` | Inputs processed at once (default 2) |
 | `--from-file F` | Read inputs from a file, one per line |
@@ -495,6 +496,35 @@ A clip starting at `00:05:00` has its first subtitle cue at `0:00:00` and its
 first keyframe at `Frame 1 @ 0:00:00`. The summary says so, on its own line
 under the title, because that is the one thing about a clipped summary that
 will otherwise mislead a reader.
+
+### One window per input
+
+`--clip` applies to every input in the invocation. When only some of them need
+trimming — and especially when they all belong in one `--combine` document —
+append `#t=WINDOW` to the input itself instead:
+
+```bash
+./pipeline.sh \
+  "<iframe … entry_id=1_aaa …></iframe>" \
+  "<iframe … entry_id=1_bbb …></iframe>#t=00:00:00-01:16:04" \
+  "<iframe … entry_id=1_ccc …></iframe>#t=00:00:00-00:23:00" \
+  --resources "/srv/course/notes.md" \
+  --combine "/srv/course/Requirements-guide.md" --jobs 1
+```
+
+The suffix works on any input type — a YouTube URL, a pasted Kaltura
+`<iframe>` (put it after the closing tag), or a local path — and takes the same
+spellings as `--clip`. It overrides `--clip` for that one input; inputs without
+it fall back to `--clip`, or to no window at all.
+
+It is stripped before the input is classified, so it never reaches the run id,
+the stored input, the provenance comment or the link line. A `#t=` that doesn't
+parse as a window is an error, not a silently truncated URL — and a `#t=` on
+something that isn't an input is left alone.
+
+In a `--from-file` list a `#` only starts a comment at the beginning of a line
+or after whitespace, so `…?v=abc#t=5:00-90:00` survives while
+`…?v=abc   # week 3` still gets its comment stripped.
 
 **A clipped run is a separate run.** Its id carries the window
 (`yt_abc123_c000500-013000_20260910_143000`), so clipping a lecture you have
@@ -1069,7 +1099,7 @@ python3 lib/test_clip.py                     # --clip parsing, the cut, caption 
 python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli (111)
 python3 summarize/test_pdf_units.py          # frame cropping, citations, PDF render (60)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
-bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (191)
+bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (220)
 bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (69)
 ```
 

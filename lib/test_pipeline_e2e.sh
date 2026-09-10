@@ -903,6 +903,141 @@ grep -qx -- "--clip-captions" "$STUB_TRANSCRIBE_ARGS" \
   && bad "noclip: passed --clip-captions to transcribe" \
   || ok "noclip: transcribe got no window"
 
+
+echo ""
+echo "=================================================================="
+echo "N+1. #t= — a window on ONE input, in a multi-input invocation"
+echo "=================================================================="
+
+echo "--- Only the input carrying #t= is clipped"
+# The case this exists for: several lectures summarized together, some of them
+# needing trimming, and one --combine document over the lot. A global --clip
+# cannot express it, and splitting into one invocation per window would split
+# the combined document too.
+rm -f "$STUB_FFMPEG_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=tsuffix00001" \
+               "https://www.youtube.com/watch?v=tsuffix00002#t=00:00:00-01:16:04" \
+               "https://www.youtube.com/watch?v=tsuffix00003" --jobs 1 2>&1)
+check "t=: exits 0" "$?" "0"
+clipped_run=$(ls -1d "$RUNS"/yt_tsuffix00002_* | head -n 1)
+plain_run=$(ls -1d "$RUNS"/yt_tsuffix00001_* | head -n 1)
+check "t=: the marked input is clipped" \
+  "$(state get --run-dir "$clipped_run" --key clip)" "00:00:00-01:16:04"
+state get --run-dir "$plain_run" --key clip >/dev/null 2>&1 \
+  && bad "t=: the window leaked onto a neighbouring input" \
+  || ok "t=: its neighbours are untouched"
+case "$(basename "$clipped_run")" in
+  yt_tsuffix00002_c000000-011604_*) ok "t=: window is in that run's id" ;;
+  *) bad "t=: run id is wrong: $(basename "$clipped_run")" ;;
+esac
+
+echo "--- The suffix does not reach the input, the run id, or the document"
+# The input string is the auto-resume key and the provenance link. A window
+# left inside it would make the link wrong and every resume miss.
+check "t=: the suffix is stripped from the stored input" \
+  "$(state get --run-dir "$clipped_run" --key input)" \
+  "https://www.youtube.com/watch?v=tsuffix00002"
+case "$(basename "$clipped_run")" in
+  *"#t="*) bad "t=: the suffix leaked into the run id" ;;
+  *) ok "t=: no suffix in the run id" ;;
+esac
+
+echo "--- #t= overrides --clip for its own input only"
+rm -f "$STUB_FFMPEG_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=tsuffix00004" \
+               "https://www.youtube.com/watch?v=tsuffix00005#t=00:10:00-00:20:00" \
+               --clip 00:05:00-01:30:00 --jobs 1 2>&1)
+check "t=: exits 0" "$?" "0"
+check "t=: the unmarked input took --clip" \
+  "$(state get --run-dir "$(ls -1d "$RUNS"/yt_tsuffix00004_* | head -n 1)" --key clip)" \
+  "00:05:00-01:30:00"
+check "t=: the marked input overrode it" \
+  "$(state get --run-dir "$(ls -1d "$RUNS"/yt_tsuffix00005_* | head -n 1)" --key clip)" \
+  "00:10:00-00:20:00"
+
+echo "--- A Kaltura <iframe> takes the suffix after the closing tag"
+# The blob is what gets pasted out of the LMS, so the suffix has to survive
+# sitting on the end of 900 characters of HTML with a quoted src in the middle.
+IFRAME='<iframe id="kaltura_player" src="https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/52668182?iframeembed=true&amp;entry_id=1_tsuffix1" style="width: 400px;height: 285px;border: 0;" allowfullscreen title="2110423 Online Lecture Sessions"></iframe>'
+out=$(pipeline "${IFRAME}#t=00:00:00-00:23:00" 2>&1)
+check "t=/kaltura: exits 0" "$?" "0"
+run=$(latest_run)
+check "t=/kaltura: window recorded" \
+  "$(state get --run-dir "$RUNS/$run" --key clip)" "00:00:00-00:23:00"
+case "$run" in
+  kal_1_tsuffix1_c000000-002300_*) ok "t=/kaltura: entry id and window in the run id" ;;
+  *) bad "t=/kaltura: run id is wrong: $run" ;;
+esac
+# The blob is normalised to a canonical embed URL before summarize sees it;
+# what matters here is that no fragment rode along with it.
+grep -q -- "#t=" "$STUB_SUMMARIZE_ARGS" \
+  && bad "t=/kaltura: the suffix reached summarize" \
+  || ok "t=/kaltura: no suffix downstream"
+
+echo "--- A local file takes it too"
+echo "fake recording" > "$TESTROOT/suffix lecture.mp4"
+out=$(pipeline "$TESTROOT/suffix lecture.mp4#t=00:01:00-00:02:00" 2>&1)
+check "t=/local: exits 0" "$?" "0"
+run=$(latest_run)
+check "t=/local: window recorded" \
+  "$(state get --run-dir "$RUNS/$run" --key clip)" "00:01:00-00:02:00"
+check "t=/local: the path is intact, suffix and space and all" \
+  "$(state get --run-dir "$RUNS/$run" --key input)" "$TESTROOT/suffix lecture.mp4"
+
+echo "--- The same window resumes whether it came from #t= or --clip"
+touch "$STUB_FAIL_SUMMARIZE"
+pipeline "https://www.youtube.com/watch?v=tsuffix00006#t=00:05:00-01:30:00" \
+  >/dev/null 2>&1
+first=$(latest_run)
+rm -f "$STUB_FAIL_SUMMARIZE"
+out=$(pipeline "https://www.youtube.com/watch?v=tsuffix00006" --clip 5:00-90:00 2>&1)
+check "t=: exits 0" "$?" "0"
+check "t=: the two spellings are one run" "$(latest_run)" "$first"
+
+echo "--- An unparseable window is refused before anything is created"
+before=$(latest_run)
+out=$(pipeline "https://www.youtube.com/watch?v=tsuffix00007#t=90:00-5:00" 2>&1)
+check "t=: exits 1" "$?" "1"
+echo "$out" | grep -q "ends at or before it starts" \
+  && ok "t=: names the problem" || bad "t=: unclear error"
+check "t=: no run created" "$(latest_run)" "$before"
+
+echo "--- A fragment that is not a window is left on the URL"
+# "#t=" only becomes a window when what is left of it still looks like an
+# input AND the remainder parses. Anything else stays part of the URL rather
+# than being silently truncated.
+out=$(pipeline "https://www.youtube.com/watch?v=tsuffix00008" 2>&1)
+check "t=: a plain URL is unaffected" "$?" "0"
+state get --run-dir "$RUNS/$(latest_run)" --key clip >/dev/null 2>&1 \
+  && bad "t=: invented a window" || ok "t=: no window on a plain URL"
+
+echo "--- --from-file carries #t=, and still honours real comments"
+cat > "$TESTROOT/links.txt" <<'LINKS'
+# a comment line
+https://www.youtube.com/watch?v=tsuffix00009#t=00:05:00-01:30:00
+https://www.youtube.com/watch?v=tsuffix00010   # trailing comment
+LINKS
+out=$(pipeline --from-file "$TESTROOT/links.txt" --jobs 1 2>&1)
+check "t=/from-file: exits 0" "$?" "0"
+check "t=/from-file: the window survived the comment stripper" \
+  "$(state get --run-dir "$(ls -1d "$RUNS"/yt_tsuffix00009_* | head -n 1)" --key clip)" \
+  "00:05:00-01:30:00"
+check "t=/from-file: a trailing comment is still stripped" \
+  "$(state get --run-dir "$(ls -1d "$RUNS"/yt_tsuffix00010_* | head -n 1)" --key input)" \
+  "https://www.youtube.com/watch?v=tsuffix00010"
+
+echo "--- Several windows in one invocation still make one combined document"
+COMBINED="$TESTROOT/combined clips.md"
+out=$(pipeline "https://www.youtube.com/watch?v=tcomb00000001#t=00:00:00-01:16:04" \
+               "https://www.youtube.com/watch?v=tcomb00000002" \
+               "https://www.youtube.com/watch?v=tcomb00000003#t=00:00:00-00:23:00" \
+               --jobs 1 --combine "$COMBINED" 2>&1)
+check "t=/combine: exits 0" "$?" "0"
+[ -f "$COMBINED" ] && ok "t=/combine: one document for three windows" \
+  || bad "t=/combine: no combined document"
+check "t=/combine: all three sections present" \
+  "$(grep -c "^# " "$COMBINED")" "3"
+
 echo ""
 echo "=================================================================="
 echo "Result: $PASS passed, $FAIL failed"
