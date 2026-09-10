@@ -6,6 +6,9 @@
 # Usage:
 #   lib/run_one.sh --run-dir DIR [--force]
 #
+# The clip window, like the resources list, is read back out of state.json
+# rather than passed: a resume must cut the same window the first attempt did.
+#
 # All the per-run configuration (input, name, language, prompt) is read back
 # out of the run's state.json, which pipeline.sh writes with `runstate init`.
 # That's what makes a resume a single argument: everything needed to finish the
@@ -30,6 +33,19 @@
 #
 #     input ──> fetch_video ──┬─> transcribe ─┐
 #                             └─> frames ─────┴─> summarize
+#
+# --clip adds one more stage, `clip`, which cuts the requested window out of
+# the media with ffmpeg. Everything after it is handed the CLIP and never
+# learns a window existed — which is what makes the output timestamps
+# clip-relative without an offset being threaded through four stages.
+# It sits wherever the media first exists:
+#
+#     local file / kaltura:  ... fetch_video ──> clip ──┬─> transcribe ─┐
+#                                                       └─> frames ─────┴─> summarize
+#     youtube:               fetch_video ──> clip ──> frames   (transcribe runs
+#                                                               off captions and
+#                                                               is windowed by
+#                                                               transcribe.sh)
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -78,6 +94,10 @@ SAFE_NAME="$(cfg safe_name)"
 LANGUAGE="$(cfg language)"
 PROMPT_NAME="$(cfg prompt)"
 DISPLAY_NAME="$(cfg display_name)"
+# The clip window, replayed from state.json on every attempt exactly like the
+# resources list — a resume has to cut the same window the first attempt did or
+# it would summarize a different video onto the same artifact paths.
+CLIP="$(cfg clip)"
 # Reference material for this run (slides repo / folder), one spec per line.
 # Replayed on every attempt so a resumed run summarizes against the same
 # material the first attempt used.
@@ -142,6 +162,10 @@ paths_require || exit 2
 MP4_FILE="${RECORDINGS_DIR}/${RUN_ID}.mp4"
 TRANSCRIPT_BASE="${TRANSCRIPTS_DIR}/${RUN_ID}"
 RUN_FRAMES_DIR="${FRAMES_DIR}/${RUN_ID}"
+# Lives in the run dir, beside the YouTube/Kaltura download it is cut from,
+# because it is derived data with the same lifetime: cheap to remake from the
+# source, and swept with the rest of the run dir.
+CLIP_FILE="$RUN_DIR/clip.mp4"
 SUMMARY_FILE="${SUMMARIES_DIR}/${RUN_ID}.md"
 SUMMARY_PDF="${PDF_DIR}/${RUN_ID}.pdf"
 paths_mkdir RECORDINGS_DIR TRANSCRIPTS_DIR FRAMES_DIR SUMMARIES_DIR PDF_DIR
@@ -285,9 +309,22 @@ do_fetch_kaltura() {
   "$PYTHON_BIN" "$SCRIPT_DIR/kaltura.py" download "$INPUT" "$RUN_DIR/video.mp4"
 }
 
+# Cut the window out of whatever media this run has. Everything downstream —
+# transcribe, frames, summarize — is then handed the clip and never learns a
+# window existed, which is what makes the output timestamps clip-relative
+# without a single offset being threaded through four stages.
+do_clip() {
+  local src="$1"
+  "$PYTHON_BIN" "$SCRIPT_DIR/clip.py" cut "$src" "$CLIP_FILE" "$CLIP"
+}
+
 do_transcribe() {
   local src="$1"
   local args=("$src" "$SAFE_NAME" "$LANGUAGE" --out-base "$TRANSCRIPT_BASE")
+  # Only the caption backends act on this. When AssemblyAI is used the media
+  # it receives has already been cut, so applying the window again would
+  # take a second slice out of the first one.
+  [ -n "$CLIP" ] && args+=(--clip-captions "$CLIP")
   # On the Kaltura path the *input* is passed so free captions can be tried
   # first, with the downloaded MP4 behind --media as the AssemblyAI fallback.
   [ -n "${2:-}" ] && args+=(--media "$2")
@@ -319,6 +356,9 @@ do_summarize() {
     # artifacts actually live in, not just the meeting name.
     --run-id "$RUN_ID"
   )
+  # Recorded in the document's provenance comment. Without it a reader has no
+  # way to tell that "0:00:00" in this summary is 00:05:00 in the source.
+  [ -n "$CLIP" ] && args+=(--clip "$CLIP")
   [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
   # Kaltura has no yt-dlp to ask for a title, so the entry's own name (read at
   # fetch time into kaltura.json) is passed explicitly. Best-effort: a run
@@ -338,23 +378,36 @@ do_summarize() {
 
 # --- Resolve the video for this input type -----------------------------------
 # Sets VIDEO_FILE, or leaves it empty when the video branch has to run first.
-resolve_video() {
+# The media this run started from, before any window was cut out of it.
+resolve_source_video() {
   case "$INPUT_TYPE" in
     local_file) VIDEO_FILE="$INPUT" ;;
     meeting)    VIDEO_FILE="$MP4_FILE" ;;
     youtube|kaltura)
       VIDEO_FILE="$(rs get --run-dir "$RUN_DIR" --key stages.fetch_video.artifacts.video 2>/dev/null || true)"
       if [ -z "$VIDEO_FILE" ]; then
-        VIDEO_FILE="$(ls -1 "$RUN_DIR"/video.* 2>/dev/null | head -n 1)"
+        VIDEO_FILE="$(ls -1 "$RUN_DIR"/video.* 2>/dev/null | grep -v '\.part$' | head -n 1)"
       fi
       ;;
   esac
+}
+
+# The media every stage after the cut should use. On a clipped run that is the
+# clip; on every other run it is the source, unchanged. Nothing downstream
+# branches on the window — this function is the only place that knows.
+resolve_video() {
+  if [ -n "$CLIP" ] && [ -f "$CLIP_FILE" ]; then
+    VIDEO_FILE="$CLIP_FILE"
+    return 0
+  fi
+  resolve_source_video
 }
 
 echo "=================================================================="
 echo "Run: $RUN_ID"
 echo "  input:    $INPUT ($INPUT_TYPE)"
 echo "  language: $LANGUAGE   prompt: ${PROMPT_NAME:-(default)}"
+[ -n "$CLIP" ] && echo "  clip:     $CLIP  (output timestamps are relative to it)"
 echo "=================================================================="
 
 # --- Stage 1: record (meeting URLs only) -------------------------------------
@@ -391,6 +444,38 @@ ensure_video_fetched() {
   mark_done fetch_video "video=$got" || return 1
 }
 
+# The cut, shared by both callers below exactly like ensure_video_fetched, and
+# idempotent for the same reason: on the Kaltura and local-file paths it runs
+# ahead of both branches (transcribe needs the clipped audio), while on the
+# YouTube path there is nothing to transcribe from the media at all, so it runs
+# inside the frames branch right after the download. Calling it twice must be
+# free.
+#
+# A no-op when this run has no window, so the callers stay unconditional.
+ensure_video_clipped() {
+  [ -n "$CLIP" ] || return 0
+  if [ "$(stage_status clip)" = "done" ]; then
+    echo "[clip] already done — skipping"
+    return 0
+  fi
+  resolve_source_video
+  if [ -z "${VIDEO_FILE:-}" ] || [ ! -f "$VIDEO_FILE" ]; then
+    rs fail --run-dir "$RUN_DIR" --stage clip \
+      --error "no source media at '${VIDEO_FILE:-}' to cut $CLIP out of"
+    echo "[clip] no source media at '${VIDEO_FILE:-}' — cannot cut $CLIP" >&2
+    return 1
+  fi
+  # Never cut the clip out of itself. resolve_source_video can't return
+  # CLIP_FILE, but a stale half-written one from a killed run can still be
+  # sitting there, and ffmpeg would happily read it as the source.
+  # clip.part.mp4, not clip.mp4.part — ffmpeg picks its muxer from the
+  # extension, so the partial keeps it. See lib/clip.py.
+  rm -f "$CLIP_FILE" "$RUN_DIR/clip.part.mp4"
+  echo "==> Cutting $CLIP out of $VIDEO_FILE"
+  run_stage clip do_clip "$VIDEO_FILE" || return 1
+  mark_done clip "video=$CLIP_FILE" || return 1
+}
+
 branch_transcribe() {
   # YouTube goes to youtube-transcript.io with the URL itself (captions, no
   # download); Kaltura passes the input too — free captions when the entry has
@@ -412,6 +497,10 @@ branch_transcribe() {
 branch_frames() {
   if [ "$INPUT_TYPE" = "youtube" ]; then
     ensure_video_fetched || return 1
+    # Only here: the YouTube transcribe branch runs off captions, so it is
+    # already finished with the window (transcribe.sh applies it to the
+    # segments) and never waits on this.
+    ensure_video_clipped || return 1
   fi
 
   resolve_video
@@ -430,6 +519,22 @@ if [ "$INPUT_TYPE" = "kaltura" ]; then
   echo ""
   echo "==> Fetching the Kaltura entry before transcribe and frames"
   if ! ensure_video_fetched; then
+    echo "    Resume with:  ./pipeline.sh --run-id $RUN_ID" >&2
+    exit 1
+  fi
+fi
+
+# The cut, for every input whose TRANSCRIBE branch reads the media: a local
+# file, and Kaltura when the entry has no captions. Both branches must see the
+# same clip, so it happens before either starts rather than inside one of them.
+#
+# YouTube is the exception and is handled inside branch_frames: its transcript
+# comes from captions and never opens the media at all, so making transcription
+# wait for a download and an ffmpeg pass would serialize two stages that have
+# nothing to say to each other.
+if [ -n "$CLIP" ] && [ "$INPUT_TYPE" != "youtube" ]; then
+  echo ""
+  if ! ensure_video_clipped; then
     echo "    Resume with:  ./pipeline.sh --run-id $RUN_ID" >&2
     exit 1
   fi

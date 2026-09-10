@@ -19,6 +19,7 @@
 #   ./pipeline.sh "https://www.youtube.com/playlist?list=PL..." --playlist
 #   ./pipeline.sh "https://meet.google.com/abc-defg-hij" --name "Weekly Standup"
 #   ./pipeline.sh /path/to/recording.mp4 --language en
+#   ./pipeline.sh "https://youtu.be/bbb" --clip 00:05:00-01:30:00
 #
 # RESUMING. State lives in /opt/meeting-bot/runs/<run_id>/. If a run fails
 # partway, just run the same command again: it finds the unfinished run for
@@ -42,6 +43,15 @@
 #                       or a local file or folder. Repeatable. Their text is
 #                       given to the summarizer as reference material and their
 #                       slide images are embedded in the PDF.
+#   --clip W            summarize only part of the video: --clip 00:05:00-01:30:00
+#                       (also MM:SS, bare seconds, or an open end: 00:05:00-).
+#                       The media is cut to the window before transcription, so
+#                       AssemblyAI only bills those minutes — and every
+#                       timestamp in the output is relative to the CLIP, not to
+#                       the source video. A clipped run gets its own run id, so
+#                       it never overwrites a full summary of the same input.
+#                       Not accepted for a live meeting URL: there is no source
+#                       to clip.
 #   --jobs N            how many inputs to process at once (default 2)
 #   --from-file F       read inputs from a file, one per line, # for comments
 #   --playlist          expand YouTube playlist URLs into their videos
@@ -86,6 +96,7 @@ FROM_FILE=""
 COMBINE_FILE=""
 COMBINE_PDF=""
 COMBINE_WANT_PDF=1
+CLIP_SPEC=""
 declare -a POSITIONAL=()
 declare -a RESOURCE_SPECS=()
 # RESOURCES in .env is the default for every run; --resources adds to it.
@@ -96,7 +107,7 @@ if [ -n "${RESOURCES:-}" ]; then
   done < <(printf '%s\n' "$RESOURCES" | tr ',' '\n')
 fi
 
-usage() { sed -n '2,48p' "$0"; }
+usage() { sed -n '2,57p' "$0"; }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -105,6 +116,7 @@ while [ "$#" -gt 0 ]; do
     --language)     LANGUAGE="${2:-}"; shift 2 ;;
     --prompt)       PROMPT_NAME="${2:-}"; shift 2 ;;
     --jobs)         JOBS="${2:-2}"; shift 2 ;;
+    --clip)         CLIP_SPEC="${2:-}"; shift 2 ;;
     --from-file)    FROM_FILE="${2:-}"; shift 2 ;;
     --combine)      COMBINE_FILE="${2:-}"; shift 2 ;;
     --combine-pdf)  COMBINE_PDF="${2:-}"; shift 2 ;;
@@ -134,6 +146,25 @@ while [ "$#" -gt 0 ]; do
     *) POSITIONAL+=("$1"); shift ;;
   esac
 done
+
+# --- The clip window, settled before anything is classified ------------------
+# Parsed here and only here, so a typo costs nothing: an unreadable window must
+# fail in the first second, not after a download and an AssemblyAI charge. The
+# canonical LABEL (not the raw spec) is what gets stored and matched on, so
+# "5:00-90:00" and "00:05:00-01:30:00" resume into the same run instead of
+# quietly making two.
+CLIP_LABEL=""
+CLIP_TOKEN=""
+if [ -n "$CLIP_SPEC" ]; then
+  CLIP_JSON="$("$PYTHON_BIN" "$SCRIPT_DIR/lib/clip.py" parse "$CLIP_SPEC")" || exit 1
+  CLIP_LABEL="$(printf '%s' "$CLIP_JSON" | sed -nE 's/.*"label": "([^"]*)".*/\1/p')"
+  CLIP_TOKEN="$(printf '%s' "$CLIP_JSON" | sed -nE 's/.*"token": "([^"]*)".*/\1/p')"
+  if [ -z "$CLIP_LABEL" ] || [ -z "$CLIP_TOKEN" ]; then
+    echo "ERROR: could not parse the --clip window: $CLIP_SPEC" >&2
+    exit 1
+  fi
+  echo "==> Clip window: $CLIP_LABEL (output timestamps are relative to it)"
+fi
 
 # --- Input classification ----------------------------------------------------
 # Kaltura inputs are recognised by lib/kaltura.py rather than by a regex here:
@@ -343,6 +374,13 @@ else
   fi
   for input in "${INPUTS[@]}"; do
     kind="$(classify_input "$input")"
+    if [ "$kind" = "meeting" ] && [ -n "$CLIP_LABEL" ]; then
+      echo "ERROR: --clip does not apply to a live meeting: $input" >&2
+      echo "  The window is cut out of an existing recording, and this input" >&2
+      echo "  has none yet. Record it first, then clip the MP4:" >&2
+      echo "    ./pipeline.sh \"\$RECORDINGS_DIR/<run_id>.mp4\" --clip $CLIP_LABEL" >&2
+      exit 1
+    fi
     if [ "$kind" = "unknown" ]; then
       echo "ERROR: unrecognized input: $input" >&2
       echo "  Expected a Google Meet or Zoom URL, a YouTube URL, a Kaltura" >&2
@@ -355,7 +393,7 @@ else
     # than duplicated. --force always starts a clean run instead.
     existing=""
     if [ "$FORCE" -eq 0 ]; then
-      existing="$(rs find --root "$RUNS_DIR" --input "$input" --incomplete 2>/dev/null || true)"
+      existing="$(rs find --root "$RUNS_DIR" --input "$input" --clip "$CLIP_LABEL" --incomplete 2>/dev/null || true)"
     fi
 
     if [ -n "$existing" ]; then
@@ -365,6 +403,7 @@ else
     else
       safe="$(derive_safe_name "$input" "$kind")"
       [ -z "$safe" ] && safe="meeting"
+      [ -n "$CLIP_TOKEN" ] && safe="${safe}_${CLIP_TOKEN}"
       run_dir="$RUNS_DIR/${safe}_$(date +%Y%m%d_%H%M%S)"
       # Two inputs starting in the same second would otherwise share a run dir.
       suffix=1
@@ -379,6 +418,7 @@ else
         --language "$LANGUAGE" --prompt "$PROMPT_NAME"
         --display-name "$DISPLAY_NAME"
       )
+      [ -n "$CLIP_LABEL" ] && init_args+=(--clip "$CLIP_LABEL")
       for spec in "${RESOURCE_SPECS[@]:-}"; do
         [ -n "$spec" ] && init_args+=(--resources "$spec")
       done

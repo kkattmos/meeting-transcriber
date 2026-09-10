@@ -385,7 +385,8 @@ def _sweep_stale_yt_tmpdirs():
 
 
 def _wrap_document(body, *, original_input, source_url, video_path, transcript,
-                   title_override, prompt_path, meeting_name, run_id=None):
+                   title_override, prompt_path, meeting_name, run_id=None,
+                   clip=None):
     """Build the course-note document around the model's summary body."""
     # The source we cite is the URL the user actually gave us. On the pipeline's
     # YouTube path, video_path is a local download, so --source-url carries the
@@ -419,11 +420,16 @@ def _wrap_document(body, *, original_input, source_url, video_path, transcript,
         # comment points at /opt/meeting-bot/runs/<id>/. Standalone
         # invocations have no run, so the meeting name stands in.
         run_id=run_id or meeting_name,
+        # Recorded and stated in the document, never acted on here: by the time
+        # this stage runs the media has already been cut, so the transcript and
+        # the frames are the clip's. This is the only place the reader is told
+        # that their timestamps are clip-relative.
+        clip=clip,
     )
 
 
 FLAGS_WITH_VALUES = ("--prompt", "--frames-manifest", "--source-url",
-                     "--title", "--format", "--run-id", "--pdf-out")
+                     "--title", "--format", "--run-id", "--pdf-out", "--clip")
 # Repeatable: several --resources build up a list rather than overwriting.
 REPEATABLE_FLAGS = ("--resources",)
 # Presence-only switches.
@@ -589,6 +595,7 @@ def main():
     title_override = options.get("title")
     doc_format = options.get("format") or os.environ.get("SUMMARY_DOC_FORMAT", "auto")
     run_id = options.get("run_id")
+    clip = options.get("clip")
     resource_specs = options.get("resources") or botresources.parse_specs_arg(
         os.environ.get("RESOURCES", ""))
     write_markdown = options.get("write_markdown", pdf_export.want_markdown())
@@ -601,6 +608,7 @@ def main():
             f"[<output_md_path>] [--prompt NAME] [--frames-manifest PATH] "
             f"[--resources SPEC] [--pdf-out PATH] [--no-pdf] [--no-markdown] "
             f"[--source-url URL] [--title TEXT] [--format auto|always|never] [--run-id ID]"
+        f" [--clip WINDOW]"
         )
         sys.exit(1)
 
@@ -721,6 +729,7 @@ def main():
                 prompt_path=prompt_path,
                 meeting_name=meeting_name,
                 run_id=run_id,
+                clip=clip,
             )
 
         # 7. Write the output: markdown first, then the PDF (which embeds

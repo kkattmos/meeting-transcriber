@@ -262,6 +262,8 @@ runs/<run_id>/
   admitted        per-run admission marker
   record.pid      record/join/ffmpeg pids + display + sink for this recording
   video.mp4       YouTube download, when applicable
+  clip.mp4        the --clip window, cut from video.mp4 / the input
+  kaltura.json    entry facts, cached at fetch time
 ```
 
 `run_id` is `<safe_name>_<YYYYmmdd_HHMMSS>`, and **all artifact paths derive
@@ -280,6 +282,10 @@ input ──┤                    ├─> summarize
         └─> fetch_video ──> frames
 ```
 
+`clip` is a sixth stage, run only when `--clip` is given; see the section below
+for where it sits. On an unclipped run it stays `pending` forever, the same way
+`record` does on every non-meeting input.
+
 `transcribe` and `fetch_video`→`frames` run as concurrent bash branches; both
 write state through the flock'd `runstate.py`, so their writes can't clobber
 each other.
@@ -297,6 +303,86 @@ input ──> fetch_video ──┬─> transcribe ─┐
 `ensure_video_fetched` is idempotent (it returns early on a `done` stage), which
 is what lets the same function be called ahead of the branches here and from
 inside the frames branch on the YouTube path without ever downloading twice.
+
+### `--clip`: summarizing part of a video
+
+Settled with the operator 2026-09-10. Four decisions, all of them deliberate:
+
+1. **The media is cut, not the transcript filtered.** `lib/clip.py cut` runs
+   ffmpeg before transcription, so AssemblyAI bills the window and not the
+   lecture, and frame extraction only walks the window. Filtering afterwards
+   would have been less code and would have paid full price on every clip.
+2. **`--clip` is one flag for the whole invocation**, not a per-input suffix.
+   Several windows means several invocations.
+3. **Output timestamps are clip-relative.** Because the cut happens first,
+   nothing after it knows a window existed: no offset is threaded through
+   transcribe → chunking → frames → pdf, and there is no way for one stage to
+   forget to apply it. The cost is that `Frame 1 @ 0:00:00` in a clipped
+   summary is 00:05:00 in the source, which is why `document.py` prints a
+   visible `Clip:` line as well as a provenance field. Absolute timestamps
+   would have meant an offset in four modules and a silent failure in whichever
+   one missed it.
+4. **A clipped run has its own run id** — the window's token goes in the safe
+   name (`yt_abc123_c000500-013000_20260910_143000`). Every artifact path
+   derives from the run id, so this one string is what keeps a clip's `.txt`,
+   `.srt`, `.md` and `.pdf` from landing on a full run's.
+
+The stage sits wherever the media first exists:
+
+```
+local file / kaltura:  ... fetch_video ──> clip ──┬─> transcribe ─┐
+                                                  └─> frames ─────┴─> summarize
+youtube:               fetch_video ──> clip ──> frames
+```
+
+`ensure_video_clipped` mirrors `ensure_video_fetched` exactly — idempotent, so
+it can be called ahead of both branches (local file, Kaltura: transcribe reads
+the media) or from inside the frames branch (YouTube: transcribe reads captions
+and would otherwise be made to wait on a download and an ffmpeg pass for
+nothing).
+
+Non-obvious details:
+
+- **The label, not the raw spec, is what gets stored.** `pipeline.sh` parses
+  `--clip` before it classifies anything — a typo must cost nothing, not a
+  download and an AssemblyAI charge — and writes the canonical
+  `00:05:00-01:30:00` into `state.json`. `5:00-90:00` and `300-5400` therefore
+  resume the same run instead of making three runs of the same 85 minutes.
+  `runstate find` matches on input **and** clip; without that, asking for
+  01:30:00-02:00:00 would resume the 00:05:00-01:30:00 run.
+- **The label has to parse back.** It is re-read from `state.json` on every
+  attempt, including every resume, so `parse_clip(label(w)) == w` is an
+  invariant, not a nicety — which is why `parse_clip` accepts the word `end`
+  that `label` emits for an open window. The first version didn't, and failed
+  one download in, on the resume path only.
+- **The partial is `clip.part.mp4`, not `clip.mp4.part`.** ffmpeg picks its
+  muxer from the output extension and refuses to start on a name ending
+  `.part` ("Unable to choose an output format"). The Kaltura download's
+  `.part` convention doesn't transfer, because that one is an HTTP body being
+  written to a file, not ffmpeg choosing a container.
+- **`-ss` before `-i`, and `-t` rather than `-to`.** Seeking before the input
+  is the difference between seconds and minutes on a 90-minute lecture; and
+  with `-ss` first the timestamps are already rebased, so `-to` would measure
+  from the wrong origin and the clip would run long.
+- **`-avoid_negative_ts make_zero` is what makes the clip start at t=0.**
+  Without it the first frame is still stamped 00:05:00, every SRT cue and frame
+  timestamp inherits the offset, and the clip-relative timebase this feature
+  promises is silently absolute. Nothing errors.
+- **Stream copy by default**; `CLIP_REENCODE=1` re-encodes. The copy lands on
+  the keyframe at or before the requested start — a few seconds early here —
+  and costs seconds instead of the half hour a re-encode of an 85-minute window
+  takes on this box.
+- **Captions have no media to cut**, so `transcribe.sh --clip-captions` applies
+  the same window to the segments and shifts them onto the same clock, using
+  `clip.window_segments` — the same module, so the two halves cannot disagree
+  about what "00:05:00" means. The flag is named for what it does: it has no
+  effect on the AssemblyAI path, whose media has already been cut, and applying
+  a window there too would take a second slice out of the first.
+  A straddling caption cue is truncated rather than dropped: the words were
+  spoken inside the window.
+- **A window that leaves no transcript is exit 2**, not an empty summary.
+- **`--clip` on a live meeting URL is refused** in `pipeline.sh`, with the
+  command to clip the recording afterwards. There is no source to cut.
 
 ### Resume semantics
 
@@ -366,6 +452,9 @@ One script now, not a host wrapper plus an in-container body.
   Caption text arrives HTML-escaped (`&lt;i&gt;`, `&amp;`), so
   `_clean_caption_text` unescapes and drops the markup.
 - Both feed one shared writer producing `.txt` + `.srt`.
+- `--clip-captions WINDOW` trims a *caption-derived* transcript to a window and
+  rebases it, immediately before that shared writer. It is a no-op on the
+  AssemblyAI path by design — see the `--clip` section above.
 - `--out-base PATH` overrides the timestamped default (see the run model).
 - Language default `th`, override via arg or `ASSEMBLYAI_LANGUAGE`.
 - `ASSEMBLYAI_BASE_URL` and `YT_TRANSCRIPT_API_URL` exist so
@@ -1081,6 +1170,26 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   download would make every YouTube run fetch the same video twice.
 - **Artifact paths derive from the run id, not the clock.** Resume depends on
   it. This is why `--out-base` and `--pdf-out` exist.
+- **A clipped run gets its own run id.** Dropping the window from the run id
+  makes a clip overwrite the full summary of the same lecture, and two windows
+  overwrite each other — silently, because every artifact path is a function of
+  the run id and nothing checks what is already there.
+- **`--clip` cuts the media; it does not filter the transcript afterwards.**
+  Filtering pays AssemblyAI for the whole video on every clip. The one
+  exception is captions, which have no media to cut and are free anyway.
+- **Clip timestamps are relative, and the document says so.** The `Clip:` line
+  in `document.py` is not decoration: without it every timestamp in a clipped
+  summary points at the wrong moment of the source video and looks correct.
+- **`clip.label()` must round-trip through `clip.parse_clip()`.** The label is
+  what `state.json` stores and what every resume parses back. A label that
+  doesn't parse fails one download in, on the resume path only.
+- **`-avoid_negative_ts make_zero` stays in the ffmpeg cut**, and `-ss` stays
+  before `-i`. Dropping the first makes the clip-relative timebase silently
+  absolute; moving the second turns a few seconds of seeking into minutes of
+  decoding.
+- **The clip's partial file keeps the destination extension**
+  (`clip.part.mp4`). ffmpeg chooses its muxer from the extension and refuses to
+  start without one.
 - **The five output directories are required, with no defaults.** See the
   configuration section: a silent default is worse than an error here.
 - **`runstate.py status` verifies artifacts exist on disk** before reporting
@@ -1182,19 +1291,27 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
-| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, `--combine` citation shifting, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 109 |
+| `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
+| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, `--combine` citation shifting, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 111 |
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, manifest merging for `--combine`, real PDF render | 60 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combined PDF and its frame sweep, the Kaltura DAG | 148 |
-| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, and the real llm_client against a stub `claude` binary | 75 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combined PDF and its frame sweep, the Kaltura DAG, the `--clip` DAG and run-id separation | 191 |
+| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary, and a real ffmpeg clip probed for duration and rebased timestamps | 82 |
 | `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 
 `test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs
 only the four expensive stages, behind the same argument/output contract. It has
-caught five real bugs so far (`--from-file` with no positionals, an unhelpful
+caught six real bugs so far (`--from-file` with no positionals, an unhelpful
 unrecognized-input error, the double YouTube download, the
-`$BASHPID`-in-substitution queue bug, and a stage exiting 0 without writing its
-artifacts). Add to it when you touch orchestration.
+`$BASHPID`-in-substitution queue bug, a stage exiting 0 without writing its
+artifacts, and a `--clip` label that could not be parsed back on a resume).
+Add to it when you touch orchestration.
+
+The `--clip` split between the two shell suites is worth knowing: the pipeline
+suite stubs ffmpeg and asserts on the argv and the DAG, and `test_media_e2e.sh`
+runs the real thing against a real MP4 and probes the result with ffprobe. Only
+the second could see that ffmpeg refuses to write a file named `.part`, and
+only the first can afford to exercise nine different windows.
 
 The Kaltura network seam is **not** in `test_media_e2e.sh`. `lib/test_kaltura.py`
 drives a fake `requests.Session` instead, which asserts on what we send — the
@@ -1254,6 +1371,7 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── xsession.sh               <- per-run Xvfb display + PulseAudio sink
 │   ├── resources.py              <- slides/notes from GitHub or a folder
 │   ├── kaltura.py                <- Kaltura embeds: parse, media URL, captions
+│   ├── clip.py                   <- --clip: window parsing + the ffmpeg cut
 │   ├── run_one.sh                <- the per-run stage DAG
 │   ├── fake_api_server.py        <- stub AssemblyAI/YouTube servers
 │   ├── fake_claude_cli.py        <- stub `claude` binary for the media test
@@ -1262,6 +1380,7 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── test_keyring.py
 │   ├── test_resources.py
 │   ├── test_kaltura.py
+│   ├── test_clip.py
 │   ├── test_pipeline_e2e.sh
 │   └── test_media_e2e.sh
 ├── screen/

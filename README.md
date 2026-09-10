@@ -29,6 +29,7 @@ without the others — and `pipeline.sh` chains them.
 - [Install](#install)
 - [First-time login (you can't see a window)](#first-time-login-you-cant-see-a-window)
 - [Commands](#commands)
+- [Summarizing part of a video](#summarizing-part-of-a-video)
 - [Slides and reference material](#slides-and-reference-material)
 - [Resuming a failed run](#resuming-a-failed-run)
 - [Parallelism](#parallelism)
@@ -382,6 +383,7 @@ done. `KEEP_FRAMES=1` still keeps them.
 | `--display-name D` | Name the bot shows in the meeting (default `Meeting Bot`) |
 | `--language L` | `th` (default), `en`, `auto`, or any AssemblyAI code |
 | `--prompt P` | A file in `summarize/prompts/`, e.g. `--prompt lecture-claude` |
+| `--clip W` | Summarize only part of the video, e.g. `--clip 00:05:00-01:30:00` (see below) |
 | `--resources SPEC` | Slides / notes for this session; repeatable (see below) |
 | `--jobs N` | Inputs processed at once (default 2) |
 | `--from-file F` | Read inputs from a file, one per line |
@@ -457,6 +459,60 @@ curl -X POST http://<tailscale-host>:8765/trigger \
 
 Returns `202` immediately and runs `pipeline.sh` in the background, logging to
 `$MEETING_BOT_ROOT/logs/trigger_<timestamp>.log`.
+
+---
+
+## Summarizing part of a video
+
+`--clip` takes a time window and summarizes only that stretch — the second half
+of a three-hour lecture, one talk out of a recorded conference day, the part
+after the break.
+
+```bash
+./pipeline.sh "https://youtu.be/aaa" --clip 00:05:00-01:30:00
+```
+
+The window can be written as `HH:MM:SS`, `MM:SS`, or a plain number of seconds,
+and either end may be left open:
+
+| Spelling | Means |
+|---|---|
+| `--clip 00:05:00-01:30:00` | five minutes in, to ninety minutes in |
+| `--clip 5:00-90:00` | the same window |
+| `--clip 300-5400` | the same window, in seconds |
+| `--clip 00:05:00-` | from five minutes in, to the end |
+| `--clip -00:10:00` | the first ten minutes |
+
+**The media is cut before it is transcribed.** That is the point: AssemblyAI
+bills for the minutes you asked for and not for the whole lecture, and frame
+extraction only walks the window. The cut is a stream copy, so it costs seconds
+rather than a re-encode — the price is that it starts at the keyframe at or
+before your start time, which on these recordings is within a few seconds. Set
+`CLIP_REENCODE=1` if you need it exact.
+
+**Timestamps in the output are relative to the clip, not to the source video.**
+A clip starting at `00:05:00` has its first subtitle cue at `0:00:00` and its
+first keyframe at `Frame 1 @ 0:00:00`. The summary says so, on its own line
+under the title, because that is the one thing about a clipped summary that
+will otherwise mislead a reader.
+
+**A clipped run is a separate run.** Its id carries the window
+(`yt_abc123_c000500-013000_20260910_143000`), so clipping a lecture you have
+already summarized in full leaves the full summary alone, and two different
+windows of the same video keep their own transcript, summary and PDF. Asking
+for the same window twice still resumes, however you spell it.
+
+YouTube and Kaltura entries that have captions are the one case with no media
+to cut — the captions come back whole and free — so there the window is applied
+to the transcript instead, and shifted onto the same clip-relative clock. The
+result is the same either way.
+
+`--clip` is refused for a live Meet or Zoom URL: there is no recording yet to
+take a window out of. Record it, then clip the MP4:
+
+```bash
+./pipeline.sh "$RECORDINGS_DIR/<run_id>.mp4" --clip 00:05:00-01:30:00
+```
 
 ---
 
@@ -958,9 +1014,17 @@ another key would fail identically.
 | `SCENE_THRESHOLD` | 0.3 | ffmpeg scene-change score cutoff |
 | `FRAME_PERIOD_SECONDS` | 30 | Periodic safety-net sample; `0` disables |
 | `FRAME_MAX_DIMENSION` | 1024 | Long edge, in pixels, of the frame *copies* sent to the LLM; `0` sends the originals |
+| `CLIP_REENCODE` | 0 | `--clip` cuts by stream copy; `1` re-encodes for a frame-accurate start |
 
 Aggressive: `FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2`.
 Slides only: `FRAME_PERIOD_SECONDS=300 SCENE_THRESHOLD=0.6`.
+
+**`CLIP_REENCODE` buys exactness with a full transcode.** The default stream
+copy takes seconds and starts at the keyframe at or before the requested time —
+a few seconds early on these recordings. Re-encoding is frame-accurate and
+costs a full encode: this box runs at 2.3x realtime, so an 85-minute window is
+over half an hour of CPU. Worth it only when the clip boundary has to land on
+an exact word.
 
 **`FRAME_MAX_DIMENSION` never touches the frames you keep.** A 1920x1080
 keyframe costs the model roughly 1,844 tokens every time it opens one, and
@@ -1001,11 +1065,12 @@ python3 lib/test_slotqueue.py                # cross-session component queue (23
 python3 lib/test_keyring.py                  # numbered keys + rotation cursor (22)
 python3 lib/test_resources.py                # resource specs, extraction, GitHub (27)
 python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions, retries (51)
-python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli (109)
+python3 lib/test_clip.py                     # --clip parsing, the cut, caption windowing (33)
+python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli (111)
 python3 summarize/test_pdf_units.py          # frame cropping, citations, PDF render (60)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
-bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (148)
-bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (62)
+bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (191)
+bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (69)
 ```
 
 Two of those are worth understanding:

@@ -24,11 +24,22 @@
 # (region, login state, captions availability, audio quality) and re-run.
 #
 # Usage:
-#   ./transcribe/transcribe.sh <file_or_url> "<name>" [language] [--out-base PATH] [--media PATH]
+#   ./transcribe/transcribe.sh <file_or_url> "<name>" [language] [--out-base PATH] \
+#                              [--media PATH] [--clip-captions WINDOW]
 #
 # --media PATH is the already-downloaded media file to fall back to when a URL
 # input turns out to have no captions. The pipeline passes it on the Kaltura
 # path, where the download has happened before this stage runs anyway.
+#
+# --clip-captions WINDOW ("00:05:00-01:30:00") trims a CAPTION-DERIVED
+# transcript to that window and shifts it to clip-relative time. It is
+# deliberately named for what it does: it has no effect on the AssemblyAI path,
+# because a media file is windowed by cutting the media (lib/clip.py cut) —
+# which is what the pipeline does before this stage runs, so that AssemblyAI
+# only bills the minutes asked for. Applying a window here as well would take a
+# second slice out of the first one. If you are calling this script directly on
+# a media file and want part of it, cut it first:
+#     lib/clip.py cut lecture.mp4 /tmp/clip.mp4 00:05:00-01:30:00
 #
 # Language is an ISO-639-1 code AssemblyAI recognises: "th" (Thai, default),
 # "en", "auto", or any AssemblyAI language code. Ignored on the YouTube path
@@ -55,18 +66,20 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 OUT_BASE=""
 MEDIA_FALLBACK=""
+CLIP_CAPTIONS=""
 declare -a ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --out-base) OUT_BASE="${2:-}"; shift 2 ;;
     --media)    MEDIA_FALLBACK="${2:-}"; shift 2 ;;
+    --clip-captions) CLIP_CAPTIONS="${2:-}"; shift 2 ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
 set -- "${ARGS[@]:-}"
 
 if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
-  echo "Usage: $0 <file_or_url> <name> [language] [--out-base PATH] [--media PATH]"
+  echo "Usage: $0 <file_or_url> <name> [language] [--out-base PATH] [--media PATH] [--clip-captions W]"
   echo "  language: th (default), en, auto, or any AssemblyAI language code"
   exit 1
 fi
@@ -117,6 +130,9 @@ if [ "$IS_YOUTUBE" -eq 0 ] && [ ! -f "$INPUT" ] \
 fi
 
 SEGMENTS_FILE=""
+# Whether the segments came from a caption track rather than from AssemblyAI.
+# --clip-captions acts on exactly this case and no other; see the header.
+SEGMENTS_ARE_CAPTIONS=0
 
 # --- YouTube path: youtube-transcript.io API -------------------------------
 if [ "$IS_YOUTUBE" -eq 1 ]; then
@@ -139,6 +155,7 @@ if [ "$IS_YOUTUBE" -eq 1 ]; then
     rm -rf "$WORK_DIR"
     exit 2
   fi
+  SEGMENTS_ARE_CAPTIONS=1
 else
   # The file AssemblyAI will be given. Normally the input itself; on the
   # Kaltura path the input is a URL and this becomes --media instead.
@@ -162,6 +179,7 @@ else
       0)
         echo "    using the entry's caption track — skipping AssemblyAI"
         HAVE_SEGMENTS=1
+        SEGMENTS_ARE_CAPTIONS=1
         ;;
       3)
         echo "    no caption track on this entry — transcribing the audio instead"
@@ -237,6 +255,32 @@ else
       rm -rf "$WORK_DIR"
       exit "$EXIT_CODE"
     fi
+  fi
+fi
+
+# --- Caption window --------------------------------------------------------
+# Captions arrive whole and free, so there is no media to cut on this path and
+# the window is applied to the segments instead — by lib/clip.py, the same code
+# that parses it for the pipeline, so the two halves can never disagree about
+# what "00:05:00" means. Segments come out rebased to the clip, matching the
+# timebase a cut media file would have produced.
+if [ -n "$CLIP_CAPTIONS" ] && [ "$SEGMENTS_ARE_CAPTIONS" -eq 1 ]; then
+  echo "==> Trimming the captions to $CLIP_CAPTIONS"
+  if ! "$PYTHON_BIN" "$ROOT_DIR/lib/clip.py" segments "$CLIP_CAPTIONS" \
+        < "$SEGMENTS_FILE" > "$WORK_DIR/segments-clipped.json"; then
+    echo "ERROR: could not apply the clip window $CLIP_CAPTIONS"
+    rm -rf "$WORK_DIR"
+    exit 1
+  fi
+  mv "$WORK_DIR/segments-clipped.json" "$SEGMENTS_FILE"
+  # An empty result is a real failure, not an empty transcript: it means the
+  # window falls outside the video, and every later stage would go on to
+  # summarize nothing at all.
+  if ! grep -q '"text"' "$SEGMENTS_FILE"; then
+    echo "ERROR: no transcript falls inside $CLIP_CAPTIONS."
+    echo "       The window is probably past the end of the video."
+    rm -rf "$WORK_DIR"
+    exit 2
   fi
 fi
 

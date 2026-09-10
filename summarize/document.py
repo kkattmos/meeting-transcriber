@@ -121,7 +121,7 @@ def provenance_comment(**fields):
 def build_document(body, *, source, source_kind, title=None, transcript="",
                    backend=None, model=None, prompt_name=None, run_id=None,
                    generated=None, include_chapter_line=True,
-                   include_transcript=True):
+                   include_transcript=True, clip=None):
     """Wrap a model-written summary body in the course-note template."""
     generated = generated or date.today().isoformat()
 
@@ -131,6 +131,7 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
         model=f"{backend}/{model}" if backend and model else (model or backend),
         prompt=prompt_name or "summarize.md",
         run_id=run_id,
+        clip=clip,
         generated=generated,
     )]
 
@@ -147,6 +148,18 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
         parts.append(f"Video Link: `{source}`")
     elif source:
         parts.append(f"Source File: `{source}`")
+
+    # Visible, not just in the provenance comment. Every timestamp below this
+    # line — the SRT the transcript came from, "Frame 4 @ 0:02:11", the model's
+    # own references — is measured from the START OF THE CLIP, because the
+    # media was cut before any of them were produced. A reader who doesn't know
+    # that will scrub to the wrong place in the source video and conclude the
+    # summary is wrong.
+    if clip:
+        parts.append(
+            f"Clip: `{clip}` of the source. "
+            "Timestamps below are relative to the start of the clip."
+        )
 
     if include_transcript:
         transcript_block = _indent_transcript(transcript.strip()) if transcript.strip() \

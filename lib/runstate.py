@@ -31,7 +31,7 @@ temp file and get renamed, so a crash mid-write can't leave truncated JSON.
 CLI (all subcommands take --run-dir, except `latest`/`list` which take --root):
 
     runstate.py init    --run-dir D --input U --input-type T --name N \
-                        --safe-name S [--language L] [--prompt P]
+                        --safe-name S [--language L] [--prompt P] [--clip W]
     runstate.py status  --run-dir D --stage S      -> prints pending|running|done|failed
     runstate.py start   --run-dir D --stage S
     runstate.py done    --run-dir D --stage S [--artifact k=v]...
@@ -39,6 +39,7 @@ CLI (all subcommands take --run-dir, except `latest`/`list` which take --root):
     runstate.py get     --run-dir D --key stages.transcribe.artifacts.txt
     runstate.py reset   --run-dir D [--stage S]    -> back to pending (--force path)
     runstate.py show    --run-dir D                -> human-readable summary
+    runstate.py find    [--root R] --input U [--clip W] [--incomplete]
     runstate.py latest  [--root R]                 -> run_id of the newest run
     runstate.py list    [--root R] [--limit N]     -> one line per run
     runstate.py sweep   [--root R] [--days N]      -> delete run dirs older than N days
@@ -59,7 +60,12 @@ DEFAULT_ROOT = Path(os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot")) / "r
 # Declared in dependency order for display purposes only; the actual DAG lives
 # in pipeline.sh. `fetch_video` exists so the YouTube download can run in
 # parallel with caption fetching instead of being buried inside summarize.py.
-STAGES = ("record", "fetch_video", "transcribe", "frames", "summarize")
+# Order matters only for display. `clip` sits after fetch_video because that is
+# where it runs: the window is cut out of whatever media the run has, which on
+# a YouTube or Kaltura input is the download. It stays `pending` forever on an
+# unclipped run, which is the same thing `record` does on every non-meeting
+# input — a stage that never applies is not a stage that failed.
+STAGES = ("record", "fetch_video", "clip", "transcribe", "frames", "summarize")
 
 PENDING, RUNNING, DONE, FAILED = "pending", "running", "done", "failed"
 
@@ -285,6 +291,10 @@ def main():
     p.add_argument("--language")
     p.add_argument("--prompt")
     p.add_argument("--display-name")
+    # The canonical clip label ("00:05:00-01:30:00"), or absent for a whole
+    # video. Stored so a resume replays the same window and so `find` can tell
+    # a clipped run apart from a full one — see the find command below.
+    p.add_argument("--clip")
     # Repeatable: the slides/reference sources for this run, replayed to
     # summarize.py on every attempt so a resume uses the same material.
     p.add_argument("--resources", action="append", default=None)
@@ -322,6 +332,7 @@ def main():
     p = sub.add_parser("find")
     p.add_argument("--root", default=str(DEFAULT_ROOT))
     p.add_argument("--input", required=True)
+    p.add_argument("--clip", default="")
     p.add_argument("--incomplete", action="store_true",
                    help="only match runs that haven't finished summarizing")
 
@@ -350,6 +361,13 @@ def main():
         for d in _iter_runs(args.root):
             st = RunState(d)
             if st.get("input") != args.input:
+                continue
+            # The same input clipped to a different window is a DIFFERENT run.
+            # Matching on the input alone would resume a 00:05:00-01:30:00 run
+            # when the operator asked for 01:30:00-02:00:00, and every artifact
+            # path derives from the run id, so the second window would land on
+            # the first one's transcript and summary.
+            if (st.get("clip") or "") != (args.clip or ""):
                 continue
             if args.incomplete and st.status("summarize") == DONE:
                 continue
@@ -393,7 +411,7 @@ def main():
         state.init(input=args.input, input_type=args.input_type, name=args.name,
                    safe_name=args.safe_name, language=args.language,
                    prompt=args.prompt, display_name=args.display_name,
-                   resources=args.resources or [])
+                   clip=args.clip, resources=args.resources or [])
         return 0
 
     if args.cmd == "status":
@@ -442,6 +460,9 @@ def main():
             return 1
         print(f"run_id:     {data.get('run_id')}")
         print(f"input:      {data.get('input')}  ({data.get('input_type')})")
+        if data.get("clip"):
+            print(f"clip:       {data.get('clip')}"
+                  "  (output timestamps are relative to it)")
         print(f"name:       {data.get('name')}  (safe: {data.get('safe_name')})")
         print(f"language:   {data.get('language')}   prompt: {data.get('prompt') or '(default)'}")
         print(f"created:    {data.get('created_at')}")

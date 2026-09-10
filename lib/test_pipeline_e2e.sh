@@ -196,6 +196,21 @@ mkdir -p "$(dirname "$path")"; echo "fake youtube video" > "$path"
 echo "stub: downloaded $path"
 STUB
 chmod +x "$FAKE_BIN/yt-dlp"
+
+# ffmpeg, for the clip stage. lib/clip.py is NOT stubbed — the window parsing,
+# the flag order and the .part rename are the parts worth exercising against
+# the real orchestrator — so only the encoder underneath it is faked. It
+# records its argv, which is how the clip tests assert that the window that
+# reached ffmpeg is the one the operator typed.
+cat > "$FAKE_BIN/ffmpeg" <<'STUB'
+#!/bin/bash
+[ -f "$STUB_FAIL_CLIP" ] && { echo "stub ffmpeg: failing on purpose" >&2; exit 1; }
+[ -n "${STUB_FFMPEG_ARGS:-}" ] && printf '%s\n' "$@" > "$STUB_FFMPEG_ARGS"
+# The output path is always the last argument.
+for out in "$@"; do :; done
+mkdir -p "$(dirname "$out")"; echo "fake clipped video" > "$out"
+STUB
+chmod +x "$FAKE_BIN/ffmpeg"
 export PATH="$FAKE_BIN:$PATH"
 
 export STUB_FAIL_RECORD="$TESTROOT/fail_record"
@@ -207,6 +222,8 @@ export STUB_FAIL_FETCH="$TESTROOT/fail_fetch"
 export STUB_SUMMARIZE_ARGS="$TESTROOT/summarize_args.txt"
 export STUB_TRANSCRIBE_ARGS="$TESTROOT/transcribe_args.txt"
 export STUB_FAIL_KALTURA="$TESTROOT/fail_kaltura"
+export STUB_FAIL_CLIP="$TESTROOT/fail_clip"
+export STUB_FFMPEG_ARGS="$TESTROOT/ffmpeg_args.txt"
 
 RUNS="$MEETING_BOT_ROOT/runs"
 pipeline() { ( cd "$STAGING" && bash ./pipeline.sh "$@" ) ; }
@@ -729,6 +746,162 @@ check "resources: both specs recorded" \
   "$(state get --run-dir "$RUNS/$(latest_run)" --key resources | wc -l)" "2"
 check "resources: both passed to summarize" \
   "$(grep -cx -- "--resources" "$STUB_SUMMARIZE_ARGS")" "2"
+
+
+echo ""
+echo "=================================================================="
+echo "N. --clip: summarize only part of a video"
+echo "=================================================================="
+
+echo "--- YouTube: the window is cut after the download, before frames"
+rm -f "$STUB_FFMPEG_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=clip000000001" \
+      --clip 00:05:00-01:30:00 2>&1)
+check "clip/yt: exits 0" "$?" "0"
+run=$(latest_run)
+check "clip/yt: clip stage done" "$(state status --run-dir "$RUNS/$run" --stage clip)" "done"
+check "clip/yt: window recorded in state.json" \
+  "$(state get --run-dir "$RUNS/$run" --key clip)" "00:05:00-01:30:00"
+# The run id is what every artifact path derives from, so this is what keeps a
+# clipped run's transcript and summary away from a full run's.
+case "$run" in
+  *_c000500-013000_*) ok "clip/yt: window is in the run id" ;;
+  *) bad "clip/yt: run id carries no window: $run" ;;
+esac
+[ -f "$RUNS/$run/clip.mp4" ] && ok "clip/yt: clip.mp4 written" || bad "clip/yt: no clip.mp4"
+[ -f "$RUNS/$run/clip.part.mp4" ] && bad "clip/yt: left a .part behind" \
+  || ok "clip/yt: no .part left behind"
+grep -qx -- "-ss" "$STUB_FFMPEG_ARGS" && ok "clip/yt: ffmpeg seeked" \
+  || bad "clip/yt: ffmpeg got no -ss"
+grep -qx -- "300.000" "$STUB_FFMPEG_ARGS" && ok "clip/yt: seeked to the start" \
+  || bad "clip/yt: wrong start"
+grep -qx -- "5100.000" "$STUB_FFMPEG_ARGS" && ok "clip/yt: cut the right duration" \
+  || bad "clip/yt: wrong duration"
+
+echo "--- The clip, not the source, is what the later stages are given"
+grep -qx -- "$RUNS/$run/clip.mp4" "$STUB_SUMMARIZE_ARGS" \
+  && ok "clip: summarize got the clip" || bad "clip: summarize got the source"
+grep -qx -- "--clip" "$STUB_SUMMARIZE_ARGS" \
+  && ok "clip: window reaches the document provenance" \
+  || bad "clip: window never reached summarize"
+
+echo "--- YouTube captions are windowed by transcribe.sh, not by ffmpeg"
+# There is no media to cut on the caption path: the transcript comes back whole
+# and free, so the same window is applied to the segments instead.
+grep -qx -- "--clip-captions" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "clip/yt: transcribe told to window the captions" \
+  || bad "clip/yt: transcribe never told about the window"
+
+echo "--- A second window on the same input is a second run, not a resume"
+out=$(pipeline "https://www.youtube.com/watch?v=clip000000001" \
+      --clip 01:30:00-02:00:00 2>&1)
+check "clip: exits 0" "$?" "0"
+run2=$(latest_run)
+[ "$run2" != "$run" ] && ok "clip: a different window makes a different run" \
+  || bad "clip: the second window resumed the first window's run"
+[ -f "$SUMMARIES_DIR/$run.md" ] && [ -f "$SUMMARIES_DIR/$run2.md" ] \
+  && ok "clip: both windows kept their own summary" \
+  || bad "clip: one window overwrote the other's summary"
+
+echo "--- The same window, spelled differently, resumes rather than duplicating"
+touch "$STUB_FAIL_SUMMARIZE"
+pipeline "https://www.youtube.com/watch?v=clip000000002" --clip 00:05:00-01:30:00 \
+  >/dev/null 2>&1
+first=$(latest_run)
+rm -f "$STUB_FAIL_SUMMARIZE"
+out=$(pipeline "https://www.youtube.com/watch?v=clip000000002" --clip 5:00-90:00 2>&1)
+check "clip: exits 0" "$?" "0"
+check "clip: 5:00-90:00 resumed 00:05:00-01:30:00" "$(latest_run)" "$first"
+
+echo "--- An unclipped run of the same input is untouched by a clipped one"
+out=$(pipeline "https://www.youtube.com/watch?v=clip000000003" 2>&1)
+rc=$?
+full=$(latest_run)
+check "clip: full run exits 0" "$rc" "0"
+out=$(pipeline "https://www.youtube.com/watch?v=clip000000003" --clip 00:05:00- 2>&1)
+rc=$?
+check "clip: clipped run exits 0" "$rc" "0"
+clipped=$(latest_run)
+[ "$clipped" != "$full" ] && ok "clip: clipped run is separate from the full run" \
+  || bad "clip: the clip resumed the finished full run"
+[ -f "$SUMMARIES_DIR/$full.md" ] && ok "clip: the full summary survived" \
+  || bad "clip: the full summary was overwritten"
+case "$clipped" in
+  *_c000500-end_*) ok "clip: an open end is named in the run id" ;;
+  *) bad "clip: open-end run id is wrong: $clipped" ;;
+esac
+
+echo "--- Kaltura: the cut happens before BOTH branches"
+# Kaltura's transcribe branch reads the media (the entry usually has no
+# captions), so a cut that ran inside the frames branch would race it and
+# AssemblyAI would be billed for the whole lecture.
+rm -f "$STUB_FFMPEG_ARGS"
+out=$(pipeline "https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/1?entry_id=1_clipclip" \
+      --clip 00:10:00-00:20:00 2>&1)
+check "clip/kal: exits 0" "$?" "0"
+run=$(latest_run)
+check "clip/kal: clip stage done" "$(state status --run-dir "$RUNS/$run" --stage clip)" "done"
+grep -qx -- "$RUNS/$run/clip.mp4" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "clip/kal: transcribe got the clip, not the full download" \
+  || bad "clip/kal: transcribe got the uncut media"
+
+echo "--- A local file is cut before it is transcribed"
+rm -f "$STUB_FFMPEG_ARGS"
+echo "fake recording" > "$TESTROOT/lecture clip.mp4"
+out=$(pipeline "$TESTROOT/lecture clip.mp4" --clip 00:01:00-00:02:00 2>&1)
+check "clip/local: exits 0" "$?" "0"
+run=$(latest_run)
+grep -qx -- "$RUNS/$run/clip.mp4" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "clip/local: transcribe got the clip" \
+  || bad "clip/local: transcribe got the whole file"
+
+echo "--- A bad window fails before anything is downloaded"
+before=$(latest_run)
+out=$(pipeline "https://www.youtube.com/watch?v=clipbad000001" --clip 01:30:00-00:05:00 2>&1)
+check "clip: a backwards window exits 1" "$?" "1"
+echo "$out" | grep -q "ends at or before it starts" \
+  && ok "clip: says what is wrong with the window" || bad "clip: unclear error"
+check "clip: no run was created" "$(latest_run)" "$before"
+
+echo "--- --clip is refused for a live meeting"
+before=$(latest_run)
+out=$(pipeline "https://meet.google.com/abc-defg-hij" --clip 00:05:00-01:30:00 2>&1)
+check "clip/meet: exits 1" "$?" "1"
+echo "$out" | grep -q "does not apply to a live meeting" \
+  && ok "clip/meet: says why" || bad "clip/meet: unclear error"
+check "clip/meet: no run was created" "$(latest_run)" "$before"
+
+echo "--- A failed cut is resumable, and the resume re-cuts"
+touch "$STUB_FAIL_CLIP"
+pipeline "https://www.youtube.com/watch?v=clipfail00001" --clip 00:05:00-01:30:00 \
+  >/dev/null 2>&1
+run=$(latest_run)
+check "clip: the run failed" "$(state status --run-dir "$RUNS/$run" --stage clip)" "failed"
+check "clip: the download was kept" \
+  "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
+rm -f "$STUB_FAIL_CLIP"
+out=$(pipeline --run-id "$run" 2>&1)
+check "clip: the resume exits 0" "$?" "0"
+check "clip: the cut succeeded on the resume" \
+  "$(state status --run-dir "$RUNS/$run" --stage clip)" "done"
+
+echo "--- Without --clip nothing changes"
+rm -f "$STUB_FFMPEG_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=noclip0000001" 2>&1)
+check "noclip: exits 0" "$?" "0"
+run=$(latest_run)
+check "noclip: clip stage never runs" \
+  "$(state status --run-dir "$RUNS/$run" --stage clip)" "pending"
+[ -f "$RUNS/$run/clip.mp4" ] && bad "noclip: wrote a clip anyway" \
+  || ok "noclip: no clip.mp4"
+[ -f "$STUB_FFMPEG_ARGS" ] && bad "noclip: ran ffmpeg anyway" \
+  || ok "noclip: ffmpeg never invoked"
+grep -qx -- "--clip" "$STUB_SUMMARIZE_ARGS" \
+  && bad "noclip: passed --clip to summarize" \
+  || ok "noclip: summarize got no --clip"
+grep -qx -- "--clip-captions" "$STUB_TRANSCRIBE_ARGS" \
+  && bad "noclip: passed --clip-captions to transcribe" \
+  || ok "noclip: transcribe got no window"
 
 echo ""
 echo "=================================================================="

@@ -344,6 +344,29 @@ class DocumentTest(unittest.TestCase):
         # Everything after the comment is the document proper.
         self.assertTrue(rest.lstrip().startswith(document.CHAPTER_PLACEHOLDER))
 
+    def test_a_clip_is_declared_in_the_document_and_the_provenance(self):
+        # Every timestamp in a clipped summary — the SRT it quotes, the frame
+        # citations, the model's own references — is measured from the start of
+        # the clip, because the media was cut before any of them existed. A
+        # reader who is not told that will scrub to the wrong place in the
+        # source and conclude the summary is wrong, so it is stated visibly and
+        # not only in the greppable comment.
+        out = document.build_document(
+            "body", source="https://www.youtube.com/watch?v=abc123",
+            source_kind="youtube", title="A", transcript="x",
+            clip="00:05:00-01:30:00")
+        header, _, body = out.partition("-->")
+        self.assertIn("clip: 00:05:00-01:30:00", header)
+        self.assertIn("Clip: `00:05:00-01:30:00`", body)
+        self.assertIn("relative to the start of the clip", body)
+
+    def test_an_unclipped_document_says_nothing_about_clips(self):
+        out = document.build_document(
+            "body", source="https://www.youtube.com/watch?v=abc123",
+            source_kind="youtube", title="A", transcript="x")
+        self.assertNotIn("Clip:", out)
+        self.assertNotIn("clip:", out)
+
     def test_local_file_source_label(self):
         out = document.build_document(
             "body", source="/opt/meeting-bot/recordings/a.mp4",

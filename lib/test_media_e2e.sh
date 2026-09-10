@@ -163,6 +163,57 @@ JPEGS=$(find "$FRAME_OUT" -name '*.jpg' | wc -l)
 
 echo ""
 echo "=================================================================="
+echo "2b. The clip window, cut out of the real MP4"
+echo "=================================================================="
+# lib/test_clip.py asserts the ffmpeg COMMAND. This is the other half: that the
+# command actually produces a playable file whose timestamps start at zero.
+# Everything about --clip rests on that rebasing — without it the clip's first
+# frame is still stamped at the source offset, and every SRT cue and frame
+# timestamp downstream silently inherits it.
+CLIPPED="$TESTROOT/clip.mp4"
+"$PY" "$REPO/lib/clip.py" cut "$LECTURE" "$CLIPPED" "00:00:10-00:00:20" \
+  > "$TESTROOT/clip.log" 2>&1
+check "clip.py cut exits 0" "$?" "0"
+[ -s "$CLIPPED" ] && ok "clip.mp4 written" || bad "no clip written"
+[ -f "$CLIPPED.part" ] && bad "left a .part behind" || ok "no .part left behind"
+
+probe() {
+  ffprobe -v error -show_entries "format=$1" -of default=nw=1:nk=1 "$2" 2>/dev/null
+}
+CLIP_DURATION=$(probe duration "$CLIPPED")
+CLIP_START=$(probe start_time "$CLIPPED")
+"$PY" -c "import sys; d=float(sys.argv[1]); sys.exit(0 if 8.0 <= d <= 12.0 else 1)" \
+  "${CLIP_DURATION:-0}" \
+  && ok "the clip is ~10s long (${CLIP_DURATION}s)" \
+  || bad "expected a ~10s clip, got ${CLIP_DURATION:-none}s"
+# Stream-copy lands on the preceding keyframe, so allow a GOP of slack — the
+# assertion is that it is near ZERO, not near 10, which is what would happen
+# if -avoid_negative_ts were dropped.
+"$PY" -c "import sys; t=float(sys.argv[1]); sys.exit(0 if abs(t) < 2.0 else 1)" \
+  "${CLIP_START:-99}" \
+  && ok "the clip starts at t=0 (${CLIP_START}s), not at the source offset" \
+  || bad "clip timestamps were not rebased: start_time=${CLIP_START:-none}"
+
+echo "--- frames extracted from the clip carry clip-relative timestamps"
+CLIP_FRAMES="$FRAMES_DIR/week4-clip"
+# A short period, so the assertion is about WHERE the frames are rather than
+# about whether a 10s window happened to contain a scene change.
+FRAME_PERIOD_SECONDS=2 "$PY" "$REPO/screen/extract_frames.py" \
+  "$CLIPPED" "$CLIP_FRAMES" "week4-clip" > "$TESTROOT/clip-frames.log" 2>&1
+check "extract_frames on the clip exits 0" "$?" "0"
+LAST_TS=$("$PY" -c "
+import json,sys
+frames = json.load(open(sys.argv[1]))['frames']
+# 999 for an empty manifest, so 'no frames at all' fails this check rather
+# than passing it vacuously.
+print(max(f['timestamp_s'] for f in frames) if frames else 999)
+" "$CLIP_FRAMES/manifest.json" 2>/dev/null)
+"$PY" -c "import sys; sys.exit(0 if float(sys.argv[1]) <= 12.0 else 1)" "${LAST_TS:-999}" \
+  && ok "the last frame is at ${LAST_TS}s, inside the clip" \
+  || bad "frame timestamps are source-relative: last frame at ${LAST_TS:-none}s"
+
+echo ""
+echo "=================================================================="
 echo "3. Transcribe a local file (real AssemblyAI SDK -> stub server)"
 echo "=================================================================="
 OUT_BASE="$TRANSCRIPTS_DIR/week4"
