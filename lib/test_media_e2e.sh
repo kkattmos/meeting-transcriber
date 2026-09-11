@@ -474,6 +474,81 @@ fi
 
 echo ""
 echo "=================================================================="
+echo "4b. Several videos summarized as one (summarize.py --parts)"
+echo "=================================================================="
+# The same lecture twice stands in for two videos. That is deliberate: the
+# two share every timestamp, so if the labels the model is shown did not name
+# the video, nothing here could tell frame 1 of video 1 from frame 1 of
+# video 2 — which is exactly the ambiguity the per-video clock has to remove.
+PARTS_JSON="$TESTROOT/parts.json"
+PARTS_MD="$SUMMARIES_DIR/chapter.md"
+PARTS_PDF="$PDF_DIR/chapter.pdf"
+PARTS_RECORD="$TESTROOT/claude_cli_parts.jsonl"
+cat > "$PARTS_JSON" <<EOF
+{"parts": [
+  {"source": "$LECTURE", "kind": "local_file", "title": "Week 4 A",
+   "transcript": "${OUT_BASE}.txt", "srt": "${OUT_BASE}.srt",
+   "frames_manifest": "$FRAME_OUT/manifest.json"},
+  {"source": "$LECTURE", "kind": "local_file", "title": "Week 4 B",
+   "clip": "00:00:30-end",
+   "transcript": "${OUT_BASE}.txt", "srt": "${OUT_BASE}.srt",
+   "frames_manifest": "$FRAME_OUT/manifest.json"}
+]}
+EOF
+FAKE_CLAUDE_RECORD="$PARTS_RECORD" \
+  "$PY" "$REPO/summarize/summarize.py" --parts "$PARTS_JSON" "$PARTS_MD" \
+      --pdf-out "$PARTS_PDF" --prompt lecture-claude \
+      --run-id combine_test > "$TESTROOT/parts.log" 2>&1
+check "summarize.py --parts exits 0" "$?" "0"
+[ -s "$PARTS_MD" ] && ok "combined markdown written" || bad "no combined markdown"
+check "one summarize call for the whole set (fits under the chunk limit)" \
+  "$(wc -l < "$PARTS_RECORD")" "1"
+PARTS_PROMPT=$("$PY" - "$PARTS_RECORD" <<'PYEOF'
+import json, sys
+sys.stdout.write(json.loads(open(sys.argv[1]).readline())["prompt"])
+PYEOF
+)
+echo "$PARTS_PROMPT" | grep -q "=== video 1 of 2: Week 4 A ===" \
+  && ok "transcript fenced with video 1's label" || bad "no video 1 fence"
+echo "$PARTS_PROMPT" | grep -q "=== video 2 of 2: Week 4 B (clip 00:00:30-end) ===" \
+  && ok "video 2's fence carries its clip window" || bad "no video 2 fence"
+check "the transcript appears once per video" \
+  "$(echo "$PARTS_PROMPT" | grep -c "Dijkstra")" "2"
+echo "$PARTS_PROMPT" | grep -qE "\[frame 1 @ video 1 [0-9.]+s" \
+  && ok "video 1's frames are labelled with the video" || bad "frame label lacks video 1"
+NFRAMES=$("$PY" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["frames"]))' "$FRAME_OUT/manifest.json")
+echo "$PARTS_PROMPT" | grep -qE "\[frame $((NFRAMES + 1)) @ video 2 " \
+  && ok "video 2's numbering continues after video 1's ($NFRAMES frames)" \
+  || bad "video 2 does not continue the numbering"
+echo "$PARTS_PROMPT" | grep -qE "\[frame 1 @ video 2 " \
+  && bad "video 2 restarted the frame numbers at 1" \
+  || ok "no duplicate frame numbers across videos"
+echo "--- the combined document wrapper"
+grep -q "source_type: combined" "$PARTS_MD" && ok "provenance says combined" \
+  || bad "provenance does not say combined"
+grep -q "^# Week 4 A" "$PARTS_MD" && ok "one title, the first video's" \
+  || bad "title missing"
+grep -q "Source File (Video 1):" "$PARTS_MD" \
+  && grep -q "Source File (Video 2):" "$PARTS_MD" \
+  && ok "one link line per video" || bad "link lines missing"
+grep -q 'Clip (Video 2): `00:00:30-end`' "$PARTS_MD" \
+  && ok "video 2's clip window is stated" || bad "clip line missing"
+grep -q "Summarized from 2 videos as one" "$PARTS_MD" \
+  && ok "the document says timestamps are per video" || bad "no per-video note"
+check "exactly one transcript block" "$(grep -c '<details>' "$PARTS_MD")" "1"
+grep -q "=== video 2 of 2" "$PARTS_MD" \
+  && ok "the embedded transcript keeps the video fences" || bad "fences lost"
+if [ "$HAVE_PDF" -eq 1 ]; then
+  [ -s "$PARTS_PDF" ] && ok "combined PDF written" || bad "no combined PDF"
+  # Re-rendering from the .md needs one manifest per video, in order.
+  "$PY" "$REPO/summarize/pdf.py" "$PARTS_MD" "$TESTROOT/parts_rerender.pdf" \
+        --frames-manifest "$FRAME_OUT/manifest.json" \
+        --frames-manifest "$FRAME_OUT/manifest.json" > "$TESTROOT/parts_rerender.log" 2>&1
+  check "pdf.py re-renders a combined document from two manifests" "$?" "0"
+fi
+
+echo ""
+echo "=================================================================="
 echo "5. Reference material (--resources)"
 echo "=================================================================="
 mkdir -p "$TESTROOT/course notes"

@@ -61,11 +61,15 @@
 #   --jobs N            how many inputs to process at once (default 2)
 #   --from-file F       read inputs from a file, one per line, # for comments
 #   --playlist          expand YouTube playlist URLs into their videos
-#   --combine F         also write every summary into one file, in input order,
-#                       shaped like a course chapter file (one Chapter line at
-#                       the top, then each video's section). Per-run summaries
-#                       are still written individually. A combined PDF is
-#                       written alongside it unless PDFs are switched off.
+#   --combine F         summarize ALL the inputs together, as one lecture, into
+#                       one document F (and a PDF beside it). Each input is
+#                       still transcribed and frame-sampled on its own, but
+#                       none of them gets an individual summary: the model
+#                       reads every transcript, in input order, and writes a
+#                       single study guide. Timestamps stay relative to the
+#                       video they belong to, and the document says which.
+#                       The combined summary is a run of its own
+#                       (combine_<n>x_<hash>_<time>) and resumes like any other.
 #   --combine-pdf F     where the combined PDF goes (default: --combine's path
 #                       with a .pdf extension)
 #   --no-combine-pdf    write only the combined markdown
@@ -435,6 +439,14 @@ elif [ "$RESUME_ALL" -eq 1 ]; then
     [ -f "${run_dir}state.json" ] || continue
     status="$(rs status --run-dir "${run_dir%/}" --stage summarize)"
     [ "$status" = "done" ] && continue
+    # A member of a --combine set never summarizes on its own: its combine
+    # run does, and that run is picked up by this same loop. Resuming the
+    # member here would bill an individual summary nobody asked for.
+    combined_into="$(rs get --run-dir "${run_dir%/}" --key combined_into 2>/dev/null || true)"
+    if [ -n "$combined_into" ]; then
+      echo "==> $(basename "${run_dir%/}"): part of combine run $combined_into — resumed through it"
+      continue
+    fi
     RUN_DIRS+=("${run_dir%/}")
   done
   if [ "${#RUN_DIRS[@]}" -eq 0 ]; then
@@ -527,32 +539,92 @@ else
   done
 fi
 
-# --- Combined output: settled before any run starts --------------------------
-# It has to be decided here rather than at the end, because it changes how the
-# child runs behave. run_one.sh sweeps a run's frames the moment that run's own
-# PDF is written — they are the bulkiest thing a run leaves behind, and nothing
-# reads them once WeasyPrint has absorbed the pixels. The combined PDF breaks
-# that assumption: it is rendered down at the bottom of this script, out of
-# every run's frames at once, so by then they would all be gone and the
-# combined PDF would silently have no pictures in it. So the children are told
-# to keep them, and this script sweeps them itself once the render is done.
-COMBINE_RENDER_PDF=0
-COMBINE_SWEEP_FRAMES=0
-if [ -n "$COMBINE_FILE" ] && [ "$COMBINE_WANT_PDF" -eq 1 ]; then
-  case "$(printf '%s' "${SUMMARY_WRITE_PDF:-1}" | tr 'A-Z' 'a-z')" in
-    0|false|no) ;;
-    *) COMBINE_RENDER_PDF=1 ;;
+# --- The combine run: settled before any member starts ----------------------
+# --combine makes one more run, whose only stage is a summarize over every
+# member's transcript and frames (see run_one.sh, "A combine run"). It is
+# resolved here, before the members launch, for two reasons: the members have
+# to be told they are members (so their own summarize stage is skipped, and
+# --resume-all leaves them alone), and the auto-resume key — the member run
+# ids, in order — is only known once they are.
+COMBINE_RUN_DIR=""
+if [ -n "$COMBINE_FILE" ]; then
+  if [ -n "$EXPLICIT_RUN_ID" ] || [ "$RESUME_LAST" -eq 1 ] || [ "$RESUME_ALL" -eq 1 ]; then
+    echo "ERROR: --combine takes inputs, not --run-id/--resume-last/--resume-all." >&2
+    echo "  To resume a combined summary, re-run the original command, or" >&2
+    echo "  ./pipeline.sh --run-id <combine_...>  (see --list)." >&2
+    exit 1
+  fi
+  case "$COMBINE_FILE" in
+    /*) ;;
+    *) COMBINE_FILE="$PWD/$COMBINE_FILE" ;;
   esac
-fi
-if [ "$COMBINE_RENDER_PDF" -eq 1 ]; then
-  [ -n "$COMBINE_PDF" ] || COMBINE_PDF="${COMBINE_FILE%.md}.pdf"
-  # An operator who asked for the frames keeps them; otherwise the sweep the
-  # children were told to skip becomes ours.
-  case "$(printf '%s' "${KEEP_FRAMES:-0}" | tr 'A-Z' 'a-z')" in
-    1|true|yes|on) ;;
-    *) COMBINE_SWEEP_FRAMES=1 ;;
-  esac
-  export KEEP_FRAMES=1
+  if [ "$COMBINE_WANT_PDF" -eq 1 ]; then
+    case "$(printf '%s' "${SUMMARY_WRITE_PDF:-1}" | tr 'A-Z' 'a-z')" in
+      0|false|no) COMBINE_PDF="" ;;
+      *)
+        [ -n "$COMBINE_PDF" ] || COMBINE_PDF="${COMBINE_FILE%.md}.pdf"
+        case "$COMBINE_PDF" in
+          /*) ;;
+          *) COMBINE_PDF="$PWD/$COMBINE_PDF" ;;
+        esac
+        ;;
+    esac
+  else
+    COMBINE_PDF=""
+  fi
+
+  declare -a MEMBER_IDS=()
+  for run_dir in "${RUN_DIRS[@]}"; do
+    MEMBER_IDS+=("$(basename "$run_dir")")
+  done
+  combine_key="$("$PYTHON_BIN" "$SCRIPT_DIR/lib/combine.py" run-key "${MEMBER_IDS[@]}")"
+  # Not --incomplete, unlike a member's auto-resume. The members are always
+  # "incomplete" (their summarize never runs), so the same command always
+  # resumes the same members and lands on the same key — and a combine run
+  # that already finished must then be reported as done, not re-summarized.
+  # --force starts the members over, which makes a new key anyway.
+  existing=""
+  if [ "$FORCE" -eq 0 ]; then
+    existing="$(rs find --root "$RUNS_DIR" --input "$combine_key" 2>/dev/null || true)"
+  fi
+  if [ -n "$existing" ]; then
+    echo "==> Resuming combined summary: $existing"
+    COMBINE_RUN_DIR="$RUNS_DIR/$existing"
+  else
+    combine_safe="$("$PYTHON_BIN" "$SCRIPT_DIR/lib/combine.py" safe-name "${MEMBER_IDS[@]}")"
+    COMBINE_RUN_DIR="$RUNS_DIR/${combine_safe}_$(date +%Y%m%d_%H%M%S)"
+    suffix=1
+    while [ -d "$COMBINE_RUN_DIR" ]; do
+      COMBINE_RUN_DIR="$RUNS_DIR/${combine_safe}_$(date +%Y%m%d_%H%M%S)_$suffix"
+      suffix=$((suffix + 1))
+    done
+  fi
+  # `init` refreshes the metadata on a resume too, so a re-run that names a
+  # different --combine path writes there.
+  declare -a combine_init=(
+    --run-dir "$COMBINE_RUN_DIR"
+    --input "$combine_key" --input-type combine
+    --name "$(basename "${COMBINE_FILE%.md}")" --safe-name "$(basename "$COMBINE_RUN_DIR")"
+    --language "$LANGUAGE" --prompt "$PROMPT_NAME"
+    --display-name "$DISPLAY_NAME"
+    --output-md "$COMBINE_FILE"
+  )
+  [ -n "$COMBINE_PDF" ] && combine_init+=(--output-pdf "$COMBINE_PDF")
+  for member in "${MEMBER_IDS[@]}"; do
+    combine_init+=(--members "$member")
+  done
+  for spec in "${RESOURCE_SPECS[@]:-}"; do
+    [ -n "$spec" ] && combine_init+=(--resources "$spec")
+  done
+  mkdir -p "$RUNS_DIR"
+  rs init "${combine_init[@]}"
+  # And the reverse pointer on every member.
+  for run_dir in "${RUN_DIRS[@]}"; do
+    rs init --run-dir "$run_dir" --combined-into "$(basename "$COMBINE_RUN_DIR")"
+  done
+  echo "==> Combined summary: $COMBINE_FILE"
+  [ -n "$COMBINE_PDF" ] && echo "    PDF:              $COMBINE_PDF"
+  echo "    run id:           $(basename "$COMBINE_RUN_DIR")"
 fi
 
 # --- Execute -----------------------------------------------------------------
@@ -570,6 +642,9 @@ launch() {
   run_id="$(basename "$run_dir")"
   local args=(--run-dir "$run_dir")
   [ "$FORCE" -eq 1 ] && args+=(--force)
+  # Members of a --combine set stop after transcribe and frames; the combine
+  # run below is what summarizes them.
+  [ -n "$COMBINE_RUN_DIR" ] && args+=(--skip-summarize)
 
   (
     if [ "$TOTAL" -gt 1 ]; then
@@ -604,11 +679,16 @@ for run_dir in "${RUN_DIRS[@]}"; do
   run_id="$(basename "$run_dir")"
   rc="$(cat "$RESULT_DIR/$run_id" 2>/dev/null || echo "?")"
   if [ "$rc" = "0" ]; then
-    summary="$(rs get --run-dir "$run_dir" --key stages.summarize.artifacts.md 2>/dev/null || true)"
-    pdf="$(rs get --run-dir "$run_dir" --key stages.summarize.artifacts.pdf 2>/dev/null || true)"
     echo "  OK    $run_id"
-    [ -n "$summary" ] && echo "        -> $summary"
-    [ -n "$pdf" ] && echo "        -> $pdf"
+    if [ -n "$COMBINE_RUN_DIR" ]; then
+      txt="$(rs get --run-dir "$run_dir" --key stages.transcribe.artifacts.txt 2>/dev/null || true)"
+      [ -n "$txt" ] && echo "        -> $txt"
+    else
+      summary="$(rs get --run-dir "$run_dir" --key stages.summarize.artifacts.md 2>/dev/null || true)"
+      pdf="$(rs get --run-dir "$run_dir" --key stages.summarize.artifacts.pdf 2>/dev/null || true)"
+      [ -n "$summary" ] && echo "        -> $summary"
+      [ -n "$pdf" ] && echo "        -> $pdf"
+    fi
   else
     FAILED=$((FAILED + 1))
     echo "  FAIL  $run_id  (exit $rc)"
@@ -617,61 +697,37 @@ for run_dir in "${RUN_DIRS[@]}"; do
   fi
 done
 
-# --- Combined output ---------------------------------------------------------
-# Concatenate in INPUT order, not completion order — runs finish out of order
-# when several run at once, and a chapter file has to follow the lecture order.
-if [ -n "$COMBINE_FILE" ]; then
-  declare -a SUMMARY_PATHS=()
-  declare -a MANIFEST_ARGS=()
-  for run_dir in "${RUN_DIRS[@]}"; do
-    md="$(rs get --run-dir "$run_dir" --key stages.summarize.artifacts.md 2>/dev/null || true)"
-    [ -n "$md" ] && [ -f "$md" ] || continue
-    SUMMARY_PATHS+=("$md")
-    # One --frames-manifest per summary, in the same order, because the Nth
-    # manifest is what the Nth section's frame citations are renumbered
-    # against. A run with no frames still takes its slot as "-": drop it and
-    # every later section is shifted by the wrong amount, and the only symptom
-    # is a PDF whose pictures belong to a different lecture.
-    if [ "$COMBINE_RENDER_PDF" -eq 1 ]; then
-      manifest="$(rs get --run-dir "$run_dir" --key stages.frames.artifacts.manifest 2>/dev/null || true)"
-      if [ -n "$manifest" ] && [ -f "$manifest" ]; then
-        MANIFEST_ARGS+=(--frames-manifest "$manifest")
-      else
-        MANIFEST_ARGS+=(--frames-manifest "-")
-      fi
-    fi
-  done
-  if [ "${#SUMMARY_PATHS[@]}" -eq 0 ]; then
-    echo ""
-    echo "==> --combine: no markdown summaries were produced, nothing to"
-    echo "    combine. (--combine works on the .md files; it has nothing to do"
-    echo "    if SUMMARY_WRITE_MARKDOWN=0 / --no-markdown is in effect.)"
+# --- The combined summary ----------------------------------------------------
+# Only once every member has its transcript and frames. A member that failed
+# leaves the combine run untouched — nothing has been spent on it yet — and
+# the same command resumes both.
+COMBINE_RC=0
+if [ -n "$COMBINE_RUN_DIR" ]; then
+  echo ""
+  if [ "$FAILED" -gt 0 ]; then
+    echo "==> Combined summary not attempted: $FAILED member run(s) failed."
+    echo "    Fix or resume them, then re-run this same command — the members"
+    echo "    that finished are kept, and the combined summary is made once"
+    echo "    all of them are ready."
+    COMBINE_RC=1
   else
-    mkdir -p "$(dirname "$COMBINE_FILE")"
-    declare -a COMBINE_ARGS=(--output "$COMBINE_FILE")
-    if [ "$COMBINE_RENDER_PDF" -eq 1 ]; then
-      mkdir -p "$(dirname "$COMBINE_PDF")"
-      COMBINE_ARGS+=(--pdf-out "$COMBINE_PDF" "${MANIFEST_ARGS[@]}")
+    combine_id="$(basename "$COMBINE_RUN_DIR")"
+    declare -a combine_args=(--run-dir "$COMBINE_RUN_DIR")
+    [ "$FORCE" -eq 1 ] && combine_args+=(--force)
+    if bash "$SCRIPT_DIR/lib/run_one.sh" "${combine_args[@]}"; then
+      echo ""
+      echo "  OK    $combine_id  (combined summary)"
+      md="$(rs get --run-dir "$COMBINE_RUN_DIR" --key stages.summarize.artifacts.md 2>/dev/null || true)"
+      pdf="$(rs get --run-dir "$COMBINE_RUN_DIR" --key stages.summarize.artifacts.pdf 2>/dev/null || true)"
+      [ -n "$md" ] && echo "        -> $md"
+      [ -n "$pdf" ] && echo "        -> $pdf"
+    else
+      COMBINE_RC=1
+      echo ""
+      echo "  FAIL  $combine_id  (combined summary)"
+      echo "        details:  ./pipeline.sh --status $combine_id"
+      echo "        resume:   ./pipeline.sh --run-id $combine_id"
     fi
-    "$PYTHON_BIN" "$SCRIPT_DIR/summarize/document.py" combine \
-      "${COMBINE_ARGS[@]}" "${SUMMARY_PATHS[@]}"
-  fi
-
-  # The sweep the children were told to skip. Only ever the subdirectory each
-  # run created, and only once the combined PDF has had its chance at them.
-  if [ "$COMBINE_SWEEP_FRAMES" -eq 1 ] && [ -n "${FRAMES_DIR:-}" ]; then
-    for run_dir in "${RUN_DIRS[@]}"; do
-      run_id="$(basename "$run_dir")"
-      run_frames="$FRAMES_DIR/$run_id"
-      [ -n "$run_id" ] && [ "$run_frames" != "$FRAMES_DIR" ] || continue
-      [ -d "$run_frames" ] || continue
-      rm -rf "$run_frames"
-      # Tell runstate the paths went on purpose, or its artifact check
-      # downgrades a finished frames stage and every later --status makes a
-      # completed run look half-broken.
-      rs cleaned --run-dir "$run_dir" --stage frames || true
-    done
-    echo "==> frames swept (KEEP_FRAMES=1 to keep them)"
   fi
 fi
 
@@ -681,3 +737,4 @@ if [ "$FAILED" -gt 0 ]; then
   echo "resuming re-runs only the stages that didn't finish."
   exit 1
 fi
+[ "$COMBINE_RC" -eq 0 ] || exit 1

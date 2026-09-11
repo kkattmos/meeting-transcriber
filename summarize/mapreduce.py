@@ -29,10 +29,13 @@ MERGE_PROMPT_PATH = PROMPTS_DIR / "_merge.md"
 # the combined template goes through .format() later, and a stray brace would
 # be read as a placeholder.
 CHUNK_PREAMBLE = (
-    "You are summarizing ONE PART of a longer meeting recording — {part_label}. "
+    "You are summarizing ONE PART of a longer recording, or of several "
+    "recordings being summarized together — {part_label}. "
     "Cover this part thoroughly and do not speculate about what happened in the "
     "other parts. Your output will later be merged with the summaries of the "
-    "other parts, so keep timestamps and speaker attributions intact.\n\n"
+    "other parts, so keep timestamps and speaker attributions intact; when the "
+    "part label names a video, say which video a timestamp or frame belongs "
+    "to.\n\n"
 )
 
 

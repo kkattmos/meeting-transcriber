@@ -39,12 +39,8 @@ chapter files already do — reproducing them beats "fixing" them.
 import re
 import shutil
 import subprocess
-import sys
 from datetime import date
 from pathlib import Path
-
-# So `import pdf` works from the combine CLI however this file was invoked.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 CHAPTER_PLACEHOLDER = "Chapter N — <topic> (<date>)"
 SECTION_SEPARATOR = "<br><br>"
@@ -118,14 +114,51 @@ def provenance_comment(**fields):
     return "\n".join(lines)
 
 
+def _source_line(source, source_kind, tag=""):
+    """The clickable (or at least copyable) line naming where a video came from."""
+    if source_kind == "youtube":
+        return f"Youtube Link{tag}: `{source}`"
+    if source_kind == "kaltura":
+        # Not "Source File" — a Kaltura lecture is a link like the YouTube one,
+        # and the reader needs to be able to click it.
+        return f"Video Link{tag}: `{source}`"
+    if source:
+        return f"Source File{tag}: `{source}`"
+    return None
+
+
+def _clip_line(clip, tag=""):
+    # Visible, not just in the provenance comment. Every timestamp below this
+    # line — the SRT the transcript came from, "Frame 4 @ 0:02:11", the model's
+    # own references — is measured from the START OF THE CLIP, because the
+    # media was cut before any of them were produced. A reader who doesn't know
+    # that will scrub to the wrong place in the source video and conclude the
+    # summary is wrong.
+    if tag:
+        # A combined document says once, below the links, that every clock is
+        # its own video's; repeating it per line would just bury that.
+        return f"Clip{tag}: `{clip}` of that video."
+    return (f"Clip: `{clip}` of the source. "
+            "Timestamps below are relative to the start of the clip.")
+
+
 def build_document(body, *, source, source_kind, title=None, transcript="",
                    backend=None, model=None, prompt_name=None, run_id=None,
                    generated=None, include_chapter_line=True,
-                   include_transcript=True, clip=None):
-    """Wrap a model-written summary body in the course-note template."""
+                   include_transcript=True, clip=None, videos=None):
+    """Wrap a model-written summary body in the course-note template.
+
+    `videos`, when given, is the list of sources a --combine summary was made
+    from — dicts with `source`, `kind`, and optionally `title` and `clip`, in
+    the order the model saw them — and the wrapper then lists one link line
+    per video, tagged "(Video N)" so the model's "video 2" references and the
+    "Frame 12 @ video 2 ..." citations can be followed back to a link. The
+    document keeps a single title (the first video's, or `title`), because it
+    is one document about one topic, not a stack of sections.
+    """
     generated = generated or date.today().isoformat()
 
-    parts = [provenance_comment(
+    provenance = dict(
         source=source,
         source_type=source_kind,
         model=f"{backend}/{model}" if backend and model else (model or backend),
@@ -133,33 +166,46 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
         run_id=run_id,
         clip=clip,
         generated=generated,
-    )]
+    )
+    if videos:
+        # One line per video in the comment too, so the raw file says which
+        # sources went into it without anyone parsing the link lines.
+        provenance["source_type"] = "combined"
+        provenance["videos"] = len(videos)
+        for n, video in enumerate(videos, start=1):
+            provenance[f"video_{n}"] = video.get("source")
+            if video.get("clip"):
+                provenance[f"video_{n}_clip"] = video["clip"]
+    parts = [provenance_comment(**provenance)]
 
     if include_chapter_line:
         parts.append(CHAPTER_PLACEHOLDER)
 
+    if videos and not title:
+        title = next((v.get("title") for v in videos if v.get("title")), None)
     parts.append(f"# {title or run_id or 'Untitled'}")
 
-    if source_kind == "youtube":
-        parts.append(f"Youtube Link: `{source}`")
-    elif source_kind == "kaltura":
-        # Not "Source File" — a Kaltura lecture is a link like the YouTube one,
-        # and the reader needs to be able to click it.
-        parts.append(f"Video Link: `{source}`")
-    elif source:
-        parts.append(f"Source File: `{source}`")
-
-    # Visible, not just in the provenance comment. Every timestamp below this
-    # line — the SRT the transcript came from, "Frame 4 @ 0:02:11", the model's
-    # own references — is measured from the START OF THE CLIP, because the
-    # media was cut before any of them were produced. A reader who doesn't know
-    # that will scrub to the wrong place in the source video and conclude the
-    # summary is wrong.
-    if clip:
-        parts.append(
-            f"Clip: `{clip}` of the source. "
-            "Timestamps below are relative to the start of the clip."
-        )
+    if videos:
+        lines = []
+        for n, video in enumerate(videos, start=1):
+            line = _source_line(video.get("source"), video.get("kind"),
+                                tag=f" (Video {n})")
+            if line:
+                lines.append(line)
+            if video.get("clip"):
+                lines.append(_clip_line(video["clip"], tag=f" (Video {n})"))
+        # The one fact a reader of a combined summary has to be told: the
+        # clock restarts at every video. "0:12:30" alone does not say which.
+        lines.append(f"Summarized from {len(videos)} videos as one. "
+                     "Every timestamp is relative to the start of the video "
+                     "(or clip) it cites.")
+        parts.append("\n".join(lines))
+    else:
+        line = _source_line(source, source_kind)
+        if line:
+            parts.append(line)
+        if clip:
+            parts.append(_clip_line(clip))
 
     if include_transcript:
         transcript_block = _indent_transcript(transcript.strip()) if transcript.strip() \
@@ -176,166 +222,3 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
     parts.append(SECTION_SEPARATOR)
 
     return "\n\n".join(parts) + "\n"
-
-
-# Every way the model writes a frame number. Deliberately the same shape as
-# pdf.FRAME_MENTION_RE, which is what resolves a citation to a picture: if the
-# two ever disagree, a citation gets shifted here and looked up there under the
-# old number, or the reverse. test_shift_agrees_with_the_pdf_matcher holds them
-# together.
-FRAME_MENTION_RE = re.compile(r"frames?\s*#?\s*(\d+)", re.IGNORECASE)
-# A transcript block, so citation shifting can step over it.
-DETAILS_BLOCK_RE = re.compile(r"<details>.*?</details>",
-                              re.DOTALL | re.IGNORECASE)
-
-
-def shift_frame_citations(text, offset):
-    """Add `offset` to every "Frame N" citation in a document's prose.
-
-    Frame numbers are unique only within one recording, so combining several
-    documents into one PDF has to renumber them — see pdf.merge_manifests for
-    why, and for the other half of this operation.
-
-    The transcript block is stepped over on purpose. It is verbatim speech: a
-    lecturer saying "frame 3" is not a citation, and rewriting it would both
-    corrupt the transcript the PDF carries and invent a citation pointing at a
-    picture nobody referenced.
-    """
-    if not offset:
-        return text
-
-    def _bump(match):
-        return f"{match.group(0)[:match.start(1) - match.start(0)]}" \
-               f"{int(match.group(1)) + offset}"
-
-    out, last = [], 0
-    for block in DETAILS_BLOCK_RE.finditer(text):
-        out.append(FRAME_MENTION_RE.sub(_bump, text[last:block.start()]))
-        out.append(block.group(0))
-        last = block.end()
-    out.append(FRAME_MENTION_RE.sub(_bump, text[last:]))
-    return "".join(out)
-
-
-def strip_provenance_and_chapter(text):
-    """Remove the header comment and the Chapter placeholder from a document.
-
-    Used when concatenating several documents into one chapter file, where the
-    Chapter line belongs once at the top rather than above every video.
-    """
-    text = re.sub(r"<!--\s*meeting-transcriber.*?-->\s*", "", text,
-                  count=1, flags=re.DOTALL)
-    text = text.replace(CHAPTER_PLACEHOLDER + "\n", "", 1)
-    return text.lstrip("\n")
-
-
-def _main():
-    """CLI used by pipeline.sh --combine.
-
-        document.py combine --output chapter3.md a.md b.md c.md
-        document.py combine --output chapter3.md --pdf-out chapter3.pdf \
-                    --frames-manifest a.json --frames-manifest b.json a.md b.md
-
-    --frames-manifest is repeatable and positional: the Nth one belongs to the
-    Nth summary, and "-" (or "") stands in for a summary with no frames so the
-    two lists stay aligned. Giving them is what makes the combined PDF's frame
-    citations resolve to the right pictures; see pdf.merge_manifests.
-    """
-    import argparse
-
-    ap = argparse.ArgumentParser(description="Combine per-run summaries")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("combine")
-    p.add_argument("--output", required=True)
-    p.add_argument("--pdf-out")
-    p.add_argument("--frames-manifest", action="append", default=[],
-                   metavar="PATH")
-    p.add_argument("--no-chapter-line", action="store_true")
-    p.add_argument("summaries", nargs="+")
-    args = ap.parse_args()
-
-    manifests = [None if m in ("-", "") else m for m in args.frames_manifest]
-    if manifests and len(manifests) != len(args.summaries):
-        # Misaligned lists would renumber the wrong sections by the wrong
-        # amounts, and the only symptom is a PDF full of confidently wrong
-        # pictures. Refuse rather than guess.
-        print(f"ERROR: {len(manifests)} --frames-manifest for "
-              f"{len(args.summaries)} summaries — pass one per summary "
-              f"(use '-' for a summary with no frames)", file=sys.stderr)
-        return 2
-
-    frames, offsets = [], None
-    if manifests:
-        import pdf as pdf_mod
-        try:
-            frames, offsets = pdf_mod.merge_manifests(manifests)
-        except (OSError, ValueError, KeyError) as exc:
-            # A manifest that won't parse costs the pictures, not the chapter
-            # file. Same rule as a failed render.
-            print(f"WARNING: could not merge frame manifests ({exc}); the "
-                  f"combined PDF will have no frames", file=sys.stderr)
-            frames, offsets = [], None
-
-    text = combine_documents(args.summaries,
-                             chapter_line=not args.no_chapter_line,
-                             frame_offsets=offsets)
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(text)
-    print(f"==> Combined {len(args.summaries)} summary/summaries -> {out}")
-
-    if args.pdf_out:
-        # The markdown is the artifact; a PDF that will not render is a
-        # warning, exactly as it is for a single run.
-        import pdf as pdf_mod
-        try:
-            written = pdf_mod.render(text, args.pdf_out, frames=frames,
-                                     title=out.stem)
-            print(f"==> Combined PDF -> {written}")
-        except pdf_mod.PdfUnavailable as exc:
-            print(f"WARNING: combined PDF {args.pdf_out} not written ({exc})",
-                  file=sys.stderr)
-        except Exception as exc:  # noqa: BLE001 - never fail on the PDF
-            print(f"WARNING: combined PDF {args.pdf_out} failed to render "
-                  f"({exc})", file=sys.stderr)
-    return 0
-
-
-def combine_documents(paths, chapter_line=True, frame_offsets=None):
-    """Concatenate per-run documents into one chapter-file-shaped markdown.
-
-    Each document already ends with the <br><br> separator, so sections just
-    follow one another the way chapter2.md lays them out.
-
-    `frame_offsets`, when given, is one integer per path (the value
-    pdf.merge_manifests hands back) and shifts that section's frame citations
-    into the combined document's global numbering. Left out, nothing is
-    renumbered and the markdown is byte-for-byte what it always was — which is
-    the right answer when no PDF is being rendered, since a reader of the .md
-    resolves "Frame 4" against that section's own recording.
-    """
-    chunks = []
-    if chapter_line:
-        chunks.append(CHAPTER_PLACEHOLDER + "\n")
-    for index, path in enumerate(paths):
-        try:
-            text = Path(path).read_text()
-        except OSError:
-            continue
-        text = strip_provenance_and_chapter(text)
-        if frame_offsets:
-            # Not `frame_offsets[index]` unguarded: a caller that passed a
-            # short list would silently renumber some sections and not others.
-            try:
-                offset = frame_offsets[index]
-            except IndexError:
-                raise ValueError(
-                    f"frame_offsets has {len(frame_offsets)} entries for "
-                    f"{len(paths)} summaries") from None
-            text = shift_frame_citations(text, offset)
-        chunks.append(text.rstrip() + "\n")
-    return "\n".join(chunks)
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main())

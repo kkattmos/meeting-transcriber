@@ -264,6 +264,7 @@ runs/<run_id>/
   video.mp4       YouTube download, when applicable
   clip.mp4        the --clip window, cut from video.mp4 / the input
   kaltura.json    entry facts, cached at fetch time
+  parts.json      combine run only: the members' transcripts + manifests, rebuilt per attempt
 ```
 
 `run_id` is `<safe_name>_<YYYYmmdd_HHMMSS>`, and **all artifact paths derive
@@ -418,7 +419,14 @@ Non-obvious details:
 - Re-running the same command **resumes by default**: `runstate.py find` looks
   for a run with the same `input` whose `summarize` isn't done.
 - A stage counts as done only if **every artifact it recorded still exists**.
-  A state file that disagrees with the filesystem is worse than none.
+  A state file that disagrees with the filesystem is worse than none. The
+  one exception is a stage marked `cleaned` (frames after a sweep): it stays
+  `done` with no artifacts, and `branch_frames` re-extracts only when this
+  run is actually about to summarize.
+- **Members of a `--combine` set are permanently "incomplete"** (their
+  summarize never runs), so the same command always resumes them; the
+  combine run is matched on its key *without* `--incomplete`, so a finished
+  combined summary is reported as done rather than paid for again.
 - `run.lock` is a directory containing the owner's pid. A lock whose owner is
   gone is **taken over**, not treated as fatal — a SIGKILL'd run has to stay
   resumable, which is exactly the case resume exists for.
@@ -590,7 +598,7 @@ Split across seven modules:
 - `retry.py` — transient-failure policy (503/429/5xx).
 - `chunking.py` — splitting long transcripts, assigning frames to chunks.
 - `mapreduce.py` — parallel chunk summarization + the merge call.
-- `document.py` — the course-note document wrapper and `--combine`.
+- `document.py` — the course-note document wrapper (single and multi-video).
 - `pdf.py` + `framecrop.py` + `mathrender.py` — the PDF export, its frame
   cropping and its LaTeX typesetting.
 
@@ -855,59 +863,91 @@ Shaped to match the user's course files (`2_Transcripts/chapter1.md`,
 - Applies to `lecture-*` and `tutorial-*` prompts only (`document.wants_wrapper`);
   `meeting-*` keeps the plain executive format. Override with
   `--format always|never`.
-- `--combine` concatenates several documents with one Chapter line at the top,
-  in **input** order — runs finish out of order when several go at once — and
-  renders them as one PDF too. See below.
+- `--combine` produces one such document for several videos: one title, one
+  link line per video tagged `(Video N)`, one transcript block, one body. See
+  the `--combine` section below.
 
-### The combined PDF (`--combine`, `--combine-pdf`, `--no-combine-pdf`)
+### `--combine`: several videos summarized as ONE (`--combine-pdf`, `--no-combine-pdf`)
 
-`--combine` writes `chapter3.md` and `chapter3.pdf`. The markdown half is the
-old `document.py combine`; the PDF half goes through the same `pdf.render()` a
-single run uses, over the concatenated text. Three things had to change for
-that to be correct rather than merely produce a file:
+Reworked 2026-09-11 with the operator. Until then `--combine` summarized every
+input on its own and stapled the `.md` files together, renumbering frame
+citations per section so the combined PDF's pictures lined up. That whole
+mechanism — `document.combine_documents`, `shift_frame_citations`,
+`pdf.merge_manifests` and the offsets they passed around — is **gone**. Don't
+bring it back as a "concat mode": the operator chose to replace it, not to
+keep both.
 
-- **Frame numbers are renumbered per section, and this is the whole problem.**
-  `assign_numbers()` makes numbers unique *within one recording*. Two lectures
-  in one document both have a "Frame 2", and they are different pictures.
-  Rendering the concatenation as-is resolves every citation against the first
-  manifest, produces a perfectly plausible PDF, and gets half the pictures
-  wrong with nothing to show for it — the same silent failure documented under
-  "Frame numbers are global, and assigned exactly once", one level up.
-  So `pdf.merge_manifests()` shifts each manifest past the ones before it and
-  returns the parallel `offsets`, and `document.shift_frame_citations()`
-  applies the identical shift to the prose. **The manifest list must have one
-  entry per summary**, `None` included, or every later section shifts by the
-  wrong amount; `document.py combine` refuses a mismatched pair rather than
-  guessing, and `pipeline.sh` passes `-` for a run with no frames.
-  `shift_frame_citations` steps over the `<details>` transcript on purpose: a
-  lecturer saying "frame 3" is speech, and rewriting it would both corrupt the
-  transcript the PDF carries and invent a citation.
-  The two "Frame N" regexes (`document.FRAME_MENTION_RE`,
-  `pdf.FRAME_MENTION_RE`) are separate copies held together by
-  `test_shift_agrees_with_the_pdf_matcher` — drift means a citation shifted
-  here and resolved there under its old number.
-- **`_split_document` lifts out *every* transcript, not the first.** It used to
-  `sub(..., count=1)` and then remove "the first `<br>`", which in a combined
-  document was not the `<br>` belonging to that block. The other sections'
-  `<details>` markup then printed raw into the middle of the PDF.
-  `DETAILS_BLOCK_RE` swallows the block and its trailing `<br>` together, and
-  the transcripts are joined into the one hidden layer.
-- **The frame sweep moved up a level.** `run_one.sh` deletes a run's frames as
-  soon as *that run's* PDF is written. The combined PDF renders at the end of
-  `pipeline.sh`, out of every run's frames at once, so they would all be gone
-  and the combined PDF would silently have no pictures. `pipeline.sh` therefore
-  exports `KEEP_FRAMES=1` to the children when it is going to render one, and
-  does the sweep itself afterwards — respecting an operator-set `KEEP_FRAMES`.
+What it does now: the members run transcribe + frames and stop
+(`run_one.sh --skip-summarize`), and a **combine run** — `input_type:
+combine`, run id `combine_<n>x_<sha1[:10] of the member ids>_<time>` — runs
+one summarize stage over all of them via `summarize.py --parts parts.json`.
+The model reads every transcript, in input order, and writes one body.
+Decisions, each settled explicitly:
 
-Renumbering happens **only** when a PDF is being rendered. `--no-combine-pdf`
-leaves the markdown byte-for-byte as it always was, because a reader of the
-`.md` alone resolves "Frame 4" against that section's own recording. The
-consequence is that the combined and per-run markdown cite different numbers
-for the same picture; that is correct, and the alternative (renumbering always)
-would make the standalone `.md` wrong instead.
+1. **One summary, not a merge of per-video summaries.** N+1 calls would have
+   been cheaper to build and weaker across video boundaries; one summarize
+   spend is also the point — the members deliberately get **no individual
+   summary** (their `summarize` stays `pending`, and `combined_into` in their
+   state says why).
+2. **Per-video clocks, never a running total.** The transcript the model
+   reads is fenced per video (`chunking.part_transcript`:
+   `=== video 2 of 3: <title> ===`), every frame label carries its video
+   (`[frame 12 @ video 2 410.0s (periodic)]` — `FrameMeta.part`), chunk
+   headers name the video, the PDF caption reads `Frame 12 — Video 2, 6:50`,
+   and the document says under its links that timestamps are relative to the
+   video they cite. A continuous clock would have meant an offset in four
+   modules and a silent failure wherever one was missed — the same reasoning
+   as `--clip`'s relative timestamps, one level up.
+3. **Frame numbers are global across the set, assigned once.**
+   `pdf.load_part_manifests` tags each manifest's frames with its part and
+   runs `assign_numbers` over the lot, which now sorts by
+   `FrameMeta.sort_key = (part, timestamp_s)`. A video with no manifest still
+   consumes a part number. This is the multi-video form of "Frame numbers are
+   global, and assigned exactly once" below, and the failure mode is the same
+   silent one.
+4. **Each video is chunked on its own** (`chunking.build_part_chunks`): a
+   chunk never spans two videos, because its time window and its frames
+   belong to one clock, and a short video is never folded into a neighbour's
+   chunk because the chunk label is what the model cites frames against. If
+   the whole set fits under `SUMMARY_CHUNK_CHARS`, it goes in one call with
+   every frame — that is the case where cross-video context actually helps.
+5. **The combine run is a real run**, resumable through the same
+   `runstate find --input` auto-resume as everything else: its `input` is
+   `combine:<id1>+<id2>+…` (`lib/combine.py run-key`), so the same members in
+   the same order land on the same run. Its `members`, `output_md` and
+   `output_pdf` live in `state.json` and `init` refreshes them on every
+   invocation, so re-running with a different `--combine` path writes there.
+6. **Flat wrapper**: one title (the first video's, or `--title`), one link
+   line per video tagged `(Video N)`, one `<details>` block holding the fenced
+   transcript, one body. `document.build_document(videos=[...])`.
 
-A failed combined render is a warning naming the path, never a failed run —
-same rule as a single run's PDF.
+Non-obvious details:
+
+- **`run_one.sh` handles the combine run before the per-input DAG** (the
+  `INPUT_TYPE = combine` branch). Before summarizing it checks every member
+  has its transcript and manifest on disk; a member whose frames were swept
+  (`done` with no artifacts — the `cleaned` state) gets `rs reset --stage
+  frames` and is re-run with `--skip-summarize`. That is what makes
+  `--run-id combine_… --force` work after the sweep, and it is why
+  `parts.json` is rebuilt on every attempt rather than cached.
+- **The frame sweep belongs to the combine run** (`cleanup_member_frames`),
+  after its PDF, under the same rules as a single run. `pipeline.sh` no
+  longer exports `KEEP_FRAMES=1` to the children or sweeps anything — members
+  never reach `cleanup_frames` under `--skip-summarize`.
+- **`--resume-all` skips members** (anything with `combined_into` set) and
+  resumes the combine run instead. Without that it would bill an individual
+  summary nobody asked for. `--run-id <member>` still does run one to the
+  end — that is an explicit ask.
+- **`--combine` with `--run-id`/`--resume-last`/`--resume-all` is refused**;
+  the combine run is resolved from the inputs.
+- **A failed member leaves the combine run untouched** — no summarize is
+  attempted, exit 1, and the same command resumes both.
+- **`summarize.py --parts` looks up YouTube titles itself** (one yt-dlp call
+  per video, best-effort) because the labels the model reads need them;
+  Kaltura titles come from each member's `kaltura.json` through
+  `combine.py parts`. The `<iframe>` blob is normalised there too.
+- **`pdf.py`'s CLI takes repeated `--frames-manifest`** to re-render a
+  combined document: the Nth is video N's, `-` holds an empty slot.
 
 ### The PDF (`summarize/pdf.py`)
 
@@ -1278,13 +1318,23 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **`summarize.py` must not pass `work_dir` to `pdf.render()`.** Naming one
   transfers ownership and leaves the cropped intermediates beside the
   deliverable.
-- **A combined PDF renumbers frame citations; the combined markdown alone does
-  not.** One entry per summary in the manifest list, always — a dropped slot
-  shifts every later section by the wrong amount and reports nothing. See the
-  combined-PDF section.
-- **`pipeline.sh` owns the frame sweep whenever it renders a combined PDF.**
-  Letting `run_one.sh` sweep as usual leaves the combined render with no
-  frames and no error.
+- **`--combine` is one summary over every video, not a concatenation of
+  per-video summaries.** The members' `summarize` stage stays pending on
+  purpose; giving them individual summaries doubles the spend. See the
+  `--combine` section.
+- **Timestamps in a combined document are per video, and every place a
+  timestamp appears names the video.** The transcript fences, the frame
+  labels, the chunk headers, the PDF captions. Dropping the video from any
+  one of them makes "410.0s" ambiguous with nothing to show for it.
+- **Frames of a combined set are numbered once, across all videos, in
+  `(part, timestamp)` order.** Numbering per manifest gives two videos the
+  same "Frame 4" and the PDF resolves both to the first.
+- **A chunk never spans two videos.** Its window and its frames belong to
+  one clock.
+- **The combine run owns the members' frame sweep**, after its PDF.
+  `run_one.sh --skip-summarize` never sweeps, and `pipeline.sh` no longer
+  does either.
+- **`--resume-all` must skip runs with `combined_into` set.**
 - **Frame numbers come from `assign_numbers()` over the whole manifest, never
   from a per-chunk enumeration.** See the section above: the failure mode is
   silent, survives every unit test that looks at one chunk, and produces a PDF
@@ -1323,19 +1373,21 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
-| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, `--combine` citation shifting, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 111 |
-| `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, manifest merging for `--combine`, real PDF render | 60 |
+| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 114 |
+| `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, part-tagged manifests and captions for `--combine`, real PDF render | 60 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combined PDF and its frame sweep, the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix | 220 |
-| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary, and a real ffmpeg clip probed for duration and rebased timestamps | 82 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix | 262 |
+| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), and a real ffmpeg clip probed for duration and rebased timestamps | 82 + the `--parts` block |
 | `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 
 `test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs
 only the four expensive stages, behind the same argument/output contract. It has
-caught six real bugs so far (`--from-file` with no positionals, an unhelpful
+caught seven real bugs so far (`--from-file` with no positionals, an unhelpful
 unrecognized-input error, the double YouTube download, the
 `$BASHPID`-in-substitution queue bug, a stage exiting 0 without writing its
-artifacts, and a `--clip` label that could not be parsed back on a resume).
+artifacts, a `--clip` label that could not be parsed back on a resume, and a
+resumed run failing its `frames` branch because the frames had been swept —
+`mark_done` refused the missing manifest on a stage that had nothing to do).
 Add to it when you touch orchestration.
 
 The `--clip` split between the two shell suites is worth knowing: the pipeline
@@ -1403,6 +1455,7 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── resources.py              <- slides/notes from GitHub or a folder
 │   ├── kaltura.py                <- Kaltura embeds: parse, media URL, captions
 │   ├── clip.py                   <- --clip: window parsing + the ffmpeg cut
+│   ├── combine.py                <- --combine: parts.json from the member runs, the run key
 │   ├── run_one.sh                <- the per-run stage DAG
 │   ├── fake_api_server.py        <- stub AssemblyAI/YouTube servers
 │   ├── fake_claude_cli.py        <- stub `claude` binary for the media test

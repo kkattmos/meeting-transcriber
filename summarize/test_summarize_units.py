@@ -374,90 +374,148 @@ class DocumentTest(unittest.TestCase):
         self.assertIn("Source File: `/opt/meeting-bot/recordings/a.mp4`", out)
         self.assertNotIn("Youtube Link", out)
 
-    def test_combine_puts_the_chapter_line_once(self):
+    def test_a_combined_document_links_every_video_and_says_so(self):
+        # --combine: one document, one title, one link line per video tagged
+        # with the number the model's citations use, and the one thing the
+        # reader has to be told — that every clock is its own video's.
+        out = document.build_document(
+            "See (Frame 7 @ video 2 30.0s).",
+            source="https://youtu.be/v1", source_kind="youtube",
+            transcript="t",
+            videos=[
+                {"source": "https://youtu.be/v1", "kind": "youtube",
+                 "title": "Week 1"},
+                {"source": "/rec/w2.mp4", "kind": "local_file",
+                 "clip": "00:05:00-end"},
+                {"source": "https://k/p/1/embedPlaykitJs/uiconf_id/0?entry_id=x",
+                 "kind": "kaltura", "title": "Week 3"},
+            ])
+        self.assertEqual(out.count("\n# "), 1)
+        self.assertIn("# Week 1", out)
+        self.assertNotIn("# Week 3", out)
+        self.assertIn("Youtube Link (Video 1): `https://youtu.be/v1`", out)
+        self.assertIn("Source File (Video 2): `/rec/w2.mp4`", out)
+        self.assertIn("Clip (Video 2): `00:05:00-end`", out)
+        self.assertIn("Video Link (Video 3):", out)
+        self.assertIn("Summarized from 3 videos as one", out)
+        self.assertIn("relative to the start of the video", out)
+        # Provenance carries the set too, one line per video.
+        self.assertIn("source_type: combined", out)
+        self.assertIn("videos: 3", out)
+        self.assertIn("video_2: /rec/w2.mp4", out)
+        self.assertIn("video_2_clip: 00:05:00-end", out)
+        # Exactly one transcript block — the text was joined before it got
+        # here — and the body follows it.
+        self.assertEqual(out.count("<details>"), 1)
+        self.assertIn("See (Frame 7 @ video 2 30.0s).", out)
+
+    def test_an_explicit_title_beats_the_first_videos(self):
+        out = document.build_document(
+            "b", source="s", source_kind="youtube", title="Chapter 3",
+            transcript="t",
+            videos=[{"source": "s", "kind": "youtube", "title": "Week 1"}])
+        self.assertIn("# Chapter 3", out)
+        self.assertNotIn("# Week 1", out)
+
+    def test_a_single_video_document_is_untouched_by_the_videos_path(self):
+        out = document.build_document(
+            "b", source="https://youtu.be/v", source_kind="youtube",
+            title="V", transcript="t")
+        self.assertIn("Youtube Link: `https://youtu.be/v`", out)
+        self.assertNotIn("(Video 1)", out)
+        self.assertNotIn("Summarized from", out)
+        self.assertNotIn("combined", out)
+
+
+class CombinedPartsTest(unittest.TestCase):
+    """Several videos summarized as one (pipeline.sh --combine).
+
+    Two invariants matter. Frame numbers are unique across the whole set —
+    the model is shown one number per picture and the PDF resolves the same
+    one — and every timestamp stays relative to its own video, with the
+    video named wherever a timestamp appears, because "410.0s" on its own
+    no longer says which lecture.
+    """
+
+    def frames(self, part, *stamps):
+        return [FrameMeta(timestamp_s=t, kind="periodic",
+                          path=f"/f/{part}/{t}.jpg", part=part)
+                for t in stamps]
+
+    def test_numbers_run_across_videos_in_video_order(self):
+        # Video 2's frames come after video 1's even though their timestamps
+        # are smaller: the clock restarts per video.
+        frames = llm_client.assign_numbers(
+            self.frames(2, 10.0, 20.0) + self.frames(1, 30.0, 40.0))
+        self.assertEqual([(f.part, f.timestamp_s, f.number) for f in frames],
+                         [(1, 30.0, 1), (1, 40.0, 2), (2, 10.0, 3), (2, 20.0, 4)])
+
+    def test_the_manifest_line_names_the_video(self):
+        frames = llm_client.assign_numbers(
+            self.frames(1, 30.0) + self.frames(2, 30.0))
+        _, text = llm_client._render(frames, "t", "{frame_manifest}")
+        self.assertIn("[frame 1 @ video 1 30.0s (periodic)]", text)
+        self.assertIn("[frame 2 @ video 2 30.0s (periodic)]", text)
+        # And the render keeps video order, not timestamp order.
+        self.assertLess(text.index("frame 1 @"), text.index("frame 2 @"))
+
+    def test_a_single_recording_frame_label_is_unchanged(self):
+        frame = FrameMeta(timestamp_s=5.0, kind="scene_change", path="/f.jpg")
+        self.assertEqual(frame.label(3), "[frame 3 @ 5.0s (scene_change)]")
+
+    def test_the_part_transcript_fences_each_video(self):
+        parts = [chunking.Part(label="video 1 of 2: A", text="alpha"),
+                 chunking.Part(label="video 2 of 2: B", text="beta")]
+        text = chunking.part_transcript(parts)
+        self.assertEqual(text, "=== video 1 of 2: A ===\n\nalpha\n\n"
+                               "=== video 2 of 2: B ===\n\nbeta")
+
+    def test_short_videos_go_in_one_call(self):
+        parts = [chunking.Part(label="video 1 of 2: A", text="a" * 100),
+                 chunking.Part(label="video 2 of 2: B", text="b" * 100)]
+        self.assertEqual(chunking.build_part_chunks(parts, limit=1000), [])
+
+    def test_long_sets_are_chunked_per_video_and_labelled(self):
         with tempfile.TemporaryDirectory() as tmp:
-            paths = []
-            for i in range(3):
-                p = Path(tmp) / f"{i}.md"
-                p.write_text(document.build_document(
-                    f"body {i}", source=f"https://youtu.be/v{i}",
-                    source_kind="youtube", title=f"Video {i}", transcript="t"))
-                paths.append(p)
-            combined = document.combine_documents(paths)
-        self.assertEqual(combined.count(document.CHAPTER_PLACEHOLDER), 1)
-        self.assertEqual(combined.count("<!-- meeting-transcriber"), 0)
-        for i in range(3):
-            self.assertIn(f"# Video {i}", combined)
-        # Input order is preserved, which is what makes it drop-in.
-        self.assertLess(combined.index("# Video 0"), combined.index("# Video 1"))
-        self.assertLess(combined.index("# Video 1"), combined.index("# Video 2"))
+            srt = Path(tmp) / "a.srt"
+            srt.write_text(
+                "1\n00:00:00,000 --> 00:00:10,000\n" + "x" * 60 + "\n\n"
+                "2\n00:00:10,000 --> 00:00:20,000\n" + "y" * 60 + "\n\n"
+                "3\n00:00:20,000 --> 00:00:30,000\n" + "z" * 60 + "\n")
+            f1 = llm_client.assign_numbers(
+                self.frames(1, 5.0, 15.0, 25.0) + self.frames(2, 5.0))
+            parts = [
+                chunking.Part(label="video 1 of 2: A",
+                              text="x" * 60 + "\n" + "y" * 60 + "\n" + "z" * 60,
+                              frames=[f for f in f1 if f.part == 1],
+                              srt_path=str(srt)),
+                chunking.Part(label="video 2 of 2: B", text="short",
+                              frames=[f for f in f1 if f.part == 2]),
+            ]
+            with mock.patch.dict(os.environ, {"SUMMARY_CHUNK_OVERLAP": "0"}):
+                chunks = chunking.build_part_chunks(parts, limit=100)
+        # Video 1 split on its own segments (one per 60-char cue under a
+        # 100-char limit), video 2 is one chunk of its own even though it
+        # would have fitted into video 1's last.
+        self.assertEqual(len(chunks), 4)
+        self.assertEqual([c.index for c in chunks], [0, 1, 2, 3])
+        self.assertEqual([c.label for c in chunks],
+                         ["video 1 of 2: A"] * 3 + ["video 2 of 2: B"])
+        # Each chunk carries only its own video's frames, under their global
+        # numbers.
+        self.assertEqual([f.number for c in chunks[:3] for f in c.frames],
+                         [1, 2, 3])
+        self.assertEqual([f.number for f in chunks[3].frames], [4])
+        # The header names the video, and its window is that video's clock.
+        self.assertIn("video 1 of 2: A", chunks[0].header(4))
+        self.assertIn("00:00:00–00:00:10", chunks[0].header(4))
+        self.assertEqual(chunks[3].header(4), "part 4 of 4 (video 2 of 2: B)")
 
-
-    def test_combine_shifts_frame_citations_by_their_offset(self):
-        # Two sections that both cite "Frame 2" cite different pictures. The
-        # combined document has to say so, or the PDF resolves both to one.
-        with tempfile.TemporaryDirectory() as tmp:
-            paths = []
-            for i in range(2):
-                p = Path(tmp) / f"{i}.md"
-                p.write_text(document.build_document(
-                    f"See (Frame 2 @ 0:01:00) in part {i}.",
-                    source=f"https://youtu.be/v{i}", source_kind="youtube",
-                    title=f"Video {i}", transcript="t"))
-                paths.append(p)
-            combined = document.combine_documents(paths, frame_offsets=[0, 7])
-        self.assertIn("(Frame 2 @ 0:01:00) in part 0", combined)
-        self.assertIn("(Frame 9 @ 0:01:00) in part 1", combined)
-
-    def test_combine_without_offsets_is_byte_for_byte_unchanged(self):
-        # No PDF means no renumbering: a reader of the .md resolves "Frame 4"
-        # against that section's own recording.
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / "a.md"
-            p.write_text(document.build_document(
-                "See (Frame 4 @ 0:01:00).", source="https://youtu.be/v",
-                source_kind="youtube", title="V", transcript="t"))
-            plain = document.combine_documents([p])
-            zeroed = document.combine_documents([p], frame_offsets=[0])
-        self.assertIn("(Frame 4 @ 0:01:00)", plain)
-        self.assertEqual(plain, zeroed)
-
-    def test_combine_rejects_misaligned_offsets(self):
-        # Renumbering some sections and not others is silent in the output and
-        # wrong in the PDF. Refuse instead.
-        with tempfile.TemporaryDirectory() as tmp:
-            paths = []
-            for i in range(3):
-                p = Path(tmp) / f"{i}.md"
-                p.write_text(f"# V{i}\n\nbody\n")
-                paths.append(p)
-            with self.assertRaises(ValueError):
-                document.combine_documents(paths, frame_offsets=[0, 4])
-
-    def test_shift_steps_over_the_transcript(self):
-        # A lecturer saying "frame 3" is speech, not a citation. Rewriting it
-        # would corrupt the transcript the PDF carries and invent a citation.
-        doc = document.build_document(
-            "Body cites (Frame 3 @ 0:00:10).", source="s",
-            source_kind="local_file", title="T",
-            transcript="and then the frame 3 collapsed")
-        shifted = document.shift_frame_citations(doc, 10)
-        self.assertIn("(Frame 13 @ 0:00:10)", shifted)
-        self.assertIn("the frame 3 collapsed", shifted)
-
-    def test_shift_agrees_with_the_pdf_matcher(self):
-        # The two regexes are separate copies; if they ever drift, a citation
-        # is shifted here and resolved there under its old number.
-        import pdf
-        sample = ("(Frame 12 @ 0:01:00), [frame 3], Frames 7 and 8, "
-                  "Frame#42, frame 5")
-        self.assertEqual(
-            [int(m) for m in document.FRAME_MENTION_RE.findall(sample)],
-            pdf._cited_frame_numbers(sample))
-
-    def test_shift_by_zero_changes_nothing(self):
-        text = "(Frame 2) and Frame 30"
-        self.assertEqual(document.shift_frame_citations(text, 0), text)
+    def test_a_video_with_no_srt_still_gets_one_chunk(self):
+        parts = [chunking.Part(label="video 1 of 1: A", text="a\n" * 200)]
+        chunks = chunking.build_part_chunks(parts, limit=100)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(c.label == "video 1 of 1: A" for c in chunks))
 
 
 # ---------------------------------------------------------------------------

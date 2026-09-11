@@ -39,7 +39,6 @@ when the toolchain is missing, and summarize.py turns that into a warning: the
 markdown has already been written by then, and a missing PDF is an
 inconvenience, not a lost lecture.
 """
-import dataclasses
 import html
 import os
 import re
@@ -79,10 +78,10 @@ SLIDE_CITE_RE = re.compile(
     r"[\(\[]\s*slide\s*#?\s*(\d+)[^)\]\n]*[\)\]]", re.IGNORECASE)
 PROVENANCE_RE = re.compile(r"<!--\s*meeting-transcriber(.*?)-->", re.DOTALL)
 DETAILS_RE = re.compile(r"<details>(.*?)</details>", re.DOTALL | re.IGNORECASE)
-# The same block plus the <br> build_document emits right after it. A combined
-# document holds one of these per source, so they are stripped by iteration
-# rather than by a count=1 sub followed by removing "the first <br>" — which in
-# a combined document was not the one belonging to that block.
+# The same block plus the <br> build_document emits right after it. Stripped by
+# iteration rather than by a count=1 sub followed by removing "the first <br>":
+# a document pasted together from several summaries holds one of these per
+# source, and the old way left the later blocks' markup in the body.
 DETAILS_BLOCK_RE = re.compile(
     r"<details>(.*?)</details>[ \t]*\n?[ \t]*(?:<br\s*/?>)?",
     re.DOTALL | re.IGNORECASE)
@@ -228,7 +227,8 @@ def _prepare_frames(frames, work_dir, crop_mode=None, max_width=None,
     max_width = max_width or framecrop.max_width_from_env()
     work_dir = Path(work_dir)
     prepared = {}
-    ordered = sorted(frames, key=lambda f: f.timestamp_s)
+    ordered = sorted(frames, key=lambda f: (getattr(f, "part", 0),
+                                             f.timestamp_s))
     for position, frame in enumerate(ordered, start=1):
         # The frame's own global number is what the model was shown and so
         # what the citations name; the position in this list is only the same
@@ -253,6 +253,9 @@ def _prepare_frames(frames, work_dir, crop_mode=None, max_width=None,
             "path": str(Path(out).resolve()),
             "timestamp": frame.timestamp_s,
             "kind": frame.kind,
+            # Non-zero on a --combine render: the timestamp is relative to
+            # that video, and the caption has to say which one.
+            "part": getattr(frame, "part", 0),
         }
     return prepared
 
@@ -515,6 +518,9 @@ def _appendix_frames(prepared):
     for number in sorted(prepared):
         info = prepared[number]
         caption = f"Frame {number} — {_fmt_timestamp(info['timestamp'])}"
+        if info.get("part"):
+            caption = (f"Frame {number} — Video {info['part']}, "
+                       f"{_fmt_timestamp(info['timestamp'])}")
         parts.append(
             f'<figure class="thumb">'
             f'<img src="file://{html.escape(info["path"])}" />'
@@ -663,47 +669,42 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
     return output_path
 
 
-def load_manifest_frames(manifest_path):
-    """Read one frames manifest into numbered FrameMeta objects.
+def load_manifest_frames(manifest_path, part=0):
+    """Read one frames manifest into FrameMeta objects.
 
-    Numbering is global *within that recording*, exactly as the summarize run
-    that produced the citations saw it — see llm_client.assign_numbers.
+    `part` tags every frame with the video it came from, for a --combine
+    render; the numbering is left to the caller — see load_part_manifests —
+    because it has to run once over *every* video's frames together, exactly
+    the way llm_client.assign_numbers demands for a single recording.
+    Numbering here, per manifest, is how two videos both end up with a
+    "Frame 4" that name different pictures.
     """
     import json
-    from llm_client import FrameMeta, assign_numbers
+    from llm_client import FrameMeta
 
     data = json.loads(Path(manifest_path).read_text())
-    return assign_numbers(
-        [FrameMeta(timestamp_s=e["timestamp_s"], kind=e["kind"],
-                   path=e["path"]) for e in data.get("frames", [])])
+    return [FrameMeta(timestamp_s=e["timestamp_s"], kind=e["kind"],
+                      path=e["path"], part=part)
+            for e in data.get("frames", [])]
 
 
-def merge_manifests(manifest_paths):
-    """Merge several recordings' manifests for one combined document.
+def load_part_manifests(manifest_paths):
+    """Frames for several videos summarized as one document, numbered once.
 
-    Returns ``(frames, offsets)``. Frame numbers are only unique inside the
-    recording they came from, so document B's "Frame 4" and document A's
-    "Frame 4" are different pictures. Rendering them into one PDF without
-    renumbering is the silent-mislabelling failure assign_numbers exists to
-    prevent, one level up: nothing errors, and half the pictures are wrong.
-
-    So each manifest's numbers are shifted past every manifest before it, and
-    the parallel `offsets` list is handed back for
-    `document.shift_frame_citations` to apply the same shift to the prose.
-    An entry may be None or "" for a source with no frames, which still
-    consumes a slot so the offsets stay aligned with the summaries.
+    The Nth manifest's frames are tagged part N (1-based) and the whole list
+    is numbered globally in (part, timestamp) order, so the model is shown —
+    and the PDF resolves — one number per picture across all the videos. An
+    entry may be None or "" for a video with no frames; it still counts as a
+    part so the numbering of the videos after it stays right.
     """
-    frames, offsets, next_offset = [], [], 0
-    for path in manifest_paths:
-        offsets.append(next_offset)
+    from llm_client import assign_numbers
+
+    frames = []
+    for part, path in enumerate(manifest_paths, start=1):
         if not path:
             continue
-        section = load_manifest_frames(path)
-        for frame in section:
-            frames.append(dataclasses.replace(
-                frame, number=frame.number + next_offset))
-        next_offset += len(section)
-    return frames, offsets
+        frames.extend(load_manifest_frames(path, part=part))
+    return assign_numbers(frames)
 
 
 def want_pdf():
@@ -717,7 +718,11 @@ def want_markdown():
 
 
 def _main(argv):
-    """CLI: `pdf.py <summary.md> <out.pdf> [--frames-manifest P] [--work-dir D]`.
+    """CLI: `pdf.py <summary.md> <out.pdf> [--frames-manifest P]... [--work-dir D]`.
+
+    --frames-manifest may be repeated to re-render a --combine document: the
+    Nth manifest is video N's, in the same order the summary was made from,
+    and "-" holds the place of a video that had no frames.
 
     --work-dir names the directory the cropped frames are written to. Naming
     it also means keeping it: a directory render() invents for itself is
@@ -734,22 +739,30 @@ def _main(argv):
             # Consume the value, or it lands in `positional` and shifts the
             # output path — the previous parser did exactly that and got away
             # with it only because it read just the first two entries.
-            opts[a] = argv[i + 2] if i + 2 < len(argv) else None
+            opts.setdefault(a, []).append(
+                argv[i + 2] if i + 2 < len(argv) else None)
             skip = True
         elif any(a.startswith(v + "=") for v in _VALUED):
             k, v = a.split("=", 1)
-            opts[k] = v
+            opts.setdefault(k, []).append(v)
         elif not a.startswith("--"):
             positional.append(a)
-    manifest = opts.get("--frames-manifest")
-    work_dir = opts.get("--work-dir")
+    manifests = [m for m in opts.get("--frames-manifest", []) if m is not None]
+    work_dir = (opts.get("--work-dir") or [None])[-1]
     args = positional
     if len(args) < 2:
         print("Usage: pdf.py <summary.md> <out.pdf> [--frames-manifest PATH] "
               "[--work-dir DIR]", file=sys.stderr)
         return 2
 
-    frames = load_manifest_frames(manifest) if manifest else []
+    if len(manifests) > 1:
+        frames = load_part_manifests(
+            [None if m in ("-", "") else m for m in manifests])
+    elif manifests and manifests[0] not in ("-", ""):
+        from llm_client import assign_numbers
+        frames = assign_numbers(load_manifest_frames(manifests[0]))
+    else:
+        frames = []
     try:
         out = render(Path(args[0]).read_text(), args[1], frames=frames,
                      work_dir=work_dir)

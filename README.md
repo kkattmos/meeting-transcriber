@@ -345,17 +345,23 @@ Expand a playlist — opt-in, because a normal watch URL often carries a stray
 ./pipeline.sh "https://www.youtube.com/playlist?list=PL..." --playlist
 ```
 
-Write one combined chapter-shaped file as well as the per-run summaries:
+Summarize several videos **as one lecture** — one document, one study guide,
+the model reads every transcript:
 
 ```bash
 ./pipeline.sh --from-file chapter3_links.txt --prompt lecture-claude \
   --combine ~/courses/2_Transcripts/chapter3.md
 ```
 
-That writes `chapter3.md` **and** `chapter3.pdf` — one PDF holding every
-lecture, with a single keyframe appendix and every source transcript in the
-hidden text layer. Name the PDF somewhere else with `--combine-pdf`, or skip it
-with `--no-combine-pdf`:
+Each input is still transcribed and frame-sampled on its own (those stages
+run in parallel, and resume individually), but **none of them gets its own
+summary**: their `summarize` stage stays `pending` on purpose, and a separate
+*combine run* — `combine_3x_<hash>_<time>` in `--list` — hands every
+transcript and every frame manifest, in input order, to one summarize call.
+That writes `chapter3.md` **and** `chapter3.pdf`, with a single keyframe
+appendix across all the videos and every transcript in the hidden text layer.
+Name the PDF somewhere else with `--combine-pdf`, or skip it with
+`--no-combine-pdf`:
 
 ```bash
 ./pipeline.sh --from-file chapter3_links.txt \
@@ -363,17 +369,35 @@ with `--no-combine-pdf`:
   --combine-pdf ~/courses/pdf/chapter3.pdf
 ```
 
-Frame numbers are unique only within one recording, so the combined document
-renumbers each section's citations — lecture B's "Frame 2" becomes "Frame 5"
-if lecture A contributed three frames. That means **the combined `.md` and the
-per-run `.md` cite different numbers for the same picture**, which is the point:
-in the combined PDF each number resolves to the right lecture's frame. With
-`--no-combine-pdf` nothing is renumbered, because there is no combined
-appendix to resolve against.
+What the combined document looks like, and why:
 
-Because the combined PDF is rendered after every run has finished, `pipeline.sh`
-tells the runs to keep their frames and sweeps them itself once the render is
-done. `KEEP_FRAMES=1` still keeps them.
+- **One title** (the first video's), then **one link line per video**, tagged
+  `(Video 1)`, `(Video 2)`, … — those numbers are how the model refers to the
+  videos in the text.
+- **Timestamps are relative to the video they cite**, never to a running
+  total: the transcript the model reads is fenced per video (`=== video 2 of
+  3: <title> ===`), every frame is announced as `frame 12 @ video 2 410.0s`,
+  and the keyframe appendix captions read `Frame 12 — Video 2, 6:50`. The
+  document says so under the links. A `#t=` window on one input shows up as
+  `Clip (Video 2): …` on its line.
+- **Frame numbers are unique across the whole set**, assigned once in video
+  order, so "Frame 12" means the same picture to the model and to the PDF.
+- Long sets go through the usual chunk-and-merge path, but each video is
+  chunked on its own — a chunk never spans two videos, because its timestamps
+  and frames belong to one.
+
+The combined summary resumes like any run. Re-running the same command
+resumes it (the members skip their finished stages, the combine run skips a
+finished summarize); a member that failed blocks the combined summary until
+it is fixed, and nothing is spent on the summary in the meantime.
+`./pipeline.sh --run-id combine_…` resumes it directly, and `--force` there
+re-summarizes — re-extracting any member frames that were swept first.
+`--resume-all` leaves combine members alone and resumes their combine run
+instead.
+
+The combine run sweeps the members' frames once the combined PDF is written,
+under the same rules as a single run (`KEEP_FRAMES=1` keeps them; a PDF that
+was asked for and did not render keeps them too).
 
 ### Options
 
@@ -389,7 +413,7 @@ done. `KEEP_FRAMES=1` still keeps them.
 | `--jobs N` | Inputs processed at once (default 2) |
 | `--from-file F` | Read inputs from a file, one per line |
 | `--playlist` | Expand YouTube playlist URLs |
-| `--combine F` | Also write every summary into one file, in input order |
+| `--combine F` | Summarize all the inputs together, as one document (no per-input summaries) |
 | `--combine-pdf F` | Where the combined PDF goes (default: `--combine`'s path with `.pdf`) |
 | `--no-combine-pdf` | Write only the combined markdown |
 | `--force` | Ignore prior state, start clean |
@@ -732,11 +756,10 @@ Youtube Link: `https://www.youtube.com/watch?v=5GAfjAjLKYk`
   guess would be worse than an obvious blank.
 - The title comes from yt-dlp, the link and transcript are inserted by the code
   — the model never writes them, so they can't be hallucinated or truncated.
-- `--combine` concatenates several of these with one Chapter line at the top,
-  in **input order** (runs finish out of order when several go at once). It
-  works on the `.md` files, so it has nothing to do if `--no-markdown` is set.
-  It also renders a combined PDF from the same text — see above for the frame
-  renumbering that makes its pictures line up.
+- `--combine` produces one of these for the whole set: one title, one link
+  line per video (tagged `(Video N)`), one transcript block holding every
+  video's transcript in input order, and one model-written body. See the
+  `--combine` section above for how timestamps and frame numbers work there.
 
 `meeting-*` prompts keep the plain executive-summary format — no wrapper.
 

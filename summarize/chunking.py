@@ -59,12 +59,21 @@ class Chunk:
     start_s: Optional[float] = None
     end_s: Optional[float] = None
     frames: List = field(default_factory=list)
+    # Which video the slice came from, when several are summarized as one
+    # ("video 2: <title>"). Empty on a single-recording run. The window in
+    # the header is relative to that video, like every timestamp in it.
+    label: str = ""
 
     def header(self, total):
-        if self.start_s is None:
-            return f"part {self.index + 1} of {total}"
-        return (f"part {self.index + 1} of {total} "
-                f"({_hhmmss(self.start_s)}–{_hhmmss(self.end_s)})")
+        head = f"part {self.index + 1} of {total}"
+        inner = []
+        if self.label:
+            inner.append(self.label)
+        if self.start_s is not None:
+            inner.append(f"{_hhmmss(self.start_s)}–{_hhmmss(self.end_s)}")
+        if inner:
+            head += f" ({', '.join(inner)})"
+        return head
 
 
 def _hhmmss(seconds):
@@ -315,7 +324,7 @@ def chunk_by_text(transcript, frames, limit=None, overlap=None):
     if not groups:
         groups = [[transcript]]
 
-    ordered = sorted(frames, key=lambda f: f.timestamp_s)
+    ordered = sorted(frames, key=lambda f: getattr(f, "sort_key", f.timestamp_s))
     per = max(1, len(ordered) // max(1, len(groups)))
     out = []
     for i, group in enumerate(groups):
@@ -341,3 +350,73 @@ def build_chunks(transcript, frames, transcript_path=None):
                 return chunk_by_segments(split_long_segments(segments), frames)
 
     return chunk_by_text(transcript, frames)
+
+
+@dataclass
+class Part:
+    """One video of a combined summary (pipeline.sh --combine).
+
+    `label` is what the model is told the video is ("video 2: Week 2 —
+    Requirements"), `frames` are that video's frames already tagged with its
+    part number and numbered globally (see pdf.load_part_manifests), and
+    `srt_path` is the timed transcript when the pipeline produced one.
+    """
+    label: str
+    text: str
+    frames: List = field(default_factory=list)
+    srt_path: Optional[str] = None
+
+
+def part_transcript(parts):
+    """The transcript of several videos as one labelled text.
+
+    This is what the model reads when the whole set fits in one call, and
+    what the document embeds. Each video is fenced with its label so the
+    model can keep them apart — the timestamps inside restart from zero at
+    every fence, and nothing else in the text says so.
+    """
+    blocks = []
+    for part in parts:
+        blocks.append(f"=== {part.label} ===\n\n{part.text.strip()}")
+    return "\n\n".join(blocks)
+
+
+def _chunk_one_part(part, limit):
+    """Chunk a single video, always returning at least one chunk."""
+    segments = parse_srt(part.srt_path) if part.srt_path else []
+    if segments:
+        chunks = chunk_by_segments(split_long_segments(segments), part.frames,
+                                   limit=limit)
+    else:
+        chunks = chunk_by_text(part.text, part.frames, limit=limit)
+    if not chunks:
+        chunks = [Chunk(index=0, text=part.text, frames=list(part.frames))]
+    for chunk in chunks:
+        chunk.label = part.label
+    return chunks
+
+
+def build_part_chunks(parts, limit=None):
+    """Chunk several videos for one map-reduce pass.
+
+    Returns [] when everything fits in one call — the caller then sends
+    part_transcript() with every frame, so the model sees the whole set at
+    once and can relate one video to the next. Otherwise every video is
+    chunked on its own (its timestamps and frames are its own; a window
+    spanning two videos would mean nothing) and the chunks are laid end to
+    end in video order, each labelled with the video it came from.
+
+    A video is never merged into a neighbour's chunk even when both are
+    short: the label on a chunk is what the model cites the frames against,
+    and one chunk cannot carry two.
+    """
+    limit = chunk_chars() if limit is None else limit
+    total = sum(len(p.text) for p in parts)
+    if not (limit > 0 and total > limit):
+        return []
+    chunks = []
+    for part in parts:
+        chunks.extend(_chunk_one_part(part, limit))
+    for index, chunk in enumerate(chunks):
+        chunk.index = index
+    return chunks

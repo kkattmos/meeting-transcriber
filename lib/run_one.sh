@@ -4,7 +4,12 @@
 # run without touching the others.
 #
 # Usage:
-#   lib/run_one.sh --run-dir DIR [--force]
+#   lib/run_one.sh --run-dir DIR [--force] [--skip-summarize]
+#
+# --skip-summarize stops after transcribe and frames. pipeline.sh passes it to
+# every member of a --combine set: their summarize stage is left pending on
+# purpose, because the combine run (input_type "combine", below) is what
+# summarizes them — all of them, as one document.
 #
 # The clip window, like the resources list, is read back out of state.json
 # rather than passed: a resume must cut the same window the first attempt did.
@@ -46,6 +51,17 @@
 #                                                               off captions and
 #                                                               is windowed by
 #                                                               transcribe.sh)
+#
+# A combine run is the odd one out. It has no media and only one stage:
+#
+#     member 1 (transcribe, frames) ─┐
+#     member 2 (transcribe, frames) ─┼─> summarize   (summarize.py --parts)
+#     member N (transcribe, frames) ─┘
+#
+# It reads its members' transcripts and frame manifests straight out of their
+# state.json files, so it runs after they have finished — pipeline.sh waits —
+# and a `--run-id <combine id>` resume re-runs any member whose artifacts have
+# gone missing before it summarizes.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,12 +80,14 @@ PYTHON_BIN="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
 
 RUN_DIR=""
 FORCE=0
+SKIP_SUMMARIZE=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --run-dir) RUN_DIR="${2:-}"; shift 2 ;;
     --force)   FORCE=1; shift ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    --skip-summarize) SKIP_SUMMARIZE=1; shift ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "run_one.sh: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -98,6 +116,8 @@ DISPLAY_NAME="$(cfg display_name)"
 # resources list — a resume has to cut the same window the first attempt did or
 # it would summarize a different video onto the same artifact paths.
 CLIP="$(cfg clip)"
+# Set on a member of a --combine set: the combine run that summarizes it.
+COMBINED_INTO="$(cfg combined_into)"
 # Reference material for this run (slides repo / folder), one spec per line.
 # Replayed on every attempt so a resumed run summarizes against the same
 # material the first attempt used.
@@ -263,6 +283,157 @@ mark_done() {
   done
   rs done --run-dir "$RUN_DIR" --stage "$stage" "${args[@]}"
 }
+
+# --- A combine run: one summarize stage over several members' outputs -------
+# Lives up here, ahead of the per-input stages, because none of them apply:
+# there is no media to fetch, cut, transcribe or sample. Everything the
+# summarizer needs is already on disk in the member runs.
+
+do_summarize_combined() {
+  local parts_file="$1"
+  local args=(
+    "$ROOT_DIR/summarize/summarize.py"
+    --parts "$parts_file"
+    "$COMBINE_MD"
+    --run-id "$RUN_ID"
+  )
+  if [ -n "$COMBINE_PDF" ]; then
+    args+=(--pdf-out "$COMBINE_PDF")
+  else
+    args+=(--no-pdf)
+  fi
+  [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
+  local spec
+  for spec in "${RESOURCE_SPECS[@]:-}"; do
+    [ -n "$spec" ] && args+=(--resources "$spec")
+  done
+  "$PYTHON_BIN" "${args[@]}"
+}
+
+# The members' frames, swept once the combined PDF exists. Same rules as
+# cleanup_frames below — KEEP_FRAMES=1 keeps them, and so does a PDF that was
+# asked for and did not render, since re-rendering it needs them.
+cleanup_member_frames() {
+  case "$(printf '%s' "${KEEP_FRAMES:-0}" | tr 'A-Z' 'a-z')" in
+    1|true|yes|on) return 0 ;;
+  esac
+  [ -n "${FRAMES_DIR:-}" ] || return 0
+  if [ -n "$COMBINE_PDF" ] && [ ! -f "$COMBINE_PDF" ]; then
+    echo "[frames] kept — the combined PDF did not render, and re-rendering it needs them"
+    return 0
+  fi
+  local member member_frames
+  for member in "${MEMBERS[@]}"; do
+    member_frames="$FRAMES_DIR/$member"
+    [ -n "$member" ] && [ "$member_frames" != "$FRAMES_DIR" ] || continue
+    [ -d "$member_frames" ] || continue
+    rm -rf "$member_frames"
+    rs cleaned --run-dir "$RUNS_DIR/$member" --stage frames || true
+  done
+  echo "[frames] members' frames removed (KEEP_FRAMES=1 to keep them)"
+}
+
+run_combine() {
+  local member member_dir
+  echo "=================================================================="
+  echo "Combine run: $RUN_ID"
+  echo "  members:  ${MEMBERS[*]}"
+  echo "  output:   $COMBINE_MD"
+  [ -n "$COMBINE_PDF" ] && echo "  pdf:      $COMBINE_PDF"
+  echo "  prompt:   ${PROMPT_NAME:-(default)}"
+  echo "=================================================================="
+
+  if [ "$(stage_status summarize)" = "done" ]; then
+    echo "[summarize] already done — skipping (use --force to redo)"
+    echo "Summary:    $COMBINE_MD"
+    [ -n "$COMBINE_PDF" ] && [ -f "$COMBINE_PDF" ] && echo "PDF:        $COMBINE_PDF"
+    return 0
+  fi
+
+  # Every member has to have its transcript and its frames on disk. Normally
+  # they do — pipeline.sh just ran them. On a `--run-id` resume after the
+  # frames were swept (or a member was never finished) they may not, and the
+  # member is the thing that knows how to make them: run it. Frames that were
+  # swept on purpose sit at `done` with no artifacts, so the stage is reset
+  # first or the member would skip it.
+  for member in "${MEMBERS[@]}"; do
+    member_dir="$RUNS_DIR/$member"
+    if [ ! -f "$member_dir/state.json" ]; then
+      echo "[summarize] member run $member does not exist under $RUNS_DIR" >&2
+      rs fail --run-dir "$RUN_DIR" --stage summarize \
+        --error "member run $member is missing"
+      return 1
+    fi
+    local manifest
+    manifest="$(rs get --run-dir "$member_dir" --key stages.frames.artifacts.manifest 2>/dev/null || true)"
+    if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
+      echo "==> $member: frames were swept or never extracted — extracting them"
+      rs reset --run-dir "$member_dir" --stage frames
+    fi
+    if [ "$(rs status --run-dir "$member_dir" --stage transcribe)" != "done" ] \
+       || [ "$(rs status --run-dir "$member_dir" --stage frames)" != "done" ]; then
+      echo ""
+      echo "==> $member: finishing transcribe/frames before the combined summary"
+      if ! bash "$SCRIPT_DIR/run_one.sh" --run-dir "$member_dir" --skip-summarize; then
+        echo "[summarize] member $member could not be completed" >&2
+        rs fail --run-dir "$RUN_DIR" --stage summarize \
+          --error "member run $member failed; see $member_dir/logs"
+        return 1
+      fi
+    fi
+  done
+
+  # parts.json is rebuilt on every attempt rather than cached: it is a view
+  # of the members' state, and a member re-run above may have moved a path.
+  local parts_file="$RUN_DIR/parts.json"
+  if ! "$PYTHON_BIN" "$SCRIPT_DIR/combine.py" parts \
+         --runs-dir "$RUNS_DIR" --out "$parts_file" "${MEMBERS[@]}"; then
+    rs fail --run-dir "$RUN_DIR" --stage summarize \
+      --error "could not assemble parts.json from the member runs"
+    return 1
+  fi
+
+  echo ""
+  run_stage summarize do_summarize_combined "$parts_file" || return 1
+  local -a artifacts=()
+  [ -f "$COMBINE_MD" ] && artifacts+=("md=$COMBINE_MD")
+  [ -n "$COMBINE_PDF" ] && [ -f "$COMBINE_PDF" ] && artifacts+=("pdf=$COMBINE_PDF")
+  if [ "${#artifacts[@]}" -eq 0 ]; then
+    rs fail --run-dir "$RUN_DIR" --stage summarize \
+      --error "summarize exited 0 but wrote neither $COMBINE_MD nor ${COMBINE_PDF:-a PDF}"
+    echo "[summarize] produced no output files" >&2
+    return 1
+  fi
+  mark_done summarize "${artifacts[@]}" || return 1
+  cleanup_member_frames
+
+  echo ""
+  echo "=================================================================="
+  echo "Combine run complete: $RUN_ID"
+  echo "=================================================================="
+  echo "Summary:    $COMBINE_MD"
+  [ -n "$COMBINE_PDF" ] && [ -f "$COMBINE_PDF" ] && echo "PDF:        $COMBINE_PDF"
+  return 0
+}
+
+if [ "$INPUT_TYPE" = "combine" ]; then
+  RUNS_DIR="$(dirname "$RUN_DIR")"
+  declare -a MEMBERS=()
+  while IFS= read -r _m; do
+    [ -n "$_m" ] && MEMBERS+=("$_m")
+  done < <(rs get --run-dir "$RUN_DIR" --key members 2>/dev/null || true)
+  COMBINE_MD="$(cfg output_md)"
+  COMBINE_PDF="$(cfg output_pdf)"
+  if [ "${#MEMBERS[@]}" -eq 0 ] || [ -z "$COMBINE_MD" ]; then
+    echo "run_one.sh: combine run $RUN_ID has no members or no output path in state.json" >&2
+    exit 2
+  fi
+  if run_combine; then
+    exit 0
+  fi
+  echo "    Resume with:  ./pipeline.sh --run-id $RUN_ID" >&2
+  exit 1
+fi
 
 # --- Stage implementations ---------------------------------------------------
 
@@ -495,6 +666,20 @@ branch_transcribe() {
 }
 
 branch_frames() {
+  # A finished frames stage whose manifest is gone was swept on purpose after
+  # a summary (cleanup_frames below, or a combine run's). If nothing here is
+  # going to summarize, that is fine and the stage stays done — mark_done
+  # would otherwise refuse the missing manifest and fail a run that has
+  # nothing left to do. If this run IS about to summarize, the frames are
+  # needed again, and re-extracting them is cheap (the video outlives them).
+  if [ "$(stage_status frames)" = "done" ]; then
+    if [ -f "$RUN_FRAMES_DIR/manifest.json" ] || [ "$SKIP_SUMMARIZE" -eq 1 ]; then
+      echo "[frames] already done — skipping"
+      return 0
+    fi
+    echo "[frames] swept after the last summary — extracting them again"
+    rs reset --run-dir "$RUN_DIR" --stage frames
+  fi
   if [ "$INPUT_TYPE" = "youtube" ]; then
     ensure_video_fetched || return 1
     # Only here: the YouTube transcribe branch runs off captions, so it is
@@ -602,6 +787,22 @@ cleanup_frames() {
 }
 
 # --- Stage 3: summarize ------------------------------------------------------
+if [ "$SKIP_SUMMARIZE" -eq 1 ]; then
+  # A member of a --combine set. Its frames stay for the combine run to read;
+  # that run sweeps them once the combined PDF is written.
+  echo ""
+  echo "[summarize] skipped — this run is summarized together with the rest"
+  echo "            of its --combine set (run ${COMBINED_INTO:-<combine>})"
+  echo ""
+  echo "=================================================================="
+  echo "Run ready for the combined summary: $RUN_ID"
+  echo "=================================================================="
+  [ "$INPUT_TYPE" = "meeting" ] && echo "Recording:  $MP4_FILE"
+  echo "Transcript: ${TRANSCRIPT_BASE}.txt"
+  echo "Frames:     $RUN_FRAMES_DIR/manifest.json"
+  exit 0
+fi
+
 resolve_video
 echo ""
 if ! run_stage summarize do_summarize "$VIDEO_FILE"; then

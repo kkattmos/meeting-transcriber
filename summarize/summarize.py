@@ -10,6 +10,14 @@ Usage:
     python3 summarize/summarize.py <video_or_youtube_url> <transcript_path> [<output_md_path>]
         [--prompt NAME] [--frames-manifest PATH] [--resources SPEC]
         [--pdf-out PATH] [--no-pdf] [--no-markdown]
+    python3 summarize/summarize.py --parts PARTS.json <output_md_path>
+        [--prompt NAME] [--resources SPEC] [--pdf-out PATH] [--no-pdf] [--no-markdown]
+
+--parts PARTS.json summarizes several videos as ONE document (this is what
+pipeline.sh --combine runs). The file lists the videos in order, each with its
+transcript, its frames manifest and where it came from; see PARTS_FORMAT below.
+Every video keeps its own clock — the model is told which video each frame and
+each stretch of transcript belongs to, and the document says so.
 
 --prompt NAME picks which file in prompts/ to use (e.g. --prompt standup
 loads prompts/standup.md). Can also be set via the SUMMARY_PROMPT env var;
@@ -384,9 +392,78 @@ def _sweep_stale_yt_tmpdirs():
         print(f"==> Removed {removed} stale YouTube tempdir(s)")
 
 
+# One entry per video, in the order they are to be read. `transcript` is the
+# .txt; `srt` is its timed sibling (optional, but it is what lets each chunk
+# carry the right frames); `frames_manifest` may be null for a video with no
+# frames. `source` is what the document links to and `title` what it calls
+# the video — a YouTube title is looked up here when none is given.
+PARTS_FORMAT = """{
+  "parts": [
+    {"source": "https://youtu.be/...", "kind": "youtube|kaltura|local_file",
+     "title": "optional", "clip": "optional canonical window",
+     "transcript": "/path/x.txt", "srt": "/path/x.srt",
+     "frames_manifest": "/path/manifest.json"}
+  ]
+}"""
+
+
+def load_parts(parts_path):
+    """Read a --parts file into (chunking.Part list, document `videos` list).
+
+    Frames are tagged with their video's number and numbered globally across
+    all of them here, once — the same single-numbering rule load_manifest
+    follows for one recording, for the same reason.
+    """
+    from chunking import Part
+
+    data = json.loads(Path(parts_path).read_text())
+    entries = data.get("parts") or []
+    if not entries:
+        raise SystemExit(f"--parts: {parts_path} lists no videos")
+
+    frames = pdf_export.load_part_manifests(
+        [e.get("frames_manifest") for e in entries])
+    by_part = {}
+    for frame in frames:
+        by_part.setdefault(frame.part, []).append(frame)
+
+    parts, videos = [], []
+    for n, entry in enumerate(entries, start=1):
+        source = entry.get("source") or ""
+        kind = entry.get("kind") or (
+            "youtube" if is_youtube_url(source)
+            else "kaltura" if kaltura.looks_like_kaltura(source)
+            else "local_file")
+        title = entry.get("title")
+        if not title and kind == "youtube":
+            title, _upload = document.youtube_metadata(source)
+        if not title:
+            title = Path(entry["transcript"]).stem if entry.get("transcript") \
+                else f"Video {n}"
+        transcript_path = entry.get("transcript")
+        if not transcript_path or not Path(transcript_path).is_file():
+            raise SystemExit(f"--parts: video {n} has no transcript at "
+                             f"{transcript_path!r}")
+        text = Path(transcript_path).read_text().strip()
+        srt = entry.get("srt")
+        if not srt:
+            candidate = Path(transcript_path).with_suffix(".srt")
+            srt = str(candidate) if candidate.is_file() else None
+        elif not Path(srt).is_file():
+            srt = None
+        label = f"video {n} of {len(entries)}: {title}"
+        if entry.get("clip"):
+            label += f" (clip {entry['clip']})"
+        parts.append(Part(label=label, text=text, frames=by_part.get(n, []),
+                          srt_path=srt))
+        videos.append({"source": source, "kind": kind, "title": title,
+                       "clip": entry.get("clip")})
+    return parts, videos, frames
+
+
 def _wrap_document(body, *, original_input, source_url, video_path, transcript,
                    title_override, prompt_path, meeting_name, run_id=None,
-                   clip=None):
+                   clip=None, videos=None):
     """Build the course-note document around the model's summary body."""
     # The source we cite is the URL the user actually gave us. On the pipeline's
     # YouTube path, video_path is a local download, so --source-url carries the
@@ -425,11 +502,13 @@ def _wrap_document(body, *, original_input, source_url, video_path, transcript,
         # the frames are the clip's. This is the only place the reader is told
         # that their timestamps are clip-relative.
         clip=clip,
+        videos=videos,
     )
 
 
 FLAGS_WITH_VALUES = ("--prompt", "--frames-manifest", "--source-url",
-                     "--title", "--format", "--run-id", "--pdf-out", "--clip")
+                     "--title", "--format", "--run-id", "--pdf-out", "--clip",
+                     "--parts")
 # Repeatable: several --resources build up a list rather than overwriting.
 REPEATABLE_FLAGS = ("--resources",)
 # Presence-only switches.
@@ -587,8 +666,123 @@ def write_outputs(summary, output_path, *, write_markdown, write_pdf,
     return written
 
 
+def _select_backend_banner():
+    backend = os.environ.get("SUMMARY_BACKEND",
+                             llm_client.DEFAULT_BACKEND).lower()
+    if backend == "fallback":
+        chain = os.environ.get("SUMMARY_FALLBACK_CHAIN",
+                               llm_client.DEFAULT_FALLBACK_CHAIN)
+        print(f"==> Summarizing with fallback chain: {chain}")
+    else:
+        print(f"==> Summarizing with backend: {backend}")
+
+
+def main_parts(argv, options):
+    """The --parts path: several videos, one summary, one document.
+
+    Mirrors main() stage for stage, except that the transcript the model
+    reads is every video's in order, fenced with its label, and the frames
+    are every video's, numbered once across the set. Above the chunk limit
+    each video is chunked on its own and the chunks merged as usual — see
+    chunking.build_part_chunks.
+    """
+    from chunking import build_part_chunks, part_transcript
+
+    prompt_name = options.get("prompt") or os.environ.get("SUMMARY_PROMPT")
+    title_override = options.get("title")
+    doc_format = options.get("format") or os.environ.get("SUMMARY_DOC_FORMAT", "auto")
+    run_id = options.get("run_id")
+    resource_specs = options.get("resources") or botresources.parse_specs_arg(
+        os.environ.get("RESOURCES", ""))
+    write_markdown = options.get("write_markdown", pdf_export.want_markdown())
+    write_pdf = options.get("write_pdf", pdf_export.want_pdf())
+    pdf_out = options.get("pdf_out")
+
+    if len(argv) < 2:
+        print(f"Usage: {argv[0]} --parts PARTS.json <output_md_path> "
+              f"[--prompt NAME] [--resources SPEC] [--pdf-out PATH] "
+              f"[--no-pdf] [--no-markdown] [--title TEXT] "
+              f"[--format auto|always|never] [--run-id ID]")
+        sys.exit(1)
+    output_path = argv[1]
+    if pdf_out:
+        pdf_path = pdf_out
+    elif write_pdf:
+        pdf_path = str(botpaths.get_dir("PDF_DIR", create=True)
+                       / (Path(output_path).stem + ".pdf"))
+    else:
+        pdf_path = None
+
+    parts, videos, frames = load_parts(options["parts"])
+    print(f"==> Summarizing {len(parts)} videos as one document")
+    for part, video in zip(parts, videos):
+        print(f"    {part.label}: {len(part.text)} chars, "
+              f"{len(part.frames)} frames"
+              + (" (no .srt — frames shared out by position)"
+                 if not part.srt_path else ""))
+    if not frames:
+        # Same rule as a single run: a document with no pictures at all is
+        # not what anyone asked for, and it usually means the frames stage
+        # was swept or never ran.
+        raise SystemExit("No frames in any of the parts' manifests.")
+
+    prompt_path = resolve_prompt_path(prompt_name)
+    print(f"==> Using prompt: {prompt_path}")
+    prompt_template = load_prompt_template(prompt_path)
+    resource_bundle = load_resources(resource_specs)
+    prompt_template = inject_resources(prompt_template, resource_bundle)
+
+    _select_backend_banner()
+    transcript = part_transcript(parts)
+    chunks = build_part_chunks(parts)
+    if chunks:
+        summary = summarize_chunked(chunks, prompt_template, summarize)
+    else:
+        summary = summarize(frames, transcript, prompt_template)
+
+    # The document's one title: the operator's, else the first video's. It
+    # is resolved here so _wrap_document does not look the YouTube title up a
+    # second time.
+    title = title_override or next(
+        (v["title"] for v in videos if v.get("title")), None)
+    if document.wants_wrapper(prompt_name, doc_format):
+        summary = _wrap_document(
+            summary,
+            original_input=videos[0]["source"],
+            source_url=videos[0]["source"],
+            video_path=None,
+            transcript=transcript,
+            title_override=title,
+            prompt_path=prompt_path,
+            meeting_name=Path(output_path).stem,
+            run_id=run_id,
+            videos=videos,
+        )
+
+    write_outputs(
+        summary, output_path,
+        write_markdown=write_markdown,
+        write_pdf=write_pdf,
+        pdf_path=pdf_path,
+        frames=frames,
+        resources=resource_bundle,
+        source=videos[0]["source"],
+        title=title,
+    )
+
+    preview_lines = summary.splitlines()[:30]
+    print("")
+    print("--- preview ---")
+    print("\n".join(preview_lines))
+    if len(summary.splitlines()) > 30:
+        print(f"... ({len(summary.splitlines()) - 30} more lines in {output_path})")
+
+
 def main():
     argv, options = _extract_flags(sys.argv)
+    if options.get("parts"):
+        main_parts(argv, options)
+        return
     prompt_name = options.get("prompt") or os.environ.get("SUMMARY_PROMPT")
     manifest_arg = options.get("frames_manifest")
     source_url = options.get("source_url")
@@ -699,14 +893,7 @@ def main():
 
         # 5. Call the LLM. Dispatch and transient-failure handling live in
         #    llm_client/retry.py; here we only decide single-call vs chunked.
-        backend = os.environ.get("SUMMARY_BACKEND",
-                                 llm_client.DEFAULT_BACKEND).lower()
-        if backend == "fallback":
-            chain = os.environ.get("SUMMARY_FALLBACK_CHAIN",
-                                   llm_client.DEFAULT_FALLBACK_CHAIN)
-            print(f"==> Summarizing with fallback chain: {chain}")
-        else:
-            print(f"==> Summarizing with backend: {backend}")
+        _select_backend_banner()
 
         chunks = build_chunks(transcript, frames, transcript_path)
         if chunks:

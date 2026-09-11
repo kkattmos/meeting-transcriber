@@ -121,20 +121,39 @@ while i < len(argv):
         flags.setdefault(argv[i], []); i += 1
     else:
         args.append(argv[i]); i += 1
+# Record what we were handed so the tests can assert on it.
+with open(os.environ["STUB_SUMMARIZE_ARGS"], "w") as fh:
+    fh.write("\n".join(argv))
+if "--parts" in flags:
+    # The --combine path: one call over every member's transcript + frames.
+    # The parts file is what the tests inspect; the "summary" it writes
+    # names each part so the document proves it saw all of them.
+    import json
+    parts = json.load(open(flags["--parts"][0]))["parts"]
+    for i, part in enumerate(parts, start=1):
+        assert os.path.isfile(part["transcript"]), f"part {i}: no transcript"
+        assert os.path.isfile(part["frames_manifest"]), f"part {i}: no manifest"
+    out = args[0]
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    body = "\n".join(f"video {i}: {p['source']}" for i, p in enumerate(parts, start=1))
+    open(out, "w").write(f"<!-- meeting-transcriber\n     source_type: combined\n-->\n\n"
+                         f"Chapter N — <topic> (<date>)\n\n# Stub combined\n\n{body}\n\n"
+                         f"See (Frame 3 @ video 2 9.0s).\n\n<br><br>\n")
+    print(f"stub: combined summary of {len(parts)} parts -> {out}")
+    if "--pdf-out" in flags and os.environ.get("STUB_SUMMARIZE_NO_PDF") != "1":
+        pdf = flags["--pdf-out"][0]
+        os.makedirs(os.path.dirname(pdf), exist_ok=True)
+        open(pdf, "wb").write(b"%PDF-1.4 stub\n")
+        print(f"stub: pdf -> {pdf}")
+    sys.exit(0)
 # Assert the orchestrator handed us a pre-extracted manifest rather than making
 # us re-run frame extraction, and told us where the PDF goes (PDF_DIR is not
 # derivable from the .md path — the two directories are configured separately).
 assert "--frames-manifest" in flags, "pipeline must pass --frames-manifest"
 assert "--pdf-out" in flags, "pipeline must pass --pdf-out"
-# Record what we were handed so the tests can assert on it.
-with open(os.environ["STUB_SUMMARIZE_ARGS"], "w") as fh:
-    fh.write("\n".join(argv))
 out = args[2]
 os.makedirs(os.path.dirname(out), exist_ok=True)
 if os.environ.get("STUB_SUMMARIZE_NO_MARKDOWN") != "1":
-    # The citation is what makes --combine's frame renumbering observable:
-    # the stub frames manifest has 2 frames per run, so section N's "Frame 1"
-    # must come out as Frame 1, 3, 5, ... in the combined document.
     open(out, "w").write(f"<!-- meeting-transcriber\n     source: x\n-->\n\n"
                          f"Chapter N — <topic> (<date>)\n\n# Stub\n\nsummary of {args[0]}\n\n"
                          f"See (Frame 1 @ 0:00:01).\n\n<br><br>\n")
@@ -363,7 +382,8 @@ out=$(pipeline "https://www.youtube.com/watch?v=aaaaaaaaaaa" \
                --jobs 3 --combine "$TESTROOT/chapter.md" 2>&1)
 check "multi: exits 0" "$?" "0"
 after=$(ls -1 "$RUNS" | wc -l)
-check "multi: created 3 runs" "$((after - before))" "3"
+# Three members plus the combine run.
+check "multi: created 3 member runs and 1 combine run" "$((after - before))" "4"
 for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
   ls -d "$RUNS/yt_${vid}_"* >/dev/null 2>&1 && ok "multi: run for $vid" || bad "multi: no run for $vid"
 done
@@ -372,41 +392,131 @@ check "multi: one Chapter line in combined file" \
   "$(grep -c 'Chapter N' "$TESTROOT/chapter.md")" "1"
 echo "$out" | grep -q "3 run(s), up to 3 at a time" && ok "multi: honored --jobs 3" || bad "multi: --jobs not honored"
 
-# --- The combined PDF -------------------------------------------------------
-# Every section's summary cites "Frame 1", and every run's stub manifest holds
-# 2 frames. Frame numbers are unique only inside one recording, so the combined
-# document has to renumber them 1 / 3 / 5 — otherwise the PDF resolves all
-# three citations to the first lecture's first frame and nothing errors.
-check "multi: section 1 keeps Frame 1" \
-  "$(grep -c 'Frame 1 @' "$TESTROOT/chapter.md")" "1"
-check "multi: section 2 renumbered to Frame 3" \
-  "$(grep -c 'Frame 3 @' "$TESTROOT/chapter.md")" "1"
-check "multi: section 3 renumbered to Frame 5" \
-  "$(grep -c 'Frame 5 @' "$TESTROOT/chapter.md")" "1"
-# Default PDF path is the combined markdown's, with a .pdf extension. The
-# render itself needs weasyprint; without it the run must still succeed and say
-# so, because the markdown is the artifact.
-# Ask the interpreter pipeline.sh will actually use, not this shell's python3.
-if "${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3" \
-     -c "import weasyprint, markdown" 2>/dev/null; then
-  [ -f "$TESTROOT/chapter.pdf" ] && ok "multi: combined pdf written" \
-    || bad "multi: no combined pdf"
-else
-  echo "$out" | grep -qi "combined PDF" \
-    && ok "multi: combined pdf degraded to a warning (no weasyprint)" \
-    || bad "multi: no word about the combined pdf"
-fi
-# pipeline.sh defers run_one.sh's frame sweep so the combined render can still
-# see them, then sweeps them itself. Either way nothing is left behind.
+# --- The combined summary is ONE summarize call over every member ----------
+# --combine no longer staples three summaries together: the members stop after
+# transcribe + frames (their summarize stage stays pending, on purpose), and a
+# fourth run — the combine run — hands every transcript and manifest to
+# summarize.py --parts in input order.
+for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
+  for d in "$RUNS"/yt_${vid}_*; do
+    check "multi: $vid transcribed" "$(state status --run-dir "$d" --stage transcribe)" "done"
+    check "multi: $vid summarize left pending (combine run owns it)" \
+      "$(state status --run-dir "$d" --stage summarize)" "pending"
+    [ -f "$SUMMARIES_DIR/$(basename "$d").md" ] \
+      && bad "multi: $vid got an individual summary anyway" \
+      || ok "multi: $vid has no individual summary"
+  done
+done
+combine_run="$(ls -d "$RUNS"/combine_3x_* 2>/dev/null | head -n 1)"
+[ -n "$combine_run" ] && ok "multi: combine run created ($(basename "$combine_run"))" \
+  || bad "multi: no combine run directory"
+check "multi: combine run summarize done" \
+  "$(state status --run-dir "$combine_run" --stage summarize)" "done"
+check "multi: combine run records the markdown" \
+  "$(state get --run-dir "$combine_run" --key stages.summarize.artifacts.md)" "$TESTROOT/chapter.md"
+# Members point back at the combine run, so --resume-all leaves them alone.
+for d in "$RUNS"/yt_aaaaaaaaaaa_*; do
+  check "multi: member records its combine run" \
+    "$(state get --run-dir "$d" --key combined_into)" "$(basename "$combine_run")"
+done
+# The parts file is the whole contract with summarize.py: every member, in
+# INPUT order (runs finish out of order at --jobs 3), each with its own
+# transcript and manifest.
+parts="$combine_run/parts.json"
+[ -f "$parts" ] && ok "multi: parts.json written" || bad "multi: no parts.json"
+check "multi: parts.json lists 3 videos" \
+  "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["parts"]))' "$parts")" "3"
+check "multi: parts in input order" \
+  "$(python3 -c 'import json,sys; print(" ".join(p["source"].split("=")[-1].split("/")[-1] for p in json.load(open(sys.argv[1]))["parts"]))' "$parts")" \
+  "aaaaaaaaaaa bbbbbbbbbbb ccccccccccc"
+check "multi: each part has its own manifest" \
+  "$(python3 -c 'import json,sys; ps=json.load(open(sys.argv[1]))["parts"]; print(len({p["frames_manifest"] for p in ps}))' "$parts")" "3"
+grep -q "^--parts$" "$STUB_SUMMARIZE_ARGS" && ok "multi: summarize.py called with --parts" \
+  || bad "multi: summarize.py not called with --parts"
+grep -q "^--pdf-out$" "$STUB_SUMMARIZE_ARGS" && ok "multi: combined pdf requested" \
+  || bad "multi: no --pdf-out for the combined pdf"
+check "multi: combined document names all three videos" \
+  "$(grep -c '^video [0-9]: ' "$TESTROOT/chapter.md")" "3"
+[ -f "$TESTROOT/chapter.pdf" ] && ok "multi: combined pdf written" || bad "multi: no combined pdf"
+echo "$out" | grep -q "(combined summary)" && ok "multi: report names the combined summary" \
+  || bad "multi: report silent about the combined summary"
+# The members' frames are swept by the combine run once the PDF exists.
 leftover=0
 for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
   for d in "$FRAMES_DIR/yt_${vid}_"*; do
     [ -d "$d" ] && leftover=$((leftover + 1))
   done
 done
-check "multi: frames swept after the combined render" "$leftover" "0"
+check "multi: members' frames swept after the combined render" "$leftover" "0"
+
+echo "--- Re-running the same command resumes the combined summary, not a new one"
+: > "$STUB_SUMMARIZE_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=aaaaaaaaaaa" \
+               "https://youtu.be/bbbbbbbbbbb" \
+               "https://www.youtube.com/watch?v=ccccccccccc" \
+               --jobs 3 --combine "$TESTROOT/chapter.md" 2>&1)
+check "multi resume: exits 0" "$?" "0"
+check "multi resume: no new combine run" "$(ls -d "$RUNS"/combine_3x_* | wc -l)" "1"
+[ -s "$STUB_SUMMARIZE_ARGS" ] && bad "multi resume: summarize ran again" \
+  || ok "multi resume: summarize not re-run (already done)"
+echo "$out" | grep -q "already done" && ok "multi resume: says summarize was done" \
+  || bad "multi resume: no 'already done'"
+
+echo "--- --run-id on the combine run after --force re-extracts swept frames"
+: > "$STUB_SUMMARIZE_ARGS"
+out=$(pipeline --run-id "$(basename "$combine_run")" --force 2>&1)
+check "combine --force: exits 0" "$?" "0"
+grep -q "^--parts$" "$STUB_SUMMARIZE_ARGS" && ok "combine --force: summarized again" \
+  || bad "combine --force: summarize did not run"
+echo "$out" | grep -q "frames were swept" && ok "combine --force: re-extracted the swept frames" \
+  || bad "combine --force: did not notice the swept frames"
+
+echo "--- A failed member blocks the combined summary, and the same command resumes both"
+touch "$STUB_FAIL_TRANSCRIBE"
+: > "$STUB_SUMMARIZE_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=hhhhhhhhhhh" \
+               "https://youtu.be/iiiiiiiiiii" \
+               --combine "$TESTROOT/partial.md" 2>&1)
+check "member fail: exits 1" "$?" "1"
+[ -s "$STUB_SUMMARIZE_ARGS" ] && bad "member fail: summarize ran on an incomplete set" \
+  || ok "member fail: summarize not attempted"
+echo "$out" | grep -q "Combined summary not attempted" && ok "member fail: says why" \
+  || bad "member fail: no explanation"
+[ -f "$TESTROOT/partial.md" ] && bad "member fail: wrote a combined file anyway" \
+  || ok "member fail: no combined file"
+rm -f "$STUB_FAIL_TRANSCRIBE"
+before=$(ls -1 "$RUNS" | wc -l)
+out=$(pipeline "https://www.youtube.com/watch?v=hhhhhhhhhhh" \
+               "https://youtu.be/iiiiiiiiiii" \
+               --combine "$TESTROOT/partial.md" 2>&1)
+check "member fail resume: exits 0" "$?" "0"
+after=$(ls -1 "$RUNS" | wc -l)
+check "member fail resume: no new runs (members and combine run resumed)" "$((after - before))" "0"
+[ -f "$TESTROOT/partial.md" ] && ok "member fail resume: combined file written" \
+  || bad "member fail resume: no combined file"
+
+echo "--- --resume-all leaves combine members to their combine run"
+# Make a fresh set whose combine summarize fails, then --resume-all.
+touch "$STUB_FAIL_SUMMARIZE"
+out=$(pipeline "https://www.youtube.com/watch?v=jjjjjjjjjjj" \
+               --combine "$TESTROOT/ra.md" 2>&1)
+check "resume-all setup: combine summarize failed" "$?" "1"
+rm -f "$STUB_FAIL_SUMMARIZE"
+: > "$STUB_SUMMARIZE_ARGS"
+out=$(pipeline --resume-all 2>&1)
+check "resume-all: exits 0" "$?" "0"
+echo "$out" | grep -q "resumed through it" && ok "resume-all: skipped the member" \
+  || bad "resume-all: did not skip the member"
+grep -q "^--parts$" "$STUB_SUMMARIZE_ARGS" && ok "resume-all: ran the combine run" \
+  || bad "resume-all: combine run not resumed"
+for d in "$RUNS"/yt_jjjjjjjjjjj_*; do
+  check "resume-all: member still has no individual summary" \
+    "$(state status --run-dir "$d" --stage summarize)" "pending"
+done
+[ -f "$TESTROOT/ra.md" ] && ok "resume-all: combined file written" || bad "resume-all: no combined file"
 
 echo "--- --no-combine-pdf writes only the markdown"
+: > "$STUB_SUMMARIZE_ARGS"
 out=$(pipeline "https://www.youtube.com/watch?v=ddddddddddd" \
                "https://youtu.be/eeeeeeeeeee" \
                --combine "$TESTROOT/nopdf.md" --no-combine-pdf 2>&1)
@@ -415,17 +525,21 @@ check "no-combine-pdf: exits 0" "$?" "0"
   || bad "no-combine-pdf: no markdown"
 [ -f "$TESTROOT/nopdf.pdf" ] && bad "no-combine-pdf: wrote a pdf anyway" \
   || ok "no-combine-pdf: no pdf written"
-# No PDF means no renumbering: a reader of the .md resolves "Frame 1" against
-# that section's own recording, so both sections keep their own numbering.
-check "no-combine-pdf: citations left alone" \
-  "$(grep -c 'Frame 1 @' "$TESTROOT/nopdf.md")" "2"
+grep -q "^--no-pdf$" "$STUB_SUMMARIZE_ARGS" && ok "no-combine-pdf: summarize told --no-pdf" \
+  || bad "no-combine-pdf: summarize not told --no-pdf"
+# No PDF to wait for, so the frames go straight away.
+leftover=0
+for d in "$FRAMES_DIR"/yt_ddddddddddd_* "$FRAMES_DIR"/yt_eeeeeeeeeee_*; do
+  [ -d "$d" ] && leftover=$((leftover + 1))
+done
+check "no-combine-pdf: members' frames swept" "$leftover" "0"
 
 echo "--- --combine-pdf names the file"
 out=$(pipeline "https://www.youtube.com/watch?v=fffffffffff" \
                --combine "$TESTROOT/named.md" \
                --combine-pdf "$TESTROOT/somewhere else.pdf" 2>&1)
 check "combine-pdf: exits 0" "$?" "0"
-echo "$out" | grep -q "somewhere else.pdf" \
+[ -f "$TESTROOT/somewhere else.pdf" ] \
   && ok "combine-pdf: honored the path (with a space in it)" \
   || bad "combine-pdf: path not used"
 
@@ -436,6 +550,12 @@ check "keep-frames: exits 0" "$?" "0"
 kept=0
 for d in "$FRAMES_DIR/yt_ggggggggggg_"*; do [ -d "$d" ] && kept=1; done
 check "keep-frames: frames kept" "$kept" "1"
+
+echo "--- --combine refuses the resume-only forms"
+out=$(pipeline --resume-last --combine "$TESTROOT/x.md" 2>&1)
+check "combine + --resume-last: exits 1" "$?" "1"
+echo "$out" | grep -q "takes inputs" && ok "combine + --resume-last: clear error" \
+  || bad "combine + --resume-last: no clear error"
 
 echo "--- --from-file"
 cat > "$TESTROOT/links.txt" <<EOF
@@ -1035,8 +1155,15 @@ out=$(pipeline "https://www.youtube.com/watch?v=tcomb00000001#t=00:00:00-01:16:0
 check "t=/combine: exits 0" "$?" "0"
 [ -f "$COMBINED" ] && ok "t=/combine: one document for three windows" \
   || bad "t=/combine: no combined document"
-check "t=/combine: all three sections present" \
-  "$(grep -c "^# " "$COMBINED")" "3"
+check "t=/combine: all three videos in the one summary" \
+  "$(grep -c "^video [0-9]: " "$COMBINED")" "3"
+# The clip label travels into parts.json, so the document can say which
+# video was a window and summarize.py can label it.
+tparts="$(ls -d "$RUNS"/combine_3x_* | while read -r d; do
+  [ "$(state get --run-dir "$d" --key output_md)" = "$COMBINED" ] && echo "$d/parts.json"; done | head -n 1)"
+check "t=/combine: clip labels reach parts.json" \
+  "$(python3 -c 'import json,sys; print(" ".join(str(p["clip"]) for p in json.load(open(sys.argv[1]))["parts"]))' "$tparts")" \
+  "00:00:00-01:16:04 None 00:00:00-00:23:00"
 
 echo ""
 echo "=================================================================="

@@ -298,6 +298,17 @@ def main():
     # Repeatable: the slides/reference sources for this run, replayed to
     # summarize.py on every attempt so a resume uses the same material.
     p.add_argument("--resources", action="append", default=None)
+    # A --combine run (input_type "combine") has no media of its own: it
+    # summarizes the transcripts and frames of these member runs, in this
+    # order, into --output-md / --output-pdf. Stored so `--run-id <combine>`
+    # resumes against the same members and lands on the same files.
+    p.add_argument("--members", action="append", default=None)
+    p.add_argument("--output-md")
+    p.add_argument("--output-pdf")
+    # The other direction, on each member: the combine run it feeds. Its
+    # summarize stage is deliberately left pending — the combine run is what
+    # summarizes it — and this is how --resume-all knows not to "finish" it.
+    p.add_argument("--combined-into")
 
     p = with_run_dir(sub.add_parser("status"))
     p.add_argument("--stage", required=True)
@@ -408,10 +419,19 @@ def main():
     state = RunState(args.run_dir)
 
     if args.cmd == "init":
-        state.init(input=args.input, input_type=args.input_type, name=args.name,
-                   safe_name=args.safe_name, language=args.language,
-                   prompt=args.prompt, display_name=args.display_name,
-                   clip=args.clip, resources=args.resources or [])
+        meta = dict(input=args.input, input_type=args.input_type,
+                    name=args.name, safe_name=args.safe_name,
+                    language=args.language, prompt=args.prompt,
+                    display_name=args.display_name, clip=args.clip,
+                    combined_into=args.combined_into,
+                    members=args.members, output_md=args.output_md,
+                    output_pdf=args.output_pdf)
+        # `init` with no --resources still records an empty list — except
+        # when it is only stamping --combined-into on an existing member,
+        # which must not blank the resources that member was created with.
+        if args.combined_into is None:
+            meta["resources"] = args.resources or []
+        state.init(**meta)
         return 0
 
     if args.cmd == "status":
@@ -463,6 +483,15 @@ def main():
         if data.get("clip"):
             print(f"clip:       {data.get('clip')}"
                   "  (output timestamps are relative to it)")
+        if data.get("members"):
+            print("members:    " + ", ".join(data["members"])
+                  + "  (summarized together into one document)")
+            print(f"output:     {data.get('output_md')}")
+            if data.get("output_pdf"):
+                print(f"pdf:        {data.get('output_pdf')}")
+        if data.get("combined_into"):
+            print(f"combined:   into run {data['combined_into']}"
+                  "  (its summarize stage runs there, not here)")
         print(f"name:       {data.get('name')}  (safe: {data.get('safe_name')})")
         print(f"language:   {data.get('language')}   prompt: {data.get('prompt') or '(default)'}")
         print(f"created:    {data.get('created_at')}")

@@ -169,13 +169,15 @@ Body text citing *(Frame 2 @ 30.0s)* and again (Frame 2).
 
 
 class CombinedDocumentTest(unittest.TestCase):
-    """--combine: several recordings rendered into one PDF.
+    """--combine: several videos summarized as one, rendered into one PDF.
 
-    The hazard here is the one assign_numbers exists to prevent, one level up.
-    Frame numbers are unique only inside the recording they came from, so two
-    sections both citing "Frame 2" mean two different pictures — and rendering
-    them without renumbering produces a PDF that looks perfectly fine and has
-    half its pictures wrong.
+    The frames of every video go through the model and the PDF under ONE
+    numbering, assigned once over the whole set (pdf.load_part_manifests).
+    Numbering each manifest on its own is how two videos both end up with a
+    "Frame 2" naming different pictures — a PDF that looks perfectly fine
+    and has half its pictures wrong. The other half of the contract is that a
+    frame's timestamp stays relative to its own video, so the caption has to
+    say which video it is from.
     """
 
     def _manifest(self, directory, count, start_at=0.0):
@@ -201,103 +203,83 @@ class CombinedDocumentTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_merge_shifts_each_manifest_past_the_ones_before_it(self):
+    def test_part_manifests_are_numbered_once_in_video_order(self):
         a = self._manifest(self.dir / "a", 3)
         b = self._manifest(self.dir / "b", 2)
         c = self._manifest(self.dir / "c", 4)
-        frames, offsets = pdf_export.merge_manifests([a, b, c])
-        self.assertEqual(offsets, [0, 3, 5])
+        frames = pdf_export.load_part_manifests([a, b, c])
         self.assertEqual([f.number for f in frames],
                          [1, 2, 3, 4, 5, 6, 7, 8, 9])
-        # Every number resolves to a file from the right recording.
-        by_number = {f.number: f.path for f in frames}
-        self.assertIn("/a/", by_number[1])
-        self.assertIn("/b/", by_number[4])
-        self.assertIn("/c/", by_number[6])
+        self.assertEqual([f.part for f in frames],
+                         [1, 1, 1, 2, 2, 3, 3, 3, 3])
+        # Every number resolves to a file from the right video, and the
+        # timestamps restart with each one.
+        by_number = {f.number: f for f in frames}
+        self.assertIn("/a/", by_number[1].path)
+        self.assertIn("/b/", by_number[4].path)
+        self.assertEqual(by_number[4].timestamp_s, 0.0)
+        self.assertIn("/c/", by_number[6].path)
 
-    def test_a_source_with_no_frames_still_takes_its_slot(self):
-        # Drop the empty slot and every later section shifts by the wrong
-        # amount — with no error and no visible symptom but wrong pictures.
+    def test_a_video_with_no_frames_still_counts_as_a_part(self):
+        # Drop the empty slot and every later video is tagged with the wrong
+        # number — its frames would then be captioned as another video's.
         a = self._manifest(self.dir / "a", 2)
         c = self._manifest(self.dir / "c", 2)
-        frames, offsets = pdf_export.merge_manifests([a, None, c])
-        self.assertEqual(offsets, [0, 2, 2])
+        frames = pdf_export.load_part_manifests([a, None, c])
         self.assertEqual([f.number for f in frames], [1, 2, 3, 4])
+        self.assertEqual([f.part for f in frames], [1, 1, 3, 3])
 
-    def test_merging_does_not_mutate_the_loaded_frames(self):
-        # dataclasses.replace, not in-place: pdf.py crops the originals and a
-        # renumber that reached back into them would corrupt a later render.
+    def test_a_single_manifest_is_not_tagged_with_a_part(self):
         a = self._manifest(self.dir / "a", 2)
-        b = self._manifest(self.dir / "b", 2)
-        pdf_export.merge_manifests([a, b])
-        again = pdf_export.load_manifest_frames(b)
-        self.assertEqual([f.number for f in again], [1, 2])
+        frames = pdf_export.load_manifest_frames(a)
+        self.assertEqual([f.part for f in frames], [0, 0])
+        self.assertEqual([f.number for f in frames], [0, 0])   # caller numbers
 
     @unittest.skipIf(Image is None, "Pillow not installed")
-    def test_citations_resolve_to_the_right_recording_end_to_end(self):
-        """The whole point, from two summaries to prepared pictures."""
+    def test_citations_resolve_to_the_right_video_end_to_end(self):
+        """The whole point: one citation per video, each to its own picture."""
         sys.path.insert(0, str(SCRIPT_DIR))
         import document
 
         a = self._manifest(self.dir / "a", 3)
         b = self._manifest(self.dir / "b", 3)
-        paths = []
-        for i, name in enumerate(("A", "B")):
-            doc = self.dir / f"{name}.md"
-            doc.write_text(document.build_document(
-                f"Lecture {name} shows (Frame 2 @ 0:00:30).",
-                source=f"https://youtu.be/{name}", source_kind="youtube",
-                title=f"Lecture {name}", transcript=f"words for {name}"))
-            paths.append(doc)
+        frames = pdf_export.load_part_manifests([a, b])
+        doc = document.build_document(
+            "Video 1 shows (Frame 2 @ video 1 30.0s); video 2 shows "
+            "(Frame 5 @ video 2 30.0s).",
+            source="https://youtu.be/A", source_kind="youtube",
+            transcript="words for A\n\nwords for B",
+            videos=[{"source": "https://youtu.be/A", "kind": "youtube",
+                     "title": "Lecture A"},
+                    {"source": "https://youtu.be/B", "kind": "youtube",
+                     "title": "Lecture B"}])
 
-        frames, offsets = pdf_export.merge_manifests([a, b])
-        combined = document.combine_documents(paths, frame_offsets=offsets)
-
-        # Section A keeps Frame 2; section B's became Frame 5.
-        self.assertIn("Lecture A shows (Frame 2 @ 0:00:30)", combined)
-        self.assertIn("Lecture B shows (Frame 5 @ 0:00:30)", combined)
-
-        body, transcript, _ = pdf_export._split_document(combined)
+        body, transcript, prov = pdf_export._split_document(doc)
+        self.assertEqual(prov.get("source_type"), "combined")
+        self.assertIn("words for B", transcript)
         cited = pdf_export._cited_frame_numbers(body)
         self.assertEqual(sorted(cited), [2, 5])
 
         prepared = pdf_export._prepare_frames(
             frames, self.dir / "work", wanted=set(cited))
         self.assertEqual(sorted(prepared), [2, 5])
-        # And each one is a picture from its own lecture, not the other's.
-        self.assertIn("/a/", pdf_export.load_manifest_frames(a)[1].path)
-        self.assertIn(str(self.dir / "a"), str(
-            [f.path for f in frames if f.number == 2][0]))
-        self.assertIn(str(self.dir / "b"), str(
-            [f.path for f in frames if f.number == 5][0]))
+        self.assertIn(str(self.dir / "a"),
+                      [f.path for f in frames if f.number == 2][0])
+        self.assertIn(str(self.dir / "b"),
+                      [f.path for f in frames if f.number == 5][0])
+        # The same 30.0s in two videos: the caption tells them apart.
+        self.assertEqual(prepared[2]["part"], 1)
+        self.assertEqual(prepared[5]["part"], 2)
+        sheet = pdf_export._appendix_frames(prepared)
+        self.assertIn("Frame 2 — Video 1, 00:30", sheet)
+        self.assertIn("Frame 5 — Video 2, 00:30", sheet)
 
-    def test_every_transcript_is_lifted_out_not_just_the_first(self):
-        sys.path.insert(0, str(SCRIPT_DIR))
-        import document
-
-        with tempfile.TemporaryDirectory() as tmp:
-            paths = []
-            for name in ("A", "B", "C"):
-                doc = Path(tmp) / f"{name}.md"
-                doc.write_text(document.build_document(
-                    f"body {name}", source=f"https://youtu.be/{name}",
-                    source_kind="youtube", title=f"Lecture {name}",
-                    transcript=f"transcript of {name}"))
-                paths.append(doc)
-            combined = document.combine_documents(paths)
-
-        body, transcript, _ = pdf_export._split_document(combined)
-        for name in ("A", "B", "C"):
-            self.assertIn(f"transcript of {name}", transcript)
-            self.assertIn(f"# Lecture {name}", body)
-        # None of the markup leaks into the visible body.
-        self.assertNotIn("<details>", body)
-        self.assertNotIn("View Transcript", body)
-        # ...and neither do the <br> separators that followed each block.
-        # What is left is exactly the two-<br> section separator per lecture:
-        # a stray third would be the one build_document puts after <details>,
-        # which the count=1 sub used to strip from only the first section.
-        self.assertEqual(body.count("<br>"), 6)
+    def test_a_single_recording_caption_names_no_video(self):
+        prepared = {3: {"path": "/x.jpg", "timestamp": 30.0,
+                        "kind": "periodic", "part": 0}}
+        sheet = pdf_export._appendix_frames(prepared)
+        self.assertIn("Frame 3 — 00:30", sheet)
+        self.assertNotIn("Video", sheet)
 
     @unittest.skipUnless(HAVE_RENDERER and Image is not None,
                          "weasyprint/markdown/Pillow not installed")
@@ -307,19 +289,18 @@ class CombinedDocumentTest(unittest.TestCase):
 
         a = self._manifest(self.dir / "a", 3)
         b = self._manifest(self.dir / "b", 3)
-        paths = []
-        for name in ("A", "B"):
-            doc = self.dir / f"{name}.md"
-            doc.write_text(document.build_document(
-                f"Lecture {name} shows (Frame 2 @ 0:00:30).",
-                source=f"https://youtu.be/{name}", source_kind="youtube",
-                title=f"Lecture {name}", transcript=f"words for {name}"))
-            paths.append(doc)
-        frames, offsets = pdf_export.merge_manifests([a, b])
-        combined = document.combine_documents(paths, frame_offsets=offsets)
+        frames = pdf_export.load_part_manifests([a, b])
+        doc = document.build_document(
+            "Lecture A shows (Frame 2 @ video 1 30.0s); B shows "
+            "(Frame 5 @ video 2 30.0s).",
+            source="https://youtu.be/A", source_kind="youtube",
+            transcript="words for A and B",
+            videos=[{"source": "https://youtu.be/A", "kind": "youtube",
+                     "title": "Lecture A"},
+                    {"source": "https://youtu.be/B", "kind": "youtube"}])
 
         out = self.dir / "chapter.pdf"
-        pdf_export.render(combined, out, frames=frames, title="chapter")
+        pdf_export.render(doc, out, frames=frames, title="chapter")
         self.assertTrue(out.is_file())
         self.assertGreater(out.stat().st_size, 1000)
         # The scratch directory render() invented is its own to remove.

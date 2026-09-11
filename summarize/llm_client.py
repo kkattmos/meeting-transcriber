@@ -214,8 +214,21 @@ class FrameMeta:
     kind: str  # "scene_change" or "periodic"
     path: str
     number: int = 0
+    # Which video this frame came from when several are summarized as one
+    # (pipeline.sh --combine), 1-based; 0 for a single-recording run. The
+    # timestamp stays relative to that video, so the part is what keeps two
+    # frames at "410.0s" from being the same moment.
+    part: int = 0
+
+    @property
+    def sort_key(self):
+        """Chronological order across videos: by part first, then time."""
+        return (self.part, self.timestamp_s)
 
     def label(self, idx):
+        if self.part:
+            return (f"[frame {idx} @ video {self.part} {self.timestamp_s:.1f}s "
+                    f"({self.kind})]")
         return f"[frame {idx} @ {self.timestamp_s:.1f}s ({self.kind})]"
 
 
@@ -231,7 +244,7 @@ def assign_numbers(frames):
     different moment. Found 2026-09-08 in a real lecture summary, where
     "Frame 4" was cited at both 219s and 5484s.
     """
-    ordered = sorted(frames, key=lambda f: f.timestamp_s)
+    ordered = sorted(frames, key=lambda f: f.sort_key)
     for index, frame in enumerate(ordered, start=1):
         frame.number = index
     return ordered
@@ -277,7 +290,7 @@ def _render(frames, transcript, prompt_template, with_paths=False):
     must not have it, because they attach the bytes and a stray filesystem
     path in the prompt only invites the model to talk about paths.
     """
-    sorted_frames = sorted(frames, key=lambda f: f.timestamp_s)
+    sorted_frames = sorted(frames, key=lambda f: f.sort_key)
     lines = []
     for i, frame in enumerate(sorted_frames):
         # The frame's own number when it has one, so a chunk announces the
