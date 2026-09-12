@@ -210,6 +210,89 @@ class RunStateTest(unittest.TestCase):
         out = self._cli("show", "--run-dir", run_dir)
         self.assertIn("[MISSING]", out.stdout)
 
+    # --- A summarize stage paused on the Claude usage window ---------------
+
+    def test_annotate_sets_and_deletes_fields_without_touching_status(self):
+        self.state.init()
+        self.state.start("summarize")
+        self.state.annotate("summarize", {"waiting_until": 1_800_000_000,
+                                          "usage": {"calls": 2}})
+        st = self.state.stage("summarize")
+        self.assertEqual(st["status"], RUNNING)
+        self.assertEqual(st["waiting_until"], 1_800_000_000)
+        self.assertEqual(st["usage"], {"calls": 2})
+        self.state.annotate("summarize", {"waiting_until": None})
+        self.assertNotIn("waiting_until", self.state.stage("summarize"))
+        self.assertEqual(self.state.stage("summarize")["status"], RUNNING)
+
+    def test_paused_until_reads_the_recorded_reset(self):
+        self.state.init()
+        self.assertIsNone(self.state.paused_until())
+        self.state.annotate("summarize", {"rate_limited": {
+            "window": "five_hour", "resets_at": 1_800_000_000}})
+        self.state.fail("summarize", "paused")
+        self.assertEqual(self.state.paused_until(), 1_800_000_000)
+        self.assertEqual(self.state.status("summarize"), FAILED)
+
+    def test_a_new_attempt_clears_the_pause(self):
+        # The next attempt is not paused whatever the last one was; a stale
+        # reset time would make --resume-all skip a run that could go.
+        self.state.init()
+        self.state.annotate("summarize", {"rate_limited": {"resets_at": 1},
+                                          "waiting_until": 2})
+        self.state.start("summarize")
+        st = self.state.stage("summarize")
+        self.assertNotIn("rate_limited", st)
+        self.assertNotIn("waiting_until", st)
+        self.assertIsNone(self.state.paused_until())
+
+    def test_done_clears_the_pause_but_keeps_usage(self):
+        self.state.init()
+        self.state.annotate("summarize", {"rate_limited": {"resets_at": 1},
+                                          "usage": {"calls": 3}})
+        self.state.done("summarize")
+        st = self.state.stage("summarize")
+        self.assertNotIn("rate_limited", st)
+        self.assertEqual(st["usage"], {"calls": 3})
+
+    def test_cli_annotate_takes_json_and_bare_words(self):
+        run_dir = str(self.run_dir)
+        self._cli("init", "--run-dir", run_dir)
+        out = self._cli("annotate", "--run-dir", run_dir, "--stage", "summarize",
+                        "--set", 'rate_limited={"resets_at": 1800000000, "window": "five_hour"}',
+                        "--set", "note=hello")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        out = self._cli("get", "--run-dir", run_dir,
+                        "--key", "stages.summarize.rate_limited.resets_at")
+        self.assertEqual(out.stdout.strip(), "1800000000")
+        out = self._cli("get", "--run-dir", run_dir, "--key", "stages.summarize.note")
+        self.assertEqual(out.stdout.strip(), "hello")
+        # null deletes.
+        self._cli("annotate", "--run-dir", run_dir, "--stage", "summarize",
+                  "--set", "note=null")
+        out = self._cli("get", "--run-dir", run_dir, "--key", "stages.summarize.note")
+        self.assertNotEqual(out.returncode, 0)
+
+    def test_cli_show_explains_a_pause_and_the_usage(self):
+        run_dir = str(self.run_dir)
+        self._cli("init", "--run-dir", run_dir)
+        usage = json.dumps({
+            "calls": 4, "input_tokens": 120000, "output_tokens": 9000,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+            "cost_usd": 3.2,
+            "windows": {"five_hour": {"utilization_before": 0.1,
+                                      "utilization_after": 0.6,
+                                      "utilization_delta": 0.5}}})
+        self._cli("annotate", "--run-dir", run_dir, "--stage", "summarize",
+                  "--set", 'rate_limited={"resets_at": 1800000000, "window": "five_hour"}',
+                  "--set", f"usage={usage}")
+        self._cli("fail", "--run-dir", run_dir, "--stage", "summarize", "--error", "paused")
+        out = self._cli("show", "--run-dir", run_dir)
+        self.assertIn("paused: Claude usage window (five_hour)", out.stdout)
+        self.assertIn("--resume-all", out.stdout)
+        self.assertIn("usage: 4 call(s), 120,000 in, 9,000 out", out.stdout)
+        self.assertIn("5h window 60% (+50% this stage)", out.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

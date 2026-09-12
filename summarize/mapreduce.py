@@ -110,6 +110,19 @@ def summarize_chunked(chunks, prompt_template, summarize_fn, log=print):
                     f"{type(exc).__name__}: {exc}")
                 errors.append((chunk.index, exc))
 
+    # A chunk that stopped because the subscription window ran out (and the
+    # in-process wait gave up) is not a chunk to merge around: the document
+    # would ship with a hole in it, and the stage would be marked done, so
+    # nothing would ever fill it. Fail the stage instead — the reset time
+    # travels with the exception, run_one.sh records it, and --resume-all
+    # comes back for it once the window has reset. Duck-typed on `pause_run`
+    # so this module stays independent of llm_client's exception classes.
+    paused = [exc for _, exc in errors if getattr(exc, "pause_run", False)]
+    if paused:
+        log(f"==> {len(paused)} of {total} chunks are waiting on the Claude "
+            f"usage window; the stage pauses rather than merging without them")
+        raise paused[0]
+
     done = [r for r in results if r]
     if not done:
         raise RuntimeError(

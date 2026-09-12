@@ -28,7 +28,9 @@
 #
 #   ./pipeline.sh --run-id <run_id>     resume that run
 #   ./pipeline.sh --resume-last         resume the most recent run
-#   ./pipeline.sh --resume-all          resume every unfinished run
+#   ./pipeline.sh --resume-all          resume every unfinished run (a run
+#                                       paused on the Claude usage window is
+#                                       left alone until the window resets)
 #   ./pipeline.sh <input> --force       ignore prior state, start clean
 #   ./pipeline.sh --list                show recent runs and their stages
 #   ./pipeline.sh --status <run_id>     show one run in detail
@@ -90,6 +92,9 @@ RUNSTATE="$SCRIPT_DIR/lib/runstate.py"
 PYTHON_BIN="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
 [ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"
 rs() { "$PYTHON_BIN" "$RUNSTATE" "$@"; }
+# run_one.sh's exit status for a summarize stage that paused on an exhausted
+# Claude usage window (EX_TEMPFAIL). Reported as PAUSED, not FAIL.
+EXIT_PAUSED=75
 
 # --- Argument parsing --------------------------------------------------------
 NAME=""
@@ -435,10 +440,29 @@ elif [ "$RESUME_LAST" -eq 1 ]; then
     echo "ERROR: no runs found under $RUNS_DIR" >&2; exit 1; }
   RUN_DIRS+=("$RUNS_DIR/$last")
 elif [ "$RESUME_ALL" -eq 1 ]; then
+  PAUSED_SKIPPED=0
   for run_dir in "$RUNS_DIR"/*/; do
     [ -f "${run_dir}state.json" ] || continue
     status="$(rs status --run-dir "${run_dir%/}" --stage summarize)"
     [ "$status" = "done" ] && continue
+    # A run that ran out of Claude usage window records when the window
+    # resets. Until then there is nothing to resume into but the same wall —
+    # and this loop runs from a timer, so it must not spend a call finding
+    # that out every fifteen minutes.
+    resets_at="$(rs get --run-dir "${run_dir%/}" --key stages.summarize.rate_limited.resets_at 2>/dev/null || true)"
+    if [ -n "$resets_at" ] && [ "$resets_at" -gt "$(date +%s)" ] 2>/dev/null; then
+      echo "==> $(basename "${run_dir%/}"): paused until the Claude usage window resets ($(date -d "@$resets_at" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$resets_at"))"
+      PAUSED_SKIPPED=$((PAUSED_SKIPPED + 1))
+      continue
+    fi
+    # Another pipeline is already working on it (the timer firing while a
+    # terminal run is mid-summary, say). run_one.sh would refuse the lock
+    # anyway; skipping here keeps that out of the report.
+    owner="$(cat "${run_dir}run.lock/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      echo "==> $(basename "${run_dir%/}"): in progress under PID $owner — left alone"
+      continue
+    fi
     # A member of a --combine set never summarizes on its own: its combine
     # run does, and that run is picked up by this same loop. Resuming the
     # member here would bill an individual summary nobody asked for.
@@ -450,7 +474,11 @@ elif [ "$RESUME_ALL" -eq 1 ]; then
     RUN_DIRS+=("${run_dir%/}")
   done
   if [ "${#RUN_DIRS[@]}" -eq 0 ]; then
-    echo "==> Nothing to resume: every run has finished summarizing."
+    if [ "$PAUSED_SKIPPED" -gt 0 ]; then
+      echo "==> Nothing to resume yet: $PAUSED_SKIPPED run(s) are waiting for the Claude usage window."
+    else
+      echo "==> Nothing to resume: every run has finished summarizing."
+    fi
     exit 0
   fi
   echo "==> Resuming ${#RUN_DIRS[@]} unfinished run(s)"
@@ -675,10 +703,18 @@ echo "=================================================================="
 echo "All runs finished"
 echo "=================================================================="
 FAILED=0
+PAUSED=0
 for run_dir in "${RUN_DIRS[@]}"; do
   run_id="$(basename "$run_dir")"
   rc="$(cat "$RESULT_DIR/$run_id" 2>/dev/null || echo "?")"
-  if [ "$rc" = "0" ]; then
+  if [ "$rc" = "$EXIT_PAUSED" ]; then
+    # Out of Claude usage window, not broken. The reset time is in
+    # state.json; --resume-all (by hand or from the timer) picks it up.
+    PAUSED=$((PAUSED + 1))
+    resumes_at="$(rs get --run-dir "$run_dir" --key stages.summarize.rate_limited.resets_at_iso 2>/dev/null || true)"
+    echo "  PAUSED $run_id  (Claude usage window; resumable after ${resumes_at:-the reset})"
+    echo "        resume:   ./pipeline.sh --resume-all"
+  elif [ "$rc" = "0" ]; then
     echo "  OK    $run_id"
     if [ -n "$COMBINE_RUN_DIR" ]; then
       txt="$(rs get --run-dir "$run_dir" --key stages.transcribe.artifacts.txt 2>/dev/null || true)"
@@ -714,13 +750,21 @@ if [ -n "$COMBINE_RUN_DIR" ]; then
     combine_id="$(basename "$COMBINE_RUN_DIR")"
     declare -a combine_args=(--run-dir "$COMBINE_RUN_DIR")
     [ "$FORCE" -eq 1 ] && combine_args+=(--force)
-    if bash "$SCRIPT_DIR/lib/run_one.sh" "${combine_args[@]}"; then
+    combine_run_rc=0
+    bash "$SCRIPT_DIR/lib/run_one.sh" "${combine_args[@]}" || combine_run_rc=$?
+    if [ "$combine_run_rc" -eq 0 ]; then
       echo ""
       echo "  OK    $combine_id  (combined summary)"
       md="$(rs get --run-dir "$COMBINE_RUN_DIR" --key stages.summarize.artifacts.md 2>/dev/null || true)"
       pdf="$(rs get --run-dir "$COMBINE_RUN_DIR" --key stages.summarize.artifacts.pdf 2>/dev/null || true)"
       [ -n "$md" ] && echo "        -> $md"
       [ -n "$pdf" ] && echo "        -> $pdf"
+    elif [ "$combine_run_rc" -eq "$EXIT_PAUSED" ]; then
+      PAUSED=$((PAUSED + 1))
+      resumes_at="$(rs get --run-dir "$COMBINE_RUN_DIR" --key stages.summarize.rate_limited.resets_at_iso 2>/dev/null || true)"
+      echo ""
+      echo "  PAUSED $combine_id  (combined summary; Claude usage window, resumable after ${resumes_at:-the reset})"
+      echo "        resume:   ./pipeline.sh --resume-all"
     else
       COMBINE_RC=1
       echo ""
@@ -738,3 +782,10 @@ if [ "$FAILED" -gt 0 ]; then
   exit 1
 fi
 [ "$COMBINE_RC" -eq 0 ] || exit 1
+if [ "$PAUSED" -gt 0 ]; then
+  echo ""
+  echo "$PAUSED run(s) are waiting for the Claude usage window to reset. Nothing"
+  echo "is lost: transcripts and frames are kept, and ./pipeline.sh --resume-all"
+  echo "(or the meeting-bot-resume timer, if installed) finishes them."
+  exit "$EXIT_PAUSED"
+fi

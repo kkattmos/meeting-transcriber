@@ -167,6 +167,12 @@ from mapreduce import summarize_chunked  # noqa: E402
 import paths as botpaths  # noqa: E402
 import resources as botresources  # noqa: E402
 import kaltura  # noqa: E402
+import runstate  # noqa: E402
+
+# EX_TEMPFAIL from sysexits.h: the Claude usage window is exhausted and the
+# in-process wait gave up. run_one.sh reads this as "paused, resume later"
+# rather than "broken"; the reset time is already in state.json by then.
+EXIT_RATE_LIMITED = 75
 
 SCREEN_DIR = ROOT_DIR / "screen"
 
@@ -955,5 +961,80 @@ def main():
                 )
 
 
+def _run_state():
+    """This run's state.json, when run_one.sh launched us; else None.
+
+    run_one.sh exports MEETING_BOT_RUN_DIR. A direct invocation has no run
+    to annotate, and that is fine — everything below is bookkeeping.
+    """
+    run_dir = os.environ.get("MEETING_BOT_RUN_DIR")
+    if not run_dir or not (Path(run_dir) / "state.json").is_file():
+        return None
+    return runstate.RunState(run_dir)
+
+
+def _annotate(state, **fields):
+    if state is None:
+        return
+    try:
+        state.annotate("summarize", fields)
+    except Exception as exc:  # noqa: BLE001 — never fail a summary over bookkeeping
+        print(f"==> WARNING: could not update state.json: {exc}", file=sys.stderr)
+
+
+def _install_wait_hook(state):
+    """Mirror a wait for the usage window into state.json.
+
+    `pipeline.sh --status` then says *why* summarize has been running for
+    two hours, instead of leaving the operator to guess between "hung" and
+    "waiting".
+    """
+    def hook(waiting_until=None, resets_at=None, window=None):
+        _annotate(state, waiting_until=waiting_until)
+    llm_client.WAIT_HOOK = hook
+
+
+def _report_usage(state):
+    """Print the stage's claude-cli usage and write it to state.json.
+
+    Runs on every exit path, including a failed one: the calls that did
+    complete were spent, and a stage that ran out of window three chunks in
+    is exactly the case where the number matters.
+    """
+    summary = llm_client.USAGE.summary()
+    if not summary.get("calls"):
+        return
+    print(f"==> Claude usage this stage: {llm_client.USAGE.describe()}")
+    _annotate(state, usage=summary)
+
+
+def run():
+    """main() with the bookkeeping the pipeline needs around it."""
+    state = _run_state()
+    _install_wait_hook(state)
+    try:
+        main()
+    except llm_client.ClaudeCliRateLimited as exc:
+        when = exc.resets_at
+        _annotate(state, waiting_until=None, rate_limited={
+            "window": exc.window,
+            "resets_at": when,
+            "resets_at_iso": llm_client._iso(when) if when else None,
+            "message": str(exc)[:500],
+        })
+        print("==> PAUSED: the Claude usage window is exhausted and the wait "
+              "limit was reached.", file=sys.stderr)
+        if when:
+            print(f"    It resets at {llm_client._iso(when)}. Re-run the same "
+                  f"command, or `./pipeline.sh --resume-all`, after that.",
+                  file=sys.stderr)
+        else:
+            print("    The CLI reported no reset time; try again later with "
+                  "`./pipeline.sh --resume-all`.", file=sys.stderr)
+        sys.exit(EXIT_RATE_LIMITED)
+    finally:
+        _report_usage(state)
+
+
 if __name__ == "__main__":
-    main()
+    run()

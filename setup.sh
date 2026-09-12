@@ -12,20 +12,25 @@
 #   --with-libreoffice   also install LibreOffice, so .pptx slides passed via
 #                        --resources can be rendered into the PDF (~700MB)
 #   --with-trigger       install and enable the systemd trigger service
+#   --with-resume-timer  install a systemd timer that runs `pipeline.sh
+#                        --resume-all` every 15 min, so a run paused on the
+#                        Claude usage window finishes without anyone watching
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_CHROME=1
 INSTALL_LIBREOFFICE=0
 INSTALL_TRIGGER=0
+INSTALL_RESUME_TIMER=0
 
 for arg in "$@"; do
   case "$arg" in
     --no-chrome)        INSTALL_CHROME=0 ;;
     --with-libreoffice) INSTALL_LIBREOFFICE=1 ;;
     --with-trigger)     INSTALL_TRIGGER=1 ;;
+    --with-resume-timer) INSTALL_RESUME_TIMER=1 ;;
     -h|--help)
-      sed -n '2,16p' "$0"
+      sed -n '2,17p' "$0"
       exit 0
       ;;
     *)
@@ -225,6 +230,20 @@ if [ "$INSTALL_TRIGGER" -eq 1 ]; then
   systemctl daemon-reload
   systemctl enable --now meeting-bot-trigger.service
   systemctl --no-pager status meeting-bot-trigger.service || true
+fi
+
+if [ "$INSTALL_RESUME_TIMER" -eq 1 ]; then
+  echo "==> Installing the resume timer"
+  # The backstop for a summarize stage that paused on the Claude usage
+  # window: the stage waits in-process first, but if that process is gone
+  # (reboot, killed terminal, the 6h wait cap) this is what finishes the run.
+  sed -e "s#@REPO_ROOT@#$SCRIPT_DIR#g" \
+    "$SCRIPT_DIR/meeting-bot-resume.service" \
+    > /etc/systemd/system/meeting-bot-resume.service
+  cp "$SCRIPT_DIR/meeting-bot-resume.timer" /etc/systemd/system/meeting-bot-resume.timer
+  systemctl daemon-reload
+  systemctl enable --now meeting-bot-resume.timer
+  systemctl --no-pager list-timers meeting-bot-resume.timer || true
 fi
 
 echo ""

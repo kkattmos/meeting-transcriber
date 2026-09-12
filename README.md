@@ -128,7 +128,7 @@ so **that split is gone** and everything runs natively.
 | Browser stages | Debian container via Docker | Native |
 | Docker | Required | Not used at all |
 | Per-run isolation | Container namespaces (`:99`, `meeting_sink` hardcoded) | Display + PulseAudio sink allocated per run (`lib/xsession.sh`) |
-| Init system | OpenRC (no systemd) | systemd — `setup.sh --with-trigger` installs the trigger unit |
+| Init system | OpenRC (no systemd) | systemd — `setup.sh --with-trigger` installs the trigger unit, `--with-resume-timer` the resume timer |
 | Summarizer | Gemini first, API key | **Claude first, on your subscription** via the `claude` CLI; Gemini as fallback |
 | Keys | One each; YouTube tokens in a JSON file | **Numbered slots in `.env`**, round-robin (3 Gemini, 3 AssemblyAI, 10 YouTube) |
 | Output | Markdown, fixed layout under `/opt/meeting-bot` | Markdown **+ PDF**, five independently configured directories |
@@ -195,6 +195,7 @@ Useful flags:
 sudo -H ./setup.sh --no-chrome          # transcribe/summarize box only
 sudo -H ./setup.sh --with-libreoffice   # so .pptx slides can be rendered into the PDF (~700MB)
 sudo -H ./setup.sh --with-trigger       # install + enable the systemd trigger service
+sudo -H ./setup.sh --with-resume-timer  # every 15 min, resume runs paused on the Claude usage window
 ```
 
 ### Sign the summarizer in
@@ -642,6 +643,16 @@ Two details worth knowing:
 - **A run is locked while it's being processed**, so two invocations can't work
   the same run. If the owning process died, the lock is taken over instead of
   blocking forever — a killed run has to stay resumable.
+- **A run that ran out of Claude usage window is `PAUSED`, not failed.** The
+  summarize stage first waits in-process for the window to reset (up to
+  `CLAUDE_CLI_MAX_WAIT_SECONDS`, 6h by default); if it has to give up, the
+  reset time goes into `state.json`, `pipeline.sh` exits 75 and reports the
+  run as `PAUSED`, and `--status` says when it can go again. `--resume-all`
+  skips a paused run until that time has passed, so it is safe to run from a
+  timer — `setup.sh --with-resume-timer` installs one that fires every 15
+  minutes and 5 minutes after every boot. Nothing is spent twice: the
+  transcript and frames are kept, and only summarize re-runs. See
+  [Watch your subscription's usage window](#the-usage-window) below.
 
 Old run directories (which hold YouTube downloads) can be swept:
 
@@ -889,16 +900,19 @@ end the scan.
 | `CLAUDE_CLI_FRAME_VISION` | 1 | `0` sends the frame list as text and never opens the images |
 | `CLAUDE_CLI_STATIC_PROMPT` | 1 | Pass the prompt's unchanging half as a system prompt file, so the prefix is cache-eligible. `0` sends it inline (for a `claude` too old to know the flags) |
 | `SUMMARY_EFFORT` | `high` | `low`, `medium`, `high`, `xhigh`, `max` |
+| `CLAUDE_CLI_MAX_FRAMES` | 0 | Most frames the model is *offered* per call (`0` = all of the chunk's). Scene changes kept first, periodic frames thinned evenly. The PDF still has every frame |
+| `CLAUDE_CLI_MAX_WAIT_SECONDS` | 21600 | How long one call may sleep for the usage window to reset before the stage pauses (exit 75) |
+| `CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS` | 600 | Retry interval when the CLI reports a hit window without a reset time |
 | `GEMINI_API_KEY_1..3` | — | For the `gemini` fallback |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | Google retires model names; pin a real version, not a `-latest` alias |
 | `SUMMARY_PROMPT` | `summarize.md` | Prompt file; `--prompt` overrides |
-| `SUMMARY_MAX_TOKENS` | 16000 | |
+| `SUMMARY_MAX_TOKENS` | 16000 | **Gemini only.** The Claude CLI has no output cap, and output is not what spends a subscription window anyway — see below |
 | `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture-*`/`tutorial-*` output; `always`/`never` override |
 
 **How the Claude backend runs.** `summarize/llm_client.py` shells out to:
 
 ```
-claude -p --output-format json --model opus --effort high \
+claude -p --output-format stream-json --verbose --model opus --effort high \
        --safe-mode --no-session-persistence \
        --append-system-prompt-file "$MEETING_BOT_ROOT/tmp/claude-cli-prompts/<sha>.md" \
        --exclude-dynamic-system-prompt-sections \
@@ -959,18 +973,62 @@ no "thinking budget" setting. `high` is the sweet spot for lecture notes; `max`
 costs meaningfully more for a marginal gain on this kind of task, and `low` is
 fine for short standups.
 
-**Watch your subscription's rate limit.** A metered API key soaks up
-concurrency; a subscription does not. `SUMMARY_MAX_PARALLEL` (default 3) fires
-that many `claude` processes at once for a long transcript, and `--jobs`
-multiplies it across inputs. On a Pro plan, `SUMMARY_MAX_PARALLEL=1` with
-`--jobs 1` is the safe setting for a batch of lectures; the chain falls through
-to Gemini when you run out, so a limit shows up as Gemini-authored summaries
-rather than as an error.
+<a id="the-usage-window"></a>
+**Watch your subscription's usage window — and it is metered now.** A Claude
+Pro/Max subscription has a rolling 5-hour window (and a 7-day one). The CLI
+reports both meters on every call, and the pipeline keeps them: each call
+logs a line like
 
-Missing credentials for one backend are not fatal — the chain skips it and
-moves on. A `claude` CLI that is missing or signed out is treated exactly that
-way. Which backend answered is recorded in the document's provenance header
-(`model: claude-cli/opus`).
+```
+claude-cli/opus (effort=high): 61.2k in (48.0k cached), 4.1k out, 2.3k thinking, ~$0.71; 5h window 34%, resets 15:20 +07
+```
+
+and the stage's total lands in the run's `state.json` under
+`stages.summarize.usage` — token counts, list-price cost as a proxy, and the
+5-hour meter before and after the stage. `./pipeline.sh --status <run_id>`
+prints it. **That number is how you size a lecture to your plan**: run one,
+read `+N% this stage`, and you know how many fit in a window.
+
+`.env.example` ships Pro-sized values — `CLAUDE_CLI_MAX_FRAMES=12`,
+`FRAME_PERIOD_SECONDS=60`, `SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1` —
+which differ from the code's own defaults (0, 30, `high`, 3) on purpose: an
+unset variable behaves as it always did, a fresh `.env` fits a lecture into
+a window. Loosen them once the meter says you have room.
+
+`SUMMARY_MAX_TOKENS` does nothing here — the CLI has no output cap, and output
+is not where the window goes. What spends it, in order:
+
+1. **Frames.** Each one the model opens is ~790 tokens at the default 1024px
+   (`FRAME_MAX_DIMENSION`), and a 36-minute chunk at `FRAME_PERIOD_SECONDS=30`
+   carries ~72 of them — more input than the transcript. `CLAUDE_CLI_MAX_FRAMES`
+   caps how many are offered per call (scene changes first, the rest spread
+   evenly), and `FRAME_PERIOD_SECONDS=60` halves the count at the source.
+   `CLAUDE_CLI_FRAME_VISION=0` drops them entirely, at the cost of citations
+   to pictures the model never saw.
+2. **Effort.** `SUMMARY_EFFORT=high` buys thinking tokens on every chunk;
+   `medium` is noticeably cheaper on the window and still fine for notes.
+3. **The model.** `CLAUDE_CLI_MODEL=sonnet` spends the window several times
+   slower than `opus`.
+4. **Parallelism.** `SUMMARY_MAX_PARALLEL` (default 3) fires that many
+   `claude` processes at once for a long transcript, and `--jobs` multiplies
+   it across inputs. That doesn't change the total, but it decides whether
+   you find out the window is gone with one chunk left or with all of them.
+
+**When the window is exhausted the pipeline waits for it, on Claude.** The
+CLI reports the reset time; the call sleeps until then (plus a minute) and
+tries again — `--status` shows `waiting for the Claude usage window until
+…` meanwhile. Chunks that already finished are kept. The chain does **not**
+fall through to Gemini for this: a hit window is not a broken backend, and
+you chose to pay for a subscription. If the reset is further away than
+`CLAUDE_CLI_MAX_WAIT_SECONDS` (6h — i.e. the weekly limit, or a window that
+keeps refusing), the stage pauses instead: exit 75, `PAUSED` in the report,
+reset time in `state.json`, and `./pipeline.sh --resume-all` — by hand or
+from the `--with-resume-timer` unit — finishes it once the window is back.
+
+Missing credentials for one backend are still not fatal — the chain skips
+it and moves on. A `claude` CLI that is missing or signed out is treated
+exactly that way. Which backend answered is recorded in the document's
+provenance header (`model: claude-cli/opus`).
 
 ### PDF export
 
@@ -1113,17 +1171,17 @@ no `/opt` — against temporary directories, including one with a space in its
 path so quoting mistakes surface.
 
 ```bash
-python3 lib/test_runstate.py                 # run state, resume, concurrency (13)
+python3 lib/test_runstate.py                 # run state, resume, concurrency, the pause (19)
 python3 lib/test_slotqueue.py                # cross-session component queue (23)
 python3 lib/test_keyring.py                  # numbered keys + rotation cursor (22)
 python3 lib/test_resources.py                # resource specs, extraction, GitHub (27)
 python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions, retries (51)
 python3 lib/test_clip.py                     # --clip parsing, the cut, caption windowing (33)
-python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli (111)
+python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window (136)
 python3 summarize/test_pdf_units.py          # frame cropping, citations, PDF render (60)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
-bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (220)
-bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (69)
+bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (281)
+bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (118)
 ```
 
 Two of those are worth understanding:
@@ -1281,10 +1339,21 @@ reason on the `!! claude-cli unavailable:` line, and the finished document's
 provenance header records which backend actually answered.
 
 **`claude CLI is not logged in` in the middle of a batch**
-The subscription hit its rate limit, or the OAuth token expired. The chain
-falls through to Gemini, so the run still completes. For a long batch, drop
-`SUMMARY_MAX_PARALLEL` to 1 and `--jobs` to 1 — three concurrent `claude`
-processes per input is an API-key-shaped setting, not a subscription-shaped one.
+The OAuth token expired. The chain falls through to Gemini, so the run still
+completes; `claude auth login` fixes the next one. (An exhausted usage window
+is *not* reported this way any more — it waits, or pauses the run; see the
+next entry.)
+
+**A run says `PAUSED`, or `--status` says `waiting for the Claude usage window`**
+The subscription's 5-hour (or 7-day) window is spent. Waiting is the intended
+behaviour: the call sleeps until the reset the CLI reported, and a run that
+had to give up (`PAUSED`, exit 75) is picked up by `./pipeline.sh --resume-all`
+once its recorded reset time has passed — automatically, if you installed
+`setup.sh --with-resume-timer`. To make the next lecture fit, read
+`stages.summarize.usage` in `--status` and turn down `CLAUDE_CLI_MAX_FRAMES`,
+`FRAME_PERIOD_SECONDS` or `SUMMARY_EFFORT` — see
+[the usage window](#the-usage-window). If you would rather have Gemini answer
+than wait, set `SUMMARY_FALLBACK_CHAIN=gemini`.
 
 **A YouTube transcript comes back as `[เสียงพากย์ไทย]`**
 That's a re-voiced video whose only captions are a placeholder. Every API key

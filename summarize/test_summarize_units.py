@@ -641,11 +641,37 @@ class ClaudeCliCommandLineTest(unittest.TestCase):
         argv = self._argv()
         self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-5")
 
-    def test_print_mode_and_json_output(self):
+    def test_print_mode_and_streaming_json_output(self):
+        # stream-json, not json: it is the only format that carries the
+        # rate_limit_event — the subscription's own meter and, on a hit
+        # window, the reset time. Print mode needs --verbose to allow it.
         self._run()
         argv = self._argv()
         self.assertIn("-p", argv)
-        self.assertEqual(argv[argv.index("--output-format") + 1], "json")
+        self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
+        self.assertIn("--verbose", argv)
+
+    def test_frame_cap_thins_what_the_model_is_offered(self):
+        # Ten frames, cap 4: the manifest in the prompt names four, and the
+        # ones it names keep their global numbers.
+        frames = [FrameMeta(timestamp_s=float(i * 30), kind="periodic",
+                            path=self.frames[0].path, number=i + 1)
+                  for i in range(10)]
+        self._run({"CLAUDE_CLI_MAX_FRAMES": "4", "CLAUDE_CLI_FRAME_VISION": "0"},
+                  frames=frames)
+        prompt = self._prompt()
+        cited = [line for line in prompt.splitlines() if line.startswith("[frame ")]
+        self.assertEqual(len(cited), 4)
+        self.assertTrue(cited[0].startswith("[frame 1 @ 0.0s"))
+        self.assertTrue(cited[-1].startswith("[frame 10 @ 270.0s"))
+
+    def test_no_frame_cap_by_default(self):
+        frames = [FrameMeta(timestamp_s=float(i * 30), kind="periodic",
+                            path=self.frames[0].path, number=i + 1)
+                  for i in range(10)]
+        self._run({"CLAUDE_CLI_FRAME_VISION": "0"}, frames=frames)
+        prompt = self._prompt()
+        self.assertEqual(sum(1 for l in prompt.splitlines() if l.startswith("[frame ")), 10)
 
     def test_context_is_isolated(self):
         self._run()
@@ -777,6 +803,244 @@ class ClaudeCliResponseTest(unittest.TestCase):
         with mock.patch.object(llm_client.subprocess, "run", fake_run):
             with self.assertRaises(BackendUnavailable):
                 llm_client._run_claude_cli(["claude"], "p", {}, ".", 60)
+
+
+class ClaudeCliUsageWindowTest(unittest.TestCase):
+    """An exhausted subscription window: detected, waited out, never Gemini.
+
+    SUMMARY_MAX_TOKENS was the operator's first guess at a lever here, and it
+    does nothing on this backend; what exists instead is the meter the CLI
+    reports and a wait for the reset. These tests hold that path.
+    """
+
+    def _stream(self, status, resets_at, result="BODY", is_error=False,
+                api_error_status=None, utilization=0.5):
+        event = {"type": "rate_limit_event", "rate_limit_info": {
+            "status": status, "rateLimitType": "five_hour",
+            "unifiedWindows": {"five_hour": {"utilization": utilization,
+                                             "resetsAt": resets_at}}}}
+        if status == "rejected":
+            event["rate_limit_info"]["resetsAt"] = resets_at
+        envelope = json.loads(_envelope(result, is_error=is_error))
+        envelope["api_error_status"] = api_error_status
+        envelope["usage"] = {"input_tokens": 1000, "output_tokens": 50,
+                             "cache_read_input_tokens": 300,
+                             "output_tokens_details": {"thinking_tokens": 7}}
+        envelope["total_cost_usd"] = 0.5
+        return "\n".join(json.dumps(o) for o in (
+            {"type": "system", "subtype": "init"}, event, envelope))
+
+    def setUp(self):
+        llm_client.USAGE.reset()
+        self.slept = []
+        self._orig_sleep = llm_client._sleep
+        llm_client._sleep = lambda s: self.slept.append(s)
+        self._orig_hook = llm_client.WAIT_HOOK
+        llm_client.WAIT_HOOK = None
+
+    def tearDown(self):
+        llm_client._sleep = self._orig_sleep
+        llm_client.WAIT_HOOK = self._orig_hook
+        llm_client.USAGE.reset()
+
+    def _run_once(self, stdout):
+        def fake_run(argv, **kwargs):
+            return FakeCompleted(stdout)
+        with mock.patch.object(llm_client.subprocess, "run", fake_run):
+            return llm_client._run_claude_cli(["claude"], "p", {}, ".", 60)
+
+    def test_stream_output_parses_to_the_result_line(self):
+        self.assertEqual(self._run_once(self._stream("allowed", 1_800_000_000)),
+                         "BODY")
+
+    def test_plain_envelope_still_parses(self):
+        # An older stub, or --output-format json: no event, one object.
+        self.assertEqual(self._run_once(_envelope("BODY")), "BODY")
+
+    def test_usage_is_recorded_with_the_meter(self):
+        self._run_once(self._stream("allowed", 1_800_000_000, utilization=0.42))
+        s = llm_client.USAGE.summary()
+        self.assertEqual(s["calls"], 1)
+        self.assertEqual(s["input_tokens"], 1000)
+        self.assertEqual(s["cache_read_input_tokens"], 300)
+        self.assertEqual(s["thinking_tokens"], 7)
+        self.assertEqual(s["cost_usd"], 0.5)
+        self.assertEqual(s["windows"]["five_hour"]["utilization_after"], 0.42)
+        self.assertEqual(s["windows"]["five_hour"]["resets_at"], 1_800_000_000)
+
+    def test_meter_delta_spans_the_stage(self):
+        self._run_once(self._stream("allowed", 1_800_000_000, utilization=0.10))
+        self._run_once(self._stream("allowed", 1_800_000_000, utilization=0.35))
+        five = llm_client.USAGE.summary()["windows"]["five_hour"]
+        self.assertEqual(five["utilization_before"], 0.10)
+        self.assertEqual(five["utilization_after"], 0.35)
+        self.assertAlmostEqual(five["utilization_delta"], 0.25)
+
+    def test_rejected_event_is_rate_limited_with_the_reset_time(self):
+        with self.assertRaises(llm_client.ClaudeCliRateLimited) as ctx:
+            self._run_once(self._stream("rejected", 1_800_000_000,
+                                        result="API Error: 429", is_error=True,
+                                        api_error_status=429))
+        self.assertEqual(ctx.exception.resets_at, 1_800_000_000)
+        self.assertEqual(ctx.exception.window, "five_hour")
+        # The spent call is still on the ledger — that is the number that
+        # explains the pause.
+        self.assertEqual(llm_client.USAGE.summary()["calls"], 1)
+
+    def test_429_without_an_event_is_rate_limited(self):
+        env = json.loads(_envelope("API Error: 429 rate limit", is_error=True))
+        env["api_error_status"] = 429
+        with self.assertRaises(llm_client.ClaudeCliRateLimited) as ctx:
+            self._run_once(json.dumps(env))
+        self.assertIsNone(ctx.exception.resets_at)
+
+    def test_legacy_wording_carries_the_reset_epoch(self):
+        with self.assertRaises(llm_client.ClaudeCliRateLimited) as ctx:
+            self._run_once(_envelope("Claude AI usage limit reached|1800000000",
+                                     is_error=True))
+        self.assertEqual(ctx.exception.resets_at, 1_800_000_000)
+
+    def test_rate_limited_is_never_retried_on_the_backoff_schedule(self):
+        exc = llm_client.ClaudeCliRateLimited("window", resets_at=1)
+        self.assertFalse(retry.is_retryable(exc))
+
+    def test_rate_limited_is_not_a_login_problem(self):
+        # The CLI's own error classifier files "usage limit reached" next to
+        # "not logged in"; ours must not, or the summary goes to Gemini.
+        with self.assertRaises(llm_client.ClaudeCliRateLimited):
+            self._run_once(_envelope("Claude AI usage limit reached|1800000000",
+                                     is_error=True))
+
+    def _drive(self, outputs, env=None):
+        """summarize_claude_cli against a scripted sequence of CLI outputs."""
+        outputs = list(outputs)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return FakeCompleted(outputs.pop(0))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_vars = {"MEETING_BOT_ROOT": tmp, "CLAUDE_CLI_BIN": sys.executable,
+                        "CLAUDE_CLI_FRAME_VISION": "0"}
+            env_vars.update(env or {})
+            with mock.patch.dict(os.environ, env_vars), \
+                 mock.patch.object(llm_client.subprocess, "run", fake_run):
+                out = llm_client.summarize_claude_cli(
+                    [], "t", "{transcript}{frame_manifest}")
+        return out, calls
+
+    def test_a_hit_window_waits_for_the_reset_then_retries(self):
+        reset = int(llm_client.time.time()) + 900
+        rejected = self._stream("rejected", reset, result="429", is_error=True,
+                                api_error_status=429)
+        ok = self._stream("allowed", reset + 18000, result="AFTER RESET")
+        events = []
+        llm_client.WAIT_HOOK = lambda **kw: events.append(kw)
+        out, calls = self._drive([rejected, ok])
+        self.assertEqual(out, "AFTER RESET")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.slept), 1)
+        # Until the reset plus the margin, give or take the test's own clock.
+        self.assertGreater(self.slept[0], 900)
+        self.assertLess(self.slept[0], 900 + llm_client.RATE_LIMIT_MARGIN_SECONDS + 5)
+        # The hook saw the wait begin and end.
+        self.assertEqual(len(events), 2)
+        self.assertIsNotNone(events[0]["waiting_until"])
+        self.assertEqual(events[0]["window"], "five_hour")
+        self.assertIsNone(events[1]["waiting_until"])
+
+    def test_a_reset_beyond_the_cap_gives_up_with_the_time_attached(self):
+        reset = int(llm_client.time.time()) + 7 * 3600
+        rejected = self._stream("rejected", reset, result="429", is_error=True,
+                                api_error_status=429)
+        with self.assertRaises(llm_client.ClaudeCliRateLimited) as ctx:
+            self._drive([rejected])
+        self.assertEqual(ctx.exception.resets_at, reset)
+        self.assertEqual(self.slept, [])
+
+    def test_the_cap_is_configurable(self):
+        reset = int(llm_client.time.time()) + 900
+        rejected = self._stream("rejected", reset, result="429", is_error=True,
+                                api_error_status=429)
+        with self.assertRaises(llm_client.ClaudeCliRateLimited):
+            self._drive([rejected], env={"CLAUDE_CLI_MAX_WAIT_SECONDS": "60"})
+        self.assertEqual(self.slept, [])
+
+    def test_no_reset_time_polls_until_the_cap(self):
+        env = json.loads(_envelope("API Error: 429", is_error=True))
+        env["api_error_status"] = 429
+        rejected = json.dumps(env)
+        ok = _envelope("EVENTUALLY")
+        out, calls = self._drive([rejected, rejected, ok],
+                                 env={"CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS": "100",
+                                      "CLAUDE_CLI_MAX_WAIT_SECONDS": "250"})
+        self.assertEqual(out, "EVENTUALLY")
+        self.assertEqual(self.slept, [100, 100])
+        # A third refusal would have exceeded the cap and raised.
+
+    def test_the_chain_does_not_advance_to_gemini_on_a_hit_window(self):
+        def limited(*a, **k):
+            raise llm_client.ClaudeCliRateLimited("window", resets_at=1, window="five_hour")
+        with mock.patch.dict(llm_client._BACKENDS,
+                             {"claude-cli": limited,
+                              "gemini": lambda *a, **k: "FROM GEMINI"}), \
+             mock.patch.dict(os.environ,
+                             {"SUMMARY_FALLBACK_CHAIN": "claude-cli,gemini"}):
+            with self.assertRaises(llm_client.ClaudeCliRateLimited):
+                llm_client.summarize_with_fallback([], "t", "{transcript}{frame_manifest}")
+
+    def test_mapreduce_pauses_the_stage_instead_of_merging_around_it(self):
+        # Two chunks succeed, one is out of window: the stage must fail
+        # (resumable) rather than write a document with a hole in it.
+        def fake_summarize(frames, transcript, template):
+            if transcript == "body 1":
+                raise llm_client.ClaudeCliRateLimited("window", resets_at=1)
+            return "ok"
+        chunks = [Chunk(index=i, text=f"body {i}", start_s=i * 60.0,
+                        end_s=(i + 1) * 60.0, frames=[]) for i in range(3)]
+        with self.assertRaises(llm_client.ClaudeCliRateLimited):
+            summarize_chunked(chunks, "PROMPT {transcript}", fake_summarize,
+                              log=lambda *a: None)
+
+
+class FrameThinningTest(unittest.TestCase):
+    def _frames(self, kinds):
+        return [FrameMeta(timestamp_s=float(i * 10), kind=k, path=f"/f/{i}.jpg",
+                          number=i + 1) for i, k in enumerate(kinds)]
+
+    def test_no_cap_returns_everything(self):
+        frames = self._frames(["periodic"] * 5)
+        self.assertEqual(len(llm_client.thin_frames(frames, 0)), 5)
+        self.assertEqual(len(llm_client.thin_frames(frames, 5)), 5)
+
+    def test_scene_changes_are_kept_first(self):
+        kinds = ["periodic"] * 8
+        kinds[3] = "scene_change"
+        kinds[6] = "scene_change"
+        kept = llm_client.thin_frames(self._frames(kinds), 4)
+        self.assertEqual(len(kept), 4)
+        self.assertEqual([f.number for f in kept if f.kind == "scene_change"], [4, 7])
+
+    def test_periodic_frames_cover_the_whole_window(self):
+        kept = llm_client.thin_frames(self._frames(["periodic"] * 20), 5)
+        self.assertEqual([f.number for f in kept], [1, 6, 11, 15, 20])
+
+    def test_numbers_are_untouched(self):
+        # Thinning is about what is offered, never about renumbering: the
+        # PDF resolves citations against the whole manifest.
+        frames = self._frames(["periodic"] * 9)
+        kept = llm_client.thin_frames(frames, 3)
+        self.assertEqual([f.number for f in kept], [1, 5, 9])
+        self.assertEqual([f.number for f in frames], list(range(1, 10)))
+
+    def test_output_stays_chronological(self):
+        kinds = ["periodic"] * 10
+        kinds[8] = "scene_change"
+        kinds[1] = "scene_change"
+        kept = llm_client.thin_frames(self._frames(kinds), 5)
+        stamps = [f.timestamp_s for f in kept]
+        self.assertEqual(stamps, sorted(stamps))
 
 
 class ClaudeCliDiscoveryTest(unittest.TestCase):

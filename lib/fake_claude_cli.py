@@ -21,10 +21,14 @@ summary — billed to a metered API account instead of the subscription the
 operator meant to spend. Nothing about the output reveals it, so the only place
 that can catch the regression is a stub that reports what it was handed.
 
-It answers in the CLI's `--output-format json` envelope, because that is what
-llm_client parses: `result` holds the text, `is_error` decides whether the
-backend failed, and `permission_denials` drives the "frames may not have been
-read" warning.
+It answers the way the real CLI does for the output format it was asked
+for. With `--output-format stream-json` (what llm_client passes) that is one
+JSON object per line: a `system` init line, a `rate_limit_event` carrying the
+subscription's 5-hour / 7-day meters, and the `result` envelope last. With
+`json` it is the envelope alone. llm_client parses `result` for the text,
+`is_error` for failure, `permission_denials` for the "frames may not have
+been read" warning, `usage` for the token ledger, and the rate_limit_event
+for the meter and for an exhausted window.
 
 Modes (--mode, or $FAKE_CLAUDE_MODE):
   ok             the canned summary                          (default)
@@ -35,6 +39,13 @@ Modes (--mode, or $FAKE_CLAUDE_MODE):
   overloaded     a retryable failure, for the backoff path
   denied         a summary plus a permission_denials entry
   empty          is_error false with an empty result
+  rate-limited   the usage window is exhausted: a rate_limit_event with
+                 status "rejected" and a reset time $FAKE_CLAUDE_RESET_IN
+                 seconds from now (default 2), and an is_error envelope
+                 with api_error_status 429. Exit status 0, like the real one.
+  rate-limited-once  the same, but only for the first call recorded in
+                 $FAKE_CLAUDE_STATE (a counter file); later calls succeed.
+                 This is the wait-then-retry path end to end.
 """
 import argparse
 import json
@@ -56,11 +67,13 @@ _AUTH_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_1",
               "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
 
 
-def _envelope(result, is_error=False, denials=(), reason=None):
+def _envelope(result, is_error=False, denials=(), reason=None,
+              api_error_status=None):
     """The shape `claude -p --output-format json` prints.
 
     Only the fields llm_client reads are meaningful; the rest are present so
-    the stub's output stays a realistic sample of the real thing.
+    the stub's output stays a realistic sample of the real thing. The usage
+    numbers are fixed so the media test can assert on the ledger's totals.
     """
     return {
         "type": "result",
@@ -71,11 +84,42 @@ def _envelope(result, is_error=False, denials=(), reason=None):
         "duration_ms": 12,
         "duration_api_ms": 8,
         "num_turns": 1,
-        "total_cost_usd": 0,
+        "total_cost_usd": 0.25,
+        "api_error_status": api_error_status,
         "permission_denials": list(denials),
         "terminal_reason": reason or ("api_error" if is_error else "stop"),
-        "usage": {"input_tokens": 1000, "output_tokens": 500},
+        "usage": {"input_tokens": 1000, "output_tokens": 500,
+                  "cache_read_input_tokens": 4000,
+                  "cache_creation_input_tokens": 0,
+                  "output_tokens_details": {"thinking_tokens": 120}},
     }
+
+
+def _rate_limit_event(status, resets_at, utilization=0.42):
+    """The `rate_limit_event` line stream-json carries beside the result."""
+    info = {
+        "status": status,
+        "rateLimitType": "five_hour",
+        "unifiedWindows": {
+            "five_hour": {"utilization": utilization, "resetsAt": resets_at},
+            "seven_day": {"utilization": 0.11, "resetsAt": resets_at + 6 * 86400},
+        },
+    }
+    if status == "rejected":
+        info["resetsAt"] = resets_at
+    return {"type": "rate_limit_event", "rate_limit_info": info,
+            "session_id": "stub", "uuid": str(uuid.uuid4())}
+
+
+def _bump_counter(path):
+    """Calls so far, counted in a file; 1 for the first call."""
+    try:
+        count = int(Path(path).read_text().strip() or 0)
+    except (OSError, ValueError):
+        count = 0
+    count += 1
+    Path(path).write_text(str(count))
+    return count
 
 
 def main(argv):
@@ -104,7 +148,23 @@ def main(argv):
             fh.write(json.dumps(entry) + "\n")
 
     mode = (known.mode or "ok").strip().lower()
-    if mode == "not-logged-in":
+    if mode == "rate-limited-once":
+        state = os.environ.get("FAKE_CLAUDE_STATE") or (
+            (known.record or "/tmp/fake_claude") + ".calls")
+        mode = "rate-limited" if _bump_counter(state) == 1 else "ok"
+
+    import time
+    resets_at = int(time.time()) + int(os.environ.get("FAKE_CLAUDE_RESET_IN", "2"))
+    event = _rate_limit_event("allowed", resets_at)
+
+    if mode == "rate-limited":
+        # What a real CLI prints when the 5-hour window is spent: the event
+        # says rejected and names the reset; the envelope is an API error
+        # with status 429. Exit status 0, as ever.
+        event = _rate_limit_event("rejected", resets_at, utilization=1.0)
+        out = _envelope("API Error: 429 You've hit your limit \u00b7 resets soon",
+                        is_error=True, api_error_status=429)
+    elif mode == "not-logged-in":
         # Verbatim from a signed-out claude 2.1.x, exit code included: the CLI
         # exits 0 here, which is why llm_client parses the body instead of
         # trusting the status.
@@ -120,6 +180,13 @@ def main(argv):
     else:
         out = _envelope(SUMMARY_TEXT)
 
+    if "stream-json" in passthrough:
+        # One object per line, the result last — the same order the CLI
+        # uses. The init line is here so the parser has to skip something.
+        for obj in ({"type": "system", "subtype": "init", "session_id": "stub"},
+                    event, out):
+            sys.stdout.write(json.dumps(obj) + "\n")
+        return 0
     json.dump(out, sys.stdout)
     sys.stdout.write("\n")
     return 0

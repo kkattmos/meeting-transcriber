@@ -23,6 +23,16 @@ every artifact it recorded still exists on disk. Someone who deletes a
 transcript and re-runs expects it to be regenerated, not skipped — a state file
 that disagrees with the filesystem is worse than no state file at all.
 
+A PAUSED SUMMARIZE. When the Claude subscription window is exhausted and the
+in-process wait gives up, summarize.py exits 75 (EX_TEMPFAIL) and leaves
+`stages.summarize.rate_limited = {window, resets_at, resets_at_iso}` behind;
+run_one.sh then marks the stage failed as usual. `pipeline.sh --resume-all`
+reads that field and skips the run until `resets_at` has passed, so a timer
+running it every few minutes never retries into the same wall. `start` and
+`done` clear the field, and `waiting_until` (set while a call is sleeping)
+with it. `stages.summarize.usage` is the stage's token usage and the window
+meter before and after it — written by summarize.py, read by nothing here.
+
 CONCURRENCY. Every mutation takes an exclusive flock on state.lock and does a
 read-modify-write, so two stages finishing simultaneously (transcribe and
 frames run in parallel) can't clobber each other's entries. Writes go to a
@@ -36,6 +46,11 @@ CLI (all subcommands take --run-dir, except `latest`/`list` which take --root):
     runstate.py start   --run-dir D --stage S
     runstate.py done    --run-dir D --stage S [--artifact k=v]...
     runstate.py fail    --run-dir D --stage S [--error MSG]
+    runstate.py annotate --run-dir D --stage S --set key=JSON...
+                                                   -> extra fields on a stage
+                                                      (usage, waiting_until,
+                                                      rate_limited); a JSON
+                                                      null deletes the key
     runstate.py get     --run-dir D --key stages.transcribe.artifacts.txt
     runstate.py reset   --run-dir D [--stage S]    -> back to pending (--force path)
     runstate.py show    --run-dir D                -> human-readable summary
@@ -72,6 +87,13 @@ PENDING, RUNNING, DONE, FAILED = "pending", "running", "done", "failed"
 
 def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _local(ts):
+    try:
+        return datetime.fromtimestamp(int(ts)).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return str(ts)
 
 
 class RunState:
@@ -182,6 +204,9 @@ class RunState:
             st["attempts"] = st.get("attempts", 0) + 1
             st["started_at"] = _now()
             st.pop("error", None)
+            # A new attempt is not paused, whatever the last one was.
+            st.pop("rate_limited", None)
+            st.pop("waiting_until", None)
         return self._mutate(_fn)
 
     def done(self, name, artifacts=None):
@@ -190,9 +215,37 @@ class RunState:
             st["status"] = DONE
             st["ended_at"] = _now()
             st.pop("error", None)
+            st.pop("rate_limited", None)
+            st.pop("waiting_until", None)
             if artifacts:
                 st.setdefault("artifacts", {}).update(artifacts)
         return self._mutate(_fn)
+
+    def annotate(self, name, fields):
+        """Set extra keys on a stage without touching its status.
+
+        A value of None deletes the key. This is how summarize.py records
+        its token usage, the wait it is sitting in, and the reset time it
+        gave up on — bookkeeping that the shell side reads back but never
+        computes.
+        """
+        def _fn(data):
+            st = data.setdefault("stages", {}).setdefault(
+                name, {"status": PENDING, "attempts": 0, "artifacts": {}})
+            for key, value in (fields or {}).items():
+                if value is None:
+                    st.pop(key, None)
+                else:
+                    st[key] = value
+        return self._mutate(_fn)
+
+    def paused_until(self, name="summarize"):
+        """Unix time a paused stage may be retried at, or None if not paused."""
+        info = self.stage(name).get("rate_limited")
+        if not isinstance(info, dict):
+            return None
+        resets_at = info.get("resets_at")
+        return int(resets_at) if isinstance(resets_at, (int, float)) else None
 
     def cleaned(self, name):
         """Record that a done stage's artifacts were deliberately deleted.
@@ -329,6 +382,11 @@ def main():
     p.add_argument("--stage", required=True)
     p.add_argument("--error")
 
+    p = with_run_dir(sub.add_parser("annotate"))
+    p.add_argument("--stage", required=True)
+    p.add_argument("--set", action="append", default=[], metavar="KEY=JSON",
+                   help="a JSON value; `null` deletes the key")
+
     p = with_run_dir(sub.add_parser("get"))
     p.add_argument("--key", required=True)
 
@@ -454,6 +512,21 @@ def main():
         state.fail(args.stage, args.error)
         return 0
 
+    if args.cmd == "annotate":
+        fields = {}
+        for pair in args.set:
+            if "=" not in pair:
+                print(f"annotate: expected KEY=JSON, got {pair!r}", file=sys.stderr)
+                return 2
+            key, raw = pair.split("=", 1)
+            try:
+                fields[key] = json.loads(raw)
+            except json.JSONDecodeError:
+                # A bare word is a string; saves quoting in bash.
+                fields[key] = raw
+        state.annotate(args.stage, fields)
+        return 0
+
     if args.cmd == "get":
         value = state.get(args.key)
         if value is None:
@@ -509,6 +582,28 @@ def main():
                 print(f"      {key}: {value}{exists}")
             if st.get("error"):
                 print(f"      error: {st['error'].splitlines()[0][:160]}")
+            if st.get("waiting_until"):
+                print(f"      waiting for the Claude usage window until "
+                      f"{_local(st['waiting_until'])}")
+            if isinstance(st.get("rate_limited"), dict):
+                info = st["rate_limited"]
+                when = info.get("resets_at")
+                print(f"      paused: Claude usage window "
+                      f"({info.get('window') or 'unknown'}) exhausted; "
+                      f"resumable after {_local(when) if when else 'the reset'}"
+                      f" — ./pipeline.sh --resume-all")
+            usage = st.get("usage")
+            if isinstance(usage, dict) and usage.get("calls"):
+                five = (usage.get("windows") or {}).get("five_hour") or {}
+                meter = ""
+                if "utilization_after" in five:
+                    meter = f", 5h window {five['utilization_after'] * 100:.0f}%"
+                    if "utilization_delta" in five:
+                        meter += f" ({five['utilization_delta'] * 100:+.0f}% this stage)"
+                print(f"      usage: {usage['calls']} call(s), "
+                      f"{usage.get('input_tokens', 0) + usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0):,} in, "
+                      f"{usage.get('output_tokens', 0):,} out, "
+                      f"~${usage.get('cost_usd', 0):.2f} list{meter}")
         return 0
 
     return 0

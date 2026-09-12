@@ -110,6 +110,17 @@ cat > "$STAGING/summarize/summarize.py" <<'STUB'
 import os, sys
 if os.path.exists(os.environ.get("STUB_FAIL_SUMMARIZE", "/nonexistent")):
     sys.stderr.write("stub: summarize failing on purpose\n"); sys.exit(1)
+if os.path.exists(os.environ.get("STUB_PAUSE_SUMMARIZE", "/nonexistent")):
+    # What the real summarize.py does when the Claude usage window is
+    # exhausted and the wait gave up: record the reset time on the stage
+    # (the file holds the unix time) and exit 75.
+    import subprocess
+    resets_at = open(os.environ["STUB_PAUSE_SUMMARIZE"]).read().strip() or "0"
+    subprocess.run([sys.executable, os.environ["STUB_RUNSTATE"], "annotate",
+                    "--run-dir", os.environ["MEETING_BOT_RUN_DIR"], "--stage", "summarize",
+                    "--set", 'rate_limited={"window": "five_hour", "resets_at": %s, '
+                             '"resets_at_iso": "later"}' % resets_at], check=True)
+    sys.stderr.write("stub: PAUSED on the usage window\n"); sys.exit(75)
 argv = sys.argv[1:]
 flags = {}
 args = []
@@ -237,6 +248,8 @@ export STUB_FAIL_TRANSCRIBE="$TESTROOT/fail_transcribe"
 export STUB_LIE_TRANSCRIBE="$TESTROOT/lie_transcribe"
 export STUB_FAIL_FRAMES="$TESTROOT/fail_frames"
 export STUB_FAIL_SUMMARIZE="$TESTROOT/fail_summarize"
+export STUB_PAUSE_SUMMARIZE="$TESTROOT/pause_summarize"
+export STUB_RUNSTATE="$STAGING/lib/runstate.py"
 export STUB_FAIL_FETCH="$TESTROOT/fail_fetch"
 export STUB_SUMMARIZE_ARGS="$TESTROOT/summarize_args.txt"
 export STUB_TRANSCRIBE_ARGS="$TESTROOT/transcribe_args.txt"
@@ -640,6 +653,57 @@ for vid in broken00001 broken00002; do
   d=$(ls -d "$RUNS/yt_${vid}_"* | head -1)
   check "resume-all: $vid completed" "$(state status --run-dir "$d" --stage summarize)" "done"
 done
+
+echo "--- A summarize stage paused on the Claude usage window"
+# The stub records a reset time an hour away and exits 75, the way
+# summarize.py does when the in-process wait gives up.
+echo $(( $(date +%s) + 3600 )) > "$STUB_PAUSE_SUMMARIZE"
+LECTURE="https://www.youtube.com/watch?v=paused00001"
+out=$(pipeline "$LECTURE" 2>&1); rc=$?
+check "pause: pipeline exits 75, not 1" "$rc" "75"
+prun=$(latest_run)
+check "pause: summarize is failed (so a resume re-runs it)" \
+  "$(state status --run-dir "$RUNS/$prun" --stage summarize)" "failed"
+check "pause: frames survived" "$(state status --run-dir "$RUNS/$prun" --stage frames)" "done"
+[ -n "$(state get --run-dir "$RUNS/$prun" --key stages.summarize.rate_limited.resets_at 2>/dev/null)" ] \
+  && ok "pause: reset time recorded in state.json" || bad "pause: no reset time in state"
+echo "$out" | grep -q "PAUSED $prun" && ok "pause: reported as PAUSED, not FAIL" || bad "pause: not reported as PAUSED"
+echo "$out" | grep -q "  FAIL  $prun" && bad "pause: also reported as FAIL" || ok "pause: not reported as FAIL"
+echo "$out" | grep -q "waiting for the Claude usage window" && ok "pause: the footer explains" || bad "pause: no explanation"
+state show --run-dir "$RUNS/$prun" | grep -q "paused: Claude usage window" \
+  && ok "pause: --status explains the pause" || bad "pause: --status does not mention it"
+
+echo "--- --resume-all leaves a paused run alone until its reset"
+out=$(pipeline --resume-all 2>&1); rc=$?
+check "pause: --resume-all exits 0 with nothing to do" "$rc" "0"
+echo "$out" | grep -q "$prun: paused until" && ok "pause: --resume-all names the paused run and the time" \
+  || bad "pause: --resume-all did not mention the pause"
+echo "$out" | grep -q "waiting for the Claude usage window" && ok "pause: 'nothing to resume yet'" \
+  || bad "pause: wrong summary line"
+check "pause: summarize not attempted again" \
+  "$(state get --run-dir "$RUNS/$prun" --key stages.summarize.attempts)" "1"
+
+echo "--- Once the reset has passed, --resume-all finishes it"
+# Rewrite the recorded reset into the past and let the stub succeed.
+state annotate --run-dir "$RUNS/$prun" --stage summarize \
+  --set 'rate_limited={"window": "five_hour", "resets_at": 1000000000}'
+rm -f "$STUB_PAUSE_SUMMARIZE"
+out=$(pipeline --resume-all 2>&1); rc=$?
+check "pause: --resume-all exits 0" "$rc" "0"
+check "pause: summarize now done" "$(state status --run-dir "$RUNS/$prun" --stage summarize)" "done"
+[ -z "$(state get --run-dir "$RUNS/$prun" --key stages.summarize.rate_limited 2>/dev/null)" ] \
+  && ok "pause: the pause is cleared on completion" || bad "pause: rate_limited left behind"
+echo "$out" | grep -q "\[transcribe\] already done" && ok "pause: transcribe not re-run" || bad "pause: transcribe re-ran"
+
+echo "--- The same command resumes a paused run too"
+echo $(( $(date +%s) + 3600 )) > "$STUB_PAUSE_SUMMARIZE"
+pipeline "https://www.youtube.com/watch?v=paused00002" >/dev/null 2>&1
+prun2=$(latest_run)
+rm -f "$STUB_PAUSE_SUMMARIZE"
+out=$(pipeline "https://www.youtube.com/watch?v=paused00002" 2>&1); rc=$?
+check "pause: explicit re-run exits 0" "$rc" "0"
+check "pause: same run id" "$(latest_run)" "$prun2"
+check "pause: done" "$(state status --run-dir "$RUNS/$prun2" --stage summarize)" "done"
 
 echo "--- A failing mid-stage still reports the other branch"
 touch "$STUB_FAIL_TRANSCRIBE"

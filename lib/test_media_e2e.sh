@@ -46,7 +46,7 @@ cleanup() {
   rm -rf "$(dirname "$TESTROOT")"
   true
 }
-trap cleanup EXIT
+[ -n "${KEEP_TESTROOT:-}" ] && echo "TESTROOT=$TESTROOT" || trap cleanup EXIT
 
 # --- Preconditions -----------------------------------------------------------
 missing=""
@@ -280,8 +280,12 @@ echo "$ARGV" | grep -q '"--model", "opus"' \
   && ok "--model carried CLAUDE_CLI_MODEL" || bad "wrong model"
 echo "$ARGV" | grep -q '"-p"' \
   && ok "print mode (non-interactive)" || bad "-p not passed"
-echo "$ARGV" | grep -q '"--output-format", "json"' \
-  && ok "json output format, so errors are parseable" || bad "output format not set"
+echo "$ARGV" | grep -q '"--output-format", "stream-json"' \
+  && ok "stream-json output, so the rate_limit_event (the meter) arrives" \
+  || bad "output format not stream-json"
+echo "$ARGV" | grep -q '"--verbose"' \
+  && ok "--verbose, which print mode requires for stream-json" \
+  || bad "--verbose not passed"
 echo "$ARGV" | grep -q '"--safe-mode"' \
   && ok "--safe-mode: no CLAUDE.md, hooks or plugins bleed in" \
   || bad "--safe-mode not passed"
@@ -347,6 +351,97 @@ echo "--- the subscription, not a metered API key"
 [ "$LEAKED" = "none" ] \
   && ok "ANTHROPIC_* scrubbed from the CLI environment" \
   || bad "these reached the CLI and would redirect billing: $LEAKED"
+
+echo "--- the usage ledger: what the stage spent, and the meter"
+# The stub answers every call with the same fixed usage and a 42% five-hour
+# meter; llm_client adds them up and summarize.py writes the total to the
+# run's state.json when run_one.sh launched it (MEETING_BOT_RUN_DIR).
+USAGE_RUN="$MEETING_BOT_ROOT/runs/usage_test"
+mkdir -p "$USAGE_RUN"
+"$PY" "$REPO/lib/runstate.py" init --run-dir "$USAGE_RUN" --input x --input-type local_file --safe-name usage_test
+USAGE_MD="$SUMMARIES_DIR/usage.md"
+MEETING_BOT_RUN_DIR="$USAGE_RUN" \
+  "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$USAGE_MD" \
+    --frames-manifest "$FRAME_OUT/manifest.json" --no-pdf \
+    --run-id usage_test > "$TESTROOT/usage.log" 2>&1
+check "summarize.py exits 0" "$?" "0"
+grep -q "Claude usage this stage: 1 call(s)" "$TESTROOT/usage.log" \
+  && ok "the stage reports its usage" || bad "no usage line in the log"
+grep -q "5h window at 42%" "$TESTROOT/usage.log" \
+  && ok "the subscription meter is reported" || bad "meter not reported"
+USAGE_JSON=$("$PY" "$REPO/lib/runstate.py" get --run-dir "$USAGE_RUN" --key stages.summarize.usage 2>/dev/null)
+echo "$USAGE_JSON" | "$PY" -c '
+import json, sys
+u = json.load(sys.stdin)
+assert u["calls"] == 1, u
+assert u["input_tokens"] == 1000 and u["cache_read_input_tokens"] == 4000, u
+assert u["thinking_tokens"] == 120, u
+assert abs(u["cost_usd"] - 0.25) < 1e-6, u
+assert u["windows"]["five_hour"]["utilization_after"] == 0.42, u
+' && ok "usage recorded in state.json with the meter" \
+  || bad "state.json usage wrong or missing: $USAGE_JSON"
+
+echo "--- an exhausted usage window waits for the reset, then retries"
+# The stub refuses the first call with a rejected rate_limit_event whose
+# reset is 2s away, and answers the second. The real llm_client must sleep
+# through the reset and try again on the subscription — not retry on the
+# backoff schedule, and not hand the summary to Gemini.
+WAIT_RUN="$MEETING_BOT_ROOT/runs/wait_test"
+mkdir -p "$WAIT_RUN"
+"$PY" "$REPO/lib/runstate.py" init --run-dir "$WAIT_RUN" --input y --input-type local_file --safe-name wait_test
+WAIT_MD="$SUMMARIES_DIR/wait.md"
+WAIT_RECORD="$TESTROOT/claude_cli_wait.jsonl"
+rm -f "$TESTROOT/wait.calls"
+MEETING_BOT_RUN_DIR="$WAIT_RUN" FAKE_CLAUDE_MODE=rate-limited-once \
+  FAKE_CLAUDE_STATE="$TESTROOT/wait.calls" FAKE_CLAUDE_RECORD="$WAIT_RECORD" \
+  SUMMARY_FALLBACK_CHAIN=claude-cli,gemini GEMINI_API_KEY_1=would-be-wrong \
+  "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$WAIT_MD" \
+    --frames-manifest "$FRAME_OUT/manifest.json" --no-pdf --prompt lecture-claude \
+    --run-id wait_test > "$TESTROOT/wait.log" 2>&1
+check "summarize.py exits 0 after the wait" "$?" "0"
+check "the CLI was called twice (refused, then answered)" \
+  "$(wc -l < "$WAIT_RECORD")" "2"
+grep -q "usage window exhausted" "$TESTROOT/wait.log" \
+  && ok "the wait is announced with the window and reset" || bad "no wait line"
+grep -q "window should have reset" "$TESTROOT/wait.log" \
+  && ok "the retry follows the wait" || bad "no retry after the wait"
+grep -q "trying gemini" "$TESTROOT/wait.log" \
+  && bad "the chain advanced to Gemini on a hit window" \
+  || ok "Gemini was not tried"
+grep -q "retrying in" "$TESTROOT/wait.log" \
+  && bad "the hit window went through the backoff schedule" \
+  || ok "not retried on the backoff schedule"
+grep -q "claude-cli/opus" "$WAIT_MD" \
+  && ok "the document is Claude's" || bad "provenance is not claude-cli"
+"$PY" "$REPO/lib/runstate.py" get --run-dir "$WAIT_RUN" --key stages.summarize.waiting_until >/dev/null 2>&1 \
+  && bad "waiting_until left behind after the wait ended" \
+  || ok "waiting_until cleared once the call went through"
+
+echo "--- past the wait cap, the stage pauses with the reset time recorded"
+# Same refusal, but the wait cap is 0: the stage must exit 75, leave the
+# reset time in state.json for --resume-all, and still not try Gemini.
+PAUSE_RUN="$MEETING_BOT_ROOT/runs/pause_test"
+mkdir -p "$PAUSE_RUN"
+"$PY" "$REPO/lib/runstate.py" init --run-dir "$PAUSE_RUN" --input z --input-type local_file --safe-name pause_test
+PAUSE_MD="$SUMMARIES_DIR/pause.md"
+MEETING_BOT_RUN_DIR="$PAUSE_RUN" FAKE_CLAUDE_MODE=rate-limited FAKE_CLAUDE_RESET_IN=7200 \
+  CLAUDE_CLI_MAX_WAIT_SECONDS=0 SUMMARY_FALLBACK_CHAIN=claude-cli,gemini GEMINI_API_KEY_1=would-be-wrong \
+  "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$PAUSE_MD" \
+    --frames-manifest "$FRAME_OUT/manifest.json" --no-pdf \
+    --run-id pause_test > "$TESTROOT/pause.log" 2>&1
+check "summarize.py exits 75 (EX_TEMPFAIL) on a pause" "$?" "75"
+[ -f "$PAUSE_MD" ] && bad "a document was written for a paused run" \
+  || ok "no document written"
+PAUSE_AT=$("$PY" "$REPO/lib/runstate.py" get --run-dir "$PAUSE_RUN" --key stages.summarize.rate_limited.resets_at 2>/dev/null)
+[ -n "$PAUSE_AT" ] && [ "$PAUSE_AT" -gt "$(date +%s)" ] \
+  && ok "the reset time is in state.json for --resume-all" \
+  || bad "no usable reset time recorded: '$PAUSE_AT'"
+grep -q "trying gemini" "$TESTROOT/pause.log" \
+  && bad "the chain advanced to Gemini on a pause" || ok "Gemini not tried on a pause"
+grep -q "PAUSED" "$TESTROOT/pause.log" && ok "the log says PAUSED" || bad "no PAUSED line"
+"$PY" "$REPO/lib/runstate.py" get --run-dir "$PAUSE_RUN" --key stages.summarize.usage.calls >/dev/null 2>&1 \
+  && ok "the refused call is still on the usage ledger" \
+  || bad "usage not recorded for the refused call"
 
 echo "--- a signed-out CLI degrades instead of failing the run"
 # The CLI exits 0 when it is not logged in, so the only signal is the body.

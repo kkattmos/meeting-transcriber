@@ -261,6 +261,9 @@ runs/<run_id>/
   kill            per-run kill sentinel
   admitted        per-run admission marker
   record.pid      record/join/ffmpeg pids + display + sink for this recording
+                  (state.json's summarize stage also carries `usage`, and
+                  `waiting_until` / `rate_limited` while paused on the
+                  Claude usage window — see the summarize section)
   video.mp4       YouTube download, when applicable
   clip.mp4        the --clip window, cut from video.mp4 / the input
   kaltura.json    entry facts, cached at fetch time
@@ -621,7 +624,7 @@ subscription non-interactively. That is the whole reason for the subprocess.
 The invocation is fixed in one place and asserted in two test suites:
 
 ```
-claude -p --output-format json --model <CLAUDE_CLI_MODEL> --effort <SUMMARY_EFFORT>
+claude -p --output-format stream-json --verbose --model <CLAUDE_CLI_MODEL> --effort <SUMMARY_EFFORT>
        --safe-mode --no-session-persistence
        [--tools Read --allowedTools Read --add-dir <frames dir>]
 ```
@@ -631,7 +634,22 @@ claude -p --output-format json --model <CLAUDE_CLI_MODEL> --effort <SUMMARY_EFFO
 - **`--effort` is where `SUMMARY_EFFORT` lands.** Same scale the Messages API
   spells `output_config.effort`. There is no token-budget knob and no CLI
   spelling for one, which is a more durable fix than remembering not to send
-  `budget_tokens`.
+  `budget_tokens`. **`SUMMARY_MAX_TOKENS` is Gemini-only and always was**;
+  `_max_tokens()` is called from `summarize_gemini` and nowhere else. The
+  operator set it to 100000 in 2026-09 expecting it to bound the
+  subscription spend and saw no change, which is what led to the usage
+  window section below.
+- **`--output-format stream-json --verbose`, not `json`.** The result
+  envelope is the same object, arriving as the last line; what the streaming
+  format adds is a `rate_limit_event` line carrying the subscription's own
+  meters (`rate_limit_info.unifiedWindows.five_hour.{utilization, resetsAt}`)
+  and, on an exhausted window, `status: "rejected"` plus the reset time. That
+  event is the only machine-readable form of either fact. `--verbose` is
+  what print mode requires before it will stream. Verified 2026-09-12 on
+  v2.1.263 with two Haiku calls; `parse_cli_output` still accepts a bare
+  envelope so the unit tests and an older stub keep working. The cost is
+  that the tool results (the frame images the model Reads) are echoed into
+  stdout as base64 — a few MB per chunk, held in memory once, discarded.
 - **`--model` defaults to the alias `opus`, not a pinned id.** The CLI resolves
   aliases to the current model, so a rename doesn't 404 a box nobody has
   touched in a year. `ANTHROPIC_MODEL` is still read as a fallback name.
@@ -744,6 +762,73 @@ the PDF. `--add-dir` names both directories. Pillow is optional: without it the
 originals are sent with one warning. `SCENE_THRESHOLD` and
 `FRAME_PERIOD_SECONDS` are untouched — this changes resolution, never which
 frames exist.
+
+### The usage window: metered, waited for, never handed to Gemini
+
+Settled with the operator 2026-09-12. A Pro/Max subscription has a rolling
+5-hour window and a 7-day one; before this, running out looked like *"claude
+CLI is not logged in"* (the CLI's own error classifier files "usage limit
+reached" beside the auth errors) and the chain quietly handed the summary to
+Gemini. Four decisions:
+
+1. **Every call's usage is recorded, with the meter.** `UsageLedger`
+   (`llm_client.USAGE`) takes the envelope's `usage` (input, output, cache
+   read/creation, thinking), `total_cost_usd` (list price — a decent proxy
+   for how much of the window a call took), and the `rate_limit_event`'s
+   `unifiedWindows`. `summarize.py` writes `USAGE.summary()` to
+   `stages.summarize.usage` in `state.json` on *every* exit path — the calls
+   that completed before a failure were spent too. `utilization_delta` on
+   `five_hour` is "what fraction of the window this stage cost", which is
+   the number the operator asked for and the only honest way to size a
+   lecture to a plan. Per-call lines go to the stage log.
+2. **A hit window waits in-process, on Claude.** `_rate_limit_from` turns a
+   rejected event (or `api_error_status` 429, or the legacy
+   `usage limit reached|<epoch>` wording) into `ClaudeCliRateLimited`, which
+   is `retryable = False` — it must not burn the backoff schedule — and
+   which `summarize_with_fallback` re-raises instead of advancing to Gemini.
+   `summarize_claude_cli` loops: `_wait_for_window` sleeps until the reset
+   the CLI named plus `RATE_LIMIT_MARGIN_SECONDS` (60), or polls every
+   `CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS` when no time was given, bounded in
+   total by `CLAUDE_CLI_MAX_WAIT_SECONDS` (6h — a full 5h window plus margin;
+   anything longer is the weekly limit and no stage should sit through
+   that). Sleeps go through `llm_client._sleep` so the tests can patch the
+   clock. `WAIT_HOOK` mirrors the wait into `stages.summarize.waiting_until`
+   so `--status` can distinguish "waiting" from "hung".
+3. **Past the cap, the stage pauses rather than merging around the hole.**
+   `mapreduce` re-raises a chunk error carrying `pause_run = True` instead
+   of writing "*(this part could not be summarized)*" and marking the stage
+   done — nothing would ever fill that gap. `summarize.py` exits **75**
+   (`EX_TEMPFAIL`) with `stages.summarize.rate_limited = {window, resets_at,
+   resets_at_iso}` annotated; `run_one.sh` marks the stage failed as usual
+   and passes 75 up; `pipeline.sh` reports `PAUSED` (not `FAIL`) and exits
+   75. `runstate.start` and `done` clear the field — a stale reset time
+   would make the next point skip a run that could go.
+4. **`--resume-all` is the resume, and a timer is its backstop.** It skips a
+   run whose `rate_limited.resets_at` is still in the future (and one whose
+   `run.lock` owner is alive), so firing it every 15 minutes never retries
+   into the same wall. `meeting-bot-resume.{service,timer}` do exactly that
+   (`setup.sh --with-resume-timer`, `SuccessExitStatus=75`,
+   `OnBootSec=5min` so a reboot mid-wait recovers on its own). The in-process
+   wait is the primary path; the timer exists for the process being gone.
+
+`CLAUDE_CLI_MAX_FRAMES` came out of the same conversation: frames are the
+bulk of a call's input (~790 tokens each at 1024px, ~72 per 36-minute chunk),
+so `thin_frames` caps what the model is *offered* — scene changes first,
+periodic frames at an even stride so the cap still covers the whole window.
+Numbers are untouched (they were assigned over the whole manifest), so the
+PDF resolves whatever the model cites. Code default 0 (= off): turning it on
+by default would silently change every existing run's summaries. **The
+recommended Pro-plan values live in `.env.example` instead** (settled with the
+operator 2026-09-12): `CLAUDE_CLI_MAX_FRAMES=12`, `FRAME_PERIOD_SECONDS=60`,
+`SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`. The README's table still
+lists the code defaults; the two differing on purpose is documented there.
+
+markitdown (microsoft/markitdown) was evaluated the same day as a way to cut
+resource tokens and **rejected**: it converts to Markdown, which carries more
+markup than the words-only extraction `resources.py` already does, and its
+image path *spends* an LLM call per picture. Its real benefit is structure
+(tables, headings) for slides; the operator chose not to take on pdfminer +
+python-pptx + mammoth + magika for that. Don't re-propose it as a token saver.
 
 **The CLI exits 0 when it is not logged in.** The only signal is the body:
 `is_error: true` with `result: "Not logged in · Please run /login"`. So
@@ -1298,6 +1383,27 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   recoverable without re-running ffmpeg.
 - **The CLI's JSON body decides success, not its exit code.** It exits 0 when
   signed out. Parsing the envelope is the only way to tell.
+- **`--output-format stream-json --verbose` stays.** `json` drops the
+  `rate_limit_event`, and with it the meter and the reset time; the window
+  then goes back to looking like a login failure.
+- **`SUMMARY_MAX_TOKENS` is not a Claude lever, and must not be wired to
+  one.** There is no output cap on the CLI, and output is not what spends
+  the window. The levers are `CLAUDE_CLI_MAX_FRAMES`, `FRAME_PERIOD_SECONDS`,
+  `FRAME_MAX_DIMENSION`, `SUMMARY_EFFORT` and `CLAUDE_CLI_MODEL`.
+- **`ClaudeCliRateLimited` is `retryable = False` and the chain re-raises
+  it.** Retrying it burns the backoff schedule; advancing hands the summary to
+  Gemini, which the operator chose not to pay for. It waits, or it pauses.
+- **A paused chunk fails the stage; it is never merged around.** `pause_run`
+  in `mapreduce.py`. A document with "*this part could not be summarized*"
+  and a `done` stage is a hole nothing will ever fill.
+- **Exit 75 means paused, and `--resume-all` honours `rate_limited.resets_at`.**
+  Collapsing 75 into 1 turns a timer-driven resume into a call against the
+  same wall every fifteen minutes.
+- **`runstate.start` clears `rate_limited` and `waiting_until`.** Otherwise a
+  run that resumed and succeeded still looks paused to the next `--resume-all`.
+- **`CLAUDE_CLI_MAX_FRAMES` thins what is offered, never renumbers.** The
+  numbers come from `assign_numbers()` over the whole manifest; a thinned
+  list that renumbered would recreate the per-chunk numbering bug above.
 - **`BackendUnavailable.retryable = False` stays.** Without it a signed-out CLI
   burns the whole retry schedule before falling back to Gemini.
 - **No `thinking.budget_tokens`, ever** — and now no CLI spelling for one
@@ -1367,17 +1473,17 @@ All of these run without API keys, network, or `/opt`, against temp directories
 
 | File | Covers | Count |
 |---|---|---|
-| `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI | 13 |
+| `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI, `annotate` and the pause fields | 19 |
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
-| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing, the cacheable static prompt, frame downscaling | 114 |
+| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), the cacheable static prompt, frame downscaling, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning | 136 |
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, part-tagged manifests and captions for `--combine`, real PDF render | 60 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix | 262 |
-| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), and a real ffmpeg clip probed for duration and rebased timestamps | 82 + the `--parts` block |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing) | 281 |
+| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps | 118 |
 | `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 
 `test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs
@@ -1414,8 +1520,21 @@ prompt and the auth vars that reached the child, so the test asserts that
 frame directory, that absolute frame paths are in the prompt, and that
 `ANTHROPIC_API_KEY` — deliberately exported by the test — did *not* reach the
 CLI. It also drives `FAKE_CLAUDE_MODE=not-logged-in` to prove a signed-out CLI
-fails as `BackendUnavailable` rather than being retried. When you change the
-invocation, assert it here.
+fails as `BackendUnavailable` rather than being retried, and
+`rate-limited-once` / `rate-limited` (with `FAKE_CLAUDE_RESET_IN` and
+`CLAUDE_CLI_MAX_WAIT_SECONDS`) to drive the real wait-then-retry and the
+pause through the real `summarize.py`, state.json included. The stub answers
+in stream-json when asked to, with a `rate_limit_event` at a fixed 42% so
+the ledger's numbers can be asserted exactly. When you change the
+invocation, assert it here. Note the wait test really sleeps: the stub's
+reset is 2s away and the margin is 60s, so that block takes about a minute.
+`KEEP_TESTROOT=1` keeps the test root for inspection.
+
+Two pre-existing failures on the author's desktop are worth knowing so they
+are not mistaken for regressions: "no downscaled frame copies in the prompt"
+(the scratch venv's Pillow cannot decode the synthetic frames) and, flakily,
+"language not sent" in the transcribe section. Both fail identically on the
+commit before the usage-window work.
 
 **What no test here covers:** Chrome actually joining a live Meet/Zoom call, a
 real Kaltura tenant's access-control (`./verify_e2e.sh --kaltura` is the live
@@ -1446,6 +1565,8 @@ own flags, which is everything about stage 1 except the call itself.
 ├── verify_e2e.sh                 <- live checks: preflight + mp4/YouTube/Kaltura/Meet/Zoom
 ├── trigger_server.py
 ├── meeting-bot-trigger.service   <- systemd unit (setup.sh --with-trigger)
+├── meeting-bot-resume.service    <- `pipeline.sh --resume-all` for paused runs
+├── meeting-bot-resume.timer      <-   ...every 15 min (setup.sh --with-resume-timer)
 ├── lib/
 │   ├── runstate.py               <- run state + locking + CLI
 │   ├── slotqueue.py              <- machine-wide component queue

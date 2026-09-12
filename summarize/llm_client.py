@@ -59,7 +59,27 @@ A template without the markers is sent exactly as it always was.
 EFFORT, NOT A TOKEN BUDGET. SUMMARY_EFFORT maps onto the CLI's `--effort`
 (low | medium | high | xhigh | max), the same scale the Messages API exposes as
 `output_config.effort`. Thinking is adaptive: the model decides when to use it.
-There is no token-budget knob, deliberately.
+There is no token-budget knob, deliberately — and SUMMARY_MAX_TOKENS does NOT
+apply here: the CLI has no output cap flag, and output is not where a
+subscription window goes anyway. What actually spends it is input — the
+frames the model opens (~790 tokens each at 1024px), the transcript, and the
+thinking `--effort` buys. The levers that exist are CLAUDE_CLI_MAX_FRAMES
+(frames offered per call), FRAME_MAX_DIMENSION, CLAUDE_CLI_FRAME_VISION,
+SUMMARY_EFFORT and CLAUDE_CLI_MODEL.
+
+THE WINDOW IS METERED, AND A HIT WINDOW WAITS. `--output-format stream-json`
+makes the CLI emit a `rate_limit_event` beside the result, carrying the
+subscription's own 5-hour and 7-day meters (`unifiedWindows.five_hour.
+{utilization, resetsAt}`). Every call's token usage and the meter before and
+after it go into `USAGE`, which summarize.py writes into the run's state.json,
+so "how much of the window did that lecture cost" is a number on disk rather
+than a guess. When the window is exhausted the event says `rejected` with the
+reset time; that becomes ClaudeCliRateLimited, which is neither retried on
+the backoff schedule nor handed to Gemini — the call sleeps until the reset
+(CLAUDE_CLI_MAX_WAIT_SECONDS, default 6h, caps that) and tries again, so the
+summary stays on the subscription. Past the cap the stage fails with the
+reset time recorded, and `pipeline.sh --resume-all` (from a timer, or by
+hand) picks it up once the window has reset.
 
 TRANSIENT FAILURES. Every backend's network call goes through
 summarize/retry.py: 503 "server is busy", 429, 5xx and connection errors are
@@ -86,6 +106,13 @@ Env vars:
                         the CLI as a system prompt file; 0 sends them inline
   FRAME_MAX_DIMENSION   long edge, px, of the frame copies sent to the CLI
                         (default 1024; 0 sends the originals)
+  CLAUDE_CLI_MAX_FRAMES most frames offered to the model per call (default 0
+                        = every frame of the chunk); scene changes are kept
+                        first, periodic frames are thinned evenly
+  CLAUDE_CLI_MAX_WAIT_SECONDS  how long one call may sleep for the usage
+                        window to reset before the stage fails (default 21600)
+  CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS  retry interval when the CLI reports a
+                        hit window without a reset time (default 600)
   SUMMARY_EFFORT        low | medium | high (default) | xhigh | max
   GEMINI_API_KEY_1..3   required for gemini (GOOGLE_API_KEY also accepted)
   GEMINI_MODEL          default gemini-3.6-flash
@@ -96,10 +123,14 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import List
 
@@ -163,6 +194,38 @@ DEFAULT_FRAME_MAX_DIMENSION = 1024
 # keeping the copies under the same parent means --add-dir already covers them.
 LLM_FRAME_SUBDIR = "llm-{max_dim}"
 
+# Per-call frame cap. 0 = no cap, which is what every run did before the
+# setting existed. The frames are the bulk of a call's input, so this is the
+# first thing to turn down when a lecture doesn't fit the subscription window.
+DEFAULT_MAX_FRAMES = 0
+
+# A hit usage window: how long one call may sleep for the reset before giving
+# up (6h covers a full 5-hour window plus margin — anything longer is the
+# weekly limit, which no wait inside a stage should sit through), how often
+# to try again when the CLI names no reset time, and the margin added to the
+# reset time it does name so the retry doesn't land a second early.
+DEFAULT_MAX_WAIT_SECONDS = 6 * 3600
+DEFAULT_RATE_LIMIT_POLL_SECONDS = 600
+RATE_LIMIT_MARGIN_SECONDS = 60
+
+# Wording the CLI uses for an exhausted subscription window when the
+# machine-readable signals (a `rate_limit_event` with status "rejected", or
+# `api_error_status` 429) are absent — an older CLI, or `--output-format json`.
+# The oldest form is "Claude AI usage limit reached|<unix reset time>".
+_RATE_LIMIT_RE = re.compile(
+    r"(usage limit reached|hit your (?:\w+ )?limit|rate limit)", re.IGNORECASE)
+_RATE_LIMIT_RESET_RE = re.compile(r"limit reached\|(\d{9,11})")
+
+# Sleeps go through this so the unit tests can stand in for the clock; the
+# wait for a window reset would otherwise take hours to test.
+_sleep = time.sleep
+
+# summarize.py installs a callable here to mirror a wait into the run's
+# state.json (`waiting_until`), so `pipeline.sh --status` can say why a
+# summarize stage has been "running" for three hours. Called with keyword
+# arguments; see _wait_for_window. None means nobody is listening.
+WAIT_HOOK = None
+
 # Which backend and model actually produced the last successful summary. The
 # document header records this, and on a fallback chain it's the only way to
 # know after the fact which provider answered.
@@ -199,6 +262,168 @@ class ClaudeCliError(RuntimeError):
     classify it — the CLI has no HTTP status to expose, so its wording
     ("overloaded", "rate limit") is the only signal available.
     """
+
+
+class ClaudeCliRateLimited(ClaudeCliError):
+    """The subscription's usage window is exhausted.
+
+    Not a transient failure and not an unusable backend, so it is handled by
+    neither of the two existing paths: `retryable = False` keeps with_retries
+    from burning its backoff schedule on it, and summarize_with_fallback
+    re-raises it instead of advancing to Gemini — the operator chose to wait
+    for the subscription rather than pay a second provider. The wait itself is
+    _wait_for_window; when that gives up, `pause_run` tells mapreduce to fail
+    the stage (resumable, reset time recorded) rather than merge around the
+    missing chunk and ship a document with a hole in it.
+
+    `resets_at` is a unix timestamp when the CLI reported one, else None.
+    `window` is the CLI's name for the limit ("five_hour", "seven_day", ...).
+    """
+
+    retryable = False
+    pause_run = True
+
+    def __init__(self, message, resets_at=None, window=None):
+        super().__init__(message)
+        self.resets_at = resets_at
+        self.window = window
+
+
+class UsageLedger:
+    """Every claude-cli call's token usage plus the subscription meter.
+
+    Thread-safe because chunks are summarized in parallel. `summary()` is what
+    summarize.py writes into state.json at the end of the stage — including a
+    stage that fails partway, since the calls that did complete were spent.
+    """
+
+    _COUNTERS = ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                 "cache_creation_input_tokens", "thinking_tokens")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self.calls = []
+            self.first_windows = None
+            self.last_windows = None
+
+    @staticmethod
+    def _windows(rate_limit_info):
+        """{"five_hour": {"utilization": 0.34, "resets_at": ts}, ...} or None."""
+        if not isinstance(rate_limit_info, dict):
+            return None
+        unified = rate_limit_info.get("unifiedWindows")
+        if not isinstance(unified, dict):
+            return None
+        out = {}
+        for name, win in unified.items():
+            if not isinstance(win, dict):
+                continue
+            entry = {}
+            if isinstance(win.get("utilization"), (int, float)):
+                entry["utilization"] = round(float(win["utilization"]), 4)
+            if isinstance(win.get("resetsAt"), (int, float)):
+                entry["resets_at"] = int(win["resetsAt"])
+            if entry:
+                out[name] = entry
+        return out or None
+
+    def add(self, payload, rate_limit_info=None, label=None):
+        """Record one call from the CLI's result envelope. Returns the record."""
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        record = {"label": label, "at": _now_iso()}
+        for key in self._COUNTERS:
+            value = usage.get(key)
+            if key == "thinking_tokens":
+                details = usage.get("output_tokens_details")
+                value = details.get("thinking_tokens") if isinstance(details, dict) else None
+            record[key] = int(value) if isinstance(value, (int, float)) else 0
+        cost = payload.get("total_cost_usd") if isinstance(payload, dict) else None
+        record["cost_usd"] = round(float(cost), 4) if isinstance(cost, (int, float)) else 0.0
+        # Every frame the model opens is a tool turn, and every turn re-sends
+        # the whole context (cached, but the meter still counts it). This is
+        # why a chunk with 70 frames costs far more than 70 x 790 tokens, and
+        # why CLAUDE_CLI_MAX_FRAMES is the first lever.
+        turns = payload.get("num_turns") if isinstance(payload, dict) else None
+        record["turns"] = int(turns) if isinstance(turns, (int, float)) else 0
+        windows = self._windows(rate_limit_info)
+        if windows:
+            record["windows"] = windows
+        with self._lock:
+            self.calls.append(record)
+            if windows:
+                if self.first_windows is None:
+                    self.first_windows = windows
+                self.last_windows = windows
+        return record
+
+    def summary(self):
+        with self._lock:
+            calls = list(self.calls)
+            first, last = self.first_windows, self.last_windows
+        totals = {key: sum(c[key] for c in calls) for key in self._COUNTERS}
+        totals["cost_usd"] = round(sum(c["cost_usd"] for c in calls), 4)
+        totals["turns"] = sum(c.get("turns", 0) for c in calls)
+        out = {"calls": len(calls), **totals}
+        if first and last:
+            for name in sorted(set(first) | set(last)):
+                a = first.get(name, {}).get("utilization")
+                b = last.get(name, {}).get("utilization")
+                entry = {}
+                if a is not None:
+                    entry["utilization_before"] = a
+                if b is not None:
+                    entry["utilization_after"] = b
+                if a is not None and b is not None:
+                    # Negative means the window reset mid-run; keep the raw
+                    # numbers rather than clamp them, that is information too.
+                    entry["utilization_delta"] = round(b - a, 4)
+                reset = last.get(name, {}).get("resets_at")
+                if reset is not None:
+                    entry["resets_at"] = reset
+                    entry["resets_at_iso"] = _iso(reset)
+                out.setdefault("windows", {})[name] = entry
+        return out
+
+    def describe(self):
+        """One line for the log, e.g. '4 calls, 212k in (180k cached), 9k out'."""
+        s = self.summary()
+        if not s["calls"]:
+            return "no claude-cli calls"
+        text = (f"{s['calls']} call(s), {_k(s['input_tokens'] + s['cache_read_input_tokens'] + s['cache_creation_input_tokens'])} in "
+                f"({_k(s['cache_read_input_tokens'])} cached), {_k(s['output_tokens'])} out, "
+                f"{_k(s['thinking_tokens'])} thinking, ~${s['cost_usd']:.2f} at list price")
+        five = s.get("windows", {}).get("five_hour")
+        if five and "utilization_after" in five:
+            text += f"; 5h window at {five['utilization_after'] * 100:.0f}%"
+            if "utilization_delta" in five:
+                text += f" ({five['utilization_delta'] * 100:+.0f}% this stage)"
+            if five.get("resets_at"):
+                text += f", resets {_local_clock(five['resets_at'])}"
+        return text
+
+
+USAGE = UsageLedger()
+
+
+def _now_iso():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+
+
+def _local_clock(ts):
+    return datetime.fromtimestamp(ts).astimezone().strftime("%H:%M %Z")
+
+
+def _k(n):
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
 
 @dataclass
@@ -465,6 +690,76 @@ def _frame_max_dimension():
     return max(0, value)
 
 
+def _int_env(name, default, floor=0):
+    raw = os.environ.get(name, default)
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        print(f"  warning: {name}={raw!r} is not a number — using {default}",
+              file=sys.stderr)
+        return default
+    return max(floor, value)
+
+
+def _max_frames():
+    return _int_env("CLAUDE_CLI_MAX_FRAMES", DEFAULT_MAX_FRAMES)
+
+
+def _max_wait_seconds():
+    return _int_env("CLAUDE_CLI_MAX_WAIT_SECONDS", DEFAULT_MAX_WAIT_SECONDS)
+
+
+def _rate_limit_poll_seconds():
+    return _int_env("CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS",
+                    DEFAULT_RATE_LIMIT_POLL_SECONDS, floor=5)
+
+
+def thin_frames(frames, cap):
+    """At most `cap` frames, chosen to still cover the whole window.
+
+    Scene changes are kept first — there are rarely more than a handful, and
+    each one is a slide transition the notes should cite — and the periodic
+    frames fill the rest at an even stride, so a 36-minute chunk capped at 20
+    still shows the model something every couple of minutes rather than the
+    first twenty minutes in detail and nothing after.
+
+    The frames' numbers are untouched: they were assigned over the whole
+    manifest by assign_numbers(), and the ones left out keep theirs, so a
+    citation still resolves to the right picture in the PDF. Only what the
+    model is *offered* shrinks. cap <= 0 returns the list as it was.
+    """
+    if cap <= 0 or len(frames) <= cap:
+        return list(frames)
+    ordered = sorted(frames, key=lambda f: f.sort_key)
+    scene = [f for f in ordered if f.kind == "scene_change"]
+    periodic = [f for f in ordered if f.kind != "scene_change"]
+    if len(scene) >= cap:
+        # Even the scene changes alone are over budget: stride through them.
+        kept = _evenly(scene, cap)
+    else:
+        kept = scene + _evenly(periodic, cap - len(scene))
+    return sorted(kept, key=lambda f: f.sort_key)
+
+
+def _evenly(items, n):
+    """n items from `items` at an even stride, first and last included."""
+    if n <= 0 or not items:
+        return []
+    if n >= len(items):
+        return list(items)
+    if n == 1:
+        return [items[len(items) // 2]]
+    step = (len(items) - 1) / (n - 1)
+    picked = []
+    seen = set()
+    for i in range(n):
+        idx = round(i * step)
+        if idx not in seen:
+            seen.add(idx)
+            picked.append(items[idx])
+    return picked
+
+
 _warned_no_pillow_downscale = False
 
 
@@ -543,7 +838,104 @@ def _looks_unauthenticated(text):
     return any(marker in lowered for marker in _NOT_LOGGED_IN_MARKERS)
 
 
-def _run_claude_cli(argv, prompt, env, cwd, timeout):
+def parse_cli_output(stdout):
+    """(result_envelope, last_rate_limit_info) from what the CLI printed.
+
+    `--output-format stream-json` prints one JSON object per line: system
+    messages, the assistant turns, `rate_limit_event`s, and finally the same
+    `result` envelope that `--output-format json` prints alone. Both shapes
+    are accepted — a whole-output parse first (the plain envelope, which is
+    also what the unit tests and an older stub feed in), then line by line.
+    Returns (None, None) when there is no envelope at all, which the caller
+    reads as "the CLI refused before it got that far".
+    """
+    text = (stdout or "").strip()
+    if not text:
+        return None, None
+    try:
+        whole = json.loads(text)
+        if isinstance(whole, dict):
+            return whole, None
+    except json.JSONDecodeError:
+        pass
+    envelope = None
+    rate_limit = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        kind = obj.get("type")
+        if kind == "result":
+            envelope = obj
+        elif kind == "rate_limit_event":
+            info = obj.get("rate_limit_info")
+            if isinstance(info, dict):
+                rate_limit = info
+    return envelope, rate_limit
+
+
+def _rate_limit_from(payload, rate_limit_info, stderr=""):
+    """A ClaudeCliRateLimited if this call hit the usage window, else None.
+
+    Three signals, most reliable first: the `rate_limit_event` saying
+    `rejected` (with the reset time and which window), `api_error_status`
+    429 on the envelope, and finally the wording of the result — the last
+    covers a CLI old enough to print "usage limit reached|<epoch>" and no
+    event at all.
+    """
+    result = payload.get("result") if isinstance(payload, dict) else ""
+    result = result if isinstance(result, str) else ""
+    is_error = bool(payload.get("is_error")) or payload.get("subtype") == "error"
+
+    if isinstance(rate_limit_info, dict) and rate_limit_info.get("status") == "rejected":
+        window = rate_limit_info.get("rateLimitType") or "unknown"
+        resets_at = rate_limit_info.get("resetsAt")
+        if not isinstance(resets_at, (int, float)):
+            windows = rate_limit_info.get("unifiedWindows") or {}
+            candidate = windows.get(window) if isinstance(windows, dict) else None
+            resets_at = candidate.get("resetsAt") if isinstance(candidate, dict) else None
+        resets_at = int(resets_at) if isinstance(resets_at, (int, float)) else None
+        return ClaudeCliRateLimited(
+            f"claude usage window exhausted ({window}"
+            f"{', resets ' + _iso(resets_at) if resets_at else ''}): "
+            f"{result or stderr or 'rate_limit_event rejected'}",
+            resets_at=resets_at, window=window)
+
+    if not is_error:
+        return None
+    text = result or stderr or ""
+    if payload.get("api_error_status") == 429 or _RATE_LIMIT_RE.search(text):
+        m = _RATE_LIMIT_RESET_RE.search(text)
+        resets_at = int(m.group(1)) if m else None
+        return ClaudeCliRateLimited(
+            f"claude usage window exhausted"
+            f"{' (resets ' + _iso(resets_at) + ')' if resets_at else ''}: "
+            f"{text or 'HTTP 429'}",
+            resets_at=resets_at, window=None)
+    return None
+
+
+def _describe_call(record):
+    """The per-call usage line, e.g. '61.2k in (48.0k cached), 4.1k out'."""
+    text = (f"{_k(record['input_tokens'] + record['cache_read_input_tokens'] + record['cache_creation_input_tokens'])} in "
+            f"({_k(record['cache_read_input_tokens'])} cached), "
+            f"{_k(record['output_tokens'])} out, {_k(record['thinking_tokens'])} thinking, "
+            f"{record.get('turns', 0)} turn(s), ~${record['cost_usd']:.2f}")
+    five = (record.get("windows") or {}).get("five_hour")
+    if five and "utilization" in five:
+        text += f"; 5h window {five['utilization'] * 100:.0f}%"
+        if five.get("resets_at"):
+            text += f", resets {_local_clock(five['resets_at'])}"
+    return text
+
+
+def _run_claude_cli(argv, prompt, env, cwd, timeout, label="claude-cli"):
     """One `claude -p` invocation. Raises on anything that isn't a summary.
 
     Split out from summarize_claude_cli so with_retries wraps exactly the
@@ -571,15 +963,25 @@ def _run_claude_cli(argv, prompt, env, cwd, timeout):
             raise BackendUnavailable(f"claude CLI is not logged in: {detail}")
         raise ClaudeCliError(f"claude CLI produced no output: {detail}")
 
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
-        # --output-format json should always give us JSON. Anything else is
-        # the CLI refusing before it got that far.
+    payload, rate_limit_info = parse_cli_output(stdout)
+    if payload is None:
+        # A JSON output format should always give us a result envelope.
+        # Anything else is the CLI refusing before it got that far.
         if _looks_unauthenticated(stdout):
             raise BackendUnavailable(f"claude CLI is not logged in: {stdout}")
         raise ClaudeCliError(
             f"claude CLI returned non-JSON output: {stdout[:400]}")
+
+    # Whatever happens next, the tokens were spent — and on a rejected call
+    # the event still carries the meter, which is the number worth keeping.
+    record = USAGE.add(payload, rate_limit_info, label=label)
+
+    # Before the auth check: the CLI's own error classifier files "usage
+    # limit reached" beside "not logged in", and an exhausted window read as
+    # a signed-out CLI would hand the summary to Gemini instead of waiting.
+    limited = _rate_limit_from(payload, rate_limit_info, stderr)
+    if limited is not None:
+        raise limited
 
     result = payload.get("result")
     if not isinstance(result, str):
@@ -604,7 +1006,51 @@ def _run_claude_cli(argv, prompt, env, cwd, timeout):
 
     if not result.strip():
         raise ClaudeCliError("claude CLI returned an empty summary")
+    print(f"     {label}: {_describe_call(record)}")
     return result.strip()
+
+
+def _wait_for_window(exc, label, waited_so_far):
+    """Sleep out a hit usage window. Returns the seconds slept.
+
+    Raises the exception back when the wait would exceed
+    CLAUDE_CLI_MAX_WAIT_SECONDS in total for this call — the weekly limit,
+    or a window that keeps refusing after its reset — so the stage fails
+    with the reset time recorded and a later `--resume-all` picks it up.
+    """
+    max_wait = _max_wait_seconds()
+    now = time.time()
+    if exc.resets_at:
+        delay = exc.resets_at - now + RATE_LIMIT_MARGIN_SECONDS
+        # A reset time in the past means the CLI's clock and ours disagree,
+        # or the window already turned over while we were reading the error:
+        # try again soon rather than never.
+        delay = max(delay, RATE_LIMIT_MARGIN_SECONDS)
+        why = f"resets {_local_clock(exc.resets_at)}"
+    else:
+        delay = _rate_limit_poll_seconds()
+        why = "no reset time reported"
+    if max_wait <= 0 or waited_so_far + delay > max_wait:
+        raise exc
+    until = now + delay
+    print(f"     {label}: usage window exhausted ({exc.window or 'window'}, {why}) — "
+          f"waiting {delay / 60:.0f} min, until {_local_clock(until)}",
+          file=sys.stderr)
+    if WAIT_HOOK is not None:
+        try:
+            WAIT_HOOK(waiting_until=int(until), resets_at=exc.resets_at,
+                      window=exc.window)
+        except Exception as hook_exc:  # noqa: BLE001 — bookkeeping only
+            print(f"     warning: could not record the wait: {hook_exc}",
+                  file=sys.stderr)
+    _sleep(delay)
+    if WAIT_HOOK is not None:
+        try:
+            WAIT_HOOK(waiting_until=None, resets_at=None, window=None)
+        except Exception:  # noqa: BLE001
+            pass
+    print(f"     {label}: window should have reset — trying again", file=sys.stderr)
+    return delay
 
 
 def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
@@ -627,13 +1073,19 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
     effort = effort_level()
     vision = _frame_vision_enabled() and bool(frames)
 
+    # Fewer frames offered, when capped: they are the bulk of a call's input
+    # against the subscription window. The numbers stay global, so the ones
+    # left out still resolve in the PDF if the model never cites them.
+    offered = thin_frames(frames, _max_frames())
+    thinned = len(frames) - len(offered)
+
     # Downscaled copies, so a 1920x1080 keyframe doesn't cost ~1,844 tokens
     # every time the model opens it. Only the paths the CLI is given change —
     # pdf.py still crops and embeds the full-resolution originals.
     resized = 0
-    llm_frames = frames
+    llm_frames = offered
     if vision:
-        llm_frames, resized = _downscale_frames(frames)
+        llm_frames, resized = _downscale_frames(offered)
 
     # The half of the template that never varies goes to the CLI as a system
     # prompt read from a stable file, so the prefix is byte-identical across
@@ -660,7 +1112,12 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
 
     argv = [
         binary, "-p",
-        "--output-format", "json",
+        # stream-json, not json: the same result envelope arrives as the last
+        # line, and beside it the CLI emits a rate_limit_event carrying the
+        # subscription's own 5-hour / 7-day meters and, when the window is
+        # exhausted, the reset time. --verbose is what print mode requires
+        # for the streaming format.
+        "--output-format", "stream-json", "--verbose",
         "--model", model,
         "--effort", effort,
         # Deterministic context: no CLAUDE.md, no hooks, no plugins, no MCP
@@ -696,16 +1153,31 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
 
     label = f"claude-cli/{model} (effort={effort})"
     detail = "vision=on" if vision else "vision=off"
+    if thinned:
+        detail += f", {thinned} of {len(frames)} left out (CLAUDE_CLI_MAX_FRAMES)"
     if resized:
         detail += f", {resized} downscaled to {_frame_max_dimension()}px"
     if static_prompt_path is not None:
         detail += ", cacheable system prompt"
     print(f"     {label}: {len(sorted_frames)} frame(s), {detail}")
 
-    text = with_retries(
-        _run_claude_cli, argv, user_text, _claude_cli_env(), _claude_cli_cwd(),
-        _cli_timeout(), label=label,
-    )
+    # with_retries handles a busy server; this loop handles an exhausted
+    # subscription window, which is neither transient nor a reason to hand
+    # the summary to another provider. ClaudeCliRateLimited is not retryable,
+    # so it comes straight back out of with_retries, and the wait is bounded
+    # in total by CLAUDE_CLI_MAX_WAIT_SECONDS for this one call.
+    waited = 0.0
+    while True:
+        try:
+            # The trailing positional is _run_claude_cli's own label; the
+            # keyword one is with_retries', which it keeps for its log line.
+            text = with_retries(
+                _run_claude_cli, argv, user_text, _claude_cli_env(),
+                _claude_cli_cwd(), _cli_timeout(), label, label=label,
+            )
+            break
+        except ClaudeCliRateLimited as exc:
+            waited += _wait_for_window(exc, label, waited)
 
     _record_used("claude-cli", model)
     return text
@@ -821,6 +1293,15 @@ def summarize_with_fallback(frames: List[FrameMeta], transcript: str,
         try:
             print(f"  -> trying {name}...")
             return func(frames, transcript, prompt_template)
+        except ClaudeCliRateLimited as exc:
+            # The subscription window is exhausted and the in-process wait
+            # gave up. Not a reason to spend a second provider: the operator
+            # chose to wait for the subscription, so this fails the stage
+            # (resumable, reset time recorded) instead of advancing.
+            print(f"  !! {name}: {exc}\n"
+                  f"     not falling through to the next backend — the run "
+                  f"resumes on Claude once the window resets", file=sys.stderr)
+            raise
         except BackendUnavailable as exc:
             print(f"  !! {name} unavailable: {exc}", file=sys.stderr)
             failures.append((name, exc))

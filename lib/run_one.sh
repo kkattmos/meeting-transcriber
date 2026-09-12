@@ -73,6 +73,10 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 . "$ROOT_DIR/lib/paths.sh"
 
 RUNSTATE="$SCRIPT_DIR/runstate.py"
+# summarize.py's exit status for "the Claude usage window is exhausted; try
+# again after it resets" (EX_TEMPFAIL). Passed up unchanged so pipeline.sh
+# can report the run as paused rather than failed.
+EXIT_PAUSED=75
 SLOTQUEUE="$SCRIPT_DIR/slotqueue.py"
 
 PYTHON_BIN="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
@@ -246,6 +250,17 @@ run_stage() {
   rc=${PIPESTATUS[0]}
   release_slot
 
+  if [ "$rc" -eq "$EXIT_PAUSED" ]; then
+    # summarize.py ran out of Claude usage window and gave up waiting. Not
+    # broken: the stage is failed (so a resume re-runs it) and the reset
+    # time is already in state.json, where --resume-all reads it.
+    rs fail --run-dir "$RUN_DIR" --stage "$stage" \
+       --error "$(tail -n 5 "$log" 2>/dev/null)"
+    local resumes_at
+    resumes_at="$(rs get --run-dir "$RUN_DIR" --key "stages.$stage.rate_limited.resets_at_iso" 2>/dev/null || true)"
+    echo "[$stage] PAUSED — Claude usage window exhausted; resumable after ${resumes_at:-the reset}" >&2
+    return "$rc"
+  fi
   if [ "$rc" -ne 0 ]; then
     # Keep the tail of the log in state.json so `runstate show` explains the
     # failure without the operator having to go find the log file.
@@ -394,7 +409,7 @@ run_combine() {
   fi
 
   echo ""
-  run_stage summarize do_summarize_combined "$parts_file" || return 1
+  run_stage summarize do_summarize_combined "$parts_file" || return $?
   local -a artifacts=()
   [ -f "$COMBINE_MD" ] && artifacts+=("md=$COMBINE_MD")
   [ -n "$COMBINE_PDF" ] && [ -f "$COMBINE_PDF" ] && artifacts+=("pdf=$COMBINE_PDF")
@@ -428,10 +443,11 @@ if [ "$INPUT_TYPE" = "combine" ]; then
     echo "run_one.sh: combine run $RUN_ID has no members or no output path in state.json" >&2
     exit 2
   fi
-  if run_combine; then
-    exit 0
-  fi
+  rc=0
+  run_combine || rc=$?
+  [ "$rc" -eq 0 ] && exit 0
   echo "    Resume with:  ./pipeline.sh --run-id $RUN_ID" >&2
+  [ "$rc" -eq "$EXIT_PAUSED" ] && exit "$EXIT_PAUSED"
   exit 1
 fi
 
@@ -805,8 +821,11 @@ fi
 
 resolve_video
 echo ""
-if ! run_stage summarize do_summarize "$VIDEO_FILE"; then
+rc=0
+run_stage summarize do_summarize "$VIDEO_FILE" || rc=$?
+if [ "$rc" -ne 0 ]; then
   echo "    Resume with:  ./pipeline.sh --run-id $RUN_ID" >&2
+  [ "$rc" -eq "$EXIT_PAUSED" ] && exit "$EXIT_PAUSED"
   exit 1
 fi
 # Either output can be switched off (SUMMARY_WRITE_MARKDOWN / SUMMARY_WRITE_PDF,
