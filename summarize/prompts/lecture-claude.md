@@ -41,6 +41,7 @@ rather than from a fixed list — use the divisions the material actually has
   source material is itself an enumerated list (requirements, algorithm steps).
 - **Bold** every defined term, requirement name, technology, and named figure
   the first time it appears.
+- Include memory aids, and memorization concepts for memorized-only topics
 - Use `### N.M Subheading` where a section has genuinely distinct parts.
 - Use what the frames show — equations, diagrams, code, announcements on a
   slide — as content, but do not cite them: no `(Frame N @ …)` references, no
