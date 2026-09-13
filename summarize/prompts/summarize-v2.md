@@ -122,5 +122,5 @@ or as a periodic safety-net sample.
 {frame_manifest}
 </frames>
 
-Read the frames you need and the transcript, then produce the Markdown summary
+Look at the frames and read the transcript, then produce the Markdown summary
 described in <output_format>.

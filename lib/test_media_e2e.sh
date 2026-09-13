@@ -298,52 +298,66 @@ echo "$ARGV$PROMPT" | grep -q 'budget_tokens' \
   && bad "budget_tokens appeared (current models reject it)" \
   || ok "no budget_tokens anywhere in the invocation"
 
-echo "--- frames reach the model as files, not as image blocks"
-echo "$ARGV" | grep -q '"--tools", "Read"' \
-  && ok "Read is the only tool offered" || bad "--tools Read not passed"
-echo "$ARGV" | grep -q '"--allowedTools", "Read"' \
-  && ok "Read is pre-approved (-p mode cannot answer a prompt)" \
-  || bad "--allowedTools Read not passed"
-echo "$ARGV" | grep -q "\"--add-dir\", \"$FRAME_OUT\"" \
-  && ok "--add-dir scopes file access to this run's frame directory" \
-  || bad "--add-dir does not name $FRAME_OUT"
-# extract_frames.py names them scene_NNNNN.jpg / periodic_NNNNN.jpg; -F keeps
-# a test root containing a space (and any regex metacharacter) literal. The
-# copies the model is pointed at keep those names inside an llm-<px>/
-# subdirectory (FRAME_MAX_DIMENSION), so the segment is optional here.
+echo "--- frames reach the model as image blocks in one turn, not as files"
+# --input-format stream-json lets the user turn carry base64 image blocks,
+# so the model sees every offered frame at once and needs no tool. On the
+# older Read-tool path each frame the model opened was another turn that
+# resent the whole context as cache reads — more than the frames cost.
+echo "$ARGV" | grep -q '"--input-format", "stream-json"' \
+  && ok "stdin is a stream-json user message" || bad "--input-format stream-json not passed"
+echo "$ARGV" | grep -q '"--tools", ""' \
+  && ok "no tools offered — nothing to Read" || bad "tools were offered"
+echo "$ARGV" | grep -q '"--add-dir"' \
+  && bad "--add-dir passed; the model was given file access it has no use for" \
+  || ok "no --add-dir"
+IMAGES=$("$PY" - "$CLI_RECORD" <<'PYEOF'
+import json, sys
+images = json.loads(open(sys.argv[1]).readline()).get("images") or []
+bad = [i for i in images if i.get("media_type") != "image/jpeg" or i.get("bytes", 0) <= 0]
+print(len(images), len(bad))
+PYEOF
+)
+[ "${IMAGES%% *}" -ge 1 ] && [ "${IMAGES##* }" = "0" ] \
+  && ok "${IMAGES%% *} JPEG image block(s) rode along on stdin" \
+  || bad "image blocks wrong: count/bad = $IMAGES"
+echo "$PROMPT" | grep -qE "^\[frame [0-9]+ @ [0-9.]+s \((scene_change|periodic)\)\]" \
+  && ok "the manifest names the frames the images carry" || bad "no frame labels in the prompt"
 echo "$PROMPT" | grep -qF "$FRAME_OUT/" \
-  && ok "absolute frame paths are in the prompt" || bad "no frame paths sent"
-echo "$PROMPT" | grep -qE "(llm-[0-9]+/)?(scene|periodic)_[0-9]+\.jpg" \
-  && ok "the paths name real extracted frames" || bad "frame filenames look wrong"
+  && bad "filesystem paths in the prompt — the model has no tool to open them" \
+  || ok "no filesystem paths in the prompt"
 
-echo "--- frames are downscaled for the model, not on disk"
-# A 1920x1080 keyframe costs ~1,844 tokens every time the model opens it.
-# FRAME_MAX_DIMENSION caps the copy; the saved frame pdf.py crops must not move.
-echo "$PROMPT" | grep -qE "llm-1024/(scene|periodic)_[0-9]+\.jpg" \
-  && ok "the model is pointed at the downscaled copies" \
-  || bad "no downscaled frame copies in the prompt"
-"$PY" - "$FRAME_OUT" <<'PYEOF'
-import sys
+echo "--- frames are cropped and downscaled for the model, not on disk"
+# A 1920x1080 keyframe costs ~1,844 tokens every time the model sees it. The
+# copy is cropped to the slide (PDF_FRAME_CROP, same as the PDF) and fitted
+# to FRAME_MAX_DIMENSION; the saved frame pdf.py crops must not move.
+"$PY" - "$FRAME_OUT" "$CLI_RECORD" <<'PYEOF'
+import base64, io, json, sys
 from pathlib import Path
 out = Path(sys.argv[1])
 try:
     from PIL import Image
 except ImportError:
     sys.exit(0)          # Pillow is optional; the fallback is the original.
-copies = sorted((out / "llm-1024").glob("*.jpg"))
+copies = sorted(out.glob("llm-768*/*.jpg"))
 if not copies:
     sys.exit(1)
 for c in copies:
     with Image.open(c) as img:
-        if max(img.size) > 1024:
-            sys.exit(1)
+        if max(img.size) > 768:
+            sys.exit(2)
     with Image.open(out / c.name) as img:   # the original, still full size
-        if max(img.size) <= 1024:
-            sys.exit(1)
+        if max(img.size) <= 768:
+            sys.exit(3)
+# And the bytes on stdin are those copies, not the originals.
+images = json.loads(open(sys.argv[2]).readline()).get("images") or []
+for i in images:
+    if i["bytes"] > max(c.stat().st_size for c in copies):
+        sys.exit(4)
 sys.exit(0)
 PYEOF
-[ $? -eq 0 ] && ok "copies are <=1024px and the originals are untouched" \
-  || bad "downscaled copies wrong, or the originals were modified"
+RC=$?
+[ "$RC" -eq 0 ] && ok "copies are <=768px, the originals are untouched, the copies are what was sent" \
+  || bad "prepared copies wrong, or the originals were modified (code $RC)"
 echo "$PROMPT" | grep -q "Dijkstra" \
   && ok "transcript text included in the prompt" || bad "transcript not sent"
 

@@ -897,10 +897,14 @@ end the scan.
 | `CLAUDE_CLI_BIN` | found on `PATH`, then `~/.local/bin/claude` | Where the `claude` binary is |
 | `CLAUDE_CLI_MODEL` | `opus` | A CLI model alias (`opus`, `sonnet`) or a full id |
 | `CLAUDE_CLI_TIMEOUT_SECONDS` | 1800 | How long one summary may take before it counts as hung |
-| `CLAUDE_CLI_FRAME_VISION` | 1 | `0` sends the frame list as text and never opens the images |
+| `CLAUDE_CLI_FRAME_VISION` | 1 | `0` sends the frame list as text and never shows the images |
+| `CLAUDE_CLI_FRAME_INLINE` | 1 | Frames go to the model as image blocks in one turn. `0` reverts to the `Read`-tool path (for a `claude` too old to accept `--input-format stream-json`), where every frame the model opens is another turn |
+| `CLAUDE_CLI_FRAME_DEDUPE` | 1 | Drop consecutive frames of an unchanged slide (and blank frames) before offering them. `0` offers every frame |
+| `CLAUDE_CLI_MERGE_MODEL` | same as `CLAUDE_CLI_MODEL` | Model for the merge call of a chunked run — mechanical work, and the most expensive call; `sonnet` is fine here |
+| `SUMMARY_MERGE_EFFORT` | same as `SUMMARY_EFFORT` | Effort for that merge call |
 | `CLAUDE_CLI_STATIC_PROMPT` | 1 | Pass the prompt's unchanging half as a system prompt file, so the prefix is cache-eligible. `0` sends it inline (for a `claude` too old to know the flags) |
 | `SUMMARY_EFFORT` | `high` | `low`, `medium`, `high`, `xhigh`, `max` |
-| `CLAUDE_CLI_MAX_FRAMES` | 0 | Most frames the model is *offered* per call (`0` = all of the chunk's). Scene changes kept first, periodic frames thinned evenly. The PDF still has every frame |
+| `CLAUDE_CLI_MAX_FRAMES` | 0 | Most frames the model is *offered* per call (`0` = all of the chunk's), counted after the blank/duplicate pass. Scene changes kept first, periodic frames thinned evenly. The PDF still has every frame |
 | `CLAUDE_CLI_MAX_WAIT_SECONDS` | 21600 | How long one call may sleep for the usage window to reset before the stage pauses (exit 75) |
 | `CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS` | 600 | Retry interval when the CLI reports a hit window without a reset time |
 | `GEMINI_API_KEY_1..3` | — | For the `gemini` fallback |
@@ -916,11 +920,12 @@ claude -p --output-format stream-json --verbose --model opus --effort high \
        --safe-mode --no-session-persistence \
        --append-system-prompt-file "$MEETING_BOT_ROOT/tmp/claude-cli-prompts/<sha>.md" \
        --exclude-dynamic-system-prompt-sections \
-       --tools Read --allowedTools Read --add-dir "$FRAMES_DIR/<run_id>"
+       --input-format stream-json --tools ""
 ```
 
-The prompt (transcript, frame list, slides) goes in on stdin — an 80KB
-transcript would not fit in a command-line argument. `--safe-mode` and a
+The prompt (transcript, frame list, slides) and the frame images go in on
+stdin as one stream-json user message — an 80KB transcript would not fit in
+a command-line argument, and a dozen images certainly would not. `--safe-mode` and a
 scratch working directory keep this repo's own `CLAUDE.md`, hooks and plugins
 out of the summarizer's context, and `--no-session-persistence` stops every
 lecture leaving a full transcript in `~/.claude`.
@@ -954,13 +959,32 @@ markers, is sent exactly as before, and gets no caching benefit; copy the
 fences into your own prompt if you want it. `CLAUDE_CLI_STATIC_PROMPT=0` turns
 it off entirely.
 
-**Frames are read from disk, not uploaded.** The Messages API took inline
-images; the CLI takes a string. So the frame list carries absolute paths and
-the CLI is given the `Read` tool, scoped by `--add-dir` to that run's frame
-directory and nothing else. Set `CLAUDE_CLI_FRAME_VISION=0` to skip that: it is
-faster and lighter on your rate limit, but the model then cites frames it has
-never seen, so the pictures in the PDF may not match what the text says about
-them.
+**Frames are sent inline, in one turn.** `--input-format stream-json` lets
+the user message carry base64 image blocks, the same shape the Messages API
+takes, so every frame the model is offered arrives beside the text — labelled
+with its frame number — and the model needs no tool at all. The older delivery
+(`CLAUDE_CLI_FRAME_INLINE=0`) put absolute paths in the prompt and gave the CLI
+a `Read` tool scoped by `--add-dir` to the run's frame directory; it still
+works, but every frame the model opened was a separate turn that re-sent the
+whole context as cache reads, which on a 12-frame chunk cost more than the
+frames themselves. Set `CLAUDE_CLI_FRAME_VISION=0` to send no images at all:
+lighter still, but the model then cites frames it has never seen, so the
+pictures in the PDF may not match what the text says about them.
+
+**Before they are sent, frames are filtered, cropped and shrunk.** Blank
+frames (a screen share stopping, a slide mid-fade — the scene-change pass is
+drawn to these) and consecutive frames of an unchanged slide are dropped
+(`CLAUDE_CLI_FRAME_DEDUPE`; a texture hash of the slide region, so a moved
+cursor or a changed participant tile still counts as the same slide, while a
+changed title does not). What remains is capped by `CLAUDE_CLI_MAX_FRAMES`,
+then each copy is cropped to the slide — the same `PDF_FRAME_CROP` detector
+the PDF uses — and fitted to `FRAME_MAX_DIMENSION` px on its long edge. The
+saved frames are never touched. The per-call log line says how many frames
+went each way:
+
+```
+claude-cli/opus (effort=medium): 9 frame(s) of 41, vision=inline, 3 blank + 22 repeated frame(s) dropped, 7 more left out (CLAUDE_CLI_MAX_FRAMES), 9 cropped/downscaled to 768px, cacheable system prompt
+```
 
 **Any `ANTHROPIC_API_KEY` in your environment is stripped before the CLI runs.**
 If it survived, the CLI would quietly bill a metered console account instead of
@@ -989,27 +1013,37 @@ and the stage's total lands in the run's `state.json` under
 prints it. **That number is how you size a lecture to your plan**: run one,
 read `+N% this stage`, and you know how many fit in a window.
 
-`.env.example` ships Pro-sized values — `CLAUDE_CLI_MAX_FRAMES=12`,
-`FRAME_PERIOD_SECONDS=60`, `SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1` —
-which differ from the code's own defaults (0, 30, `high`, 3) on purpose: an
-unset variable behaves as it always did, a fresh `.env` fits a lecture into
-a window. Loosen them once the meter says you have room.
+`.env.example` ships Pro-sized values — `CLAUDE_CLI_MAX_FRAMES=20`,
+`FRAME_PERIOD_SECONDS=60`, `SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`,
+`SUMMARY_CHUNK_CHARS=60000`, `CLAUDE_CLI_MERGE_MODEL=sonnet`,
+`SUMMARY_MERGE_EFFORT=low` — which differ from the code's own defaults (0,
+30, `high`, 3, 24000, and the chunk model/effort) on purpose: an unset
+variable behaves as it always did, a fresh `.env` fits a lecture into a
+window. Loosen them once the meter says you have room.
 
 `SUMMARY_MAX_TOKENS` does nothing here — the CLI has no output cap, and output
 is not where the window goes. What spends it, in order:
 
-1. **Frames.** Each one the model opens is ~790 tokens at the default 1024px
-   (`FRAME_MAX_DIMENSION`), and a 36-minute chunk at `FRAME_PERIOD_SECONDS=30`
-   carries ~72 of them — more input than the transcript. `CLAUDE_CLI_MAX_FRAMES`
-   caps how many are offered per call (scene changes first, the rest spread
-   evenly), and `FRAME_PERIOD_SECONDS=60` halves the count at the source.
-   `CLAUDE_CLI_FRAME_VISION=0` drops them entirely, at the cost of citations
-   to pictures the model never saw.
-2. **Effort.** `SUMMARY_EFFORT=high` buys thinking tokens on every chunk;
+1. **The merge call, on a chunked run.** It reads every partial summary and
+   writes them all out again, so its output is about the size of everything
+   the chunks produced — and output tokens are the expensive kind. Two
+   levers: `SUMMARY_CHUNK_CHARS` decides whether there is a merge at all (at
+   60,000 a 90-minute Thai lecture is one call, no merge), and
+   `CLAUDE_CLI_MERGE_MODEL` / `SUMMARY_MERGE_EFFORT` put the merge on a
+   cheaper model when there is one. The chunk summaries — where the reading
+   of noisy ASR happens — stay on `CLAUDE_CLI_MODEL`.
+2. **Frames.** A whole 1920x1080 frame is ~1,844 tokens; cropped to the
+   slide and fitted to 768px (`FRAME_MAX_DIMENSION`) it is ~200-450. The
+   blank/duplicate pass usually removes most of a static lecture's periodic
+   samples before any of that; `CLAUDE_CLI_MAX_FRAMES` caps what is left
+   (scene changes first, the rest spread evenly), and `FRAME_PERIOD_SECONDS`
+   sets the count at the source. `CLAUDE_CLI_FRAME_VISION=0` drops them
+   entirely, at the cost of citations to pictures the model never saw.
+3. **Effort.** `SUMMARY_EFFORT=high` buys thinking tokens on every chunk;
    `medium` is noticeably cheaper on the window and still fine for notes.
-3. **The model.** `CLAUDE_CLI_MODEL=sonnet` spends the window several times
+4. **The model.** `CLAUDE_CLI_MODEL=sonnet` spends the window several times
    slower than `opus`.
-4. **Parallelism.** `SUMMARY_MAX_PARALLEL` (default 3) fires that many
+5. **Parallelism.** `SUMMARY_MAX_PARALLEL` (default 3) fires that many
    `claude` processes at once for a long transcript, and `--jobs` multiplies
    it across inputs. That doesn't change the total, but it decides whether
    you find out the window is gone with one chunk left or with all of them.
@@ -1079,7 +1113,7 @@ immediately rather than burning the full retry schedule first.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SUMMARY_CHUNK_CHARS` | 24000 | Above this, chunk + merge. `0` disables |
+| `SUMMARY_CHUNK_CHARS` | 24000 | Above this, chunk + merge. `0` disables. `.env.example` ships 60000: fewer seams, and no merge call at all for most lectures |
 | `SUMMARY_CHUNK_OVERLAP` | 800 | Context repeated across a boundary |
 | `SUMMARY_SEGMENT_MAX_SECONDS` | 120 | Transcript segments longer than this are split before chunking. `0` disables |
 | `SUMMARY_SEGMENT_MAX_CHARS` | 2000 | Same, by length |
@@ -1124,7 +1158,7 @@ another key would fail identically.
 |---|---|---|
 | `SCENE_THRESHOLD` | 0.3 | ffmpeg scene-change score cutoff |
 | `FRAME_PERIOD_SECONDS` | 30 | Periodic safety-net sample; `0` disables |
-| `FRAME_MAX_DIMENSION` | 1024 | Long edge, in pixels, of the frame *copies* sent to the LLM; `0` sends the originals |
+| `FRAME_MAX_DIMENSION` | 768 | Long edge, in pixels, of the frame *copies* sent to the LLM, after the crop to the slide; `0` skips the downscale |
 | `CLIP_REENCODE` | 0 | `--clip` cuts by stream copy; `1` re-encodes for a frame-accurate start |
 
 Aggressive: `FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2`.
@@ -1138,15 +1172,19 @@ over half an hour of CPU. Worth it only when the clip boundary has to land on
 an exact word.
 
 **`FRAME_MAX_DIMENSION` never touches the frames you keep.** A 1920x1080
-keyframe costs the model roughly 1,844 tokens every time it opens one, and
-about 790 at 1024px — on a three-hour lecture with 360 frames that is the
-difference between ~660k and ~280k tokens. So a downscaled *copy* is written to
-`<frame dir>/llm-1024/` and the model is pointed at that; the full-resolution
-original stays where it is, because the PDF crops and embeds it. The copies are
-reused on a resume and are as disposable as the rest of `FRAMES_DIR`. Needs
-Pillow — without it the originals are sent, with a warning. Raising
-`FRAME_PERIOD_SECONDS` is still the bigger lever for a long lecture: this
-changes how much each frame costs, not how many there are.
+keyframe costs the model roughly 1,844 tokens every time it sees one, about
+790 at 1024px and about 440 at 768px. So a *copy* is written to
+`<frame dir>/llm-768-slide/` (the dimension and the `PDF_FRAME_CROP` mode are
+in the name) and that is what the model gets; the full-resolution original
+stays where it is, because the PDF crops and embeds it. The copy is cropped to
+the slide **before** it is shrunk — the same detector the PDF uses, and one
+that declines rather than guesses — which is what keeps slide text legible at
+768px: on a Meet recording the slide is perhaps two thirds of the frame, and
+the dark chrome around it was paying for pixels that said nothing. The copies
+are reused on a resume and are as disposable as the rest of `FRAMES_DIR`.
+Needs Pillow — without it the originals are sent, with a warning. This
+changes how much each frame costs; the duplicate pass and
+`CLAUDE_CLI_MAX_FRAMES` change how many there are.
 
 ### Meeting behaviour
 
@@ -1197,9 +1235,10 @@ Two of those are worth understanding:
   for the summarizer — against a stub `claude` binary (`lib/fake_claude_cli.py`)
   that records exactly how it was invoked. The real AssemblyAI SDK and the real
   `llm_client` do the work, so it verifies things a mock never could: that
-  `--effort` carries `SUMMARY_EFFORT`, that `--add-dir` scopes file access to
-  the run's own frame directory, that the frame paths and the transcript reach
-  the prompt, that an `ANTHROPIC_API_KEY` the test deliberately exports does
+  `--effort` carries `SUMMARY_EFFORT`, that the frames arrive as image blocks
+  on stdin (cropped, downscaled, the originals untouched) with no tool and no
+  filesystem path in the prompt, that the transcript reaches the prompt, that
+  an `ANTHROPIC_API_KEY` the test deliberately exports does
   *not* reach the CLI, that a signed-out CLI falls through to the next backend
   instead of being retried, that the key cursor advances, and that the PDF comes
   out with cropped frames in it.

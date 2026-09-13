@@ -25,9 +25,13 @@ from chunking import max_parallel  # noqa: E402
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 MERGE_PROMPT_PATH = PROMPTS_DIR / "_merge.md"
 
-# Prepended to the operator's chosen prompt for each chunk. No braces in here:
-# the combined template goes through .format() later, and a stray brace would
-# be read as a placeholder.
+# Appended to the operator's chosen prompt for each chunk — appended, not
+# prepended. The part label is the one thing that differs between the chunks
+# of a run, and prompt caching keys on a byte-identical prefix: with the label
+# at the front, the reference material behind it (identical for every chunk,
+# often 10k+ tokens) never cached. At the end it sits after everything that
+# varies anyway. No braces in here: the combined template goes through
+# .format() later, and a stray brace would be read as a placeholder.
 CHUNK_PREAMBLE = (
     "You are summarizing ONE PART of a longer recording, or of several "
     "recordings being summarized together — {part_label}. "
@@ -75,7 +79,7 @@ def load_merge_template():
 def summarize_chunked(chunks, prompt_template, summarize_fn, log=print):
     """Summarize chunks in parallel, then merge.
 
-    `summarize_fn(frames, transcript, template) -> str` is llm_client.summarize,
+    `summarize_fn(frames, transcript, template, role=None) -> str` is llm_client.summarize,
     so each chunk and the merge all inherit the configured backend, its retry
     policy, and the fallback chain.
     """
@@ -83,9 +87,9 @@ def summarize_chunked(chunks, prompt_template, summarize_fn, log=print):
     log(f"==> Long transcript: summarizing {total} chunks "
         f"({max_parallel()} at a time), then merging")
 
-    chunk_template = CHUNK_PREAMBLE.replace(
+    chunk_template = prompt_template.rstrip() + "\n\n" + CHUNK_PREAMBLE.replace(
         "{part_label}", "PART_LABEL_PLACEHOLDER"
-    ) + prompt_template
+    ).rstrip() + "\n"
 
     results = [None] * total
     errors = []
@@ -144,7 +148,10 @@ def summarize_chunked(chunks, prompt_template, summarize_fn, log=print):
     combined = "\n\n---\n\n".join(parts)
 
     log(f"==> Merging {len(done)} partial summaries into the final document")
-    merged = summarize_fn([], combined, load_merge_template())
+    # role="merge" lets the claude-cli backend put this call on a cheaper
+    # model: it folds partials a stronger model already wrote, and its output
+    # is about the size of everything it read.
+    merged = summarize_fn([], combined, load_merge_template(), role="merge")
 
     if errors:
         missing = ", ".join(str(i + 1) for i, _ in sorted(errors))

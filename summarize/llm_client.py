@@ -34,13 +34,29 @@ the summary still appears, and the charge lands on an account the operator
 thought was unused. An *empty* ANTHROPIC_API_KEY is worse still: it fails
 authentication outright, which looks like a broken subscription.
 
-FRAMES ARE READ FROM DISK, NOT INLINED. The Messages API takes base64 image
-blocks; `claude -p` takes a prompt string. So the frame manifest carries
-absolute paths, the CLI is given the Read tool restricted to the frame
-directories (--tools Read --allowedTools Read --add-dir), and the model opens
-the images itself. Set CLAUDE_CLI_FRAME_VISION=0 to send the manifest as text
-only - faster and cheaper against a subscription's rate limit, but then the
-model cites frames it has never seen.
+FRAMES ARE INLINED, IN ONE TURN. `--input-format stream-json` lets the user
+message carry base64 image blocks - the same shape the Messages API takes -
+so the frames the model is offered arrive beside the text, each preceded by
+its manifest label, and the CLI needs no tool at all (--tools ""). The older
+delivery (CLAUDE_CLI_FRAME_INLINE=0, kept for a CLI too old to take
+stream-json input) put absolute paths in the manifest and gave the CLI the
+Read tool scoped by --add-dir to the frame directories; it works, but every
+frame the model opened was a separate turn that re-sent the whole context as
+cache reads, which on a 12-frame chunk cost more than the frames did. Set
+CLAUDE_CLI_FRAME_VISION=0 to send the manifest as text only - cheaper still
+against a subscription's window, but then the model cites frames it has never
+seen.
+
+BEFORE THEY ARE SENT, FRAMES ARE FILTERED, CROPPED AND SHRUNK. Three passes,
+each of which only removes or shrinks, none of which renumbers:
+drop_uninformative() discards blank frames and consecutive repeats of an
+unchanged slide (framecrop.frame_hash - a texture hash over the slide region,
+so a moved cursor is the same slide and a changed title is not);
+thin_frames() applies CLAUDE_CLI_MAX_FRAMES to what is left; and
+_downscale_frames() writes a copy of each survivor cropped to the slide
+(framecrop.detect_crop, the PDF's own PDF_FRAME_CROP mode) and fitted to
+FRAME_MAX_DIMENSION px, under <frame dir>/llm-<px>-<mode>/. The saved frames
+never move - pdf.py crops and embeds the originals.
 
 A CACHE-STABLE PREFIX. A prompt template may fence the half that never varies
 between runs (role, instructions, output format, worked example) with
@@ -56,16 +72,25 @@ what Claude's automatic prompt caching needs. There is no manual cache_control
 flag on the CLI; caching is automatic, and this is the only lever we have.
 A template without the markers is sent exactly as it always was.
 
+THE MERGE MAY RUN ON A CHEAPER MODEL. mapreduce passes role="merge" for the
+reduce step, and CLAUDE_CLI_MERGE_MODEL / SUMMARY_MERGE_EFFORT (default: the
+chunk model and effort) apply to that call alone. It folds partials a
+stronger model already wrote and emits roughly everything it read, which
+makes it the single most expensive call of a chunked run; the chunk
+summaries, where the reading of noisy ASR happens, keep CLAUDE_CLI_MODEL.
+
 EFFORT, NOT A TOKEN BUDGET. SUMMARY_EFFORT maps onto the CLI's `--effort`
 (low | medium | high | xhigh | max), the same scale the Messages API exposes as
 `output_config.effort`. Thinking is adaptive: the model decides when to use it.
 There is no token-budget knob, deliberately — and SUMMARY_MAX_TOKENS does NOT
 apply here: the CLI has no output cap flag, and output is not where a
 subscription window goes anyway. What actually spends it is input — the
-frames the model opens (~790 tokens each at 1024px), the transcript, and the
-thinking `--effort` buys. The levers that exist are CLAUDE_CLI_MAX_FRAMES
-(frames offered per call), FRAME_MAX_DIMENSION, CLAUDE_CLI_FRAME_VISION,
-SUMMARY_EFFORT and CLAUDE_CLI_MODEL.
+frames the model sees (~200-450 tokens each cropped and fitted to 768px), the
+transcript, the thinking `--effort` buys - and, on a chunked run, the merge
+call's output. The levers that exist are SUMMARY_CHUNK_CHARS (whether there is
+a merge), CLAUDE_CLI_MERGE_MODEL, CLAUDE_CLI_MAX_FRAMES (frames offered per
+call), FRAME_MAX_DIMENSION, CLAUDE_CLI_FRAME_VISION, SUMMARY_EFFORT and
+CLAUDE_CLI_MODEL.
 
 THE WINDOW IS METERED, AND A HIT WINDOW WAITS. `--output-format stream-json`
 makes the CLI emit a `rate_limit_event` beside the result, carrying the
@@ -101,11 +126,18 @@ Env vars:
   CLAUDE_CLI_BIN        path to the claude binary (default: found on PATH)
   CLAUDE_CLI_MODEL      default "opus" (ANTHROPIC_MODEL also accepted)
   CLAUDE_CLI_TIMEOUT_SECONDS  default 1800
-  CLAUDE_CLI_FRAME_VISION  1 (default) lets the model Read the frame images
+  CLAUDE_CLI_FRAME_VISION  1 (default) shows the model the frame images
+  CLAUDE_CLI_FRAME_INLINE  1 (default) sends them as image blocks on stdin;
+                        0 puts paths in the prompt and grants the Read tool
+  CLAUDE_CLI_FRAME_DEDUPE  1 (default) drops blank frames and consecutive
+                        repeats of one slide before the cap is applied
+  CLAUDE_CLI_MERGE_MODEL  model for the map-reduce merge call (default: the
+                        chunk model); SUMMARY_MERGE_EFFORT likewise
   CLAUDE_CLI_STATIC_PROMPT 1 (default) hands the unchanging instructions to
                         the CLI as a system prompt file; 0 sends them inline
-  FRAME_MAX_DIMENSION   long edge, px, of the frame copies sent to the CLI
-                        (default 1024; 0 sends the originals)
+  FRAME_MAX_DIMENSION   long edge, px, of the frame copies sent to the CLI,
+                        after the crop to the slide (default 768; 0 skips
+                        the downscale). PDF_FRAME_CROP picks the crop mode.
   CLAUDE_CLI_MAX_FRAMES most frames offered to the model per call (default 0
                         = every frame of the chunk); scene changes are kept
                         first, periodic frames are thinned evenly
@@ -187,12 +219,25 @@ STATIC_PROMPT_END = "<!-- static-prompt: end -->"
 
 # Long edge, in pixels, of the frame copies handed to the CLI. A 1920x1080
 # keyframe costs roughly 1,844 tokens once the model rescales it; 1024px is
-# about 790, and a slide is still legible. 0 disables the downscale.
-DEFAULT_FRAME_MAX_DIMENSION = 1024
-# Where the downscaled copies go, relative to the directory the originals are
+# about 790 and 768px about 440. The copy is cropped to the slide first
+# (framecrop.detect_crop, same mode as the PDF), so at 768px the slide's text
+# is still legible — it is the dark UI around it that gives up the pixels.
+# 0 disables the downscale (the crop still applies).
+DEFAULT_FRAME_MAX_DIMENSION = 768
+# Where the prepared copies go, relative to the directory the originals are
 # in. Inside FRAMES_DIR on purpose: those are the disposable artifacts, and
-# keeping the copies under the same parent means --add-dir already covers them.
-LLM_FRAME_SUBDIR = "llm-{max_dim}"
+# keeping the copies under the same parent means --add-dir already covers them
+# on the Read-tool path. The crop mode is in the name so changing
+# PDF_FRAME_CROP doesn't reuse copies cut the old way.
+LLM_FRAME_SUBDIR = "llm-{max_dim}{crop}"
+
+# Two frames whose texture hashes (framecrop.frame_hash, 4096 bits over the
+# slide region) are within this many bits are the same slide: a moved cursor
+# is ~2 bits, a fade ~5, a changed title ~58, changed body text ~176 (see the
+# measurements on frame_hash). Consecutive duplicates are dropped before the
+# frame cap is applied, so the cap covers distinct slides rather than
+# distinct minutes. Without Pillow nothing is a duplicate.
+FRAME_DEDUPE_MAX_DISTANCE = 16
 
 # Per-call frame cap. 0 = no cap, which is what every run did before the
 # setting existed. The frames are the bulk of a call's input, so this is the
@@ -632,9 +677,40 @@ def _cli_timeout():
         return DEFAULT_CLAUDE_CLI_TIMEOUT
 
 
-def _frame_vision_enabled():
-    return (os.environ.get("CLAUDE_CLI_FRAME_VISION", "1").strip().lower()
+def _flag_env(name, default="1"):
+    return (os.environ.get(name, default).strip().lower()
             not in ("0", "false", "no", "off"))
+
+
+def _frame_vision_enabled():
+    return _flag_env("CLAUDE_CLI_FRAME_VISION")
+
+
+def _frame_inline_enabled():
+    """Whether frames travel as image blocks on stdin, or as paths to Read.
+
+    On by default. Inline is one turn: the model sees every offered frame at
+    once and never re-reads its own context. The Read-tool path
+    (CLAUDE_CLI_FRAME_INLINE=0) is kept for a CLI too old to accept
+    --input-format stream-json; there every frame the model opens is another
+    turn that resends the whole context as cache reads.
+    """
+    return _flag_env("CLAUDE_CLI_FRAME_INLINE")
+
+
+def _frame_dedupe_enabled():
+    return _flag_env("CLAUDE_CLI_FRAME_DEDUPE")
+
+
+def _llm_crop_mode():
+    """The crop applied to the copies the model sees: PDF_FRAME_CROP's value.
+
+    One knob, deliberately — the model then looks at the same picture the
+    PDF prints, and framecrop's "decline rather than guess" rule already
+    keeps a wrong crop out of both.
+    """
+    from framecrop import crop_mode_from_env
+    return crop_mode_from_env()
 
 
 def _static_prompt_enabled():
@@ -760,19 +836,67 @@ def _evenly(items, n):
     return picked
 
 
+def drop_uninformative(frames):
+    """Frames worth showing a model: no blank ones, no repeats of the last.
+
+    Returns (kept, blank_count, duplicate_count). Two kinds of frame cost
+    tokens and teach the model nothing: a solid-black frame (a screen share
+    stopping, a slide mid-fade — and the scene-change pass collects these
+    preferentially, since black-to-content is the biggest scene change
+    there is), and a periodic sample of a slide that hasn't changed since the
+    previous frame. Both were being offered at full price; the PDF already
+    drops the blanks itself, and never needed the repeats.
+
+    Only *consecutive* repeats are dropped, on purpose: a slide the lecturer
+    returns to twenty minutes later is a distinct moment the notes may want
+    to cite. The frames' numbers are untouched — they were assigned over the
+    whole manifest by assign_numbers(), and the PDF still resolves every
+    number, cited or not. Without Pillow nothing is blank and nothing is a
+    duplicate, and the list comes back as it was.
+    """
+    from framecrop import frame_hash, hamming, is_blank
+    crop_mode = _llm_crop_mode()
+    ordered = sorted(frames, key=lambda f: f.sort_key)
+    kept = []
+    blanks = dupes = 0
+    last_hash = None
+    last_part = None
+    for frame in ordered:
+        if is_blank(frame.path):
+            blanks += 1
+            continue
+        digest = (frame_hash(frame.path, crop_mode=crop_mode)
+                  if _frame_dedupe_enabled() else None)
+        if (digest is not None and last_hash is not None
+                and frame.part == last_part
+                and hamming(digest, last_hash) <= FRAME_DEDUPE_MAX_DISTANCE):
+            dupes += 1
+            continue
+        kept.append(frame)
+        last_hash = digest
+        last_part = frame.part
+    return kept, blanks, dupes
+
+
 _warned_no_pillow_downscale = False
 
 
-def _downscale_one(src, max_dim):
-    """Return a path to a copy of `src` whose long edge is <= max_dim.
+def _llm_copy_path(source, max_dim, crop_mode):
+    crop = "" if crop_mode in (None, "", "none") else f"-{crop_mode}"
+    return source.parent / LLM_FRAME_SUBDIR.format(max_dim=max_dim, crop=crop) / source.name
 
-    Returns `src` itself when the image is already small enough, when Pillow
-    isn't installed, or when anything at all goes wrong — a slightly expensive
-    frame beats a missing one.
+
+def _downscale_one(src, max_dim, crop_mode="none"):
+    """Return a path to the copy of `src` the model should see.
+
+    Cropped to the slide (framecrop, same mode as the PDF) and then fitted
+    to `max_dim` on the long edge. Returns `src` itself when the image needs
+    neither, when Pillow isn't installed, or when anything at all goes wrong
+    — a slightly expensive frame beats a missing one.
     """
     global _warned_no_pillow_downscale
     try:
-        from PIL import Image
+        from PIL import Image  # noqa: F401 — presence check only
     except ImportError:
         if not _warned_no_pillow_downscale:
             _warned_no_pillow_downscale = True
@@ -780,47 +904,73 @@ def _downscale_one(src, max_dim):
                   "full resolution", file=sys.stderr)
         return src
 
+    from framecrop import fit_for_llm
     source = Path(src)
-    dest = source.parent / LLM_FRAME_SUBDIR.format(max_dim=max_dim) / source.name
+    dest = _llm_copy_path(source, max_dim, crop_mode)
     try:
         if dest.is_file() and dest.stat().st_mtime >= source.stat().st_mtime:
             return str(dest)
-        with Image.open(source) as img:
-            if max(img.size) <= max_dim:
-                return str(source)
-            img = img.convert("RGB")
-            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dest.with_suffix(f".{os.getpid()}.tmp")
-            img.save(tmp, "JPEG", quality=85, optimize=True)
-        os.replace(tmp, dest)
-        return str(dest)
+        return str(fit_for_llm(source, dest, mode=crop_mode, max_dim=max_dim))
     except (OSError, ValueError) as exc:
-        print(f"  warning: could not downscale {source.name} ({exc}) — "
+        print(f"  warning: could not prepare {source.name} ({exc}) — "
               f"sending it at full resolution", file=sys.stderr)
         return str(source)
 
 
 def _downscale_frames(frames):
-    """Frame copies pointed at downscaled images, for the CLI to Read.
+    """Frame copies pointed at the cropped, downscaled images the model sees.
 
     The originals are left exactly where they are: pdf.py crops and embeds
     them, so it needs the full-resolution files. Only the paths the model is
-    shown change, and only for this backend.
+    shown change, and only for this backend. Returns (frames, changed_count).
     """
     max_dim = _frame_max_dimension()
-    if max_dim <= 0 or not frames:
+    crop_mode = _llm_crop_mode()
+    if not frames or (max_dim <= 0 and crop_mode == "none"):
         return frames, 0
     resized = 0
     out = []
     for frame in frames:
-        path = _downscale_one(frame.path, max_dim)
+        path = _downscale_one(frame.path, max_dim, crop_mode)
         if path != frame.path:
             resized += 1
             out.append(replace(frame, path=path))
         else:
             out.append(frame)
     return out, resized
+
+
+_INLINE_PREAMBLE = """\
+The frame manifest below lists keyframes extracted from the recording, each
+with its timestamp. The frames themselves are attached after this text as
+images, in manifest order, each preceded by its frame label. Look at every
+one before writing the summary, and cite frames by the numbers in their labels.
+
+"""
+
+
+def build_inline_input(user_text, frames):
+    """The one-line stream-json user message: the prompt, then the frames.
+
+    `--input-format stream-json` lets the user turn carry content blocks, the
+    same shape the Messages API takes, so the frames go in as base64 image
+    blocks beside the text instead of as paths for a Read tool. The text
+    comes first: the reference material at the top of it is identical across
+    the chunks of one run and can cache as a prefix, while the frames differ
+    on every chunk. Each image is preceded by its manifest label so the
+    number the model cites is the number beside the picture.
+    """
+    content = [{"type": "text", "text": user_text}]
+    for i, frame in enumerate(frames):
+        data, mime = _read_image_b64(frame.path)
+        content.append({"type": "text",
+                        "text": frame.label(frame.number or (i + 1))})
+        content.append({"type": "image",
+                        "source": {"type": "base64", "media_type": mime,
+                                   "data": data}})
+    message = {"type": "user",
+               "message": {"role": "user", "content": content}}
+    return json.dumps(message) + "\n"
 
 
 _VISION_PREAMBLE = """\
@@ -1053,11 +1203,36 @@ def _wait_for_window(exc, label, waited_so_far):
     return delay
 
 
+def _merge_model(default):
+    """The model for the merge call, if the operator chose a cheaper one.
+
+    The merge folds partial summaries that a stronger model already wrote;
+    it is mechanical work, and its output is roughly the size of everything
+    it read, which makes it the single most expensive call of a chunked run.
+    CLAUDE_CLI_MERGE_MODEL puts it on a cheaper model without touching the
+    chunk summaries, where the reading of noisy ASR actually happens.
+    """
+    return (os.environ.get("CLAUDE_CLI_MERGE_MODEL") or "").strip() or default
+
+
+def _merge_effort(default):
+    value = (os.environ.get("SUMMARY_MERGE_EFFORT") or "").strip().lower()
+    if not value:
+        return default
+    if value not in EFFORT_LEVELS:
+        print(f"  warning: SUMMARY_MERGE_EFFORT={value!r} is not one of "
+              f"{', '.join(EFFORT_LEVELS)} — using {default}", file=sys.stderr)
+        return default
+    return value
+
+
 def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
-                         prompt_template: str) -> str:
+                         prompt_template: str, role: str = None) -> str:
     """Claude Code CLI in print mode — the default backend.
 
     Spends the operator's Claude subscription rather than a metered API key.
+    `role="merge"` marks the map-reduce merge call, which may run on
+    CLAUDE_CLI_MERGE_MODEL / SUMMARY_MERGE_EFFORT instead of the defaults.
     """
     binary = _claude_cli_bin()
     if binary is None:
@@ -1071,17 +1246,24 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
              or os.environ.get("ANTHROPIC_MODEL")
              or DEFAULT_CLAUDE_CLI_MODEL)
     effort = effort_level()
+    if role == "merge":
+        model = _merge_model(model)
+        effort = _merge_effort(effort)
     vision = _frame_vision_enabled() and bool(frames)
+    inline = vision and _frame_inline_enabled()
 
-    # Fewer frames offered, when capped: they are the bulk of a call's input
-    # against the subscription window. The numbers stay global, so the ones
-    # left out still resolve in the PDF if the model never cites them.
-    offered = thin_frames(frames, _max_frames())
-    thinned = len(frames) - len(offered)
+    # What the model is offered, in three passes that only ever remove:
+    # blank frames and consecutive repeats of one slide go first (they cost
+    # tokens and teach nothing), then the cap, so it counts distinct slides.
+    # The numbers stay global throughout, so whatever the model cites still
+    # resolves in the PDF — and so does whatever it was never shown.
+    offered, blanks, dupes = drop_uninformative(frames) if vision else (list(frames), 0, 0)
+    offered = thin_frames(offered, _max_frames())
+    thinned = len(frames) - blanks - dupes - len(offered)
 
-    # Downscaled copies, so a 1920x1080 keyframe doesn't cost ~1,844 tokens
-    # every time the model opens it. Only the paths the CLI is given change —
-    # pdf.py still crops and embeds the full-resolution originals.
+    # Cropped to the slide and downscaled, so a 1920x1080 keyframe doesn't
+    # cost ~1,844 tokens every time the model looks at it. Only the paths the
+    # CLI is given change — pdf.py still crops and embeds the originals.
     resized = 0
     llm_frames = offered
     if vision:
@@ -1090,7 +1272,7 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
     # The half of the template that never varies goes to the CLI as a system
     # prompt read from a stable file, so the prefix is byte-identical across
     # runs and across the chunks of one run. Everything that does vary — the
-    # chunk label, the reference material, the transcript, the frame paths —
+    # chunk label, the reference material, the transcript, the frames —
     # stays in the piped user turn. A template with no markers splits to
     # (None, itself) and behaves exactly as it did before.
     static_prompt = None
@@ -1098,8 +1280,10 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
         static_prompt, prompt_template = split_static_prompt(prompt_template)
 
     sorted_frames, user_text = _render(llm_frames, transcript, prompt_template,
-                                       with_paths=vision)
-    if vision:
+                                       with_paths=vision and not inline)
+    if inline:
+        user_text = _INLINE_PREAMBLE + user_text
+    elif vision:
         user_text = _VISION_PREAMBLE + user_text
 
     static_prompt_path = None
@@ -1137,9 +1321,17 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
                  # stable.
                  "--exclude-dynamic-system-prompt-sections"]
 
-    if vision:
+    if inline:
+        # The frames ride along as image blocks in a stream-json user
+        # message, so the model needs no tool at all: one turn, every frame
+        # seen, nothing re-read. This is the cheap path against the window —
+        # on the Read path each frame the model opens is another turn that
+        # resends the whole context.
+        argv += ["--input-format", "stream-json", "--tools", ""]
+        stdin_text = build_inline_input(user_text, sorted_frames)
+    elif vision:
         # Read only, and only inside the frame directories: both the
-        # originals' and whatever directory the downscaled copies landed in.
+        # originals' and whatever directory the prepared copies landed in.
         # The copies live in a subdirectory of the originals', and the frames
         # of one run share a directory, so this is normally one entry.
         frame_dirs = sorted({str(Path(f.path).resolve().parent)
@@ -1147,19 +1339,23 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
         argv += ["--tools", "Read", "--allowedTools", "Read"]
         for directory in frame_dirs:
             argv += ["--add-dir", directory]
+        stdin_text = user_text
     else:
         # No tools at all: the model has nothing to open and nothing to touch.
         argv += ["--tools", ""]
+        stdin_text = user_text
 
-    label = f"claude-cli/{model} (effort={effort})"
-    detail = "vision=on" if vision else "vision=off"
+    label = f"claude-cli/{model} (effort={effort}{', merge' if role == 'merge' else ''})"
+    detail = ("vision=inline" if inline else "vision=read") if vision else "vision=off"
+    if blanks or dupes:
+        detail += f", {blanks} blank + {dupes} repeated frame(s) dropped"
     if thinned:
-        detail += f", {thinned} of {len(frames)} left out (CLAUDE_CLI_MAX_FRAMES)"
+        detail += f", {thinned} more left out (CLAUDE_CLI_MAX_FRAMES)"
     if resized:
-        detail += f", {resized} downscaled to {_frame_max_dimension()}px"
+        detail += f", {resized} cropped/downscaled to {_frame_max_dimension()}px"
     if static_prompt_path is not None:
         detail += ", cacheable system prompt"
-    print(f"     {label}: {len(sorted_frames)} frame(s), {detail}")
+    print(f"     {label}: {len(sorted_frames)} frame(s) of {len(frames)}, {detail}")
 
     # with_retries handles a busy server; this loop handles an exhausted
     # subscription window, which is neither transient nor a reason to hand
@@ -1172,7 +1368,7 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
             # The trailing positional is _run_claude_cli's own label; the
             # keyword one is with_retries', which it keeps for its log line.
             text = with_retries(
-                _run_claude_cli, argv, user_text, _claude_cli_env(),
+                _run_claude_cli, argv, stdin_text, _claude_cli_env(),
                 _claude_cli_cwd(), _cli_timeout(), label, label=label,
             )
             break
@@ -1188,7 +1384,7 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
 # ---------------------------------------------------------------------------
 
 def summarize_gemini(frames: List[FrameMeta], transcript: str,
-                     prompt_template: str) -> str:
+                     prompt_template: str, role: str = None) -> str:
     """Google Gemini via the google-genai SDK, rotating up to three keys.
 
     Rotation happens outside the retry wrapper on purpose: retry.py handles a
@@ -1265,7 +1461,7 @@ _BACKENDS = {
 
 
 def summarize_with_fallback(frames: List[FrameMeta], transcript: str,
-                            prompt_template: str) -> str:
+                            prompt_template: str, role: str = None) -> str:
     """Walk SUMMARY_FALLBACK_CHAIN in order; first backend to return wins.
 
     Each backend has already retried its own transient failures by the time it
@@ -1292,7 +1488,7 @@ def summarize_with_fallback(frames: List[FrameMeta], transcript: str,
             continue
         try:
             print(f"  -> trying {name}...")
-            return func(frames, transcript, prompt_template)
+            return func(frames, transcript, prompt_template, role=role)
         except ClaudeCliRateLimited as exc:
             # The subscription window is exhausted and the in-process wait
             # gave up. Not a reason to spend a second provider: the operator
@@ -1315,15 +1511,21 @@ def summarize_with_fallback(frames: List[FrameMeta], transcript: str,
 
 
 def summarize(frames: List[FrameMeta], transcript: str,
-              prompt_template: str) -> str:
-    """Dispatch to the configured backend."""
+              prompt_template: str, role: str = None) -> str:
+    """Dispatch to the configured backend.
+
+    `role` names the kind of call for backends that care: mapreduce passes
+    "merge" for the reduce step so the claude-cli backend can put it on a
+    cheaper model (CLAUDE_CLI_MERGE_MODEL). None is an ordinary summary.
+    """
     backend = os.environ.get("SUMMARY_BACKEND", DEFAULT_BACKEND).lower()
     if backend == "fallback":
-        return summarize_with_fallback(frames, transcript, prompt_template)
+        return summarize_with_fallback(frames, transcript, prompt_template,
+                                       role=role)
     func = _BACKENDS.get(backend)
     if func is None:
         raise SystemExit(
             f"Unknown SUMMARY_BACKEND: {backend!r} "
             f"(expected claude-cli, gemini, or fallback)"
         )
-    return func(frames, transcript, prompt_template)
+    return func(frames, transcript, prompt_template, role=role)

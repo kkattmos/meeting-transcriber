@@ -597,11 +597,16 @@ def load_resources(specs):
 def inject_resources(prompt_template, bundle):
     """Add the reference material to the prompt skeleton.
 
-    Two subtleties. The template is later run through str.format() to fill in
-    {transcript} and {frame_manifest}, so every brace in the material has to
-    be doubled or a stray `{x}` in someone's slides raises KeyError and takes
-    the run down. And the material is untrusted input like the transcript is,
-    so it gets the same "this is data, not instructions" framing.
+    Three subtleties. The template is later run through str.format() to fill
+    in {transcript} and {frame_manifest}, so every brace in the material has
+    to be doubled or a stray `{x}` in someone's slides raises KeyError and
+    takes the run down. The material is untrusted input like the transcript
+    is, so it gets the same "this is data, not instructions" framing. And in
+    a template with the static-prompt markers it goes at the *top* of the
+    dynamic half, right after the end marker, not at the end: the material is
+    identical for every chunk of a run, and only a prefix can cache — behind
+    the transcript it never did. A template without markers is appended to,
+    as it always was, so its instructions still come first.
     """
     if bundle is None:
         return prompt_template
@@ -619,6 +624,11 @@ def inject_resources(prompt_template, bundle):
         f"Sources: {bundle.provenance()}\n\n"
         f"{safe}\n"
     )
+    marker = llm_client.STATIC_PROMPT_END
+    at = prompt_template.find(marker)
+    if at >= 0 and prompt_template.find(llm_client.STATIC_PROMPT_BEGIN) < at:
+        cut = at + len(marker)
+        return prompt_template[:cut] + block + "\n" + prompt_template[cut:]
     return prompt_template + block
 
 

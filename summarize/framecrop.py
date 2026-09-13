@@ -319,6 +319,105 @@ def is_blank(path, threshold=None):
     return variance ** 0.5 <= limit
 
 
+# The hash grid. 64x64 cells over the slide region: a 60px title on a 720px
+# slide is five rows of cells, so a changed title flips dozens of bits; a
+# moved cursor flips two. Each cell is judged on a 2x2 sample of an
+# antialiased 128x128 copy.
+HASH_GRID = 64
+HASH_SUBSAMPLE = 2
+# A cell with pixel spread above this (0-255) holds an edge — text, a line,
+# a picture. Below it the cell is flat background, whatever its shade.
+HASH_TEXTURE_LEVEL = 12.0
+
+
+def frame_hash(path, crop_mode="slide", grid=HASH_GRID):
+    """A 4096-bit texture hash of the frame's slide, or None if unreadable.
+
+    Where the picture is, not how bright it is: the frame is cropped to its
+    slide (detect_crop, the same detector the PDF uses, so a participant
+    filmstrip beside the slide never enters the hash), shrunk to a grid of
+    cells, and each bit records whether that cell has any texture — text,
+    a diagram line, a photo — or is flat background. Two periodic samples
+    of one unchanged slide hash identically; a slide with different text on
+    the same template does not, because the text sits in different cells.
+
+    Measured on synthetic 1920x1080 frames: a moved cursor flips 2 bits, a
+    slide that faded to a different shade 5, a changed title 58, changed
+    body text 176. FRAME_DEDUPE_MAX_DISTANCE in llm_client sits between.
+
+    Not an average hash (cell brighter than the mean): with dark UI around a
+    white slide the mean is pulled so low that every slide cell reads as
+    "bright" whether it holds text or not, and two slides with different
+    titles hashed the same — seen live, 2026-09-12. Texture is also
+    indifferent to a fade, which brightness is not. Without Pillow there is
+    no hash, and the caller treats every frame as distinct.
+    """
+    if Image is None:
+        return None
+    try:
+        box = detect_crop(path, mode=crop_mode)
+        with Image.open(path) as img:
+            gray = img.convert("L")
+            if box:
+                gray = gray.crop(box)
+            side = grid * HASH_SUBSAMPLE
+            gray = gray.resize((side, side), Image.BILINEAR)
+            px = list(gray.getdata())
+    except (OSError, ValueError):
+        return None
+    if not px:
+        return None
+    side = grid * HASH_SUBSAMPLE
+    sub = HASH_SUBSAMPLE
+    n = sub * sub
+    bits = 0
+    for by in range(grid):
+        for bx in range(grid):
+            vals = [px[(by * sub + dy) * side + bx * sub + dx]
+                    for dy in range(sub) for dx in range(sub)]
+            mean = sum(vals) / n
+            var = sum((v - mean) ** 2 for v in vals) / n
+            bits = (bits << 1) | (1 if var ** 0.5 > HASH_TEXTURE_LEVEL else 0)
+    return bits
+
+
+def hamming(a, b):
+    """Number of differing bits between two hashes."""
+    return bin(a ^ b).count("1")
+
+
+def fit_for_llm(src, dst, mode="slide", max_dim=1024):
+    """Write the copy of `src` a language model should be shown.
+
+    Crop first, then downscale: the slide is what carries the information,
+    and a frame cropped to it keeps its text legible at a long edge the whole
+    1920x1080 frame would not. detect_crop() declines rather than guesses, so
+    a frame with no findable slide is simply downscaled whole. Returns the
+    path written, or `src` itself when neither step changed anything (already
+    small, nothing to crop) — the caller then sends the original. Raises
+    OSError/ValueError on an unreadable image; the caller decides what a
+    missing copy is worth.
+    """
+    src = Path(src)
+    dst = Path(dst)
+    if Image is None:
+        return src
+    box = detect_crop(src, mode=mode)
+    with Image.open(src) as img:
+        if not box and (max_dim <= 0 or max(img.size) <= max_dim):
+            return src
+        img = img.convert("RGB")
+        if box:
+            img = img.crop(box)
+        if max_dim > 0:
+            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_suffix(f".{os.getpid()}.tmp")
+        img.save(tmp, "JPEG", quality=85, optimize=True)
+    os.replace(tmp, dst)
+    return dst
+
+
 def crop_mode_from_env():
     """PDF_FRAME_CROP: slide (default), border, or none."""
     value = (os.environ.get("PDF_FRAME_CROP") or "slide").strip().lower()

@@ -93,4 +93,4 @@ etc.) or as a periodic safety-net sample.
 
 {frame_manifest}
 
-Read all the frames and the transcript, then produce the study-guide body.
+Look at every frame and read the transcript, then produce the study-guide body.

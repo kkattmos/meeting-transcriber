@@ -31,6 +31,26 @@ from llm_client import BackendUnavailable, ClaudeCliError, FrameMeta  # noqa: E4
 from mapreduce import summarize_chunked  # noqa: E402
 
 
+def _unpack_stdin(raw):
+    """(text, image blocks) from what summarize_claude_cli piped to the CLI.
+
+    On the inline path stdin is one stream-json user message; on the Read
+    path and with vision off it is the plain prompt. Both come back as the
+    prompt text the model reads, so one assertion style serves every test.
+    """
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw, []
+    texts, images = [], []
+    for block in obj["message"]["content"]:
+        if block["type"] == "text":
+            texts.append(block["text"])
+        else:
+            images.append(block)
+    return "\n".join(texts), images
+
+
 class FakeStatusError(Exception):
     """Stands in for an SDK exception carrying an HTTP status."""
     def __init__(self, status, message="boom", headers=None):
@@ -241,7 +261,7 @@ class MapReduceTest(unittest.TestCase):
     def test_chunks_are_summarized_then_merged(self):
         calls = []
 
-        def fake_summarize(frames, transcript, template):
+        def fake_summarize(frames, transcript, template, role=None):
             calls.append(transcript)
             if "Partial summaries" in template or "merging" in template.lower():
                 return "MERGED DOCUMENT"
@@ -254,7 +274,7 @@ class MapReduceTest(unittest.TestCase):
 
     def test_partial_failure_still_produces_a_document(self):
         """Two good chunks cost real API calls; one bad one mustn't waste them."""
-        def fake_summarize(frames, transcript, template):
+        def fake_summarize(frames, transcript, template, role=None):
             if transcript == "body 1":
                 raise RuntimeError("503 overloaded")
             if "merging" in template.lower() or "Partial summaries" in template:
@@ -268,7 +288,7 @@ class MapReduceTest(unittest.TestCase):
         self.assertIn("part(s) 2 of 3", out)
 
     def test_all_chunks_failing_raises(self):
-        def fake_summarize(frames, transcript, template):
+        def fake_summarize(frames, transcript, template, role=None):
             raise RuntimeError("everything is down")
 
         with self.assertRaises(RuntimeError):
@@ -278,7 +298,7 @@ class MapReduceTest(unittest.TestCase):
     def test_chunk_order_is_preserved_despite_parallelism(self):
         import time
 
-        def fake_summarize(frames, transcript, template):
+        def fake_summarize(frames, transcript, template, role=None):
             if "Partial summaries" in template:
                 return transcript  # hand the combined text back for inspection
             # Make the first chunk the slowest, so completion order != index.
@@ -615,7 +635,10 @@ class ClaudeCliCommandLineTest(unittest.TestCase):
         return self.calls[0][0]
 
     def _prompt(self):
-        return self.calls[0][1]["input"]
+        return _unpack_stdin(self.calls[0][1]["input"])[0]
+
+    def _images(self):
+        return _unpack_stdin(self.calls[0][1]["input"])[1]
 
     def test_effort_is_passed_through(self):
         self._run({"SUMMARY_EFFORT": "xhigh"})
@@ -685,19 +708,104 @@ class ClaudeCliCommandLineTest(unittest.TestCase):
         self.assertNotIn("budget_tokens", " ".join(self._argv()))
         self.assertNotIn("budget_tokens", self._prompt())
 
-    def test_vision_grants_read_scoped_to_the_frame_dir(self):
+    def test_vision_sends_frames_inline_with_no_tools(self):
+        # The default: the frames ride along as image blocks in a stream-json
+        # user message. One turn, no Read tool, no --add-dir — and so no
+        # per-frame turn that resends the whole context as cache reads.
         self._run()
         argv = self._argv()
+        self.assertEqual(argv[argv.index("--input-format") + 1], "stream-json")
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertNotIn("--allowedTools", argv)
+        self.assertNotIn("--add-dir", argv)
+        images = self._images()
+        self.assertEqual(len(images), 2)
+        for block in images:
+            self.assertEqual(block["type"], "image")
+            self.assertEqual(block["source"]["type"], "base64")
+            self.assertEqual(block["source"]["media_type"], "image/jpeg")
+
+    def test_inline_frames_are_labelled_with_their_global_numbers(self):
+        # The label beside each picture is the number the model cites, and
+        # the number the PDF resolves — so it is the frame's own, never the
+        # position in this call's list.
+        frames = [FrameMeta(timestamp_s=5.0, kind="periodic", number=7,
+                            path=self.frames[0].path),
+                  FrameMeta(timestamp_s=30.0, kind="scene_change", number=9,
+                            path=self.frames[1].path)]
+        self._run(frames=frames)
+        raw = json.loads(self.calls[0][1]["input"])
+        content = raw["message"]["content"]
+        labels = [b["text"] for b in content[1:] if b["type"] == "text"]
+        self.assertEqual(labels, ["[frame 7 @ 5.0s (periodic)]",
+                                  "[frame 9 @ 30.0s (scene_change)]"])
+        # label, image, label, image — each picture right after its label
+        kinds = [b["type"] for b in content[1:]]
+        self.assertEqual(kinds, ["text", "image", "text", "image"])
+
+    def test_inline_prompt_carries_no_filesystem_paths(self):
+        self._run()
+        prompt = self._prompt()
+        self.assertNotIn(str(self.frame_dir), prompt)
+        self.assertNotIn("Read tool", prompt)
+        self.assertIn("attached after this text", prompt)
+
+    def test_read_path_grants_read_scoped_to_the_frame_dir(self):
+        # CLAUDE_CLI_FRAME_INLINE=0: the older delivery, kept for a CLI too
+        # old to take stream-json input.
+        self._run({"CLAUDE_CLI_FRAME_INLINE": "0"})
+        argv = self._argv()
+        self.assertNotIn("--input-format", argv)
         self.assertEqual(argv[argv.index("--tools") + 1], "Read")
         self.assertEqual(argv[argv.index("--allowedTools") + 1], "Read")
         self.assertEqual(argv[argv.index("--add-dir") + 1], str(self.frame_dir))
+        self.assertEqual(self._images(), [])
 
-    def test_vision_puts_absolute_frame_paths_in_the_prompt(self):
-        self._run()
+    def test_read_path_puts_absolute_frame_paths_in_the_prompt(self):
+        self._run({"CLAUDE_CLI_FRAME_INLINE": "0"})
         prompt = self._prompt()
         for frame in self.frames:
             self.assertIn(str(Path(frame.path).resolve()), prompt)
         self.assertIn("Read tool", prompt)
+
+    def test_merge_role_may_use_a_cheaper_model_and_effort(self):
+        env = {"CLAUDE_CLI_MODEL": "opus", "SUMMARY_EFFORT": "medium",
+               "CLAUDE_CLI_MERGE_MODEL": "sonnet", "SUMMARY_MERGE_EFFORT": "low"}
+        with mock.patch.dict(os.environ, env):
+            self._run(frames=[])
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--model") + 1], "opus")
+        self.assertEqual(argv[argv.index("--effort") + 1], "medium")
+        self.calls.clear()
+
+        def fake_run(argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return FakeCompleted(stdout=_envelope("MERGED"))
+        env.update({"MEETING_BOT_ROOT": self.tmp.name,
+                    "CLAUDE_CLI_BIN": sys.executable})
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            llm_client.summarize_claude_cli([], "partials", "{transcript}{frame_manifest}",
+                                            role="merge")
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
+        self.assertEqual(argv[argv.index("--effort") + 1], "low")
+
+    def test_merge_role_defaults_to_the_chunk_model(self):
+        def fake_run(argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return FakeCompleted(stdout=_envelope("MERGED"))
+        env = {"MEETING_BOT_ROOT": self.tmp.name, "CLAUDE_CLI_BIN": sys.executable,
+               "CLAUDE_CLI_MODEL": "opus", "SUMMARY_EFFORT": "medium"}
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            os.environ.pop("CLAUDE_CLI_MERGE_MODEL", None)
+            os.environ.pop("SUMMARY_MERGE_EFFORT", None)
+            llm_client.summarize_claude_cli([], "partials", "{transcript}{frame_manifest}",
+                                            role="merge")
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--model") + 1], "opus")
+        self.assertEqual(argv[argv.index("--effort") + 1], "medium")
 
     def test_frames_are_listed_in_timestamp_order(self):
         # The manifest numbering is what the model cites, and pdf.py matches
@@ -993,7 +1101,7 @@ class ClaudeCliUsageWindowTest(unittest.TestCase):
     def test_mapreduce_pauses_the_stage_instead_of_merging_around_it(self):
         # Two chunks succeed, one is out of window: the stage must fail
         # (resumable) rather than write a document with a hole in it.
-        def fake_summarize(frames, transcript, template):
+        def fake_summarize(frames, transcript, template, role=None):
             if transcript == "body 1":
                 raise llm_client.ClaudeCliRateLimited("window", resets_at=1)
             return "ok"
@@ -1407,20 +1515,52 @@ class StaticPromptInvocationTest(unittest.TestCase):
         self.assertIn("Old style.", kwargs["input"])
 
 
+def _slide_frame(path, size=(1920, 1080), slide=None, seed=0):
+    """A synthetic keyframe: dark UI with a bright slide carrying some marks.
+
+    Not solid white — is_blank() would (correctly) drop that — and with a
+    few dark shapes on the slide so two frames with different `seed`s hash
+    apart while two with the same seed hash together.
+    """
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", size, (20, 20, 20))
+    draw = ImageDraw.Draw(img)
+    if slide is None:
+        slide = (0, 0, size[0], size[1])
+    draw.rectangle(slide, fill=(245, 245, 245))
+    left, top, right, bottom = slide
+    w, h = right - left, bottom - top
+    # A title bar plus "text lines" whose lengths depend on the seed — the
+    # shape a real slide has, and what tells two slides of one deck apart.
+    draw.rectangle((left + w // 20, top + h // 12, right - w // 20, top + h // 5),
+                   fill=(40, 40, 40))
+    for i in range(6):
+        y = top + h // 3 + i * (h // 10)
+        length = w * (3 + (i * 5 + seed * 7) % 6) / 10
+        draw.rectangle((left + w // 20, y, left + w // 20 + int(length), y + h // 24),
+                       fill=(30, 30, 30))
+    img.save(path, "JPEG", quality=90)
+    return path
+
+
 class FrameDownscaleTest(unittest.TestCase):
-    """A 1920x1080 keyframe costs ~1,844 tokens every time the model opens it."""
+    """A 1920x1080 keyframe costs ~1,844 tokens every time the model sees it.
+
+    Driven on the Read path (CLAUDE_CLI_FRAME_INLINE=0) so the path the model
+    is pointed at is visible in the prompt; the copies on disk are the same
+    either way, and the inline test below checks the bytes that ride along.
+    """
 
     def setUp(self):
         try:
-            from PIL import Image
+            from PIL import Image  # noqa: F401
         except ImportError:
             self.skipTest("Pillow not installed")
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.frame_dir = Path(self.tmp.name) / "frames" / "run_1"
         self.frame_dir.mkdir(parents=True)
-        self.original = self.frame_dir / "scene_00001.jpg"
-        Image.new("RGB", (1920, 1080), "white").save(self.original)
+        self.original = _slide_frame(self.frame_dir / "scene_00001.jpg")
         self.before = self.original.read_bytes()
         self.frames = [FrameMeta(timestamp_s=1.0, kind="scene_change",
                                  path=str(self.original), number=1)]
@@ -1431,7 +1571,9 @@ class FrameDownscaleTest(unittest.TestCase):
             self.calls.append((argv, kwargs))
             return FakeCompleted(stdout=_envelope("BODY"))
         environ = {"MEETING_BOT_ROOT": self.tmp.name,
-                   "CLAUDE_CLI_BIN": sys.executable}
+                   "CLAUDE_CLI_BIN": sys.executable,
+                   "CLAUDE_CLI_FRAME_INLINE": "0",
+                   "PDF_FRAME_CROP": "none"}
         environ.update(env or {})
         with mock.patch.dict(os.environ, environ), \
              mock.patch.object(llm_client.subprocess, "run", fake_run):
@@ -1451,7 +1593,7 @@ class FrameDownscaleTest(unittest.TestCase):
         sent = self._sent_path(kwargs)
         self.assertNotEqual(sent, self.original)
         with Image.open(sent) as img:
-            self.assertEqual(max(img.size), 1024)
+            self.assertEqual(max(img.size), 768)
 
     def test_the_saved_frame_is_left_alone(self):
         # pdf.py crops and embeds the original; it needs the full resolution.
@@ -1469,9 +1611,7 @@ class FrameDownscaleTest(unittest.TestCase):
         self.assertEqual(self._sent_path(kwargs), self.original)
 
     def test_a_frame_already_small_enough_is_sent_as_is(self):
-        from PIL import Image
-        small = self.frame_dir / "scene_00002.jpg"
-        Image.new("RGB", (640, 360), "white").save(small)
+        small = _slide_frame(self.frame_dir / "scene_00002.jpg", size=(640, 360))
         self.frames = [FrameMeta(timestamp_s=1.0, kind="periodic",
                                  path=str(small), number=1)]
         _, kwargs = self._run()
@@ -1491,6 +1631,288 @@ class FrameDownscaleTest(unittest.TestCase):
         _, second = self._run()
         self.assertEqual(self._sent_path(second), sent)
         self.assertEqual(sent.stat().st_mtime_ns, stamp)
+
+    def test_inline_delivery_sends_the_downscaled_bytes(self):
+        # Same copy, different transport: the image block carries the small
+        # file, not the 1920x1080 original.
+        import base64
+        from PIL import Image
+        import io
+        _, kwargs = self._run(env={"CLAUDE_CLI_FRAME_INLINE": "1"})
+        _, images = _unpack_stdin(kwargs["input"])
+        self.assertEqual(len(images), 1)
+        data = base64.b64decode(images[0]["source"]["data"])
+        self.assertLess(len(data), len(self.before))
+        with Image.open(io.BytesIO(data)) as img:
+            self.assertEqual(max(img.size), 768)
+
+
+def _bright_fraction(img):
+    gray = img.convert("L").resize((50, 28))
+    values = list(gray.getdata())
+    return sum(1 for v in values if v > 200) / len(values)
+
+
+class FrameCropForLlmTest(unittest.TestCase):
+    """The copy the model sees is cropped to the slide before it is shrunk.
+
+    At 768px a whole 1920x1080 frame gives the slide maybe 500px of width;
+    cropped first, the slide gets all 768. Same detector, same mode
+    (PDF_FRAME_CROP) as the PDF, so the model looks at the picture the PDF
+    prints — and framecrop declines rather than guesses, so a frame with no
+    findable slide is shrunk whole.
+    """
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.frame_dir = Path(self.tmp.name) / "frames" / "run_1"
+        self.frame_dir.mkdir(parents=True)
+        # A 1280x720 slide sitting in dark chrome at (320, 180).
+        self.original = _slide_frame(self.frame_dir / "scene_00001.jpg",
+                                     slide=(320, 180, 1600, 900))
+
+    def test_slide_mode_crops_then_fits(self):
+        import framecrop
+        from PIL import Image
+        dst = self.frame_dir / "llm" / "scene_00001.jpg"
+        out = framecrop.fit_for_llm(self.original, dst, mode="slide", max_dim=768)
+        self.assertEqual(out, dst)
+        with Image.open(dst) as img:
+            self.assertEqual(img.width, 768)
+            # The slide, not the frame: the dark chrome is gone, so the
+            # copy is markedly lighter than the whole-frame version below.
+            self.assertGreater(_bright_fraction(img), 0.6)
+            self.assertLess(abs(img.height - 432), 16)   # still ~16:9
+
+    def test_none_mode_only_downscales(self):
+        import framecrop
+        from PIL import Image
+        dst = self.frame_dir / "llm" / "scene_00001.jpg"
+        framecrop.fit_for_llm(self.original, dst, mode="none", max_dim=768)
+        with Image.open(dst) as img:
+            self.assertEqual(img.size, (768, 432))
+            self.assertLess(_bright_fraction(img), 0.45)   # chrome still there
+
+    def test_nothing_to_do_returns_the_source(self):
+        import framecrop
+        small = _slide_frame(self.frame_dir / "small.jpg", size=(640, 360))
+        dst = self.frame_dir / "llm" / "small.jpg"
+        out = framecrop.fit_for_llm(small, dst, mode="none", max_dim=768)
+        self.assertEqual(out, small)
+        self.assertFalse(dst.exists())
+
+    def test_the_copy_directory_names_the_crop_mode(self):
+        # So flipping PDF_FRAME_CROP doesn't reuse copies cut the old way.
+        src = Path("/x/frames/run/f.jpg")
+        self.assertEqual(llm_client._llm_copy_path(src, 768, "slide"),
+                         Path("/x/frames/run/llm-768-slide/f.jpg"))
+        self.assertEqual(llm_client._llm_copy_path(src, 768, "none"),
+                         Path("/x/frames/run/llm-768/f.jpg"))
+
+    def test_the_backend_uses_pdf_frame_crop(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return FakeCompleted(stdout=_envelope("BODY"))
+        frames = [FrameMeta(timestamp_s=1.0, kind="scene_change",
+                            path=str(self.original), number=1)]
+        env = {"MEETING_BOT_ROOT": self.tmp.name, "CLAUDE_CLI_BIN": sys.executable,
+               "CLAUDE_CLI_FRAME_INLINE": "0", "PDF_FRAME_CROP": "slide"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            llm_client.summarize_claude_cli(frames, "t", "{transcript}\n{frame_manifest}")
+        prompt = calls[0][1]["input"]
+        self.assertIn("/llm-768-slide/scene_00001.jpg", prompt)
+
+
+class DropUninformativeTest(unittest.TestCase):
+    """Blank frames and repeats of the same slide are not offered."""
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def _frame(self, name, ts, seed, kind="periodic", part=0, blank=False):
+        from PIL import Image
+        path = self.dir / f"{name}.jpg"
+        if blank:
+            Image.new("RGB", (640, 360), "black").save(path)
+        else:
+            _slide_frame(path, size=(640, 360), seed=seed)
+        return FrameMeta(timestamp_s=ts, kind=kind, path=str(path), part=part)
+
+    def test_blank_frames_are_dropped(self):
+        frames = [self._frame("a", 0, 1), self._frame("b", 30, 0, blank=True),
+                  self._frame("c", 60, 2)]
+        kept, blanks, dupes = llm_client.drop_uninformative(frames)
+        self.assertEqual([f.timestamp_s for f in kept], [0, 60])
+        self.assertEqual((blanks, dupes), (1, 0))
+
+    def test_consecutive_repeats_of_one_slide_are_dropped(self):
+        frames = [self._frame("a", 0, 1), self._frame("b", 30, 1),
+                  self._frame("c", 60, 1), self._frame("d", 90, 2)]
+        kept, blanks, dupes = llm_client.drop_uninformative(frames)
+        self.assertEqual([f.timestamp_s for f in kept], [0, 90])
+        self.assertEqual((blanks, dupes), (0, 2))
+
+    def test_a_slide_returned_to_later_is_kept(self):
+        # Only *consecutive* repeats go: coming back to a diagram twenty
+        # minutes later is a moment the notes may cite.
+        frames = [self._frame("a", 0, 1), self._frame("b", 30, 2),
+                  self._frame("c", 60, 1)]
+        kept, _, dupes = llm_client.drop_uninformative(frames)
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(dupes, 0)
+
+    def test_numbers_are_untouched(self):
+        frames = llm_client.assign_numbers(
+            [self._frame("a", 0, 1), self._frame("b", 30, 1), self._frame("c", 60, 2)])
+        kept, _, _ = llm_client.drop_uninformative(frames)
+        self.assertEqual([f.number for f in kept], [1, 3])
+
+    def test_frames_of_different_videos_are_never_each_others_repeat(self):
+        frames = [self._frame("a", 0, 1, part=1), self._frame("b", 0, 1, part=2)]
+        kept, _, dupes = llm_client.drop_uninformative(frames)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(dupes, 0)
+
+    def test_dedupe_can_be_turned_off(self):
+        frames = [self._frame("a", 0, 1), self._frame("b", 30, 1)]
+        with mock.patch.dict(os.environ, {"CLAUDE_CLI_FRAME_DEDUPE": "0"}):
+            kept, _, dupes = llm_client.drop_uninformative(frames)
+        self.assertEqual(len(kept), 2)
+
+    def test_dedupe_runs_before_the_cap(self):
+        # Ten periodic samples of one slide, then one new slide, cap 3: the
+        # model sees both slides. Thinning first would have shown it the
+        # first slide three times.
+        frames = [self._frame(f"f{i}", i * 30, 1) for i in range(10)]
+        frames.append(self._frame("new", 300, 2))
+        frames = llm_client.assign_numbers(frames)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(kwargs)
+            return FakeCompleted(stdout=_envelope("BODY"))
+        env = {"MEETING_BOT_ROOT": self.tmp.name, "CLAUDE_CLI_BIN": sys.executable,
+               "CLAUDE_CLI_MAX_FRAMES": "3", "PDF_FRAME_CROP": "none"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            llm_client.summarize_claude_cli(frames, "t", "{transcript}\n{frame_manifest}")
+        text, images = _unpack_stdin(calls[0]["input"])
+        self.assertEqual(len(images), 2)
+        self.assertIn("[frame 1 @ 0.0s", text)
+        self.assertIn("[frame 11 @ 300.0s", text)
+
+    def test_frame_hash_tells_slides_apart(self):
+        import framecrop
+        a = framecrop.frame_hash(self._frame("a", 0, 1).path)
+        b = framecrop.frame_hash(self._frame("b", 0, 1).path)
+        c = framecrop.frame_hash(self._frame("c", 0, 2).path)
+        self.assertEqual(framecrop.hamming(a, b), 0)
+        self.assertGreater(framecrop.hamming(a, c), llm_client.FRAME_DEDUPE_MAX_DISTANCE)
+
+    def _text_slide(self, name, title, cursor=None, tile=False):
+        # Real rendered text in dark chrome, the way a Meet recording of a
+        # shared slide looks: this is the case the hash exists for.
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (1920, 1080), (20, 20, 20))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((320, 180, 1600, 900), fill="white")
+        draw.text((400, 300), title, fill="black", font_size=60)
+        if cursor:
+            draw.ellipse((cursor[0], cursor[1], cursor[0] + 18, cursor[1] + 18), fill="black")
+        if tile:
+            draw.rectangle((1650, 200, 1900, 340), fill=(90, 120, 200))
+        path = self.dir / f"{name}.jpg"
+        img.save(path, "JPEG", quality=90)
+        return path
+
+    def test_a_changed_title_is_a_different_slide(self):
+        # The false positive seen live 2026-09-12: same template, different
+        # title, deduped by an average hash. Texture bits tell them apart.
+        import framecrop
+        a = framecrop.frame_hash(self._text_slide("t1", "Dijkstra: relax edges"))
+        b = framecrop.frame_hash(self._text_slide("t2", "Bellman-Ford: V-1 passes"))
+        self.assertGreater(framecrop.hamming(a, b), llm_client.FRAME_DEDUPE_MAX_DISTANCE)
+
+    def test_a_cursor_or_a_filmstrip_change_is_the_same_slide(self):
+        import framecrop
+        a = framecrop.frame_hash(self._text_slide("s1", "Dijkstra: relax edges"))
+        cursor = framecrop.frame_hash(self._text_slide("s2", "Dijkstra: relax edges", cursor=(900, 600)))
+        tile = framecrop.frame_hash(self._text_slide("s3", "Dijkstra: relax edges", tile=True))
+        self.assertLessEqual(framecrop.hamming(a, cursor), llm_client.FRAME_DEDUPE_MAX_DISTANCE)
+        self.assertLessEqual(framecrop.hamming(a, tile), llm_client.FRAME_DEDUPE_MAX_DISTANCE)
+
+
+class PromptOrderForCachingTest(unittest.TestCase):
+    """What varies per chunk goes last; what is the same for a run goes first."""
+
+    def test_the_chunk_label_is_appended_not_prepended(self):
+        seen = []
+
+        def fake_summarize(frames, transcript, template, role=None):
+            seen.append(template)
+            return "x"
+        chunks = [Chunk(index=i, text=f"body {i}", start_s=i * 60.0,
+                        end_s=(i + 1) * 60.0, frames=[]) for i in range(2)]
+        summarize_chunked(chunks, "INSTRUCTIONS\n{transcript}\n{frame_manifest}",
+                          fake_summarize, log=lambda *a: None)
+        chunk_templates = [t for t in seen if "ONE PART" in t]
+        self.assertEqual(len(chunk_templates), 2)
+        for template in chunk_templates:
+            self.assertTrue(template.startswith("INSTRUCTIONS"))
+            self.assertGreater(template.index("ONE PART"), template.index("{frame_manifest}"))
+
+    def test_the_merge_is_called_with_the_merge_role(self):
+        roles = []
+
+        def fake_summarize(frames, transcript, template, role=None):
+            roles.append(role)
+            return "x"
+        chunks = [Chunk(index=i, text=f"body {i}", start_s=i * 60.0,
+                        end_s=(i + 1) * 60.0, frames=[]) for i in range(2)]
+        summarize_chunked(chunks, "P {transcript}", fake_summarize, log=lambda *a: None)
+        self.assertEqual(roles, [None, None, "merge"])
+
+    def test_reference_material_goes_to_the_top_of_the_dynamic_half(self):
+        import summarize as summarize_main
+
+        class Bundle:
+            def text_block(self):
+                return "Week 4 slides {x}"
+
+            def provenance(self):
+                return "repo"
+        template = (f"{BEGIN}\nRULES\n{END}\n# Input\n{{transcript}}\n{{frame_manifest}}\n")
+        out = summarize_main.inject_resources(template, Bundle())
+        static, dynamic = llm_client.split_static_prompt(out)
+        self.assertNotIn("Week 4", static)
+        self.assertLess(dynamic.index("Week 4 slides {{x}}"), dynamic.index("# Input"))
+
+    def test_reference_material_is_appended_to_an_unmarked_template(self):
+        import summarize as summarize_main
+
+        class Bundle:
+            def text_block(self):
+                return "Week 4 slides"
+
+            def provenance(self):
+                return "repo"
+        out = summarize_main.inject_resources("RULES\n{transcript}", Bundle())
+        self.assertTrue(out.startswith("RULES"))
+        self.assertGreater(out.index("Week 4"), out.index("{transcript}"))
 
 
 if __name__ == "__main__":

@@ -12,8 +12,15 @@ What it records (one JSON line appended to --record, or $FAKE_CLAUDE_RECORD):
 
     {"api": "claude-cli",
      "argv":   [...],          the exact command line llm_client built
-     "prompt": "...",          everything it sent on stdin
+     "prompt": "...",          the text it sent on stdin (see below)
+     "images": [...],          the inline image blocks, if any: their
+                               media_type and decoded byte size
      "env": {"ANTHROPIC_API_KEY": null, ...}}   the auth vars it did NOT scrub
+
+With `--input-format stream-json` (the default frame delivery) stdin is one
+JSON line holding a user message whose content is text blocks and base64
+image blocks. `prompt` is then the text blocks joined, so the same
+assertions work on both paths, and `images` says what pictures rode along.
 
 `env` is the point of the whole file. A summarize run that leaves
 ANTHROPIC_API_KEY in the child's environment still produces a perfectly good
@@ -111,6 +118,42 @@ def _rate_limit_event(status, resets_at, utilization=0.42):
             "session_id": "stub", "uuid": str(uuid.uuid4())}
 
 
+def _unpack_stream_json(raw):
+    """(joined text, image summaries) from a stream-json user message.
+
+    Mirrors how the real CLI reads its stdin in this mode: one JSON object per
+    line, a `user` message whose content is a list of blocks. A line that
+    isn't JSON is kept as text, so a stub fed a plain prompt still records it.
+    """
+    import base64
+    texts, images = [], []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            texts.append(line)
+            continue
+        content = (obj.get("message") or {}).get("content")
+        if isinstance(content, str):
+            texts.append(content)
+            continue
+        for block in content or []:
+            if block.get("type") == "text":
+                texts.append(block.get("text", ""))
+            elif block.get("type") == "image":
+                src = block.get("source") or {}
+                try:
+                    size = len(base64.b64decode(src.get("data", "")))
+                except (ValueError, TypeError):
+                    size = -1
+                images.append({"media_type": src.get("media_type"),
+                               "bytes": size})
+    return "\n".join(texts), images
+
+
 def _bump_counter(path):
     """Calls so far, counted in a file; 1 for the first call."""
     try:
@@ -136,11 +179,16 @@ def main(argv):
         except (OSError, UnicodeDecodeError):
             prompt = ""
 
+    images = []
+    if "--input-format" in passthrough and "stream-json" in passthrough:
+        prompt, images = _unpack_stream_json(prompt)
+
     if known.record:
         entry = {
             "api": "claude-cli",
             "argv": passthrough,
             "prompt": prompt,
+            "images": images,
             "cwd": os.getcwd(),
             "env": {var: os.environ.get(var) for var in _AUTH_VARS},
         }

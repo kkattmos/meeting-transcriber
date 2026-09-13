@@ -626,7 +626,10 @@ The invocation is fixed in one place and asserted in two test suites:
 ```
 claude -p --output-format stream-json --verbose --model <CLAUDE_CLI_MODEL> --effort <SUMMARY_EFFORT>
        --safe-mode --no-session-persistence
-       [--tools Read --allowedTools Read --add-dir <frames dir>]
+       [--append-system-prompt-file <sha>.md --exclude-dynamic-system-prompt-sections]
+       --input-format stream-json --tools ""            (frames inline; the default)
+     | --tools Read --allowedTools Read --add-dir <dir>  (CLAUDE_CLI_FRAME_INLINE=0)
+     | --tools ""                                        (no frames / vision off)
 ```
 
 - **The prompt goes in on stdin, never in argv.** An 80KB transcript in an
@@ -681,14 +684,49 @@ the operator thought was unused. An empty `ANTHROPIC_API_KEY` is worse: it fails
 auth in a way that reads like a broken subscription. `lib/fake_claude_cli.py`
 records what reached the child process precisely so this regression is visible.
 
-**Frames are read from disk, not inlined.** The Messages API took base64 image
-blocks; the CLI takes a string. So the manifest carries absolute paths, the CLI
-gets `--tools Read --allowedTools Read` scoped by `--add-dir` to the run's frame
-directory, and the model opens the images itself. `--allowedTools` is required
-because `-p` mode cannot answer a permission prompt. `CLAUDE_CLI_FRAME_VISION=0`
-sends the manifest as text only — cheaper against a subscription's rate limit,
-but then the model cites frames it has never seen and the pictures in the PDF
-may not match the text.
+**Frames are inlined as image blocks, in one turn** (settled 2026-09-12,
+the token-usage pass). `--input-format stream-json` makes stdin a JSON user
+message whose content is blocks, and the CLI accepts `image` blocks there
+exactly as the Messages API does — verified on v2.1.263 with Haiku
+(`build_inline_input`). The prompt text goes first, then for each offered
+frame its manifest label and the image, so the number beside the picture is
+the number the model cites. `--tools ""`: nothing to open.
+
+The previous delivery — absolute paths in the manifest, `--tools Read
+--allowedTools Read --add-dir <frame dir>`, the model Reads each file — is
+kept behind `CLAUDE_CLI_FRAME_INLINE=0` for a CLI too old to take stream-json
+input, and for nothing else. It was replaced because **each Read is a turn,
+and each turn re-sends the whole context**: `usage.iterations` in the
+envelope showed it, and on a 12-frame chunk over a ~30k context that is
+300k+ cache-read tokens — more than the frames themselves cost. The ledger's
+`cache_read_input_tokens` against `input_tokens` is the tell in any old
+`state.json`. `CLAUDE_CLI_FRAME_VISION=0` still sends the manifest as text
+only, and then the model cites frames it has never seen.
+
+**Frames are filtered before they are offered** (`drop_uninformative`, same
+pass). Two kinds cost tokens and teach nothing: blank frames — the PDF already
+drops them (`framecrop.is_blank`) but the model was still being shown them,
+and the scene-change pass *prefers* them — and consecutive periodic samples of
+a slide that has not changed. The repeat test is `framecrop.frame_hash`: a
+**texture** hash (per-cell pixel spread, 64x64 cells) over the *slide region*
+found by `detect_crop`, so a participant filmstrip beside the slide never
+enters it. Measured on synthetic 1920x1080 frames: a moved cursor flips 2 of
+4096 bits, a shade change 5, a changed title 58, changed body text 176;
+`FRAME_DEDUPE_MAX_DISTANCE` is 16. Only *consecutive* repeats go — a slide
+returned to later is a moment the notes may cite — and a frame is never
+matched against one from another video of a `--combine` set. Numbers are
+untouched; the PDF resolves every citation as before. Two hashes were tried
+and rejected first, and the reasons matter if anyone revisits this: a
+difference hash encodes only the *sign* of the gradient between neighbours,
+so a text line that grew or shrank left it unchanged; an average hash
+compares cells against the frame's mean, which the dark chrome drags so low
+that every cell on a white slide reads "bright" whether it holds text or not
+— it deduplicated two slides with different titles in the live check.
+`CLAUDE_CLI_FRAME_DEDUPE=0` offers everything.
+
+The order is fixed: drop blanks and repeats, *then* `thin_frames` to the cap,
+*then* crop and downscale. Thinning first would spend the cap on twelve
+copies of one slide. `test_dedupe_runs_before_the_cap` holds it.
 
 **The static half of the prompt is a system prompt file, so the prefix can
 cache.** Claude's prompt caching keys on a byte-identical prefix; the CLI has
@@ -750,18 +788,51 @@ the first *substring* match rather than on a heading:
 Prefer the markers over relying on the cut. If you write a new prompt file
 without them, check what `load_prompt_template` actually returns.
 
-**Frames sent to the CLI are downscaled; the saved frames are not.**
-`FRAME_MAX_DIMENSION` (default 1024, 0 disables) caps the long edge of a
-*copy*, written to `<frame dir>/llm-<px>/<same name>.jpg` and reused on the
-next run. A 1920x1080 keyframe is ~1,844 tokens every time the model opens it
-and ~790 at 1024px; measured here, six real frames went 442KB → 152KB. The
+**Frames sent to the CLI are cropped to the slide and downscaled; the saved
+frames are not.** `framecrop.fit_for_llm` runs `detect_crop` in the PDF's own
+`PDF_FRAME_CROP` mode (one knob, deliberately: the model looks at the picture
+the PDF prints, and the detector's decline-rather-than-guess rule protects
+both) and then fits the result to `FRAME_MAX_DIMENSION` (default **768** since
+2026-09-12, was 1024) on the long edge. Cropping first is what makes 768
+enough: on a Meet recording the slide is maybe two thirds of the frame, and
+the dark chrome was paying for pixels that said nothing. Live check with
+Haiku: 60px slide titles read correctly off the 768px cropped copy. A whole
+1920x1080 frame is ~1,844 tokens, ~790 at 1024px, ~440 at 768px, and the crop
+takes it lower still. The copy goes to `<frame dir>/llm-<px>-<mode>/<same
+name>.jpg` — the mode is in the directory name so flipping `PDF_FRAME_CROP`
+doesn't reuse copies cut the old way — and is reused on the next run. The
 originals never move, because `pdf.py` crops and embeds them and needs the
 resolution — `_downscale_frames` builds new `FrameMeta` objects with
 `dataclasses.replace` rather than touching the ones `summarize.py` passes on to
-the PDF. `--add-dir` names both directories. Pillow is optional: without it the
-originals are sent with one warning. `SCENE_THRESHOLD` and
-`FRAME_PERIOD_SECONDS` are untouched — this changes resolution, never which
-frames exist.
+the PDF. Pillow is optional: without it the originals are sent with one
+warning. `SCENE_THRESHOLD` and `FRAME_PERIOD_SECONDS` are untouched — this
+changes resolution, never which frames exist.
+
+**The chunk label is appended, not prepended, and the reference material sits
+at the top of the dynamic half.** Both in the same pass. Caching keys on a
+prefix, and the label is the one thing that differs between the chunks of a
+run; in front of everything it meant the `--resources` block behind it —
+identical on every chunk, up to `RESOURCE_MAX_CHARS` = 40k characters — never
+cached. Now `inject_resources` inserts the block right after the static-prompt
+end marker (a template without markers is appended to, as before, so its
+instructions still come first) and `mapreduce` puts the label after the frame
+manifest. `PromptOrderForCachingTest` holds both. In the inline-image message
+the text block comes before the images for the same reason: the images differ
+on every chunk.
+
+**The merge call may run on a cheaper model.** `mapreduce` passes
+`role="merge"` through `summarize` → `summarize_with_fallback` → the backend;
+`summarize_claude_cli` swaps in `CLAUDE_CLI_MERGE_MODEL` / `SUMMARY_MERGE_EFFORT`
+for that call only (default: the chunk's model and effort, so an existing
+`.env` changes nothing). The merge reads every partial and — by `_merge.md`'s
+own rule, "do not compress" — writes them all out again, so its output is
+about the size of everything the chunks produced; output tokens are the
+expensive kind, and this was the single most expensive call of a chunked run.
+The chunk summaries, where the reading of noisy Thai ASR happens, stay on
+Opus. `.env.example` recommends `sonnet` / `low` for the merge and
+`SUMMARY_CHUNK_CHARS=60000`, so most lectures under ~90 minutes are one call
+and have no merge at all; the code defaults (24000, same model) are
+unchanged. `gemini` accepts and ignores `role`.
 
 ### The usage window: metered, waited for, never handed to Gemini
 
@@ -812,16 +883,25 @@ Gemini. Four decisions:
    wait is the primary path; the timer exists for the process being gone.
 
 `CLAUDE_CLI_MAX_FRAMES` came out of the same conversation: frames are the
-bulk of a call's input (~790 tokens each at 1024px, ~72 per 36-minute chunk),
-so `thin_frames` caps what the model is *offered* — scene changes first,
-periodic frames at an even stride so the cap still covers the whole window.
-Numbers are untouched (they were assigned over the whole manifest), so the
-PDF resolves whatever the model cites. Code default 0 (= off): turning it on
-by default would silently change every existing run's summaries. **The
-recommended Pro-plan values live in `.env.example` instead** (settled with the
-operator 2026-09-12): `CLAUDE_CLI_MAX_FRAMES=12`, `FRAME_PERIOD_SECONDS=60`,
-`SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`. The README's table still
-lists the code defaults; the two differing on purpose is documented there.
+bulk of a call's input, so `thin_frames` caps what the model is *offered* —
+scene changes first, periodic frames at an even stride so the cap still
+covers the whole window. It runs after the blank/duplicate pass, so the cap
+counts distinct slides. Numbers are untouched (they were assigned over the
+whole manifest), so the PDF resolves whatever the model cites. Code default 0
+(= off): turning it on by default would silently change every existing run's
+summaries. **The recommended Pro-plan values live in `.env.example` instead**
+(settled with the operator 2026-09-12): `CLAUDE_CLI_MAX_FRAMES=20` (raised
+from 12 the same day — with duplicates gone and each frame a third of its old
+cost, 20 distinct slides per chunk is cheaper than 12 samples were),
+`FRAME_PERIOD_SECONDS=60`, `SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`,
+`SUMMARY_CHUNK_CHARS=60000`, `CLAUDE_CLI_MERGE_MODEL=sonnet`,
+`SUMMARY_MERGE_EFFORT=low`. The README's table still lists the code defaults;
+the two differing on purpose is documented there.
+
+The fixed overhead the CLI itself adds was measured while sizing this
+(v2.1.263, Haiku, trivial prompt): ~4.9k tokens of system prompt with the
+Read tool, ~3.5k with `--tools ""`, cached as `ephemeral_1h` automatically.
+Small next to a chunk; not a lever worth chasing.
 
 markitdown (microsoft/markitdown) was evaluated the same day as a way to cut
 resource tokens and **rejected**: it converts to Markdown, which carries more
@@ -1381,6 +1461,21 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **`FRAME_MAX_DIMENSION` downscales a copy, never the saved frame.** `pdf.py`
   crops and embeds the original; overwriting it degrades every PDF and is not
   recoverable without re-running ffmpeg.
+- **Frames go to the CLI as image blocks in one turn, not as paths to Read.**
+  The Read path re-sends the whole context once per frame opened. It stays
+  only as `CLAUDE_CLI_FRAME_INLINE=0` for an old CLI; don't make it the default
+  again.
+- **Blank and repeated frames are dropped before the cap, and the cap before
+  the crop.** Reordering spends the cap on copies of one slide. The repeat
+  test is a texture hash over the slide region — not a difference hash (blind
+  to a line that grew) and not an average hash (blind to text on a white slide
+  next to dark chrome); both were tried and both merged distinct slides.
+- **The chunk label goes after the frame manifest; the reference material goes
+  right after the static-prompt end marker.** Anything constant across a run's
+  chunks must precede anything that varies, or it never caches — and nothing
+  reports the miss.
+- **`role="merge"` reaches every backend's signature.** A backend that doesn't
+  take it breaks the fallback chain on the merge call with a TypeError.
 - **The CLI's JSON body decides success, not its exit code.** It exits 0 when
   signed out. Parsing the envelope is the only way to tell.
 - **`--output-format stream-json --verbose` stays.** `json` drops the
@@ -1388,7 +1483,8 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   then goes back to looking like a login failure.
 - **`SUMMARY_MAX_TOKENS` is not a Claude lever, and must not be wired to
   one.** There is no output cap on the CLI, and output is not what spends
-  the window. The levers are `CLAUDE_CLI_MAX_FRAMES`, `FRAME_PERIOD_SECONDS`,
+  the window. The levers are `SUMMARY_CHUNK_CHARS` (whether there is a merge),
+  `CLAUDE_CLI_MERGE_MODEL`, `CLAUDE_CLI_MAX_FRAMES`, `FRAME_PERIOD_SECONDS`,
   `FRAME_MAX_DIMENSION`, `SUMMARY_EFFORT` and `CLAUDE_CLI_MODEL`.
 - **`ClaudeCliRateLimited` is `retryable = False` and the chain re-raises
   it.** Retrying it burns the backoff schedule; advancing hands the summary to
@@ -1479,7 +1575,7 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
-| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), the cacheable static prompt, frame downscaling, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning | 136 |
+| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning | 161 |
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, part-tagged manifests and captions for `--combine`, real PDF render | 60 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing) | 281 |
@@ -1516,10 +1612,13 @@ only place that can assert on **what we actually send**. For the summarizer
 that seam is no longer HTTP — it is `lib/fake_claude_cli.py`, a stub
 *executable* that `CLAUDE_CLI_BIN` points at. It records the argv, the piped
 prompt and the auth vars that reached the child, so the test asserts that
-`--effort` carries `SUMMARY_EFFORT`, that `--add-dir` scopes Read to the run's
-frame directory, that absolute frame paths are in the prompt, and that
+`--effort` carries `SUMMARY_EFFORT`, that the frames arrive as JPEG image
+blocks in a stream-json user message with `--tools ""` and no `--add-dir`,
+that no filesystem path is in the prompt, that the copies sent are the
+cropped ≤768px ones and the originals are untouched, and that
 `ANTHROPIC_API_KEY` — deliberately exported by the test — did *not* reach the
-CLI. It also drives `FAKE_CLAUDE_MODE=not-logged-in` to prove a signed-out CLI
+CLI. The stub unpacks the stream-json line so its `prompt` field is still the
+text the model read, and records the image blocks under `images`. It also drives `FAKE_CLAUDE_MODE=not-logged-in` to prove a signed-out CLI
 fails as `BackendUnavailable` rather than being retried, and
 `rate-limited-once` / `rate-limited` (with `FAKE_CLAUDE_RESET_IN` and
 `CLAUDE_CLI_MAX_WAIT_SECONDS`) to drive the real wait-then-retry and the
@@ -1530,11 +1629,15 @@ invocation, assert it here. Note the wait test really sleeps: the stub's
 reset is 2s away and the margin is 60s, so that block takes about a minute.
 `KEEP_TESTROOT=1` keeps the test root for inspection.
 
-Two pre-existing failures on the author's desktop are worth knowing so they
-are not mistaken for regressions: "no downscaled frame copies in the prompt"
-(the scratch venv's Pillow cannot decode the synthetic frames) and, flakily,
-"language not sent" in the transcribe section. Both fail identically on the
-commit before the usage-window work.
+One pre-existing flaky failure on the author's desktop is worth knowing so
+it is not mistaken for a regression: "language not sent" in the transcribe
+section. (The earlier "no downscaled frame copies" failure went away with a
+scratch venv built from `requirements.txt` — `/opt/meeting-bot-venv` on the
+desktop is an empty 3.14 venv, so run the shell suites with
+`MEETING_BOT_VENV=<a venv built with uv from requirements.txt>`.) The media
+test's synthetic slides are flat colour, so the duplicate pass collapses all
+three to one image block; that is the fixture, not a bug — real slides carry
+text, which is what the texture hash keys on.
 
 **What no test here covers:** Chrome actually joining a live Meet/Zoom call, a
 real Kaltura tenant's access-control (`./verify_e2e.sh --kaltura` is the live
