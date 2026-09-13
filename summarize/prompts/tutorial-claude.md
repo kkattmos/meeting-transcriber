@@ -14,16 +14,24 @@ Return ONLY the body of the guide. The tooling wraps your output in a document
 template, so do NOT write any of the following — they would be duplicated:
 
 - a `Chapter N — ...` line
-- a top-level `# Title` heading
 - the video link
 - the transcript, or a `<details>` block
 
-Open with one or two sentences naming what the video demonstrates and the
+Begin with a top-level `# Title` heading naming the tool or system and what
+the video does with it (e.g. `# Docker Compose — Multi-Container Setup`). It
+becomes the document's title, so name the material, not the video file.
+
+Then open with one or two sentences naming what the video demonstrates and the
 concrete tools or system involved, **bolding** the key nouns. Then use the
 sections below, numbered sequentially (`## 1. ...`, `## 2. ...`) and separated
 by `---` horizontal rules. Add further numbered sections of your own where the
 material has divisions these don't cover, and drop any that don't apply —
-keeping the numbering contiguous. The visual index always comes last.
+keeping the numbering contiguous.
+
+Use what the frames show — code, terminal output, UI state, diagrams — as
+content, but never cite them: no `(Frame N @ …)` references and no frame
+numbers anywhere in the guide. Chapter timestamps (`[mm:ss]`) stay; they are
+how a viewer jumps to a segment.
 
 ## N. Video Overview & Key Takeaways
 * **Primary Objective**: A 2-sentence overview of what this video teaches or demonstrates.
@@ -35,7 +43,6 @@ Provide navigable chapters so the viewer can skip directly to sections of intere
 
 * **`[00:00]` - [Chapter Title]**: Brief summary of the introduction or topic.
 * **`[mm:ss]` - [Chapter Title]**: Detailed bullet points covering what is explained or demonstrated in this segment.
-  * *Visual Marker*: Highlight keyframes or visual changes (e.g., *Demo shown at frame 8 @ 185s*).
 
 ## N. Visual Demonstrations & Code Walkthroughs
 Focus specifically on interactive portions, live coding, or diagram explanations:
@@ -43,19 +50,13 @@ Focus specifically on interactive portions, live coding, or diagram explanations
   * **What is shown**: Description of the UI, code block, or architecture diagram.
   * **Step-by-step Execution**: Key steps or commands executed by the speaker. Reproduce commands, flags, file paths, and code **verbatim** exactly as shown on screen or dictated — do not paraphrase syntax. If a command is partially obscured or cut off, write `[partially visible: <what is legible>]` rather than completing it from guesswork.
 
-## N. High-Value Visual Index (Jump-to Markers)
-Always the final section. A reference table for key screens (diagrams, architecture, final code state, summary slides):
-
-| Frame / Index | Timestamp | Screen Category | Content Description |
-| :--- | :--- | :--- | :--- |
-| Frame # | `[mm:ss]` | [Slide / Code / UI / Diagram] | Description of visual state |
-
-Merge consecutive frames showing materially the same screen state into a single row spanning the timestamp range, rather than listing near-duplicate periodic samples separately. Prioritize `scene_change` frames; include `periodic_sample` frames only when they capture meaningful in-progress change (e.g., code being typed, a build running) not already represented nearby. If there are more distinct visual moments than reasonably fit in one table, keep the ~40 most content-distinct rows, always retaining the final code/architecture state, and note "Additional repeated/minor frames omitted" at the end.
+Do not end with a visual index or frame table. The last section is the last
+content section.
 
 ---
 
 # Execution Rules
-1. **Precision Timestamps**: Ensure all time markers match the transcript and frame timestamps accurately.
+1. **Precision Timestamps**: Ensure all chapter time markers match the transcript accurately.
 2. **Demonstration Clarity**: Focus heavily on *how* things are executed on screen rather than just what is said verbally.
 3. **No Assumptions**: Base all chapter descriptions strictly on provided transcript lines and keyframe data.
 4. **Conflict Handling**: If on-screen code/UI contradicts the presenter's verbal description (e.g., a typo they don't notice, or a flag they misname aloud), note the discrepancy directly rather than silently picking one version.
@@ -63,7 +64,7 @@ Merge consecutive frames showing materially the same screen state into a single 
 6. **Transcription Noise**: These transcripts come from automatic speech recognition and contain misrecognized words, especially technical terms, flags, and proper nouns. Infer the intended term from context and write it correctly (a garbled rendering of "REST API" should appear as **REST API**). Do not reproduce obvious ASR garbage verbatim. Where the frames show the real spelling of a command or identifier, the frames win over the transcript.
 7. **Language**: Write the guide in English even when the transcript is in another language, but keep proper nouns, product names, commands, and on-screen identifiers verbatim.
 8. **Timestamp Format**: Use `[mm:ss]` for videos under 60 minutes. For videos 60 minutes or longer, switch to `[h:mm:ss]` consistently across the entire document.
-9. **Empty Section Handling**: Omit a section with no applicable content entirely, keeping the numbering contiguous — do not emit a heading with `None` under it. The visual index is the exception: keep it, and write `No notable screens captured.` if there is genuinely nothing.
+9. **Empty Section Handling**: Omit a section with no applicable content entirely, keeping the numbering contiguous — do not emit a heading with `None` under it.
 
 ---
 

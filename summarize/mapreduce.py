@@ -55,6 +55,8 @@ def _default_merge_template():
         "Rules:\n"
         "- Produce ONE coherent document, not a list of parts. Never mention "
         "that it was assembled from parts.\n"
+        "- If the partials open with a `# Title` heading, keep exactly one, "
+        "as the first line.\n"
         "- Merge duplicates: the parts overlap slightly, so the same point may "
         "appear more than once.\n"
         "- Collect all action items into a single list with owners and due "

@@ -14,7 +14,7 @@ for a large LaTeX subset that ships **Computer Modern** — the TeX face — as
 `mathtext.fontset = "cm"`, and needs no TeX installation, no node, no network.
 Each expression becomes a small SVG inlined as a `data:` URI.
 
-Four things are worth knowing before editing this:
+Five things are worth knowing before editing this:
 
   * **Extraction runs on the markdown, before the HTML conversion.** Markdown
     eats the syntax otherwise: `_{trans}` becomes emphasis, backslashes vanish,
@@ -27,16 +27,25 @@ Four things are worth knowing before editing this:
     baseline); depth becomes a negative `vertical-align`, so inline maths sits
     on the text baseline instead of floating.
 
-  * **Nothing here may fail the render.** matplotlib is optional and its
-    parser rejects plenty of real LaTeX (`\\begin{cases}`, `\\substack`), so
-    every failure degrades to cleaned-up text in a serif face. A summary with
-    ugly maths still beats no PDF — the same rule the rest of the export
-    follows.
+  * **Environments are composed here, not parsed by mathtext.** mathtext has
+    no `\\begin` at all, and `\\begin{cases}` / `\\begin{bmatrix}` are exactly
+    what a signals lecture writes. So an expression is cut into pieces around
+    each environment: the plain pieces and every cell go through mathtext one
+    at a time, and the cells are laid out on a grid — columns aligned the way
+    the environment says, rows on a common baseline — between delimiters
+    drawn as SVG paths stretched to the grid's height. The pieces are then
+    stacked side by side on one baseline and the whole thing shipped as one
+    SVG, the same shape a plain expression produces. Nested environments
+    recurse. See _layout.
 
-  * **`\\begin{aligned}` is split here, not in mathtext.** mathtext has no
-    environments at all; multi-row display maths is broken on `\\\\` and
-    rendered a row at a time, stacked. That covers what the lecture prompts
-    actually produce; anything else falls back to text.
+  * **Nothing here may fail the render.** matplotlib is optional and its
+    parser still rejects some real LaTeX (`\\substack`, `\\overset`), so every
+    failure degrades to cleaned-up text in a serif face. A summary with ugly
+    maths still beats no PDF — the same rule the rest of the export follows.
+
+  * **A plain expression's SVG is matplotlib's own file, untouched.** Only
+    expressions holding an environment are re-assembled. Both report the same
+    metrics, so the two paths line up on the page.
 """
 import base64
 import html as _html
@@ -48,9 +57,10 @@ import re
 # of it, so this number never reaches the page.
 DPI = 100.0
 
-# Computer Modern's x-height is small next to a UI sans at the same nominal
-# size, so maths set at the body size reads a size too small. Nudge it up.
-DEFAULT_MATH_SCALE = 1.15
+# The body face is Computer Modern too (see pdf.DEFAULT_FONT_STACK), so maths
+# set at the body size is the right size. A sans body with a taller x-height
+# wants ~1.15 here — that is what the setting exists for.
+DEFAULT_MATH_SCALE = 1.0
 
 # Regions where a `$` is a dollar sign, not maths.
 CODE_SPAN_RE = re.compile(r"```.*?```|~~~.*?~~~|`[^`\n]*`", re.DOTALL)
@@ -64,11 +74,33 @@ TOKEN_PREFIX = "MTHX"
 TOKEN_SUFFIX = "Z"
 TOKEN_RE = re.compile(rf"{TOKEN_PREFIX}(\d+){TOKEN_SUFFIX}")
 
-# The environments mathtext cannot parse but that split cleanly into rows.
-ENV_RE = re.compile(
-    r"\\begin\{(aligned|align\*?|gather\*?|split|array)\}"
-    r"(?:\{[^}]*\})?(.*?)\\end\{\1\}", re.DOTALL)
+BEGIN_RE = re.compile(r"\\begin\{([A-Za-z]+\*?)\}")
 ROW_SPLIT_RE = re.compile(r"\\\\(?:\s*\[[^\]]*\])?")
+
+# Every environment the composer knows: (left delimiter, right delimiter,
+# column alignment). Alignment is one letter for every column, or "rl" for
+# the alternating right/left of aligned — `a &= b` puts the `=` flush against
+# the `a`, which is what the ampersand is for. array reads its own spec.
+ENVIRONMENTS = {
+    "cases": ("{", "", "l"), "dcases": ("{", "", "l"), "rcases": ("", "}", "l"),
+    "matrix": ("", "", "c"), "smallmatrix": ("", "", "c"),
+    "pmatrix": ("(", ")", "c"), "bmatrix": ("[", "]", "c"),
+    "Bmatrix": ("{", "}", "c"), "vmatrix": ("|", "|", "c"),
+    "Vmatrix": ("\u2016", "\u2016", "c"),
+    "aligned": ("", "", "rl"), "align": ("", "", "rl"),
+    "align*": ("", "", "rl"), "split": ("", "", "rl"),
+    "alignedat": ("", "", "rl"),
+    "gather": ("", "", "c"), "gather*": ("", "", "c"), "gathered": ("", "", "c"),
+    "array": (None, None, None),
+}
+# `\left( \begin{array}...\end{array} \right)` — the delimiter the author put
+# around an environment, read as the environment's own.
+_LEFT_RE = re.compile(r"\\left\s*(\\\{|\\\}|\\\||\\lbrace|\\rbrace|\\lvert|\\rvert|\\langle|\\rangle|[(\[{|.])\s*$")
+_RIGHT_RE = re.compile(r"^\s*\\right\s*(\\\{|\\\}|\\\||\\lbrace|\\rbrace|\\lvert|\\rvert|\\langle|\\rangle|[)\]}|.])")
+_DELIM_SPELLINGS = {
+    "\\{": "{", "\\}": "}", "\\lbrace": "{", "\\rbrace": "}", "\\|": "\u2016",
+    "\\lvert": "|", "\\rvert": "|", "\\langle": "<", "\\rangle": ">", ".": "",
+}
 
 # Groups whose digits are already upright and must not be rewritten.
 _TEXT_COMMANDS = ("\\text", "\\mathrm", "\\mathbf", "\\mathit", "\\mathsf",
@@ -130,7 +162,7 @@ def _looks_like_money(tex):
     """
     if any(c in tex for c in "\\_^{}"):
         return False
-    return bool(re.match(r"^\d", tex)) and bool(re.search(r"\s\w", tex))
+    return bool(re.match(r"^\d", tex)) and bool(re.search(r"\s[A-Za-z]", tex))
 
 
 def restore(html_text, snippets):
@@ -232,7 +264,7 @@ def render_all(exprs, *, size_pt=8.0, color="#16181d", scale=None):
 
 
 def _one(tex, display, engine, size_pt, color):
-    rows = _rows(tex) if display else [_flatten(tex)]
+    rows = _rows(tex) if display else [tex]
     pieces = []
     for row in rows:
         row = row.strip()
@@ -247,32 +279,78 @@ def _one(tex, display, engine, size_pt, color):
     return f'<span class="math-block">{lines}</span>'
 
 
+def _img_html(svg, width, height, depth, alt, display):
+    cls = "math math-display" if display else "math math-inline"
+    uri = "data:image/svg+xml;base64," + base64.b64encode(svg).decode("ascii")
+    return (f'<img class="{cls}" src="{uri}" '
+            f'alt="{_html.escape(alt, quote=True)}" '
+            f'style="width:{width:.2f}pt;height:{height:.2f}pt;'
+            f'vertical-align:{-depth:.2f}pt" />')
+
+
 def _row_html(row, engine, size_pt, color, display):
-    prepared = _prepare(row)
     if engine is not None:
-        for candidate in (prepared, _compat(_flatten(row))):
-            # Two attempts: the tidied form, then the author's own. The digit
-            # rewriting below is cosmetic, so it must never be what loses an
-            # expression that mathtext would otherwise have accepted.
+        if BEGIN_RE.search(row):
+            # An environment: composed out of mathtext pieces, see _layout.
             try:
-                svg, width, height, depth = engine(candidate, size_pt, color)
-            except Exception:  # noqa: BLE001 - unparseable TeX, keep going
-                continue
-            cls = "math math-display" if display else "math math-inline"
-            uri = ("data:image/svg+xml;base64,"
-                   + base64.b64encode(svg).decode("ascii"))
-            return (f'<img class="{cls}" src="{uri}" '
-                    f'alt="{_html.escape(row, quote=True)}" '
-                    f'style="width:{width:.2f}pt;height:{height:.2f}pt;'
-                    f'vertical-align:{-depth:.2f}pt" />')
+                box = _layout(row, engine, size_pt, color, display)
+            except Exception:  # noqa: BLE001 - anything unparseable: fall back
+                box = None
+            if box is not None:
+                return _img_html(_svg_document(box), box.width, box.height,
+                                 box.depth, _flatten(row), display)
+            return _fallback_html(row)
+        result = _try_engine(row, engine, size_pt, color, display)
+        if result is not None:
+            svg, width, height, depth = result
+            return _img_html(svg, width, height, depth, row, display)
     return _fallback_html(row)
 
 
+def _try_engine(tex, engine, size_pt, color, display=False):
+    """mathtext on the tidied form, then on the author's own; None if neither.
+
+    The digit rewriting and the display-style fractions in _prepare are
+    cosmetic, so they must never be what loses an expression that mathtext
+    would otherwise have accepted; the last candidate is the author's
+    spelling with every \\dfrac demoted, for a mathtext too old to know it.
+    """
+    plain = _compat(_flatten(tex))
+    for candidate in (_prepare(tex, display), plain,
+                      plain.replace("\\dfrac", "\\frac")):
+        try:
+            return engine(candidate, size_pt, color)
+        except Exception:  # noqa: BLE001 - unparseable TeX, try the next
+            continue
+    return None
+
+
 def _rows(tex):
-    """Split display maths into rows: aligned/gather environments, or `\\\\`."""
-    match = ENV_RE.search(tex)
-    body = match.group(2) if match else tex
-    return [_flatten(r) for r in ROW_SPLIT_RE.split(body)]
+    """Split display maths into rows on a top-level `\\\\`.
+
+    A `\\\\` inside an environment is that environment's row break and is
+    left to the grid; only the ones outside any \\begin...\\end stack the
+    display into lines.
+    """
+    return [r for r in _split_top_level(tex)]
+
+
+def _split_top_level(tex):
+    out, depth, last, i = [], 0, 0, 0
+    while i < len(tex):
+        if tex.startswith("\\begin{", i):
+            depth += 1
+        elif tex.startswith("\\end{", i):
+            depth -= 1
+        elif depth == 0 and tex.startswith("\\\\", i):
+            out.append(tex[last:i])
+            m = ROW_SPLIT_RE.match(tex, i)
+            i = m.end()
+            last = i
+            continue
+        i += 1
+    out.append(tex[last:])
+    return out
 
 
 def _flatten(tex):
@@ -280,15 +358,340 @@ def _flatten(tex):
     return re.sub(r"\s+", " ", tex.replace("&", " ")).strip()
 
 
+# --------------------------------------------------------------------------
+# Environments: cases, matrices, aligned — composed from mathtext pieces.
+# --------------------------------------------------------------------------
+
+class _Box:
+    """An SVG fragment with its metrics, all in points.
+
+    `body` draws in a local frame whose origin is the top-left corner and
+    whose baseline sits at y = height - depth. `defs` are the glyph outlines
+    it references, keyed by id, so a composite made of many mathtext pieces
+    ships each glyph once.
+    """
+    __slots__ = ("width", "height", "depth", "body", "defs")
+
+    def __init__(self, width, height, depth, body="", defs=None):
+        self.width, self.height, self.depth = width, height, depth
+        self.body, self.defs = body, defs or {}
+
+    @property
+    def ascent(self):
+        return self.height - self.depth
+
+
+def _find_env(tex, start=0):
+    """The first environment at or after `start`: (begin, end, name, spec,
+    body), with `end` just past the \\end — or None. Nesting of the same
+    name is honoured so a matrix inside a matrix closes at the right place."""
+    m = BEGIN_RE.search(tex, start)
+    if not m:
+        return None
+    name = m.group(1)
+    pos = m.end()
+    spec = None
+    if name == "array":
+        s = re.match(r"\s*\{([^}]*)\}", tex[pos:])
+        if s:
+            spec = s.group(1)
+            pos += s.end()
+    depth = 1
+    scan = pos
+    begin_tag, end_tag = f"\\begin{{{name}}}", f"\\end{{{name}}}"
+    while depth:
+        nb = tex.find(begin_tag, scan)
+        ne = tex.find(end_tag, scan)
+        if ne == -1:
+            raise ValueError(f"unterminated \\begin{{{name}}}")
+        if nb != -1 and nb < ne:
+            depth += 1
+            scan = nb + len(begin_tag)
+        else:
+            depth -= 1
+            scan = ne + len(end_tag)
+    body = tex[pos:scan - len(end_tag)]
+    return m.start(), scan, name, spec, body
+
+
+def _segments(tex):
+    """Cut an expression into ("tex", s) and ("env", name, spec, body, l, r).
+
+    A `\\left X` just before an environment and the matching `\\right Y` just
+    after it become that environment's delimiters — `\\left\\{ \\begin{array}
+    ... \\right.` is how some authors spell cases — because mathtext's own
+    \\left/\\right can't stretch around something it never sees.
+    """
+    out = []
+    pos = 0
+    while True:
+        found = _find_env(tex, pos)
+        if not found:
+            break
+        begin, end, name, spec, body = found
+        if name not in ENVIRONMENTS:
+            raise ValueError(f"unknown environment {name}")
+        before = tex[pos:begin]
+        after = tex[end:]
+        left, right, _align = ENVIRONMENTS[name]
+        lm, rm = _LEFT_RE.search(before), _RIGHT_RE.match(after)
+        if lm and rm:
+            left = _DELIM_SPELLINGS.get(lm.group(1), lm.group(1))
+            right = _DELIM_SPELLINGS.get(rm.group(1), rm.group(1))
+            before = before[:lm.start()]
+            end += rm.end()
+        if before.strip():
+            out.append(("tex", before))
+        out.append(("env", name, spec, body, left or "", right or ""))
+        pos = end
+    if tex[pos:].strip():
+        out.append(("tex", tex[pos:]))
+    return out
+
+
+def _layout(tex, engine, size_pt, color, display=False):
+    """Typeset an expression that may hold environments into one _Box."""
+    boxes = []
+    for seg in _segments(tex):
+        if seg[0] == "tex":
+            boxes.append(_text_box(seg[1], engine, size_pt, color, display))
+        else:
+            _kind, name, spec, body, left, right = seg
+            boxes.append(_env_box(name, spec, body, left, right,
+                                  engine, size_pt, color, display))
+    if not boxes:
+        raise ValueError("empty expression")
+    return _hstack(boxes, gap=0.15 * size_pt)
+
+
+def _text_box(tex, engine, size_pt, color, display=False):
+    result = _try_engine(tex, engine, size_pt, color, display)
+    if result is None:
+        raise ValueError(f"mathtext rejected {tex!r}")
+    svg, width, height, depth = result
+    defs, body = _svg_parts(svg)
+    return _Box(width, height, depth, body, defs)
+
+
+_DEFS_RE = re.compile(r"<defs>(.*?)</defs>", re.DOTALL)
+_DEF_PATH_RE = re.compile(r'<path id="([^"]+)"[^>]*/>', re.DOTALL)
+_PATCH_RE = re.compile(r'<g id="patch_\d+">.*?</g>', re.DOTALL)
+
+
+def _svg_parts(svg):
+    """(defs, body) out of a matplotlib SVG: the glyph outlines by id, and
+    the drawing that uses them with the figure/patch/text ids stripped, so
+    several can share one document without colliding."""
+    text = svg.decode("utf-8") if isinstance(svg, bytes) else svg
+    defs = {}
+    for block in _DEFS_RE.findall(text):
+        for m in _DEF_PATH_RE.finditer(block):
+            defs.setdefault(m.group(1), m.group(0))
+    m = re.search(r'<g id="figure_1">(.*)</g>\s*</svg>', text, re.DOTALL)
+    body = m.group(1) if m else ""
+    body = _DEFS_RE.sub("", body)
+    body = _PATCH_RE.sub("", body)
+    body = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    body = re.sub(r' id="(?:figure|text|axes|patch)_\d+"', "", body)
+    return defs, body.strip()
+
+
+# Environments whose cells LaTeX sets in text style even inside display
+# maths: a fraction in a matrix entry stays small.
+_TEXT_STYLE_ENVS = {"cases", "dcases", "rcases", "matrix", "smallmatrix",
+                    "pmatrix", "bmatrix", "Bmatrix", "vmatrix", "Vmatrix",
+                    "array"}
+
+
+def _cells(body, engine, size_pt, color, display=False):
+    """The environment body as rows of _Box cells."""
+    rows = []
+    for row in _split_top_level(body):
+        row = re.sub(r"\\hline", "", row)
+        if not row.strip():
+            continue
+        cells = []
+        for cell in _split_top_level_amp(row):
+            cell = cell.strip()
+            if not cell:
+                cells.append(_Box(0.0, 0.0, 0.0))
+            elif BEGIN_RE.search(cell):
+                cells.append(_layout(cell, engine, size_pt, color, display))
+            else:
+                cells.append(_text_box(cell, engine, size_pt, color, display))
+        rows.append(cells)
+    if not rows:
+        raise ValueError("empty environment")
+    return rows
+
+
+def _split_top_level_amp(row):
+    out, depth, last, i = [], 0, 0, 0
+    while i < len(row):
+        if row.startswith("\\begin{", i):
+            depth += 1
+        elif row.startswith("\\end{", i):
+            depth -= 1
+        elif row[i] == "\\":
+            i += 2
+            continue
+        elif depth == 0 and row[i] == "&":
+            out.append(row[last:i])
+            last = i + 1
+        i += 1
+    out.append(row[last:])
+    return out
+
+
+def _alignments(name, spec, ncols):
+    _l, _r, align = ENVIRONMENTS[name]
+    if name == "array":
+        letters = [c for c in (spec or "") if c in "clr"]
+        return [(letters[i] if i < len(letters) else "c") for i in range(ncols)]
+    if align == "rl":
+        return ["r" if i % 2 == 0 else "l" for i in range(ncols)]
+    return [align] * ncols
+
+
+def _env_box(name, spec, body, left, right, engine, size_pt, color,
+             display=False):
+    rows = _cells(body, engine, size_pt, color,
+                  display and name not in _TEXT_STYLE_ENVS)
+    ncols = max(len(r) for r in rows)
+    aligns = _alignments(name, spec, ncols)
+    # cases separates value from condition by a \quad; a matrix by
+    # \arraycolsep either side; aligned puts its columns nearly flush so the
+    # relation lands beside its left-hand side.
+    colgap = {"cases": 1.0, "dcases": 1.0, "rcases": 1.0}.get(name, 0.8)
+    if ENVIRONMENTS[name][2] == "rl":
+        colgap = 0.25
+    grid = _grid(rows, aligns, colgap * size_pt, 0.3 * size_pt, size_pt)
+    parts = []
+    if left:
+        parts.append(_delim_box(left, grid, size_pt, color, mirror=False))
+    parts.append(grid)
+    if right:
+        parts.append(_delim_box(right, grid, size_pt, color, mirror=True))
+    return _hstack(parts, gap=0.12 * size_pt if (left or right) else 0.0)
+
+
+def _grid(rows, aligns, colgap, rowgap, size_pt):
+    ncols = len(aligns)
+    widths = [0.0] * ncols
+    for row in rows:
+        for c, box in enumerate(row):
+            widths[c] = max(widths[c], box.width)
+    ascents = [max(b.ascent for b in row) for row in rows]
+    depths = [max(b.depth for b in row) for row in rows]
+    total_w = sum(widths) + colgap * max(ncols - 1, 0)
+    total_h = sum(a + d for a, d in zip(ascents, depths)) + rowgap * (len(rows) - 1)
+    body, defs = [], {}
+    y = 0.0
+    for r, row in enumerate(rows):
+        baseline = y + ascents[r]
+        x = 0.0
+        for c, box in enumerate(row):
+            slack = widths[c] - box.width
+            dx = {"l": 0.0, "r": slack, "c": slack / 2}[aligns[c]]
+            if box.body:
+                body.append(_placed(box, x + dx, baseline - box.ascent))
+                defs.update(box.defs)
+            x += widths[c] + colgap
+        y += ascents[r] + depths[r] + rowgap
+    # The grid is centred on the maths axis — a quarter em above the
+    # baseline in Computer Modern — which is where the surrounding `=` sits.
+    axis = 0.25 * size_pt
+    depth = total_h / 2 - axis
+    return _Box(total_w, total_h, depth, "".join(body), defs)
+
+
+def _placed(box, x, y):
+    return f'<g transform="translate({x:.3f} {y:.3f})">{box.body}</g>'
+
+
+def _hstack(boxes, gap):
+    ascent = max(b.ascent for b in boxes)
+    depth = max(b.depth for b in boxes)
+    body, defs = [], {}
+    x = 0.0
+    for i, box in enumerate(boxes):
+        if i:
+            x += gap
+        if box.body:
+            body.append(_placed(box, x, ascent - box.ascent))
+            defs.update(box.defs)
+        x += box.width
+    return _Box(x, ascent + depth, depth, "".join(body), defs)
+
+
+def _delim_box(kind, grid, size_pt, color, mirror):
+    """A delimiter drawn as a stroked path, stretched to the grid's height.
+
+    Computer Modern's extensible delimiters are assembled from glyph pieces;
+    at 8pt a stroked curve of the same shape is indistinguishable from them
+    and needs no glyph table. `mirror` flips a left shape into its right
+    counterpart, so each shape is drawn once.
+    """
+    over = 0.1 * size_pt
+    height = grid.height + 2 * over
+    stroke = 0.06 * size_pt
+    h = height - stroke
+    w = {"(": 0.32, ")": 0.32, "[": 0.26, "]": 0.26, "{": 0.42, "}": 0.42,
+         "|": 0.16, "\u2016": 0.3, "<": 0.3, ">": 0.3}.get(kind)
+    if w is None:
+        raise ValueError(f"unknown delimiter {kind!r}")
+    w *= size_pt
+    if kind in "()":
+        d = f"M {w:.3f} 0 Q {-w:.3f} {h / 2:.3f} {w:.3f} {h:.3f}"
+    elif kind in "[]":
+        tick = 0.7 * w
+        d = f"M {tick:.3f} 0 L 0 0 L 0 {h:.3f} L {tick:.3f} {h:.3f}"
+    elif kind in "{}":
+        r = min(0.28 * size_pt, h / 4)
+        mid, xm = h / 2, w / 2
+        d = (f"M {w:.3f} 0 Q {xm:.3f} 0 {xm:.3f} {r:.3f} "
+             f"L {xm:.3f} {mid - r:.3f} Q {xm:.3f} {mid:.3f} 0 {mid:.3f} "
+             f"Q {xm:.3f} {mid:.3f} {xm:.3f} {mid + r:.3f} "
+             f"L {xm:.3f} {h - r:.3f} Q {xm:.3f} {h:.3f} {w:.3f} {h:.3f}")
+    elif kind == "|":
+        d = f"M {w / 2:.3f} 0 L {w / 2:.3f} {h:.3f}"
+    elif kind == "\u2016":
+        d = (f"M {w / 3:.3f} 0 L {w / 3:.3f} {h:.3f} "
+             f"M {2 * w / 3:.3f} 0 L {2 * w / 3:.3f} {h:.3f}")
+    else:  # angle brackets
+        d = f"M {w:.3f} 0 L 0 {h / 2:.3f} L {w:.3f} {h:.3f}"
+    flip = f"translate({w:.3f} 0) scale(-1 1) " if mirror else ""
+    body = (f'<g transform="translate({stroke / 2:.3f} {stroke / 2:.3f})">'
+            f'<path d="{d}" transform="{flip}" fill="none" '
+            f'stroke="{color}" stroke-width="{stroke:.3f}" '
+            f'stroke-linecap="round" stroke-linejoin="round"/></g>')
+    return _Box(w + stroke, height, grid.depth + over, body)
+
+
+def _svg_document(box):
+    defs = "".join(box.defs.values())
+    w, h = box.width, box.height
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'xmlns:xlink="http://www.w3.org/1999/xlink" '
+            f'width="{w:.3f}pt" height="{h:.3f}pt" viewBox="0 0 {w:.3f} {h:.3f}">'
+            f'<defs><style type="text/css">*{{stroke-linejoin: round; '
+            f'stroke-linecap: butt}}</style>{defs}</defs>'
+            f'{box.body}</svg>').encode("utf-8")
+
+
 # Spellings mathtext doesn't know, and the equivalent it does. Cheaper than
 # losing the whole expression to the text fallback over one arrow.
 _COMPAT = {
     "\\implies": "\\Rightarrow", "\\impliedby": "\\Leftarrow",
-    "\\iff": "\\Leftrightarrow", "\\dfrac": "\\frac",
-    "\\tfrac": "\\frac", "\\operatorname": "\\mathrm",
+    "\\iff": "\\Leftrightarrow", "\\tfrac": "\\frac",
+    "\\operatorname": "\\mathrm",
     "\\mbox": "\\mathrm", "\\textbf": "\\mathbf",
     "\\textit": "\\mathit", "\\lvert": "|", "\\rvert": "|",
     "\\nonumber": "", "\\notag": "", "\\limits": "",
+    # The short relation names. mathtext knows only the long ones, and a
+    # signals lecture writes "0 \\le t < T" in every other formula.
+    "\\le": "\\leq", "\\ge": "\\geq", "\\ne": "\\neq",
+    "\\lt": "<", "\\gt": ">",
 }
 
 
@@ -296,13 +699,21 @@ def _compat(tex):
     """Rewrite LaTeX mathtext doesn't implement into what it does."""
     def _sub(match):
         return _COMPAT.get(match.group(0), match.group(0))
-    return re.sub(r"\\[A-Za-z]+", _sub, tex)
+    tex = re.sub(r"\\[A-Za-z]+", _sub, tex)
+    # mathtext puts nothing between an unlimited integral sign and what
+    # follows, so "\int x" printed the x on top of the sign's tail.
+    return re.sub(r"(\\o?int)(?![A-Za-z_^\\])\s*", r"\1\\, ", tex)
 
 
-def _prepare(tex):
-    return _upright_digits(_compat(_flatten(tex)))
-
-
+def _prepare(tex, display=False):
+    tex = _compat(_flatten(tex))
+    if display:
+        # mathtext sets \frac in text style everywhere, so a display formula
+        # came out with the small stacked fractions of running text. \dfrac
+        # is its display-style fraction — full-size numerator and
+        # denominator, the way $$...$$ prints in LaTeX.
+        tex = re.sub(r"\\frac(?![A-Za-z])", r"\\dfrac", tex)
+    return _upright_digits(tex)
 def _upright_digits(tex):
     """Wrap bare digit runs in \\mathrm{}, the way LaTeX sets them.
 

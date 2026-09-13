@@ -788,6 +788,18 @@ the first *substring* match rather than on a heading:
 Prefer the markers over relying on the cut. If you write a new prompt file
 without them, check what `load_prompt_template` actually returns.
 
+**The lecture/tutorial prompts no longer ask for frame citations or a visual
+index** (operator's call, 2026-09-13, after reading a real sheet). The
+frames are still sent — slides carry the equations and the exam notes — but
+the model is told to use them as content and never write `(Frame N @ …)`,
+and the closing "Visual & Board Work Index" table is gone from all four
+(`lecture-*`, `tutorial-*`; `meeting-*` untouched). Tutorial chapter
+timestamps (`[mm:ss]`) stay — they are navigation, not citations. The PDF's
+citation fade and `PDF_FRAMES=contact|inline` still work for documents that
+do cite (older runs, custom prompts); they just have nothing to do on new
+ones. `_merge.md` was told to keep exactly one `# Title` at the top, since
+every partial now opens with one.
+
 **Frames sent to the CLI are cropped to the slide and downscaled; the saved
 frames are not.** `framecrop.fit_for_llm` runs `detect_crop` in the PDF's own
 `PDF_FRAME_CROP` mode (one knob, deliberately: the model looks at the picture
@@ -926,6 +938,22 @@ provider is busy"; the rotation loop handles "this key is exhausted or
 revoked". Inside the retry wrapper, a dead key would burn the full backoff
 schedule before the chain ever advanced.
 
+**`GEMINI_MODEL` is a chain, walked keys-first** (settled with the operator
+2026-09-13). `gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash` means: try
+every key on 3.8, and only when all of them are out move to 3.7. Quota is
+per key *and* per model, so a rate-limited key says nothing about its
+neighbours, and the operator wanted the keys exhausted before a weaker model
+is used. Two exceptions carry `retryable = False` so `with_retries` raises
+them at once: `GeminiQuotaExhausted` (429 / `RESOURCE_EXHAUSTED`) → next key,
+no backoff — a 429 used to sit through the whole schedule first; and
+`GeminiModelUnavailable` (404 / "not found" / "not supported for
+generateContent") → next model on the first key, since the name is dead for
+all of them. The "model" test is deliberately narrow: an *unsupported
+request* (a mime type) is a 400 and stays a real error. A 503 still gets the
+backoff. `_record_used` names the model that actually answered, so the
+provenance header says which link of the chain paid. `GeminiModelChainTest`
+drives all of it through a fake `google.genai`.
+
 **`BackendUnavailable` carries `retryable = False`, and `retry.is_retryable`
 honours that before every other check.** It is raised from *inside*
 `with_retries` (the CLI only reveals "not logged in" once it has run), and
@@ -1001,12 +1029,11 @@ Two non-obvious details:
 
 ```
 <!-- meeting-transcriber ... source / model / prompt / run_id / generated -->
-Chapter N — <topic> (<date>)
-# <video title from yt-dlp>
+# <the model's own title; the video's from yt-dlp only if the body has none>
 Youtube Link: `<url>`
 <details><summary> View Transcript </summary>  ...4-space indented...  </details>
 <br>
-...the model's body...
+...the rest of the model's body...
 <br><br>
 ```
 
@@ -1019,9 +1046,18 @@ Shaped to match the user's course files (`2_Transcripts/chapter1.md`,
 - **Provenance is an HTML comment**, so it survives being pasted into a bigger
   chapter file without adding visual noise. Values are escaped so a `-->` in a
   source can't terminate the comment early.
-- **The Chapter line is a literal placeholder.** The chapter number isn't
-  derivable from the video; a plausible-looking wrong guess is worse than an
-  obvious blank.
+- **The heading is the model's** (settled 2026-09-13). The lecture and
+  tutorial prompts ask for a `# Title` (they used to forbid one — that line
+  was flipped the same day, or the wrapper's H1 would always have been the
+  video's); `split_leading_heading` lifts it above the link lines, and
+  the video title is only the fallback for a body without one — "Signals and
+  Transformations" names the material where "2110203 L01" names the file.
+  Until then the wrapper put a `Chapter N — <topic> (<date>)` placeholder and
+  the video title above the body; both went at the operator's request.
+  `pdf._drop_legacy_header` strips them from the older files it re-renders
+  (the placeholder always; the video-title H1 only when a second H1 follows
+  the link lines, in which case that one moves up to head the page), so a
+  document with a single heading is never touched.
 - **The 4-space indent inside `<details>` is deliberate**, reproducing what the
   existing chapter files do (most renderers show it as a code block). Don't
   "fix" it.
@@ -1120,17 +1156,52 @@ WeasyPrint, markdown→HTML→PDF. Chosen over headless Chrome (which would coup
 stage 3 to the browser half) and over pandoc/LaTeX (a gigabyte of texlive, and
 Thai in LaTeX is genuinely painful).
 
-Reworked 2026-09-08 after the operator read a real 39-page output. Four
-decisions came out of it, and each is load-bearing:
+Reworked 2026-09-13 after the operator read a real 71-page combined sheet
+(six lectures, Gemini backend). Settled then, each with a reason:
 
-- **Keyframes are an appendix, not illustrations.** `PDF_FRAMES=contact` (the
-  default) leaves every citation as the model wrote it and puts the frames it
-  names into a thumbnail contact sheet in Appendix A. Inline figures were the
+- **The sheet is the summary alone.** `PDF_FRAMES=none`,
+  `PDF_TRANSCRIPT=none` and the new `PDF_RESOURCES=none` are the code
+  defaults; the 71 pages were 19 of notes and 52 of keyframe thumbnails,
+  reference slides and white-on-white transcript. The `.md` keeps its
+  `<details>` transcript — that was an explicit condition. Every appendix is
+  still there on request (`contact`/`inline`, `hidden`/`appendix`,
+  `appendix`), and `test_media_e2e.sh` exports `PDF_FRAMES=contact` because
+  it asserts on frames being cropped and embedded.
+- **Body text is CMU Serif** (`fonts-cmu`) — real Computer Modern, the face
+  mathtext already sets the maths in, so `PDF_MATH_SCALE` is 1.0 now (the
+  1.15 nudge was for a sans body's taller x-height). The old stack named
+  Adwaita Sans and Arial, and neither is installable on this box —
+  `fonts-adwaita*` is not in Debian 13's archive and Arial needs the contrib
+  `ttf-mscorefonts-installer` — so every PDF had silently been Liberation
+  Sans. The operator chose CMU Serif over CMU Sans and Arial. Noto Serif Thai
+  is the Thai fallback; Computer Modern has no Thai glyphs.
+- **Nested bullets are re-indented before conversion**
+  (`_normalize_list_indent`). Gemini indents sub-items two spaces, Claude
+  often does; python-markdown nests only at four and folds anything less
+  into the parent item, which flattened every outline. Levels are read from
+  the indents seen so far and rewritten to four a level; continuation lines
+  (a display formula under a bullet) follow their item; fenced code is left
+  alone. It runs *after* `mathrender.extract`, so a multi-line `$$` block is
+  one token by then and can't be cut mid-matrix. The same pass inserts the
+  blank line python-markdown needs between a paragraph and a list that
+  follows it directly — CommonMark and the model both consider that a list.
+- **Frame citations are faded, not removed** (`.cite { opacity: 0.3 }`,
+  `_fade_citations` on the rendered HTML — "70% transparent" was the
+  operator's spec). `CITATION_RE` covers every spelling seen in real output:
+  `(Video 1, Frame 52 @ 0:08:52)`, `(Frame 280 @ Video 1 [02:21:00])`,
+  `(Frames 20–26 @ …)` and the frameless `(Video 6, [02:51:30])`.
+- **The provenance line and the source go under the title**, not over it.
+- **Environments are composed in `mathrender`** — see the LaTeX section.
+
+The 2026-09-08 rework (after a real 39-page output) still stands underneath:
+
+- **Keyframes are an appendix, not illustrations.** `PDF_FRAMES=contact`
+  leaves every citation as the model wrote it and puts the frames it names
+  into a thumbnail contact sheet in Appendix A. Inline figures were the
   export's worst feature: a keyframe is a screenshot of a video call, so most
   of them are a face, a half-drawn slide, or solid black — and the
   scene-change pass is *drawn to* the black ones, because black-to-content is
-  the largest scene change in the video. `inline` restores the old behaviour,
-  `none` drops frames entirely.
+  the largest scene change in the video. `inline` restores the old behaviour.
 - **Only cited frames are cropped, and blank ones are dropped.**
   `_cited_frame_numbers` scans the rendered HTML with a looser regex than
   `FRAME_CITE_RE` so the second and third number of a compound citation
@@ -1138,24 +1209,23 @@ decisions came out of it, and each is load-bearing:
   `wanted` set. A three-hour manifest is hundreds of frames and cropping is
   the expensive part of this file; this made a real render 34s instead of
   minutes. `framecrop.is_blank` is the black-frame filter.
-- **The transcript is an invisible layer, not an appendix.** White, 1pt,
-  between `BEGIN_TRANSCRIPT` and `END_TRANSCRIPT` markers, in normal flow —
-  *not* `display: none`, which would put nothing in the PDF at all. The reader
-  never sees it; `pdftotext` always finds it.
+- **The transcript, when asked for, is an invisible layer, not an appendix.**
+  `PDF_TRANSCRIPT=hidden`: white, 1pt, between `BEGIN_TRANSCRIPT` and
+  `END_TRANSCRIPT` markers, in normal flow — *not* `display: none`, which
+  would put nothing in the PDF at all. The reader never sees it; `pdftotext`
+  always finds it.
   **It is cut into 40,000-character pieces on purpose.** Poppler silently
   stops returning text after roughly 50,000 characters on a single page:
   measured here, one 85k-character block came back 60% complete from
   `pdftotext` while pypdf read all of it off the same page. Since this repo's
   own `resources.py` shells out to `pdftotext`, a silent 40% loss was not an
   option. The cost is a couple of blank-looking pages at the back.
-  `PDF_TRANSCRIPT=appendix` prints it as Appendix C; `none` omits it.
-- **Body text is Adwaita Sans at 8pt, and every other size is an `em`.**
-  `PDF_FONT_SIZE` therefore rescales headings, tables, captions and code
-  together instead of leaving them stranded at their old point sizes. Arial
-  and Liberation Sans sit behind Adwaita in the stack (Arial for a box that
-  has it; Liberation is what "Arial" resolves to on Debian), and **Noto Sans
-  Thai must stay in any custom stack** — Adwaita has no Thai glyphs, and a
-  Thai lecture then renders as tofu.
+  `PDF_TRANSCRIPT=appendix` prints it as Appendix C.
+- **Body text is 8pt, and every other size is an `em`.** `PDF_FONT_SIZE`
+  therefore rescales headings, tables, captions and code together instead of
+  leaving them stranded at their old point sizes. **A Thai face must stay in
+  any custom stack** — Computer Modern has no Thai glyphs, and a Thai lecture
+  then renders as tofu.
 
 The older decisions still hold:
 
@@ -1217,6 +1287,33 @@ That is the whole reason matplotlib is in `requirements.in`.
 
 Non-obvious parts, all of them regression-tested:
 
+- **Environments are composed, not parsed** (2026-09-13). mathtext has no
+  `\begin` at all, and a signals lecture writes `\begin{cases}` and
+  `\begin{bmatrix}` in every other formula — the operator's sheet had 18
+  of them printed as source. `_segments` cuts the expression around each
+  environment (nesting-aware; a `\left(` … `\right)` around one becomes its
+  delimiters), every plain piece and every cell goes through mathtext on its
+  own, `_grid` lays the cells out with the environment's column alignment
+  (`c` for matrices, `l` for cases, alternating `rl` for aligned, the
+  `{spec}` for array) on shared row baselines, and `_delim_box` draws the
+  brace/bracket/paren as a stroked SVG path stretched to the grid — at 8pt
+  indistinguishable from CM's extensible glyphs, and no glyph table needed.
+  The pieces are stacked on one baseline with the grid centred on the maths
+  axis (0.25em) and shipped as **one** SVG, so the page sees exactly what a
+  plain expression produces. The cell SVGs are matplotlib's own, inlined as
+  `<g transform>` with their glyph `<defs>` deduplicated by id and the
+  `figure_1`/`patch_1`/`text_1` ids stripped. Expressions without an
+  environment still ship matplotlib's file untouched — the two paths report
+  the same metrics. Nested environments recurse; an unknown one falls back
+  to text like before.
+- **Display formulas use `\dfrac`.** mathtext sets `\frac` in text style
+  everywhere, so every `$$` block had running-text fractions; `_prepare`
+  promotes `\frac` in display mode, and `_try_engine`'s last candidate
+  demotes every `\dfrac` for a mathtext too old to know it. Cells of
+  matrices and cases stay text style, as in LaTeX.
+- **`\le`, `\ge`, `\ne` are mapped to the long names** in `_COMPAT`.
+  mathtext knows only `\leq`; every remaining fallback in the real sheet was
+  one of these.
 - **Extraction runs on the markdown, before the HTML conversion.** Convert
   first and python-markdown has already eaten `_{trans}` into emphasis and
   dropped the backslashes. The maths comes out into opaque alphanumeric tokens
@@ -1225,9 +1322,9 @@ Non-obvious parts, all of them regression-tested:
 - **Baseline alignment is computed, not guessed.** `MathTextParser` reports
   width, height and depth; depth becomes a negative `vertical-align` in
   points, so inline maths sits on the text baseline instead of floating.
-- **`\begin{aligned}` is split here.** mathtext has no environments at all —
-  `\begin` is an unknown symbol to it — so multi-row display maths is broken
-  on `\\` and rendered a row at a time, stacked.
+- **A top-level `\\` still stacks a display block into lines**, but only
+  outside any environment (`_split_top_level`); inside one it is the grid's
+  row break.
 - **Digits are wrapped in `\mathrm{}` outside `\text{}` groups.** With
   `mathtext.default = "it"` matplotlib italicises digits, which LaTeX does
   not, so `2 \times 10^8` came out visibly wrong. The rewrite is cosmetic, so
@@ -1515,8 +1612,20 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   limit**, and is white text in normal flow rather than `display: none`.
   Either mistake — one big block, or a display rule that emits nothing —
   turns "the transcript travels with the PDF" into a silent half-truth.
-- **Keep a Thai face in `PDF_FONT_FAMILY`.** Adwaita Sans, Arial and
-  Liberation Sans all lack Thai glyphs.
+- **Keep a Thai face in `PDF_FONT_FAMILY`.** Computer Modern has no Thai
+  glyphs.
+- **The PDF defaults are the summary alone** — `PDF_FRAMES`,
+  `PDF_TRANSCRIPT` and `PDF_RESOURCES` all `none`. The `.md` keeps the
+  transcript. Don't turn an appendix back on by default; the operator read
+  the 71-page version.
+- **`_normalize_list_indent` runs after `mathrender.extract`.** Before it, a
+  multi-line `$$` matrix under a bullet is cut in half.
+- **Environments never reach mathtext whole.** `\begin{cases}` is composed
+  from cells in `mathrender._layout`; handing the whole expression to the
+  parser is the text fallback the operator complained about.
+- **The chapter placeholder and the fixed video-title H1 are gone from the
+  wrapper.** The heading is the model's. Don't put them back for the course
+  files' sake — the operator chose this for the markdown too.
 - **`summarize.py` must not pass `work_dir` to `pdf.render()`.** Naming one
   transfers ownership and leaves the cropped intermediates beside the
   deliverable.
@@ -1575,11 +1684,11 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
-| `summarize/test_summarize_units.py` | retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning | 161 |
-| `summarize/test_pdf_units.py` | crop geometry, citation rewriting, blank-frame detection, LaTeX extraction/fallback, the hidden transcript, part-tagged manifests and captions for `--combine`, real PDF render | 60 |
+| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document | 171 |
+| `summarize/test_pdf_units.py` | crop geometry, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, real PDF render | 73 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing) | 281 |
-| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps | 118 |
+| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps | 119 |
 | `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 
 `test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs

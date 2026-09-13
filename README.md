@@ -741,9 +741,7 @@ course-note document, shaped to drop straight into a chapter file:
      generated: 2026-09-04
 -->
 
-Chapter N — <topic> (<date>)
-
-# 2110203 L01 : Signals and Transformations
+# Computer Engineering Mathematics II — Signals and Transformations
 
 Youtube Link: `https://www.youtube.com/watch?v=5GAfjAjLKYk`
 
@@ -762,11 +760,11 @@ Youtube Link: `https://www.youtube.com/watch?v=5GAfjAjLKYk`
 - The provenance header is an HTML comment: invisible when rendered, greppable
   in the raw file, and harmless when pasted into a larger document. On a
   fallback chain it is the only record of which provider actually answered.
-- `Chapter N — <topic> (<date>)` is a literal placeholder for you to fill in.
-  The chapter number isn't derivable from the video, and a plausible-looking
-  guess would be worse than an obvious blank.
-- The title comes from yt-dlp, the link and transcript are inserted by the code
-  — the model never writes them, so they can't be hallucinated or truncated.
+- The title is the model's own: the lecture prompts ask for a `# Title`, and
+  when the summary opens with one it is lifted to the top of the file. Only a
+  summary without one falls back to the video's title from yt-dlp. The link
+  and transcript are inserted by the code — the model never writes them, so
+  they can't be hallucinated or truncated.
 - `--combine` produces one of these for the whole set: one title, one link
   line per video (tagged `(Video N)`), one transcript block holding every
   video's transcript in input order, and one model-written body. See the
@@ -788,19 +786,30 @@ The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint:
   conversion and hands it to matplotlib's `mathtext` — a LaTeX-subset
   typesetter that ships Computer Modern and needs no TeX installation —
   inlining the result as SVG, baseline-aligned to the text around it.
-  `\begin{aligned}` blocks are split into rows first, since mathtext has no
-  environments. Anything it still can't parse degrades to cleaned-up text
-  rather than failing the render. `PDF_MATH=0` turns the whole pass off;
-  `PDF_MATH_SCALE` sizes the maths against the body text.
-- **Keyframes go to Appendix A, not into the argument.** A keyframe is a
-  screenshot of a video call: mostly a participant's face, a half-drawn slide,
-  or — the scene-change pass being drawn to exactly this — solid black.
-  Printed full width mid-paragraph they were noise, so the citations stay as
-  the model wrote them and the frames they name are collected into a thumbnail
-  contact sheet at the back: each frame once, blank ones dropped, and only the
-  cited ones cropped at all. `PDF_FRAMES=inline` restores the old behaviour of
-  replacing the first citation of each frame with the picture; `none` drops
-  frames from the PDF entirely.
+  mathtext has no environments, so `\begin{cases}`, the matrices
+  (`pmatrix`, `bmatrix`, `vmatrix`, …), `array`, `aligned` and `gather` are
+  composed here: every cell is typeset on its own and laid out on a grid
+  between delimiters stretched to fit, nested ones included. Display
+  formulas get full-size fractions. Anything it still can't parse degrades
+  to cleaned-up text rather than failing the render. `PDF_MATH=0` turns the
+  whole pass off; `PDF_MATH_SCALE` sizes the maths against the body text.
+- **Nested bullets nest.** The model indents sub-items by two spaces, which
+  every markdown reader accepts and python-markdown flattens; the export
+  re-indents them before conversion so a three-level outline stays one.
+- **Frame citations, where a prompt produces them, are faded.** The bundled
+  `lecture-*` and `tutorial-*` prompts no longer ask for `(Frame N @ …)`
+  citations or the closing visual-index table — the frames still inform the
+  notes, they are just not indexed. A document that does cite (an older run,
+  a custom prompt) keeps the citations at 30% opacity so the notes read as
+  notes.
+- **The sheet is the summary alone.** No keyframe appendix, no reference
+  slides, no transcript layer by default; the `.md` beside it still carries
+  the transcript in its `<details>` block. Each comes back on request:
+  `PDF_FRAMES=contact` collects the cited frames into a thumbnail contact
+  sheet at the back (Appendix A — each frame once, blank ones dropped, only
+  the cited ones cropped), `inline` replaces the first citation of each frame
+  with the picture; `PDF_RESOURCES=appendix` prints the `--resources` slides
+  as Appendix B.
 - **Frames are cropped to the slide.** A raw 1920×1080 Meet frame is mostly
   dark UI chrome and participant tiles. `summarize/framecrop.py` finds the
   largest bright rectangle — slides are overwhelmingly light on dark UI — and
@@ -809,22 +818,22 @@ The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint:
   to the untouched frame: a confidently wrong crop (half a slide, one
   participant's face) is worse than no crop. Tune with `PDF_FRAME_CROP`
   (`slide` | `border` | `none`).
-- **The transcript is present but invisible.** It goes in as white 1pt text
-  between `BEGIN_TRANSCRIPT` and `END_TRANSCRIPT` markers: nobody reading the
-  PDF sees it, and `pdftotext` — or any other extractor — hands an agent the
-  summary followed by the labelled transcript. It is written in ~40,000-
-  character pieces because poppler silently stops extracting text after about
-  50,000 characters on one page, so a single block would come back truncated
-  with no warning; the cost is a couple of blank-looking pages at the back of
-  a long lecture. `PDF_TRANSCRIPT=appendix` prints it as Appendix C instead,
-  `none` leaves it out. Reference slides get Appendix B either way.
-- **Body text is Adwaita Sans at 8pt** (`PDF_FONT_FAMILY`, `PDF_FONT_SIZE`),
-  with Arial and Liberation Sans behind it and Noto Sans Thai for the Thai —
-  every other size in the document is relative to `PDF_FONT_SIZE`, so changing
-  it rescales headings, tables and captions together. `setup.sh` installs
-  `fonts-adwaita-sans`; if it isn't available the stack falls through to
-  Liberation Sans. Keep a Thai face in any custom stack or a Thai lecture
-  renders as tofu boxes.
+- **The transcript can travel with the PDF.** `PDF_TRANSCRIPT=hidden` puts
+  it in as white 1pt text between `BEGIN_TRANSCRIPT` and `END_TRANSCRIPT`
+  markers: nobody reading the PDF sees it, and `pdftotext` — or any other
+  extractor — hands an agent the summary followed by the labelled
+  transcript. It is written in ~40,000-character pieces because poppler
+  silently stops extracting text after about 50,000 characters on one page,
+  so a single block would come back truncated with no warning; the cost is a
+  couple of blank-looking pages at the back of a long lecture.
+  `PDF_TRANSCRIPT=appendix` prints it as Appendix C instead.
+- **Body text is CMU Serif at 8pt** (`PDF_FONT_FAMILY`, `PDF_FONT_SIZE`) —
+  Computer Modern, the face the maths is set in, so text and formulae match
+  — with Noto Serif Thai for the Thai. Every other size in the document is
+  relative to `PDF_FONT_SIZE`, so changing it rescales headings, tables and
+  captions together. `setup.sh` installs `fonts-cmu`; without it the stack
+  falls through to Noto Serif. Keep a Thai face in any custom stack or a Thai
+  lecture renders as tofu boxes.
 
 A PDF that fails to render logs a warning and leaves the run successful — the
 Markdown is the artifact everything downstream depends on. Turn either output
@@ -908,7 +917,7 @@ end the scan.
 | `CLAUDE_CLI_MAX_WAIT_SECONDS` | 21600 | How long one call may sleep for the usage window to reset before the stage pauses (exit 75) |
 | `CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS` | 600 | Retry interval when the CLI reports a hit window without a reset time |
 | `GEMINI_API_KEY_1..3` | — | For the `gemini` fallback |
-| `GEMINI_MODEL` | `gemini-3.6-flash` | Google retires model names; pin a real version, not a `-latest` alias |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | A comma-separated list is a fallback chain: every key is tried on the first model, then the next model (`gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash` in `.env.example`). A rate-limited key moves on at once; an unknown model is skipped. Pin real versions, not `-latest` aliases |
 | `SUMMARY_PROMPT` | `summarize.md` | Prompt file; `--prompt` overrides |
 | `SUMMARY_MAX_TOKENS` | 16000 | **Gemini only.** The Claude CLI has no output cap, and output is not what spends a subscription window anyway — see below |
 | `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture-*`/`tutorial-*` output; `always`/`never` override |
@@ -1070,17 +1079,18 @@ provenance header (`model: claude-cli/opus`).
 |---|---|---|
 | `SUMMARY_WRITE_PDF` | 1 | `0` = markdown only (same as `--no-pdf`) |
 | `SUMMARY_WRITE_MARKDOWN` | 1 | `0` = PDF only (same as `--no-markdown`) |
-| `PDF_FRAMES` | `contact` | `contact` (thumbnail appendix), `inline` (figures in the body), or `none` |
+| `PDF_FRAMES` | `none` | `none`, `contact` (thumbnail appendix), or `inline` (figures in the body) |
 | `PDF_FRAME_CROP` | `slide` | `slide`, `border`, or `none` |
 | `PDF_FRAME_MAX_WIDTH` | 1280 | Inline figures are downscaled to this |
 | `PDF_CONTACT_MAX_WIDTH` | 640 | Contact-sheet thumbnails are downscaled to this |
-| `PDF_TRANSCRIPT` | `hidden` | `hidden` (white 1pt layer), `appendix`, or `none` |
+| `PDF_TRANSCRIPT` | `none` | `none`, `hidden` (white 1pt layer), or `appendix` |
+| `PDF_RESOURCES` | `none` | `none` or `appendix` (the `--resources` slides as Appendix B) |
 | `PDF_HIDDEN_CHUNK_CHARS` | 40000 | Characters of hidden transcript per page; above ~50k poppler stops extracting |
 | `PDF_PAGE_SIZE` | `A4` | Any WeasyPrint page size |
-| `PDF_FONT_FAMILY` | `Adwaita Sans, Arial, Liberation Sans, Noto Sans Thai, Noto Sans, DejaVu Sans, sans-serif` | Keep a Thai face in the stack |
+| `PDF_FONT_FAMILY` | `CMU Serif, Latin Modern Roman, Noto Serif Thai, Noto Sans Thai, Noto Serif, Liberation Serif, DejaVu Serif, serif` | Keep a Thai face in the stack |
 | `PDF_FONT_SIZE` | 8 | Body size in points; everything else scales with it |
 | `PDF_MATH` | 1 | 0 leaves LaTeX as text instead of typesetting it |
-| `PDF_MATH_SCALE` | 1.15 | Maths size relative to the body text |
+| `PDF_MATH_SCALE` | 1.0 | Maths size relative to the body text (Computer Modern both, so 1.0; a sans body wants ~1.15) |
 | `PDF_MATH_FONTSET` | `cm` | matplotlib mathtext font set (`cm` is Computer Modern) |
 
 ### Reference material
@@ -1215,11 +1225,11 @@ python3 lib/test_keyring.py                  # numbered keys + rotation cursor (
 python3 lib/test_resources.py                # resource specs, extraction, GitHub (27)
 python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions, retries (51)
 python3 lib/test_clip.py                     # --clip parsing, the cut, caption windowing (33)
-python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window (136)
-python3 summarize/test_pdf_units.py          # frame cropping, citations, PDF render (60)
+python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain (171)
+python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, PDF render (73)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
 bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (281)
-bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (118)
+bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (119)
 ```
 
 Two of those are worth understanding:

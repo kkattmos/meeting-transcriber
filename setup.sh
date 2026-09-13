@@ -97,19 +97,11 @@ apt-get install -y --no-install-recommends \
   wmctrl xdotool \
   poppler-utils \
   libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b libffi-dev \
-  fonts-thai-tlwg fonts-liberation fonts-noto-core
+  fonts-thai-tlwg fonts-liberation fonts-noto-core fonts-cmu
 
-# Adwaita Sans is the first face in the PDF's font stack (see summarize/pdf.py).
-# Debian 13 packages no Adwaita font at all — verified on the target box, where
-# both fonts-adwaita-sans and fonts-adwaita are unknown to apt — so this is a
-# genuine optional: without it the stack falls through Arial to Liberation Sans,
-# which is metric-compatible Arial and installed above. Try both spellings
-# anyway, so a box that does carry it (Ubuntu, or a later Debian) gets it.
-echo "==> Installing the PDF body font (optional)"
-apt-get install -y --no-install-recommends fonts-adwaita-sans 2>/dev/null \
-  || apt-get install -y --no-install-recommends fonts-adwaita 2>/dev/null \
-  || echo "    note: no Adwaita font in this distro — the PDF will use" \
-          "Liberation Sans (Arial metrics), which is the next face in the stack"
+# fonts-cmu is CMU Serif — Computer Modern, the PDF's body face and the face
+# mathtext already sets the maths in (see summarize/pdf.py). fonts-noto-core
+# carries Noto Serif Thai, the Thai fallback behind it.
 
 # Thai locale: Chrome is driven with locale th-TH so Thai participant names
 # render instead of boxes. See CLAUDE.md — this is deliberate, not cosmetic.

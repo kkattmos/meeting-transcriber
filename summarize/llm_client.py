@@ -147,7 +147,8 @@ Env vars:
                         hit window without a reset time (default 600)
   SUMMARY_EFFORT        low | medium | high (default) | xhigh | max
   GEMINI_API_KEY_1..3   required for gemini (GOOGLE_API_KEY also accepted)
-  GEMINI_MODEL          default gemini-3.6-flash
+  GEMINI_MODEL          default gemini-3.6-flash; a comma-separated list is
+                        a fallback chain of models, tried in order
   SUMMARY_MAX_TOKENS    default 16000 (gemini only; the CLI has no such flag)
 """
 import base64
@@ -169,7 +170,7 @@ from typing import List
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
-from retry import with_retries  # noqa: E402
+from retry import with_retries, _status_of as _http_status  # noqa: E402
 from keyring import KeyRing, missing_keys_message  # noqa: E402
 
 DEFAULT_BACKEND = "fallback"
@@ -1383,21 +1384,69 @@ def summarize_claude_cli(frames: List[FrameMeta], transcript: str,
 # Google Gemini
 # ---------------------------------------------------------------------------
 
+class GeminiQuotaExhausted(Exception):
+    """429 / RESOURCE_EXHAUSTED on one key for one model.
+
+    `retryable = False` so with_retries raises it at once instead of sitting
+    through the backoff schedule: the rotation loop tries the next key, and
+    when every key is out on this model, the next model. Quota is per key
+    and per model, so both moves can work where waiting would not.
+    """
+    retryable = False
+
+
+class GeminiModelUnavailable(Exception):
+    """404 / NOT_FOUND, or "not supported": this model name is dead for every
+    key, so the loop moves straight to the next model."""
+    retryable = False
+
+
+def _gemini_models():
+    """GEMINI_MODEL as an ordered chain: `a,b,c` tries a, then b, then c."""
+    raw = os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+    seen = []
+    for name in re.split(r"[,\s]+", raw):
+        if name and name not in seen:
+            seen.append(name)
+    return seen or [DEFAULT_GEMINI_MODEL]
+
+
+def _classify_gemini_error(exc):
+    """'quota', 'model', or None for anything the retry policy should judge."""
+    status = _http_status(exc)
+    text = str(exc).lower()
+    if status == 429 or "resource_exhausted" in text or "quota" in text \
+            or "rate limit" in text or "rate-limit" in text:
+        return "quota"
+    # Only the wording Gemini uses for a model name it does not serve — an
+    # "unsupported" *request* (a mime type, say) is a real error, not a
+    # reason to walk the chain.
+    if status == 404 or "not_found" in text or "is not found" in text \
+            or "not supported for generatecontent" in text:
+        return "model"
+    return None
+
+
 def summarize_gemini(frames: List[FrameMeta], transcript: str,
                      prompt_template: str, role: str = None) -> str:
-    """Google Gemini via the google-genai SDK, rotating up to three keys.
+    """Google Gemini via the google-genai SDK: a chain of models, three keys
+    each.
 
-    Rotation happens outside the retry wrapper on purpose: retry.py handles a
-    provider that is busy, this loop handles a key that is exhausted or
-    revoked. A key whose quota is gone would otherwise burn the full retry
-    schedule before the chain ever moved on.
+    `GEMINI_MODEL=gemini-3.8-flash,gemini-3.7-flash` is walked in order. For
+    each model every key is tried before the next model, because quota is
+    per key and a rate-limited key says nothing about its neighbours; a
+    model that does not exist (404) is abandoned on the first key, because
+    it will not exist for the others either. Both moves happen *outside* the
+    retry wrapper and without backoff — retry.py handles a provider that is
+    busy (5xx, overloaded), this loop handles a key or a model that is out.
+    A 429 used to burn the whole backoff schedule before anything moved.
     """
     try:
         from google import genai as new_genai
     except ImportError as exc:
         raise BackendUnavailable(f"google-genai SDK not installed: {exc}") from exc
 
-    model_name = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    models = _gemini_models()
     ring = KeyRing.from_env("GEMINI_API_KEY", aliases=("GOOGLE_API_KEY",),
                             max_slots=GEMINI_MAX_KEYS)
     if not ring:
@@ -1418,29 +1467,47 @@ def summarize_gemini(frames: List[FrameMeta], transcript: str,
             }
         })
 
-    last_error = None
-    for slot, key in ring.rotate():
-        client = new_genai.Client(api_key=key)
+    def _call(client, model_name):
         try:
-            response = with_retries(
-                client.models.generate_content,
-                label=f"gemini/{model_name} ({ring.label(slot)})",
+            return client.models.generate_content(
                 model=model_name,
-                contents=[{"role": "user", "parts": parts}],
-            )
-        except Exception as exc:  # noqa: BLE001 - try the next key
-            if len(ring) == 1:
-                raise
-            print(f"  !! gemini {ring.label(slot)} failed: "
-                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
-            last_error = exc
-            continue
-        ring.commit(slot)
-        _record_used("gemini", model_name)
-        return (response.text or "").strip()
+                contents=[{"role": "user", "parts": parts}])
+        except Exception as exc:  # noqa: BLE001 - classified, then re-raised
+            kind = _classify_gemini_error(exc)
+            if kind == "quota":
+                raise GeminiQuotaExhausted(str(exc)) from exc
+            if kind == "model":
+                raise GeminiModelUnavailable(str(exc)) from exc
+            raise
+
+    last_error = None
+    for model_name in models:
+        for slot, key in ring.rotate():
+            client = new_genai.Client(api_key=key)
+            try:
+                response = with_retries(
+                    _call, client, model_name,
+                    label=f"gemini/{model_name} ({ring.label(slot)})")
+            except GeminiModelUnavailable as exc:
+                print(f"  !! gemini/{model_name} unavailable: {exc}",
+                      file=sys.stderr)
+                last_error = exc
+                break   # every key would 404 the same way: next model
+            except Exception as exc:  # noqa: BLE001 - try the next key
+                print(f"  !! gemini/{model_name} {ring.label(slot)} failed: "
+                      f"{type(exc).__name__}: {exc}", file=sys.stderr)
+                last_error = exc
+                continue
+            ring.commit(slot)
+            _record_used("gemini", model_name)
+            return (response.text or "").strip()
+        if model_name != models[-1]:
+            print(f"  !! gemini/{model_name}: no key succeeded — trying "
+                  f"the next model", file=sys.stderr)
 
     raise RuntimeError(
-        f"All {len(ring)} Gemini key(s) failed. Last error: {last_error}")
+        f"All {len(models)} Gemini model(s) x {len(ring)} key(s) failed. "
+        f"Last error: {last_error}")
 
 
 # chain-name -> backend function.

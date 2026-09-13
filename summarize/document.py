@@ -11,9 +11,7 @@ The shape matches the course-note template — see
 `2_Transcripts/_template_lecture_summary.md` and the chapter files next to it:
 
     <!-- meeting-transcriber provenance ... -->
-    Chapter N — <topic> (<date>)
-
-    # <video title>
+    # <the model's own title>
 
     Youtube Link: `https://www.youtube.com/watch?v=...`
 
@@ -24,15 +22,20 @@ The shape matches the course-note template — see
     </details>
     <br>
 
-    ...the model's structured summary...
+    ...the rest of the model's structured summary...
 
     <br><br>
 
-The `Chapter N — <topic> (<date>)` line is emitted as a literal placeholder, on
-purpose: the chapter number isn't derivable from the video and a guess that
-looks right but isn't would be worse than an obvious blank to fill in.
+The heading is the model's: the lecture prompts ask for a title, and the
+one it writes ("Computer Engineering Mathematics II — Signal Processing
+Module") names the material where the video's own title ("2110203 L01")
+names the file. So a body that opens with an H1 has that H1 lifted to the
+top, above the link lines, and only a body without one falls back to the
+video title. Until 2026-09-13 the wrapper put a `Chapter N — <topic>
+(<date>)` placeholder and the video title above the body; both went at the
+operator's request, and pdf.py drops them from the older files it meets.
 
-The four-space indent inside <details> is deliberate too. It makes most
+The four-space indent inside <details> is deliberate. It makes most
 renderers show the transcript as a code block, which is what the existing
 chapter files already do — reproducing them beats "fixing" them.
 """
@@ -42,7 +45,6 @@ import subprocess
 from datetime import date
 from pathlib import Path
 
-CHAPTER_PLACEHOLDER = "Chapter N — <topic> (<date>)"
 SECTION_SEPARATOR = "<br><br>"
 
 # Prompts whose output is course-note shaped. meeting-* keeps the plain
@@ -142,10 +144,18 @@ def _clip_line(clip, tag=""):
             "Timestamps below are relative to the start of the clip.")
 
 
+def split_leading_heading(body):
+    """(heading text, rest) when the body opens with an H1; else (None, body)."""
+    lines = body.strip().splitlines()
+    if lines and re.match(r"^#\s+\S", lines[0]):
+        return lines[0][1:].strip(), "\n".join(lines[1:]).strip()
+    return None, body.strip()
+
+
 def build_document(body, *, source, source_kind, title=None, transcript="",
                    backend=None, model=None, prompt_name=None, run_id=None,
-                   generated=None, include_chapter_line=True,
-                   include_transcript=True, clip=None, videos=None):
+                   generated=None, include_transcript=True, clip=None,
+                   videos=None):
     """Wrap a model-written summary body in the course-note template.
 
     `videos`, when given, is the list of sources a --combine summary was made
@@ -153,8 +163,11 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
     the order the model saw them — and the wrapper then lists one link line
     per video, tagged "(Video N)" so the model's "video 2" references and the
     "Frame 12 @ video 2 ..." citations can be followed back to a link. The
-    document keeps a single title (the first video's, or `title`), because it
-    is one document about one topic, not a stack of sections.
+    document keeps a single title, because it is one document about one
+    topic, not a stack of sections.
+
+    `title` is the video's, and is used only when the body has no H1 of its
+    own — see the module docstring.
     """
     generated = generated or date.today().isoformat()
 
@@ -178,12 +191,12 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
                 provenance[f"video_{n}_clip"] = video["clip"]
     parts = [provenance_comment(**provenance)]
 
-    if include_chapter_line:
-        parts.append(CHAPTER_PLACEHOLDER)
-
-    if videos and not title:
-        title = next((v.get("title") for v in videos if v.get("title")), None)
-    parts.append(f"# {title or run_id or 'Untitled'}")
+    heading, body = split_leading_heading(body)
+    if not heading:
+        heading = title
+    if videos and not heading:
+        heading = next((v.get("title") for v in videos if v.get("title")), None)
+    parts.append(f"# {heading or run_id or 'Untitled'}")
 
     if videos:
         lines = []

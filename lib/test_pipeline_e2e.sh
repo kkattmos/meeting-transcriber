@@ -148,7 +148,7 @@ if "--parts" in flags:
     os.makedirs(os.path.dirname(out), exist_ok=True)
     body = "\n".join(f"video {i}: {p['source']}" for i, p in enumerate(parts, start=1))
     open(out, "w").write(f"<!-- meeting-transcriber\n     source_type: combined\n-->\n\n"
-                         f"Chapter N — <topic> (<date>)\n\n# Stub combined\n\n{body}\n\n"
+                         f"# Stub combined\n\n{body}\n\n"
                          f"See (Frame 3 @ video 2 9.0s).\n\n<br><br>\n")
     print(f"stub: combined summary of {len(parts)} parts -> {out}")
     if "--pdf-out" in flags and os.environ.get("STUB_SUMMARIZE_NO_PDF") != "1":
@@ -166,7 +166,7 @@ out = args[2]
 os.makedirs(os.path.dirname(out), exist_ok=True)
 if os.environ.get("STUB_SUMMARIZE_NO_MARKDOWN") != "1":
     open(out, "w").write(f"<!-- meeting-transcriber\n     source: x\n-->\n\n"
-                         f"Chapter N — <topic> (<date>)\n\n# Stub\n\nsummary of {args[0]}\n\n"
+                         f"# Stub\n\nsummary of {args[0]}\n\n"
                          f"See (Frame 1 @ 0:00:01).\n\n<br><br>\n")
     print(f"stub: summary -> {out}")
 pdf = flags["--pdf-out"][0]
@@ -401,8 +401,8 @@ for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
   ls -d "$RUNS/yt_${vid}_"* >/dev/null 2>&1 && ok "multi: run for $vid" || bad "multi: no run for $vid"
 done
 [ -f "$TESTROOT/chapter.md" ] && ok "multi: combined file written" || bad "multi: no combined file"
-check "multi: one Chapter line in combined file" \
-  "$(grep -c 'Chapter N' "$TESTROOT/chapter.md")" "1"
+check "multi: one title in combined file" \
+  "$(grep -c '^# Stub combined' "$TESTROOT/chapter.md")" "1"
 echo "$out" | grep -q "3 run(s), up to 3 at a time" && ok "multi: honored --jobs 3" || bad "multi: --jobs not honored"
 
 # --- The combined summary is ONE summarize call over every member ----------

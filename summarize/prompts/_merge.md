@@ -15,6 +15,8 @@ Rules:
 
 - Produce ONE coherent document. Never mention that it was assembled from parts,
   and do not keep the "part N of M" headings.
+- If the partials open with a top-level `# Title` heading, keep exactly one,
+  as the first line of the document. Never repeat it between sections.
 - Merge duplicates. Because the parts overlap, the same decision or topic may
   appear in two consecutive summaries — state it once.
 - Collect every action item into a single list, preserving owners and due dates

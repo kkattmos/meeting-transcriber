@@ -9,30 +9,30 @@ Four things happen here that the markdown doesn't need.
     every expression is lifted out before the HTML conversion and comes back
     as Computer Modern, set by matplotlib's mathtext. See mathrender.py.
 
-  * **Keyframes go to the back, not into the argument.** A keyframe is a
-    screenshot of a video call: mostly a participant's face, a half-drawn
-    slide, or (the scene-change pass being drawn to exactly this) solid black.
-    Printed full width mid-paragraph they were noise, so by default the
-    citations stay as the model wrote them and the frames they name become a
-    thumbnail contact sheet in Appendix A — blank ones dropped, each frame
-    once, and only the ones actually cited get cropped at all.
-    `PDF_FRAMES=inline` restores the old behaviour; `none` drops them.
+  * **Nested bullets are re-indented.** The model writes sub-items two
+    spaces in, like every markdown reader accepts; python-markdown wants four
+    and flattens anything less into the parent list. See
+    _normalize_list_indent.
 
-  * **The transcript is present but invisible.** A PDF has no collapsed
-    <details>, and eighty kilobytes of ASR output — as an appendix or at the
-    top — buries the summary. It goes in as a white 1pt layer between
-    BEGIN_TRANSCRIPT and END_TRANSCRIPT markers instead: the reader never sees
-    it, `pdftotext` always finds it. `PDF_TRANSCRIPT=appendix` prints it.
+  * **Frame citations are faded.** `(Video 1, Frame 52 @ 0:08:52)` after
+    every second sentence is what lets a reader scrub to the moment, and also
+    what makes the notes hard to read. They stay, at 30% opacity.
 
-  * **Reference material gets Appendix B**: the slide images collected from
-    the GitHub repo or folder passed via --resources, each captioned with the
-    file it came from. The provenance comment becomes a real footer line.
+  * **The sheet is the summary alone, by default.** The keyframe contact
+    sheet (`PDF_FRAMES=contact`), the reference slides (`PDF_RESOURCES=
+    appendix`) and the transcript (`PDF_TRANSCRIPT=hidden|appendix`) are all
+    off unless asked for. A keyframe is a screenshot of a video call — mostly
+    a face, a half-drawn slide or solid black — and a study sheet with forty
+    of them at the back, plus a few blank-looking pages of white 1pt
+    transcript, is not the document the operator prints. The markdown still
+    carries the transcript in its <details> block.
 
 WeasyPrint does the rendering: pip-installable, needs no browser, embeds local
 images by path, and shapes Thai correctly given a Thai font. The default face
-is Adwaita Sans at 8pt with Arial and Liberation Sans behind it and Noto Sans
-Thai for the Thai — see DEFAULT_FONT_STACK, and note that dropping the Thai
-font from a custom PDF_FONT_FAMILY turns a Thai lecture into tofu boxes.
+is CMU Serif — Computer Modern, the same face mathtext sets the maths in — at
+8pt, with Noto Serif Thai for the Thai; see DEFAULT_FONT_STACK, and note that
+dropping the Thai font from a custom PDF_FONT_FAMILY turns a Thai lecture
+into tofu boxes.
 
 Nothing here is allowed to take the run down. `render()` raises PdfUnavailable
 when the toolchain is missing, and summarize.py turns that into a warning: the
@@ -57,13 +57,14 @@ class PdfUnavailable(RuntimeError):
     """The PDF toolchain isn't installed (weasyprint / markdown)."""
 
 
-# Adwaita Sans first (installed by setup.sh), Arial next so a box that has the
-# real thing uses it, then Liberation Sans — which is what "Arial" resolves to
-# on a Debian box without it. Noto Sans Thai has to stay in the stack: Adwaita
-# has no Thai glyphs, and a Thai lecture summary in tofu boxes is not a PDF.
-DEFAULT_FONT_STACK = ("Adwaita Sans", "Arial", "Liberation Sans",
-                      "Noto Sans Thai", "Noto Sans", "DejaVu Sans",
-                      "sans-serif")
+# CMU Serif is Computer Modern (Debian: fonts-cmu, installed by setup.sh),
+# the face the maths is already set in, so text and formulae match. Latin
+# Modern is the same design under another name for a box that has that
+# instead. Noto Serif Thai has to stay in the stack: Computer Modern has no
+# Thai glyphs, and a Thai lecture summary in tofu boxes is not a PDF.
+DEFAULT_FONT_STACK = ("CMU Serif", "Latin Modern Roman", "Noto Serif Thai",
+                      "Noto Sans Thai", "Noto Serif", "Liberation Serif",
+                      "DejaVu Serif", "serif")
 DEFAULT_FONT_SIZE_PT = 8.0
 # Contact-sheet thumbnails are three to a row on an A4 page — about 55mm wide.
 # Anything past ~640px of source is detail the print can't show.
@@ -111,35 +112,52 @@ def _font_size():
 
 
 def frames_mode():
-    """PDF_FRAMES: contact (default), inline, or none.
+    """PDF_FRAMES: none (default), contact, or inline.
 
     `contact` keeps the citations as the model wrote them and collects the
-    frames they name into a thumbnail appendix. It is the default because
-    inline frames were the export's worst feature: a keyframe is a screenshot
-    of a video call, so most of them are a participant's face, a half-drawn
-    slide or — the scene-change pass being what it is — solid black, printed
-    full width in the middle of an argument they illustrate only by accident.
+    frames they name into a thumbnail appendix; `inline` replaces the first
+    citation of each with the picture. Neither is the default: a keyframe is
+    a screenshot of a video call, so most of them are a participant's face, a
+    half-drawn slide or — the scene-change pass being what it is — solid
+    black, and the sheet reads better without them. The citations themselves
+    stay, so a reader can still scrub to the moment.
     """
-    value = (os.environ.get("PDF_FRAMES") or "contact").strip().lower()
+    value = (os.environ.get("PDF_FRAMES") or "none").strip().lower()
     if value not in ("contact", "inline", "none"):
-        print(f"  warning: PDF_FRAMES={value!r} — expected contact, inline or "
-              f"none; using contact", file=sys.stderr)
-        return "contact"
+        print(f"  warning: PDF_FRAMES={value!r} — expected none, contact or "
+              f"inline; using none", file=sys.stderr)
+        return "none"
     return value
 
 
 def transcript_mode():
-    """PDF_TRANSCRIPT: hidden (default), appendix, or none.
+    """PDF_TRANSCRIPT: none (default), hidden, or appendix.
 
     `hidden` writes the transcript into the page as white 1pt text between
     BEGIN_TRANSCRIPT / END_TRANSCRIPT markers: invisible to a reader, and
-    still the first thing `pdftotext` hands an agent. See _hidden_transcript.
+    still the first thing `pdftotext` hands an agent — at the cost of a few
+    blank-looking pages at the back. See _hidden_transcript. Off by default
+    since the markdown beside the PDF carries the transcript anyway.
     """
-    value = (os.environ.get("PDF_TRANSCRIPT") or "hidden").strip().lower()
+    value = (os.environ.get("PDF_TRANSCRIPT") or "none").strip().lower()
     if value not in ("hidden", "appendix", "none"):
-        print(f"  warning: PDF_TRANSCRIPT={value!r} — expected hidden, "
-              f"appendix or none; using hidden", file=sys.stderr)
-        return "hidden"
+        print(f"  warning: PDF_TRANSCRIPT={value!r} — expected none, hidden "
+              f"or appendix; using none", file=sys.stderr)
+        return "none"
+    return value
+
+
+def resources_mode():
+    """PDF_RESOURCES: none (default) or appendix.
+
+    `appendix` prints the slide images collected by --resources as Appendix
+    B, captioned with the file each came from.
+    """
+    value = (os.environ.get("PDF_RESOURCES") or "none").strip().lower()
+    if value not in ("appendix", "none"):
+        print(f"  warning: PDF_RESOURCES={value!r} — expected none or "
+              f"appendix; using none", file=sys.stderr)
+        return "none"
     return value
 
 
@@ -208,8 +226,119 @@ def _split_document(text):
         return ""
 
     text = DETAILS_BLOCK_RE.sub(_take, text)
+    text = _drop_legacy_header(text)
 
     return text.strip(), "\n\n".join(transcripts), provenance
+
+
+# What document.py used to put above the body, until 2026-09-13: a chapter
+# placeholder for the operator to fill in, and the video's title as a fixed
+# H1 over the model's own. Files written before then still carry them.
+LEGACY_CHAPTER_LINE = "Chapter N — <topic> (<date>)"
+LINK_LINE_RE = re.compile(
+    r"^(?:(?:Youtube Link|Video Link|Source File|Clip)(?: \(Video \d+\))?:"
+    r"|Summarized from \d+ videos as one\.)")
+H1_RE = re.compile(r"^#\s+\S")
+
+
+def _drop_legacy_header(text):
+    """Strip the old wrapper's chapter placeholder and fixed video-title H1.
+
+    The placeholder is never something a PDF should print. The video-title
+    H1 goes only when the document has a second one right after the link
+    lines — that is the model's own title, which is the one the sheet should
+    carry, and it moves up to where the first one stood so the title still
+    heads the page. A document with a single heading, old or new, is left
+    exactly as it is.
+    """
+    lines = text.splitlines()
+    lines = [ln for ln in lines if ln.strip() != LEGACY_CHAPTER_LINE]
+    heads = [i for i, ln in enumerate(lines) if H1_RE.match(ln)]
+    if len(heads) >= 2:
+        first, second = heads[0], heads[1]
+        between = [ln for ln in lines[first + 1:second] if ln.strip()]
+        if all(LINK_LINE_RE.match(ln) for ln in between):
+            lines[first] = lines[second]
+            del lines[second]
+    return "\n".join(lines)
+
+
+LIST_ITEM_RE = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+")
+FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
+
+def _normalize_list_indent(text):
+    """Re-indent nested lists so python-markdown nests them too.
+
+    The models write sub-bullets two spaces in (Gemini always, Claude often),
+    which GitHub, Obsidian and every other reader nest correctly. python-
+    markdown nests only at four, and treats anything less as a continuation
+    of the *parent* item — so a three-level outline flattened into one long
+    list, which on a study sheet is the difference between structure and a
+    wall of bullets. Each item's level is read from the indents seen so far
+    and rewritten to four spaces a level; a continuation line (a paragraph or
+    a display formula under an item) is indented to sit inside its item.
+    Fenced code is left alone, and an outline already at four spaces is
+    unchanged.
+    """
+    out, stack, fence = [], [], None
+    for line in text.splitlines():
+        f = FENCE_RE.match(line)
+        if f:
+            fence = None if fence == f.group(1) else (fence or f.group(1))
+            out.append(line)
+            continue
+        if fence or not line.strip():
+            out.append(line)
+            continue
+        expanded = line.expandtabs(4)
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        item = LIST_ITEM_RE.match(expanded)
+        if item:
+            if not stack:
+                if indent >= 4:
+                    # An indented list with no list open is markdown's
+                    # code block; not ours to reinterpret.
+                    out.append(line)
+                    continue
+                if out and out[-1].strip():
+                    # "The modules are:" straight into "1. Signals" — a list
+                    # to CommonMark and to the model, but python-markdown
+                    # needs the blank line or it prints numbered prose.
+                    out.append("")
+                stack = [indent]
+            elif indent > stack[-1]:
+                stack.append(indent)
+            else:
+                while len(stack) > 1 and indent < stack[-1]:
+                    stack.pop()
+            level = len(stack) - 1
+            out.append(" " * (4 * level) + expanded.lstrip(" "))
+            continue
+        if stack and indent > stack[0]:
+            # Continuation of the deepest item whose indent it reaches.
+            level = max(i for i, w in enumerate(stack) if w <= indent)
+            out.append(" " * (4 * (level + 1)) + expanded.lstrip(" "))
+            continue
+        stack = []
+        out.append(line)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+# "(Video 1, Frame 52 @ 0:08:52)", "(Frame 280 @ Video 1 [02:21:00])",
+# "(Frames 20–26 @ 0:05:25–0:05:41)", and the frameless "(Video 6,
+# [02:51:30])": the parenthesised citation as a whole, on the rendered HTML,
+# so the <em> markdown wraps it in is outside the span.
+CITATION_RE = re.compile(
+    r"\(\s*(?:video\s*\d+\s*,\s*)?frames?\s*#?\s*\d+[^()<>\n]*\)"
+    r"|\(\s*video\s*\d+\s*,[^()<>\n]*\)",
+    re.IGNORECASE)
+
+
+def _fade_citations(html_body):
+    """Wrap every frame citation so the stylesheet can fade it."""
+    return CITATION_RE.sub(
+        lambda m: f'<span class="cite">{m.group(0)}</span>', html_body)
 
 
 def _prepare_frames(frames, work_dir, crop_mode=None, max_width=None,
@@ -360,6 +489,7 @@ def _css():
     margin: 18mm 16mm 20mm 16mm;
     @bottom-center {{
         content: counter(page) " / " counter(pages);
+        font-family: {_font_stack()};
         font-size: 7pt;
         color: #777;
     }}
@@ -377,7 +507,8 @@ h3 {{ font-size: 1.12em; margin: 10pt 0 3pt 0; break-after: avoid; }}
 h4 {{ font-size: 1em; margin: 8pt 0 3pt 0; break-after: avoid; }}
 p, li {{ orphans: 2; widows: 2; }}
 ul, ol {{ margin: 4pt 0 4pt 16pt; padding: 0; }}
-code {{ font-family: "DejaVu Sans Mono", monospace; font-size: 0.92em;
+code {{ font-family: "CMU Typewriter Text", "DejaVu Sans Mono", monospace;
+        font-size: 0.92em;
         background: #f2f3f5; padding: 0 2px; border-radius: 2px; }}
 pre {{ background: #f2f3f5; padding: 6pt; border-radius: 3px;
        font-size: 0.88em; white-space: pre-wrap; word-wrap: break-word; }}
@@ -399,6 +530,9 @@ figure.frame figcaption {{ font-size: 0.9em; color: #666; margin-top: 3pt; }}
 .transcript {{ font-size: 0.9em; line-height: 1.45; color: #333;
                white-space: pre-wrap; }}
 .notes {{ font-size: 0.9em; color: #8a6d3b; }}
+/* Frame citations: kept, so the reader can scrub to the moment, but faded so
+   the notes read as notes. 70% transparent. */
+.cite {{ opacity: 0.3; }}
 
 /* Contact sheet: three thumbnails to a row, inline-block rather than grid
    because that lays out identically on every WeasyPrint version we might
@@ -597,12 +731,13 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
     try:
         body_md, transcript, provenance = _split_document(markdown_text)
 
-        # The document's own "# Title" line becomes the PDF title; keep it in the
-        # body too so a run without a wrapper still shows a heading.
-        doc_title = title or provenance.get("title")
-        if not doc_title:
-            m = re.search(r"^#\s+(.+)$", body_md, re.MULTILINE)
-            doc_title = m.group(1).strip() if m else "Summary"
+        # The document's own "# Title" line is the PDF title — the model's,
+        # since 2026-09-13 — and stays in the body as the heading. The
+        # caller's title (the video's) is only the fallback for a body with
+        # no heading of its own.
+        m = re.search(r"^#\s+(.+)$", body_md, re.MULTILINE)
+        doc_title = (m.group(1).strip() if m else None) or title \
+            or provenance.get("title") or "Summary"
 
         slide_images = collect_slide_images(resources)
 
@@ -611,6 +746,9 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
         # back in after the citation passes, so those never have to step over a
         # base64 data: URI. See mathrender.
         body_md, math_exprs = mathrender.extract(body_md)
+        # After extract: a display formula under a bullet is one token by
+        # now, so it re-indents as one line instead of being cut mid-matrix.
+        body_md = _normalize_list_indent(body_md)
 
         body_html = _markdown_to_html(body_md)
 
@@ -628,6 +766,7 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
                                         _contact_max_width(), wanted=cited))
             frame_appendix = _appendix_frames(prepared)
 
+        body_html = _fade_citations(body_html)
         body_html = mathrender.restore(
             body_html,
             mathrender.render_all(math_exprs, size_pt=_font_size()))
@@ -638,15 +777,23 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
             source_line = (f'<p class="source"><b>Source:</b> '
                            f'{html.escape(str(src))}</p>')
 
+        # The provenance line and the source go under the title, not over
+        # it: this is a study sheet, and the first thing on the page is what
+        # it is about.
+        meta = (_meta_html(provenance, {'generated': date.today().isoformat()})
+                + source_line)
+        if "</h1>" in body_html:
+            body_html = body_html.replace("</h1>", "</h1>" + meta, 1)
+        else:
+            body_html = meta + body_html
+
         t_mode = transcript_mode()
         document = (
             f"<html><head><meta charset='utf-8'>"
             f"<title>{html.escape(doc_title)}</title></head><body>"
-            f"{_meta_html(provenance, {'generated': date.today().isoformat()})}"
-            f"{source_line}"
             f"{body_html}"
             f"{frame_appendix}"
-            f"{_appendix_resources(resources, slide_images)}"
+            f"{_appendix_resources(resources, slide_images) if resources_mode() == 'appendix' else ''}"
             f"{_appendix_transcript(transcript) if t_mode == 'appendix' else ''}"
             f"{_hidden_transcript(transcript) if t_mode == 'hidden' else ''}"
             f"</body></html>"

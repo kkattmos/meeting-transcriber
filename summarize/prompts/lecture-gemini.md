@@ -18,19 +18,21 @@ Return ONLY the body of the study guide. A wrapper is added around your output
 by the tooling, so do NOT write any of the following — they will be duplicated:
 
 - a `Chapter N — ...` line
-- a top-level `# Title` heading
 - the video link
 - the transcript, or a `<details>` block
 
-Start directly with the opening paragraph described below.
-
 ## Structure
 
-1. **Opening paragraph.** One or two sentences stating what this video covers
+1. **Title.** The first line is a top-level `# Title` heading naming the
+   course and the topic of this lecture (e.g. `# Computer Engineering
+   Mathematics II — Signals and Transformations`). It becomes the document's
+   title, so name the material, not the video file.
+
+2. **Opening paragraph.** One or two sentences stating what this video covers
    and naming the concrete system, tool, or topic under discussion. Bold the
    key nouns.
 
-2. **Numbered content sections.** Derive the sections from the material itself
+3. **Numbered content sections.** Derive the sections from the material itself
    rather than from a fixed list — use whatever divisions the lecture actually
    has (`## 1. Background`, `## 2. Functional Requirements`,
    `## 3. Non-Functional Requirements`, `## 4. Constraints`, `## 5. Worked
@@ -42,21 +44,19 @@ Start directly with the opening paragraph described below.
    - **Bold** every defined term, requirement name, technology, and figure the
      first time it appears.
    - Use `### N.M Subheading` where a section has genuinely distinct parts.
-   - Cite visuals inline where they support the point, as *(Frame 4 @ 92.0s)*.
+   - Use what the frames show — equations, diagrams, code, announcements on
+     a slide — as content, but do not cite them: no `(Frame N @ …)`
+     references, no frame numbers, no timestamps. The notes must read as a
+     study sheet, not as an index into the recording.
    - Preserve numeric detail exactly: percentages, time limits, counts, version
      numbers, complexities such as $O(N)$.
 
-3. **Anything the instructor flagged.** If exam scope, deadlines, assignment
+4. **Anything the instructor flagged.** If exam scope, deadlines, assignment
    details, or "this will be tested" moments appear, give them their own
    numbered section near the top — do not bury them in a bullet.
 
-4. **Final section: the visual index.** Always end with this table, numbered as
-   the last section, so the frame-to-topic mapping survives:
-
-   ## N. Visual & Board Work Index
-   | Frame / Index | Timestamp | Slide / Board Content | Related Topic |
-   | :--- | :--- | :--- | :--- |
-   | Frame # | `[mm:ss]` | Description of the text, diagram, or written code | Topic title |
+Do not end with a visual index, frame table, or list of timestamps. The last
+section is the last content section.
 
 # Execution Rules
 
@@ -74,5 +74,4 @@ Start directly with the opening paragraph described below.
    API**). Do not reproduce obvious ASR garbage verbatim.
 5. **Empty sections.** Omit a section that has no content entirely, rather than
    emitting a heading with `None` under it — the numbering should stay
-   contiguous. The visual index is the one exception: keep it, and write
-   `No slides or board work captured.` if there is genuinely nothing.
+   contiguous.

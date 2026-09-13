@@ -336,7 +336,8 @@ class DocumentTest(unittest.TestCase):
         self.assertTrue(out.startswith("<!-- meeting-transcriber"))
         self.assertIn("prompt: lecture-gemini.md", out)
         self.assertIn("model: gemini/gemini-2.5-flash", out)
-        self.assertIn("Chapter N — <topic> (<date>)", out)
+        self.assertNotIn("Chapter N", out)
+        # No H1 in the body, so the video's title heads the document.
         self.assertIn("# Chapter01 SRS n UI 1", out)
         self.assertIn("Youtube Link: `https://www.youtube.com/watch?v=abc123`", out)
         self.assertIn("<details>", out)
@@ -362,7 +363,28 @@ class DocumentTest(unittest.TestCase):
         self.assertNotIn("-->", header)
         self.assertIn("--&gt;", header)
         # Everything after the comment is the document proper.
-        self.assertTrue(rest.lstrip().startswith(document.CHAPTER_PLACEHOLDER))
+        self.assertTrue(rest.lstrip().startswith("# t"))
+
+    def test_the_models_own_title_heads_the_document(self):
+        # The lecture prompts ask for a `# Title`; when the body opens with
+        # one it is lifted above the link lines and the video title is not
+        # used — "Signals and Transformations" names the material where
+        # "2110203 L01" names the file.
+        out = document.build_document(
+            "# Signals and Transformations\n\n## 1. Background\nText.",
+            source="https://www.youtube.com/watch?v=abc123",
+            source_kind="youtube", title="2110203 L01", transcript="x")
+        self.assertEqual(out.count("\n# "), 1)
+        self.assertIn("# Signals and Transformations\n\nYoutube Link:", out)
+        self.assertNotIn("2110203 L01", out)
+        self.assertNotIn("Chapter N", out)
+        # The body keeps everything under the heading.
+        self.assertIn("## 1. Background\nText.", out)
+
+    def test_split_leading_heading(self):
+        self.assertEqual(document.split_leading_heading("# A\n\nb"), ("A", "b"))
+        self.assertEqual(document.split_leading_heading("b\n# A"), (None, "b\n# A"))
+        self.assertEqual(document.split_leading_heading("## A\nb"), (None, "## A\nb"))
 
     def test_a_clip_is_declared_in_the_document_and_the_provenance(self):
         # Every timestamp in a clipped summary — the SRT it quotes, the frame
@@ -1913,6 +1935,137 @@ class PromptOrderForCachingTest(unittest.TestCase):
         out = summarize_main.inject_resources("RULES\n{transcript}", Bundle())
         self.assertTrue(out.startswith("RULES"))
         self.assertGreater(out.index("Week 4"), out.index("{transcript}"))
+
+
+class GeminiModelChainTest(unittest.TestCase):
+    """GEMINI_MODEL as a chain: every key on a model, then the next model.
+
+    Driven through a fake `google.genai` so the real rotation loop, the real
+    retry wrapper and the real classification run; the script says what each
+    (key, model) pair answers.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.calls = []
+        self.script = {}
+        test = self
+
+        class _Resp:
+            def __init__(self, text):
+                self.text = text
+
+        class _Models:
+            def __init__(self, key):
+                self.key = key
+
+            def generate_content(self, model, contents):
+                test.calls.append((self.key, model))
+                outcome = test.script.get((self.key, model), "ok")
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return _Resp(outcome)
+
+        class Client:
+            def __init__(self, api_key):
+                self.models = _Models(api_key)
+
+        google = type(sys)("google")
+        genai = type(sys)("google.genai")
+        genai.Client = Client
+        google.genai = genai
+        self._modules = mock.patch.dict(sys.modules,
+                                        {"google": google, "google.genai": genai})
+        self._modules.start()
+        self._env = mock.patch.dict(os.environ, {
+            "MEETING_BOT_ROOT": self._tmp.name,
+            "GEMINI_API_KEY_1": "k1", "GEMINI_API_KEY_2": "k2",
+            "GEMINI_API_KEY_3": "k3",
+            "GEMINI_MODEL": "gemini-3.8-flash, gemini-3.7-flash,gemini-3.6-flash",
+            "SUMMARY_MAX_RETRIES": "2",
+        })
+        self._env.start()
+        self._sleep = mock.patch.object(retry.time, "sleep", lambda s: None)
+        self._sleep.start()
+
+    def tearDown(self):
+        self._sleep.stop()
+        self._env.stop()
+        self._modules.stop()
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _err(code, text):
+        exc = RuntimeError(text)
+        exc.code = code
+        return exc
+
+    def _run(self):
+        return llm_client.summarize_gemini([], "words", "{transcript}")
+
+    def test_the_variable_is_a_chain(self):
+        self.assertEqual(llm_client._gemini_models(),
+                         ["gemini-3.8-flash", "gemini-3.7-flash",
+                          "gemini-3.6-flash"])
+        with mock.patch.dict(os.environ, {"GEMINI_MODEL": "one-model"}):
+            self.assertEqual(llm_client._gemini_models(), ["one-model"])
+
+    def test_the_first_model_answers_on_the_first_key(self):
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(self.calls, [("k1", "gemini-3.8-flash")])
+        self.assertEqual(llm_client.LAST_MODEL, "gemini-3.8-flash")
+
+    def test_a_rate_limited_key_hands_to_the_next_key_without_backoff(self):
+        quota = self._err(429, "429 RESOURCE_EXHAUSTED: quota exceeded")
+        self.script[("k1", "gemini-3.8-flash")] = quota
+        self.assertEqual(self._run(), "ok")
+        # One call on k1 — not the two the retry schedule allows — then k2.
+        self.assertEqual(self.calls, [("k1", "gemini-3.8-flash"),
+                                      ("k2", "gemini-3.8-flash")])
+
+    def test_every_key_rate_limited_moves_to_the_next_model(self):
+        quota = self._err(429, "429 RESOURCE_EXHAUSTED")
+        for key in ("k1", "k2", "k3"):
+            self.script[(key, "gemini-3.8-flash")] = quota
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual([m for _k, m in self.calls],
+                         ["gemini-3.8-flash"] * 3 + ["gemini-3.7-flash"])
+        self.assertEqual(llm_client.LAST_MODEL, "gemini-3.7-flash")
+
+    def test_an_unknown_model_is_abandoned_on_the_first_key(self):
+        gone = self._err(404, "404 NOT_FOUND: models/gemini-3.8-flash is not "
+                              "found for API version v1beta")
+        self.script[("k1", "gemini-3.8-flash")] = gone
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(self.calls, [("k1", "gemini-3.8-flash"),
+                                      ("k1", "gemini-3.7-flash")])
+
+    def test_a_busy_server_still_gets_the_retry_backoff(self):
+        busy = self._err(503, "503 UNAVAILABLE: overloaded")
+        self.script[("k1", "gemini-3.8-flash")] = busy
+        self.assertEqual(self._run(), "ok")
+        # Two attempts on k1 (the schedule), then k2.
+        self.assertEqual(self.calls, [("k1", "gemini-3.8-flash"),
+                                      ("k1", "gemini-3.8-flash"),
+                                      ("k2", "gemini-3.8-flash")])
+
+    def test_everything_out_names_the_whole_chain(self):
+        quota = self._err(429, "429 RESOURCE_EXHAUSTED")
+        for key in ("k1", "k2", "k3"):
+            for model in ("gemini-3.8-flash", "gemini-3.7-flash",
+                          "gemini-3.6-flash"):
+                self.script[(key, model)] = quota
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run()
+        self.assertIn("3 Gemini model(s) x 3 key(s)", str(ctx.exception))
+        self.assertEqual(len(self.calls), 9)
+
+    def test_an_unsupported_request_is_not_mistaken_for_a_dead_model(self):
+        self.assertIsNone(llm_client._classify_gemini_error(
+            self._err(400, "400 INVALID_ARGUMENT: Unsupported MIME type")))
+        self.assertEqual(llm_client._classify_gemini_error(
+            self._err(None, "models/x is not supported for generateContent")),
+            "model")
 
 
 if __name__ == "__main__":

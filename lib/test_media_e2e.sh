@@ -68,6 +68,10 @@ export TRANSCRIPTS_DIR="$TESTROOT/opt/transcripts"
 export FRAMES_DIR="$TESTROOT/opt/frames"
 export SUMMARIES_DIR="$TESTROOT/opt/summaries"
 export PDF_DIR="$TESTROOT/opt/pdf"
+# The sheet carries no keyframes by default (PDF_FRAMES=none since
+# 2026-09-13); this suite asserts that frames are cropped and embedded, so it
+# asks for the appendix explicitly.
+export PDF_FRAMES=contact
 export RESOURCE_CACHE_DIR="$TESTROOT/opt/resources"
 mkdir -p "$RECORDINGS_DIR" "$TRANSCRIPTS_DIR" "$FRAMES_DIR" "$SUMMARIES_DIR" \
          "$PDF_DIR" "$RESOURCE_CACHE_DIR" "$MEETING_BOT_ROOT/state"
@@ -541,8 +545,10 @@ grep -q "claude-cli/opus" "$SUMMARY_MD" \
   && ok "provenance names the backend that answered" || bad "backend not recorded"
 grep -q "View Transcript" "$SUMMARY_MD" && ok "transcript embedded in <details>" \
   || bad "transcript block missing"
-grep -q "Chapter N" "$SUMMARY_MD" && ok "chapter placeholder present" \
-  || bad "no chapter line"
+grep -q "Chapter N" "$SUMMARY_MD" && bad "the chapter placeholder is back" \
+  || ok "no chapter placeholder"
+# The stub's body has no H1 of its own, so the video's title heads the file.
+grep -q "^# " "$SUMMARY_MD" && ok "document has a title" || bad "no title"
 
 if [ "$HAVE_PDF" -eq 1 ]; then
   [ -s "$SUMMARY_PDF" ] && ok "PDF written" || bad "no PDF"

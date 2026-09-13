@@ -22,16 +22,24 @@ Return ONLY the body of the guide. The tooling wraps your output in a document
 template, so do NOT write any of the following — they would be duplicated:
 
 - a `Chapter N — ...` line
-- a top-level `# Title` heading
 - the video link
 - the transcript, or a `<details>` block
 
-Open with one or two sentences naming what the video demonstrates and the
+Begin with a top-level `# Title` heading naming the tool or system and what
+the video does with it (e.g. `# Docker Compose — Multi-Container Setup`). It
+becomes the document's title, so name the material, not the video file.
+
+Then open with one or two sentences naming what the video demonstrates and the
 concrete tools or system involved, **bolding** the key nouns. Then use the
 sections below, numbered sequentially (`## 1. ...`, `## 2. ...`) and separated
 by `---` horizontal rules. Add further numbered sections of your own where the
 material has divisions these don't cover, and drop any that don't apply —
-keeping the numbering contiguous. The visual index always comes last.
+keeping the numbering contiguous.
+
+Use what the frames show — code, terminal output, UI state, diagrams — as
+content, but never cite them: no `(Frame N @ …)` references and no frame
+numbers anywhere in the guide. Chapter timestamps (`[mm:ss]`) stay; they are
+how a viewer jumps to a segment.
 
 ## N. Overview & Key Takeaways
 * **Primary Objective**: A two-sentence overview of the video's goal.
@@ -43,7 +51,6 @@ keeping the numbering contiguous. The visual index always comes last.
 * **`[00:00]` — [Chapter Title]**: Brief summary of the introduction.
 * **`[mm:ss]` — [Chapter Title]**: Bullets covering what is explained or
   demonstrated in this segment.
-  * *Visual Marker*: Note the corresponding keyframe, e.g. *(Frame 8 @ 185.0s)*.
 
 ## N. Visual Demonstrations, Diagrams & Code Walkthroughs
 ### N.M [Demo / Code / Architecture Topic] (`[mm:ss]`)
@@ -55,24 +62,14 @@ keeping the numbering contiguous. The visual index always comes last.
   as shown — do not paraphrase syntax. If something is cut off, write
   `[partially visible: <what is legible>]` rather than completing it by guess.
 
-## N. High-Value Visual Index (Jump-to Markers)
-| Frame / Index | Timestamp | Screen Category | Content Description |
-| :--- | :--- | :--- | :--- |
-| Frame # | `[mm:ss]` | [Slide / Code / UI / Diagram] | Description of visual state |
-
-Merge consecutive frames showing materially the same screen into a single row
-spanning the timestamp range rather than listing near-duplicate periodic
-samples. Prioritize scene-change frames; include periodic ones only when they
-capture meaningful in-progress change (code being typed, a build running) not
-already represented nearby. Above roughly 40 rows, keep the most
-content-distinct ones — always retaining the final code/architecture state —
-and note "Additional repeated/minor frames omitted" after the table.
+Do not end with a visual index or frame table. The last section is the last
+content section.
 
 ---
 
 # Execution Rules
-1. **Precision timestamps**: Time markers must match the transcript and frame
-   timestamps accurately.
+1. **Precision timestamps**: Chapter time markers must match the transcript
+   accurately.
 2. **Demonstration clarity**: Focus on *how* things are executed on screen, not
    only on what is said aloud.
 3. **No assumptions**: Base every description strictly on the transcript and
@@ -94,5 +91,4 @@ and note "Additional repeated/minor frames omitted" after the table.
 8. **Timestamp format**: `[mm:ss]` under 60 minutes, `[h:mm:ss]` consistently
    for anything longer.
 9. **Empty sections**: Omit a section with no applicable content entirely,
-   keeping the numbering contiguous. The visual index is the exception: keep it,
-   and write `No notable screens captured.` if there is genuinely nothing.
+   keeping the numbering contiguous.

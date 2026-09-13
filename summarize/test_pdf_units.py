@@ -378,13 +378,18 @@ class RenderTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_render_produces_a_pdf_with_the_frame_embedded(self):
+        import os
         frame_path = make_frame(self.dir / "scene_00001.jpg",
                                 slide=((80, 40, 880, 500), (250, 250, 245)))
         frames = [FrameMeta(timestamp_s=30.0, kind="scene_change",
                             path=str(frame_path))]
-        out = pdf_export.render(
-            DocumentSplitTest.DOC, self.dir / "out.pdf", frames=frames,
-            work_dir=self.dir / "work")
+        os.environ["PDF_FRAMES"] = "contact"
+        try:
+            out = pdf_export.render(
+                DocumentSplitTest.DOC, self.dir / "out.pdf", frames=frames,
+                work_dir=self.dir / "work")
+        finally:
+            os.environ.pop("PDF_FRAMES", None)
         self.assertTrue(Path(out).is_file())
         data = Path(out).read_bytes()
         self.assertTrue(data.startswith(b"%PDF"))
@@ -419,12 +424,17 @@ class RenderTest(unittest.TestCase):
         return captured["doc"]
 
     def test_contact_mode_puts_the_frames_in_an_appendix_not_the_body(self):
+        import os
         frame_path = make_frame(self.dir / "scene_00001.jpg",
                                 slide=((80, 40, 880, 500), (250, 250, 245)))
         frames = [FrameMeta(timestamp_s=2.0, kind="scene_change",
                             path=str(frame_path))]
-        doc = self._captured_document("# T\n\nA point *(Frame 1 @ 2.0s)*.",
-                                      frames=frames)
+        os.environ["PDF_FRAMES"] = "contact"
+        try:
+            doc = self._captured_document(
+                "# T\n\nA point *(Frame 1 @ 2.0s)*.", frames=frames)
+        finally:
+            os.environ.pop("PDF_FRAMES", None)
         self.assertIn("Appendix A \u2014 Keyframes", doc)
         self.assertIn('figure class="thumb"', doc)
         self.assertNotIn('figure class="frame"', doc)
@@ -447,11 +457,78 @@ class RenderTest(unittest.TestCase):
         self.assertIn('figure class="frame"', doc)
         self.assertNotIn("Appendix A", doc)
 
-    def test_the_transcript_goes_in_hidden_by_default(self):
-        doc = self._captured_document(DocumentSplitTest.DOC)
+    def test_the_sheet_is_the_summary_alone_by_default(self):
+        # No keyframe appendix, no transcript layer, no reference slides:
+        # the study sheet the operator prints is the notes and nothing else.
+        # The markdown beside it still carries the transcript.
+        frame_path = make_frame(self.dir / "scene_00001.jpg",
+                                slide=((80, 40, 880, 500), (250, 250, 245)))
+        frames = [FrameMeta(timestamp_s=30.0, kind="scene_change",
+                            path=str(frame_path))]
+        doc = self._captured_document(DocumentSplitTest.DOC, frames=frames)
+        self.assertNotIn("Appendix", doc)
+        self.assertNotIn("hidden-transcript", doc)
+        self.assertNotIn("BEGIN_TRANSCRIPT", doc)
+        self.assertNotIn("hello there", doc)
+        self.assertNotIn('figure class="thumb"', doc)
+        # The citation stays — faded, not gone.
+        self.assertIn('<span class="cite">(Frame 2 @ 30.0s)</span>', doc)
+
+    def test_the_transcript_can_still_be_asked_for(self):
+        import os
+        os.environ["PDF_TRANSCRIPT"] = "hidden"
+        try:
+            doc = self._captured_document(DocumentSplitTest.DOC)
+        finally:
+            os.environ.pop("PDF_TRANSCRIPT", None)
         self.assertIn("hidden-transcript", doc)
         self.assertIn("BEGIN_TRANSCRIPT", doc)
         self.assertNotIn("Appendix C", doc)
+
+    def test_the_legacy_header_is_dropped_and_the_models_title_kept(self):
+        # A document written before 2026-09-13 carries the chapter
+        # placeholder and the video title over the model's own H1. The
+        # sheet prints neither: the model's title is the one that names the
+        # material.
+        old = DocumentSplitTest.DOC.replace(
+            "Body text citing", "# Graphs, Properly\n\nBody text citing")
+        doc = self._captured_document(old)
+        self.assertNotIn("Chapter N", doc)
+        self.assertNotIn("Graph Algorithms", doc)
+        self.assertIn("<title>Graphs, Properly</title>", doc)
+        self.assertEqual(doc.count("<h1>"), 1)
+        # ...and it still heads the page, above the link lines.
+        self.assertLess(doc.index("<h1>"), doc.index("Youtube Link"))
+
+    def test_the_provenance_line_sits_under_the_title(self):
+        doc = self._captured_document(DocumentSplitTest.DOC)
+        self.assertLess(doc.index("<h1>"), doc.index('class="docmeta"'))
+        self.assertLess(doc.index("<h1>"), doc.index('class="source"'))
+
+    def test_a_list_straight_after_a_paragraph_is_a_list(self):
+        doc = self._captured_document(
+            "# T\n\nThree modules:\n1. Signals\n2. Optimization\n")
+        self.assertIn("<ol>", doc)
+
+    def test_a_single_heading_is_never_dropped(self):
+        doc = self._captured_document(DocumentSplitTest.DOC)
+        self.assertNotIn("Chapter N", doc)
+        self.assertIn("<h1>Graph Algorithms</h1>", doc)
+
+    def test_nested_bullets_nest(self):
+        doc = self._captured_document(
+            "# T\n\n* top\n  * second\n    * third\n* top again\n")
+        self.assertEqual(doc.count("<ul>"), 3)
+        self.assertIn("third", doc)
+
+    def test_frame_citations_are_faded_in_every_spelling(self):
+        doc = self._captured_document(
+            "# T\n\nA *(Video 1, Frame 52 @ 0:08:52)* b "
+            "*(Frame 280 @ Video 1 [02:21:00])* c "
+            "*(Video 1, Frames 20\u201326 @ 0:05:25\u20130:05:41)* d "
+            "*(Video 6, [02:51:30])* e (not one) (Video 1 alone).")
+        self.assertEqual(doc.count('class="cite"'), 4)
+        self.assertIn(".cite { opacity: 0.3; }", pdf_export._css())
 
     def test_maths_reaches_the_page_as_an_image(self):
         doc = self._captured_document("# T\n\nRate $R$ bits per second.")
@@ -527,6 +604,14 @@ class MathExtractionTest(unittest.TestCase):
     def test_currency_is_not_mistaken_for_maths(self):
         _, exprs = mathrender.extract("It costs $5 and change $ then.")
         self.assertEqual(exprs, [])
+        # ...but arithmetic that happens to start with a digit is maths.
+        _, exprs = mathrender.extract("Length $4 + 4 - 1 = 7$ samples.")
+        self.assertEqual(len(exprs), 1)
+
+    def test_display_fractions_are_full_size(self):
+        self.assertIn(r"\dfrac{a}{b}", mathrender._prepare(r"\frac{a}{b}", True))
+        self.assertIn(r"\frac{a}{b}", mathrender._prepare(r"\frac{a}{b}", False))
+        self.assertNotIn("dfrac", mathrender._prepare(r"\frac{a}{b}", False))
 
     def test_restore_puts_snippets_back_in_order(self):
         text, exprs = mathrender.extract("a $x$ b $y$")
@@ -539,12 +624,60 @@ class MathExtractionTest(unittest.TestCase):
         out = mathrender.restore(html_body, ['<span class="math-block"></span>'])
         self.assertNotIn("<p>", out)
 
-    def test_aligned_environment_becomes_rows(self):
+    def test_a_top_level_line_break_stacks_but_an_environments_does_not(self):
         rows = mathrender._rows(
-            r"\begin{aligned} a &= b \\[6pt] c &= d \end{aligned}")
-        self.assertEqual(len(rows), 2)
-        self.assertNotIn("&", rows[0])
-        self.assertNotIn("aligned", rows[0])
+            r"a = b \\ \begin{cases} 1 \\ 2 \end{cases} \\[6pt] c")
+        self.assertEqual(len(rows), 3)
+        self.assertIn("\\begin{cases} 1 \\\\ 2 \\end{cases}", rows[1])
+
+    def test_environments_are_cut_out_and_their_cells_split(self):
+        segs = mathrender._segments(
+            r"x = \left( \begin{array}{cc} 1 & 2 \\ 3 & 4 \end{array} \right) y")
+        self.assertEqual([s[0] for s in segs], ["tex", "env", "tex"])
+        _kind, name, spec, body, left, right = segs[1]
+        self.assertEqual((name, spec, left, right), ("array", "cc", "(", ")"))
+        self.assertNotIn("\\left", segs[0][1])
+        self.assertNotIn("\\right", segs[2][1])
+        self.assertEqual(mathrender._split_top_level_amp("1 & 2 \\& 3"),
+                         ["1 ", " 2 \\& 3"])
+
+    def test_nested_environments_close_at_the_right_end(self):
+        found = mathrender._find_env(
+            r"\begin{cases} \begin{cases} a \end{cases} \\ b \end{cases} z")
+        self.assertEqual(found[2], "cases")
+        self.assertTrue(found[3] is None)
+        self.assertEqual(found[4].strip(), r"\begin{cases} a \end{cases} \\ b")
+        self.assertEqual(found[1], len(r"\begin{cases} \begin{cases} a \end{cases} \\ b \end{cases}"))
+
+    @unittest.skipUnless(mathrender.available(), "matplotlib not installed")
+    def test_cases_and_matrices_become_one_image(self):
+        # mathtext has no environments; the composer builds them from cells.
+        # What the page gets is still a single baseline-aligned <img>.
+        for tex in (r"u(t) = \begin{cases} 1, & t > 0 \\ 0, & t < 0 \end{cases}",
+                    r"\mathbf{W} = \begin{bmatrix} 1 & 1 \\ 1 & -j \end{bmatrix}",
+                    r"\begin{aligned} a &= b \\ c &= d \end{aligned}",
+                    r"\begin{pmatrix} \begin{cases} a \\ b \end{cases} \\ 1 \end{pmatrix}"):
+            out = mathrender._one(tex, True, mathrender._engine(), 8.0, "#000")
+            self.assertEqual(out.count("<img"), 1, tex)
+            self.assertNotIn("math-fallback", out, tex)
+            self.assertIn("vertical-align:", out)
+
+    @unittest.skipUnless(mathrender.available(), "matplotlib not installed")
+    def test_the_composite_carries_each_glyph_once(self):
+        box = mathrender._layout(
+            r"\begin{bmatrix} 1 & 1 \\ 1 & 1 \end{bmatrix}",
+            mathrender._engine(), 8.0, "#000")
+        svg = mathrender._svg_document(box).decode()
+        self.assertEqual(svg.count('<path id="'), len(box.defs))
+        self.assertEqual(svg.count("<path d="), 2)   # the two brackets
+        self.assertNotIn('id="figure_1"', svg)
+        self.assertGreater(box.height, 2 * 8.0)      # two rows tall
+        self.assertLess(box.depth, box.height / 2)   # centred on the axis
+
+    def test_an_unknown_environment_falls_back_to_text(self):
+        out = mathrender._one(r"\begin{substack} a \\ b \end{substack}",
+                              False, mathrender._engine(), 8.0, "#000")
+        self.assertIn("math-fallback", out)
 
     def test_digits_go_upright_outside_text_groups(self):
         out = mathrender._upright_digits(r"2 \times 10^8 \text{ 1 Gbps}")
@@ -602,7 +735,7 @@ class FrameSelectionTest(unittest.TestCase):
         import os
         os.environ["PDF_FRAMES"] = "sideways"
         try:
-            self.assertEqual(pdf_export.frames_mode(), "contact")
+            self.assertEqual(pdf_export.frames_mode(), "none")
         finally:
             os.environ.pop("PDF_FRAMES", None)
 
