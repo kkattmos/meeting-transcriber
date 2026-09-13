@@ -33,3 +33,6 @@ seadrive-cli/
 scripts/
 .env*
 !.env.example
+runs/
+.log
+.save
