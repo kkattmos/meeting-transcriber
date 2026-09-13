@@ -126,9 +126,10 @@ when deciding what to put on which disk:
 | `SUMMARIES_DIR` | a summarize run (subscription quota) | Prefer not |
 | `PDF_DIR` | free, from the `.md` + the frames | Yes, *if* the frames still exist |
 
-Frames are the one genuinely disposable set, because the source video always
-outlives them: a recording sits in `RECORDINGS_DIR`, and a YouTube download
-sits in `runs/<run_id>/video.mp4`. Losing frames costs one ffmpeg pass, and
+Frames are the one genuinely disposable set, because the source always
+outlives them: a recording sits in `RECORDINGS_DIR`, and a YouTube/Kaltura
+download can be fetched again. Losing frames costs one ffmpeg pass (plus the
+re-download, since 2026-09-13 — see "The download is swept" below), and
 `runstate.py status` already re-runs the stage when the artifacts are gone.
 
 **Don't put `FRAMES_DIR` on `/tmp` here** — though the reason is durability,
@@ -264,8 +265,8 @@ runs/<run_id>/
                   (state.json's summarize stage also carries `usage`, and
                   `waiting_until` / `rate_limited` while paused on the
                   Claude usage window — see the summarize section)
-  video.mp4       YouTube download, when applicable
-  clip.mp4        the --clip window, cut from video.mp4 / the input
+  video.mp4       YouTube/Kaltura download — deleted once summarize is done
+  clip.mp4        the --clip window, cut from video.mp4 / the input — same lifetime
   kaltura.json    entry facts, cached at fetch time
   parts.json      combine run only: the members' transcripts + manifests, rebuilt per attempt
 ```
@@ -437,6 +438,10 @@ Non-obvious details:
   are the explicit forms.
 - The run's `resources` list is stored in `state.json` and replayed on every
   attempt, so a resume summarizes against the same slides.
+- `fetch_video` and `clip` are also `cleaned` after the summary (the download
+  is deleted — see the Kaltura section). `ensure_video_fetched` and
+  `ensure_video_clipped` treat "done, file gone" as "fetch again", and
+  `media_needed` keeps a finished run from doing so for nothing.
 
 ## Per-stage reference
 
@@ -578,9 +583,50 @@ Non-obvious details:
 Two things that table is worth keeping for: the transcript arrives as 19 cues
 for 89 minutes, so this input type leans hard on
 `chunking.split_long_segments` (the AssemblyAI-Thai problem documented under
-Stage 3), and the 446MB download stays in the run dir after the frames are
-swept — it is the resume's cheap path back to frames, and the disk cost of a
-Kaltura run is therefore the video, not the frames.
+Stage 3), and the 446MB download used to stay in the run dir after the frames
+were swept. Since 2026-09-13 it is swept with them (next section); a resume
+that needs the frames back re-downloads, ~10s here.
+
+### The download is swept after the summary; the recording never is
+
+Settled with the operator 2026-09-13: the box was filling with
+`runs/<id>/video.mp4` from YouTube and Kaltura runs that had long since been
+summarized. `sweep_run_media` in `lib/run_one.sh` deletes `video.*`,
+`clip.mp4` and any `.part` from the run dir right after `cleanup_frames`,
+and a combine run does the same for its members (`cleanup_member_videos`)
+after the combined PDF. The rules:
+
+- **Only files inside the run dir.** A meeting's recording is in
+  `RECORDINGS_DIR` and a local-file input is the operator's own file; neither
+  is ever at these paths, and `sweep_run_media` also returns early on
+  `input_type = meeting` so nobody has to trust the path argument alone.
+- **Whatever happened to the PDF.** `cleanup_frames` keeps the frames when a
+  PDF was asked for and did not render, because re-rendering needs them. It
+  never needs the media, so the video goes regardless.
+- **`KEEP_FRAMES=1` keeps the video too.** The operator chose one switch
+  over a second `KEEP_VIDEO`: it is the "keep what this run used" flag, and
+  the video is what the frames come from.
+- **The stages are marked `cleaned`**, exactly like frames, so
+  `fetch_video` and `clip` stay `done` instead of sliding back to `pending`
+  and making a finished run look half-broken in `--status`.
+- **`ensure_video_fetched` / `ensure_video_clipped` re-fetch on a swept
+  stage.** Both used to return early on `done`; now a `done` stage whose
+  file is gone is reset and run again. That is what makes a `--combine
+  --force` (which re-extracts the members' swept frames) and a `--force` on
+  a finished single run work after the sweep.
+- **`media_needed` guards the ahead-of-branches fetch and cut.** The Kaltura
+  fetch and the non-YouTube clip run *before* the branches, unconditionally
+  until now. With the file gone after every summary, re-invoking a finished
+  run with `--run-id` would have pulled 446MB back for a run with nothing to
+  do. `frames_settled` (frames done, and either the manifest exists or
+  nothing here will summarize — `--skip-summarize`, or summarize already
+  done) is the same test `branch_frames` uses to decide whether to
+  re-extract; before this it re-extracted (and now would re-download) on a
+  finished run too. Both are asserted in `test_pipeline_e2e.sh` ("A finished
+  run re-invoked by --run-id neither downloads nor extracts again", and the
+  Kaltura twin).
+- A failed or paused run keeps its download — the sweep is after
+  `mark_done summarize`, same as the frames.
 
 **An entry that needs a real LMS login fails loudly** — `getPlaybackContext`
 returns no sources, and the error names the partner and entry id. Browser
@@ -1646,6 +1692,17 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   `run_one.sh --skip-summarize` never sweeps, and `pipeline.sh` no longer
   does either.
 - **`--resume-all` must skip runs with `combined_into` set.**
+- **The post-summary media sweep touches only `runs/<id>/video.*` and the
+  clip.** Never `RECORDINGS_DIR`, never the local-file input. A meeting
+  recording is the one irreplaceable artifact; `sweep_run_media` returns
+  early on `input_type = meeting` on top of never being pointed there.
+- **The sweep runs after `mark_done summarize`, never before.** A failed or
+  paused run keeps its download so the resume doesn't pay for it twice.
+- **`ensure_video_fetched` / `ensure_video_clipped` re-fetch a `done` stage
+  whose file is gone**, and the ahead-of-branches calls are behind
+  `media_needed`. Drop the first and every post-sweep re-extraction fails
+  with "no video available"; drop the second and every `--run-id` on a
+  finished Kaltura run downloads the entry again.
 - **Frame numbers come from `assign_numbers()` over the whole manifest, never
   from a per-chunk enumeration.** See the section above: the failure mode is
   silent, survives every unit test that looks at one chunk, and produces a PDF
@@ -1687,7 +1744,7 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document | 171 |
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, real PDF render | 73 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing) | 281 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`) | 314 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps | 119 |
 | `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
 

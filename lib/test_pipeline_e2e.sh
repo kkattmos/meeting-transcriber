@@ -278,6 +278,10 @@ for stage in record transcribe frames summarize; do
 done
 check "meet: fetch_video skipped" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "pending"
 [ -f "$RECORDINGS_DIR/$run.mp4" ] && ok "meet: mp4 written" || bad "meet: no mp4"
+# The recording is the one irreplaceable artifact; the post-summary media
+# sweep only ever touches downloads inside the run dir.
+[ -f "$RECORDINGS_DIR/$run.mp4" ] && ok "meet: recording kept after the summary" \
+  || bad "meet: the recording was swept"
 [ -f "$SUMMARIES_DIR/$run.md" ] && ok "meet: summary written" || bad "meet: no summary"
 [ -f "$PDF_DIR/$run.pdf" ] && ok "meet: pdf written to PDF_DIR" || bad "meet: no pdf"
 
@@ -297,6 +301,8 @@ check "local: name derived from filename" "${run%_*_*}" "my_lecture"
 check "local: record skipped" "$(state status --run-dir "$RUNS/$run" --stage record)" "pending"
 check "local: transcribed" "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "done"
 check "local: summarized" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+[ -f "$TESTROOT/my_lecture.mp4" ] && ok "local: the input file is untouched by the sweep" \
+  || bad "local: the sweep deleted the operator's own file"
 
 echo "--- YouTube URL (the one from the request, with its &list= parameter)"
 YT="https://www.youtube.com/watch?v=5GAfjAjLKYk&list=PLMvKqhmt0Lp8"
@@ -307,6 +313,17 @@ check "youtube: run id is the video id" "${run%_*_*}" "yt_5GAfjAjLKYk"
 check "youtube: record skipped" "$(state status --run-dir "$RUNS/$run" --stage record)" "pending"
 check "youtube: video fetched" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
 check "youtube: summarized" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+# The download is swept once the summary exists — it was only ever there for
+# the frames — and the stage stays done (cleaned) rather than sliding back
+# to pending.
+[ -e "$RUNS/$run/video.mp4" ] && bad "youtube: video.mp4 kept after the summary" \
+  || ok "youtube: video.mp4 swept after the summary"
+check "youtube: fetch_video still done after the sweep" \
+  "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
+check "youtube: fetch_video marked cleaned" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.fetch_video.cleaned)" "True"
+echo "$out" | grep -q "\[video\] removed the downloaded media" \
+  && ok "youtube: the sweep is reported" || bad "youtube: sweep not reported"
 echo "$out" | grep -q -- "--no-playlist" && ok "youtube: &list= did not expand" || ok "youtube: &list= did not expand (single run)"
 
 echo "--- Kaltura embed, pasted as the whole <iframe> tag"
@@ -344,6 +361,10 @@ grep -q "Stub Kaltura Lecture" "$STUB_SUMMARIZE_ARGS" \
   && ok "kaltura: the title is the entry's own name" || bad "kaltura: wrong title"
 [ -f "$RUNS/$run/kaltura.json" ] \
   && ok "kaltura: entry facts cached in the run dir" || bad "kaltura: no kaltura.json"
+[ -e "$RUNS/$run/video.mp4" ] && bad "kaltura: video.mp4 kept after the summary" \
+  || ok "kaltura: video.mp4 swept after the summary"
+check "kaltura: fetch_video still done after the sweep" \
+  "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
 
 echo "--- Kaltura embed, given as just the src URL"
 KAL_URL="https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/52668182?iframeembed=true&entry_id=1_y9jay9sw"
@@ -378,6 +399,17 @@ rm -f "$STUB_FAIL_KALTURA"
 out=$(pipeline --run-id "$run" 2>&1)
 check "kaltura resume: exits 0" "$?" "0"
 check "kaltura resume: completes" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+
+echo "--- A finished Kaltura run re-invoked by --run-id does not download again"
+# The ahead-of-branches fetch used to run unconditionally; with the download
+# swept after the summary that would pull 446MB back for a run with nothing
+# left to do.
+out=$(pipeline --run-id "$run" 2>&1)
+check "kaltura finished: exits 0" "$?" "0"
+echo "$out" | grep -q "downloading again" && bad "kaltura finished: re-downloaded the entry" \
+  || ok "kaltura finished: no re-download"
+[ -e "$RUNS/$run/video.mp4" ] && bad "kaltura finished: a video.mp4 reappeared" \
+  || ok "kaltura finished: run dir still has no video"
 
 echo "--- Unrecognized input"
 out=$(pipeline "not-a-real-thing" 2>&1); rc=$?
@@ -461,6 +493,13 @@ for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
   done
 done
 check "multi: members' frames swept after the combined render" "$leftover" "0"
+leftover=0
+for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
+  for f in "$RUNS/yt_${vid}_"*/video.mp4; do
+    [ -e "$f" ] && leftover=$((leftover + 1))
+  done
+done
+check "multi: members' downloads swept after the combined render" "$leftover" "0"
 
 echo "--- Re-running the same command resumes the combined summary, not a new one"
 : > "$STUB_SUMMARIZE_ARGS"
@@ -483,6 +522,16 @@ grep -q "^--parts$" "$STUB_SUMMARIZE_ARGS" && ok "combine --force: summarized ag
   || bad "combine --force: summarize did not run"
 echo "$out" | grep -q "frames were swept" && ok "combine --force: re-extracted the swept frames" \
   || bad "combine --force: did not notice the swept frames"
+echo "$out" | grep -q "\[fetch_video\] swept after the last summary" \
+  && ok "combine --force: fetched the swept downloads again" \
+  || bad "combine --force: did not re-download for the re-extraction"
+leftover=0
+for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
+  for f in "$RUNS/yt_${vid}_"*/video.mp4; do
+    [ -e "$f" ] && leftover=$((leftover + 1))
+  done
+done
+check "combine --force: the re-fetched downloads are swept again" "$leftover" "0"
 
 echo "--- A failed member blocks the combined summary, and the same command resumes both"
 touch "$STUB_FAIL_TRANSCRIBE"
@@ -563,6 +612,16 @@ check "keep-frames: exits 0" "$?" "0"
 kept=0
 for d in "$FRAMES_DIR/yt_ggggggggggg_"*; do [ -d "$d" ] && kept=1; done
 check "keep-frames: frames kept" "$kept" "1"
+kept=0
+for f in "$RUNS/yt_ggggggggggg_"*/video.mp4; do [ -e "$f" ] && kept=1; done
+check "keep-frames: the download is kept too" "$kept" "1"
+
+echo "--- KEEP_FRAMES=1 keeps a single run's download as well"
+out=$(KEEP_FRAMES=1 pipeline "https://youtu.be/keepvideo01" 2>&1)
+check "keep-video: exits 0" "$?" "0"
+run=$(latest_run)
+[ -f "$RUNS/$run/video.mp4" ] && ok "keep-video: video.mp4 kept" || bad "keep-video: video.mp4 swept"
+[ -d "$FRAMES_DIR/$run" ] && ok "keep-video: frames kept" || bad "keep-video: frames swept"
 
 echo "--- --combine refuses the resume-only forms"
 out=$(pipeline --resume-last --combine "$TESTROOT/x.md" 2>&1)
@@ -610,6 +669,8 @@ run=$(latest_run)
 check "resume: transcribe survived" "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "done"
 check "resume: frames survived" "$(state status --run-dir "$RUNS/$run" --stage frames)" "done"
 check "resume: summarize marked failed" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "failed"
+[ -f "$RUNS/$run/video.mp4" ] && ok "resume: the download survived the failure" \
+  || bad "resume: the download was swept before the summary existed"
 state show --run-dir "$RUNS/$run" | grep -q "error:" && ok "resume: error recorded in state" || bad "resume: no error recorded"
 
 echo "--- Re-running the same command resumes instead of starting over"
@@ -623,6 +684,17 @@ echo "$out" | grep -q "\[frames\] already done" && ok "resume: skipped frames" |
 check "resume: summarize now done" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
 check "resume: transcribe attempted once only" \
   "$(state get --run-dir "$RUNS/$run" --key stages.transcribe.attempts)" "1"
+[ -e "$RUNS/$run/video.mp4" ] && bad "resume: the download outlived the summary" \
+  || ok "resume: the download swept once the summary existed"
+
+echo "--- A finished run re-invoked by --run-id neither downloads nor extracts again"
+out=$(pipeline --run-id "$run" 2>&1)
+check "finished: exits 0" "$?" "0"
+echo "$out" | grep -q "downloading again" && bad "finished: re-downloaded" || ok "finished: no re-download"
+echo "$out" | grep -q "extracting them again" && bad "finished: re-extracted frames" \
+  || ok "finished: no re-extraction"
+check "finished: fetch_video attempted once only" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.fetch_video.attempts)" "1"
 
 echo "--- Deleting an artifact makes that stage run again"
 rm -f "$TRANSCRIPTS_DIR/$run.txt"
@@ -635,6 +707,10 @@ check "force: exits 0" "$?" "0"
 check "force: transcribe re-run (attempts reset to 1)" \
   "$(state get --run-dir "$RUNS/$run" --key stages.transcribe.attempts)" "1"
 echo "$out" | grep -q "discarding previous stage results" && ok "force: announced" || bad "force: not announced"
+check "force: the swept download was fetched again" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.fetch_video.attempts)" "1"
+[ -e "$RUNS/$run/video.mp4" ] && bad "force: the re-fetched download was not swept" \
+  || ok "force: the re-fetched download was swept after the summary"
 
 echo "--- A completed run is not resumed; a fresh one starts"
 out=$(pipeline "$LECTURE" 2>&1)
@@ -952,7 +1028,13 @@ case "$run" in
   *_c000500-013000_*) ok "clip/yt: window is in the run id" ;;
   *) bad "clip/yt: run id carries no window: $run" ;;
 esac
-[ -f "$RUNS/$run/clip.mp4" ] && ok "clip/yt: clip.mp4 written" || bad "clip/yt: no clip.mp4"
+# The clip is derived data with the download's lifetime: written (mark_done
+# refuses a missing artifact, so `clip done` proves it existed) and then swept
+# with the download once the summary is out.
+[ -f "$RUNS/$run/clip.mp4" ] && bad "clip/yt: clip.mp4 kept after the summary" \
+  || ok "clip/yt: clip.mp4 swept after the summary"
+check "clip/yt: clip stage marked cleaned" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.clip.cleaned)" "True"
 [ -f "$RUNS/$run/clip.part.mp4" ] && bad "clip/yt: left a .part behind" \
   || ok "clip/yt: no .part left behind"
 grep -qx -- "-ss" "$STUB_FFMPEG_ARGS" && ok "clip/yt: ffmpeg seeked" \
@@ -1068,6 +1150,21 @@ out=$(pipeline --run-id "$run" 2>&1)
 check "clip: the resume exits 0" "$?" "0"
 check "clip: the cut succeeded on the resume" \
   "$(state status --run-dir "$RUNS/$run" --stage clip)" "done"
+
+echo "--- A swept clip is cut again when a resume needs the frames back"
+# Simulates a summary that has to be redone after the sweep: reset summarize
+# and frames, keep fetch_video and clip at their swept `done`.
+state reset --run-dir "$RUNS/$run" --stage summarize
+state reset --run-dir "$RUNS/$run" --stage frames
+out=$(pipeline --run-id "$run" 2>&1)
+check "clip re-cut: exits 0" "$?" "0"
+echo "$out" | grep -q "\[fetch_video\] swept after the last summary" \
+  && ok "clip re-cut: download fetched again" || bad "clip re-cut: no re-download"
+echo "$out" | grep -q "\[clip\] swept after the last summary" \
+  && ok "clip re-cut: window cut again" || bad "clip re-cut: clip not re-cut"
+grep -qx -- "-ss" "$STUB_FFMPEG_ARGS" && ok "clip re-cut: ffmpeg ran" || bad "clip re-cut: ffmpeg did not run"
+check "clip re-cut: summarized again" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+[ -e "$RUNS/$run/clip.mp4" ] && bad "clip re-cut: clip kept afterwards" || ok "clip re-cut: clip swept again"
 
 echo "--- Without --clip nothing changes"
 rm -f "$STUB_FFMPEG_ARGS"

@@ -106,9 +106,11 @@ $SUMMARIES_DIR/<run_id>.md              the deliverable
 $PDF_DIR/<run_id>.pdf                   the readable deliverable
 
 $MEETING_BOT_ROOT/                      the pipeline's own bookkeeping
-├── runs/<run_id>/                       state.json, logs/, kill, admitted, record.pid
+├── runs/<run_id>/                       state.json, logs/, kill, admitted, record.pid,
+│                                        and the YouTube/Kaltura download while the run
+│                                        is in progress (deleted once it is summarized)
 ├── state/keycursor.json                 API-key rotation cursor
-├── tmp/                                 YouTube downloads, audio demuxes
+├── tmp/                                 claude CLI scratch cwd + cached system prompts
 ├── resources/                           cached slide repos + rendered slides
 └── chrome-profile/                      persistent Google/Zoom login
 ```
@@ -396,9 +398,10 @@ re-summarizes — re-extracting any member frames that were swept first.
 `--resume-all` leaves combine members alone and resumes their combine run
 instead.
 
-The combine run sweeps the members' frames once the combined PDF is written,
-under the same rules as a single run (`KEEP_FRAMES=1` keeps them; a PDF that
-was asked for and did not render keeps them too).
+The combine run sweeps the members' frames and their downloads once the
+combined PDF is written, under the same rules as a single run
+(`KEEP_FRAMES=1` keeps them; a PDF that was asked for and did not render
+keeps the frames too).
 
 ### Options
 
@@ -654,7 +657,26 @@ Two details worth knowing:
   transcript and frames are kept, and only summarize re-runs. See
   [Watch your subscription's usage window](#the-usage-window) below.
 
-Old run directories (which hold YouTube downloads) can be swept:
+### What is kept, and what is deleted after the summary
+
+A YouTube or Kaltura video is downloaded into `runs/<run_id>/` only so that
+frames can be extracted from it (and, for Kaltura, so AssemblyAI has a file
+to transcribe). **Once the summary is written, that download — and the
+`--clip` window cut from it — is deleted.** The frames are swept at the same
+point. A meeting recording is different: it is the one thing that cannot be
+regenerated, so `$RECORDINGS_DIR/<run_id>.mp4` is never touched, and a
+local file you pass as input is never touched either.
+
+- A run that failed or is `PAUSED` keeps its download, so the resume does
+  not pay for it again.
+- If a finished run ever needs its frames back (`--force`, or a `--combine`
+  `--force` over members whose frames are gone), the video is downloaded
+  again first — `--status` shows `fetch_video` as done with its artifacts
+  "deleted after use" in the meantime, not as failed.
+- `KEEP_FRAMES=1` keeps both the frames and the download.
+
+Old run directories (which still hold the download of a run that never
+finished, or one run with `KEEP_FRAMES=1`) can be swept:
 
 ```bash
 python3 lib/runstate.py sweep --days 30

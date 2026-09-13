@@ -348,6 +348,52 @@ cleanup_member_frames() {
   echo "[frames] members' frames removed (KEEP_FRAMES=1 to keep them)"
 }
 
+# The members' downloads, swept with their frames: a member never summarizes
+# on its own, so the combined summary is the last thing that reads them.
+cleanup_member_videos() {
+  local member
+  for member in "${MEMBERS[@]}"; do
+    [ -n "$member" ] || continue
+    sweep_run_media "$RUNS_DIR/$member"
+  done
+}
+
+# Remove the media a run downloaded or cut into its own run dir — the
+# YouTube/Kaltura `video.*` and the `--clip` window — once nothing will read
+# it again. Only ever files *inside* the run dir: a meeting recording lives in
+# RECORDINGS_DIR and is the one irreplaceable artifact, and a local-file input
+# is the operator's own file. Neither is ever touched here, whatever the
+# input type says, because neither is ever at these paths.
+#
+# The stages that produced the files are marked `cleaned` so runstate keeps
+# reporting them done; ensure_video_fetched / ensure_video_clipped notice the
+# missing file and fetch again if a resume ever needs the media back.
+#
+# KEEP_FRAMES=1 keeps the video too — it is the "keep everything this run
+# used" switch, and the video is what the frames come from.
+sweep_run_media() {
+  local dir="$1"
+  case "$(printf '%s' "${KEEP_FRAMES:-0}" | tr 'A-Z' 'a-z')" in
+    1|true|yes|on) return 0 ;;
+  esac
+  [ -n "$dir" ] && [ -d "$dir" ] && [ -f "$dir/state.json" ] || return 0
+  local input_type
+  input_type="$(rs get --run-dir "$dir" --key input_type 2>/dev/null || true)"
+  [ "$input_type" = "meeting" ] && return 0
+  local f removed=0
+  for f in "$dir"/video.* "$dir/clip.mp4" "$dir/clip.part.mp4"; do
+    [ -f "$f" ] || continue
+    rm -f "$f"
+    removed=$((removed + 1))
+  done
+  # Idempotent on a stage that isn't done: `cleaned` is a no-op there.
+  rs cleaned --run-dir "$dir" --stage fetch_video || true
+  rs cleaned --run-dir "$dir" --stage clip || true
+  [ "$removed" -gt 0 ] \
+    && echo "[video] removed the downloaded media in $dir (KEEP_FRAMES=1 to keep it)"
+  return 0
+}
+
 run_combine() {
   local member member_dir
   echo "=================================================================="
@@ -421,6 +467,7 @@ run_combine() {
   fi
   mark_done summarize "${artifacts[@]}" || return 1
   cleanup_member_frames
+  cleanup_member_videos
 
   echo ""
   echo "=================================================================="
@@ -464,8 +511,8 @@ do_fetch_video() {
     return $?
   fi
   # Downloads to the run dir rather than a tempdir: on a resume, frames can be
-  # re-extracted without paying for the download again, and the sweep in
-  # runstate.py reclaims the space later.
+  # re-extracted without paying for the download again. The file is swept
+  # once the summary exists (sweep_run_media), not before.
   if ! command -v yt-dlp >/dev/null 2>&1; then
     echo "yt-dlp is not installed. Run ./setup.sh first." >&2
     return 1
@@ -616,8 +663,15 @@ fi
 # inside the frames branch (youtube) can't download twice.
 ensure_video_fetched() {
   if [ "$(stage_status fetch_video)" = "done" ]; then
-    echo "[fetch_video] already done — skipping"
-    return 0
+    # A done stage with no file was swept after a summary (sweep_run_media).
+    # The callers only get here when something downstream needs the media
+    # again, so fetch it again rather than failing two stages later.
+    if [ -n "$(ls -1 "$RUN_DIR"/video.* 2>/dev/null | grep -v '\.part$' | head -n 1)" ]; then
+      echo "[fetch_video] already done — skipping"
+      return 0
+    fi
+    echo "[fetch_video] swept after the last summary — downloading again"
+    rs reset --run-dir "$RUN_DIR" --stage fetch_video
   fi
   run_stage fetch_video do_fetch_video || return 1
   local got
@@ -642,8 +696,14 @@ ensure_video_fetched() {
 ensure_video_clipped() {
   [ -n "$CLIP" ] || return 0
   if [ "$(stage_status clip)" = "done" ]; then
-    echo "[clip] already done — skipping"
-    return 0
+    if [ -f "$CLIP_FILE" ]; then
+      echo "[clip] already done — skipping"
+      return 0
+    fi
+    # Swept with the download after a summary; same reasoning as
+    # ensure_video_fetched.
+    echo "[clip] swept after the last summary — cutting it again"
+    rs reset --run-dir "$RUN_DIR" --stage clip
   fi
   resolve_source_video
   if [ -z "${VIDEO_FILE:-}" ] || [ ! -f "$VIDEO_FILE" ]; then
@@ -681,15 +741,31 @@ branch_transcribe() {
   mark_done transcribe "txt=${TRANSCRIPT_BASE}.txt" "srt=${TRANSCRIPT_BASE}.srt"
 }
 
+# A finished frames stage whose manifest is gone was swept on purpose after
+# a summary (cleanup_frames below, or a combine run's). If nothing here is
+# going to summarize — a --combine member, or a run whose summary already
+# exists — that is fine and the stage stays done: mark_done would otherwise
+# refuse the missing manifest and fail a run that has nothing left to do.
+# Only when this run IS about to summarize are the frames needed again.
+frames_settled() {
+  [ "$(stage_status frames)" = "done" ] || return 1
+  [ -f "$RUN_FRAMES_DIR/manifest.json" ] && return 0
+  [ "$SKIP_SUMMARIZE" -eq 1 ] && return 0
+  [ "$(stage_status summarize)" = "done" ] && return 0
+  return 1
+}
+
+# Whether any stage still to run reads this run's media. The download and the
+# clip are swept after the summary, so the ahead-of-branches fetch/cut below
+# must not fetch a video back just to find both branches already done.
+media_needed() {
+  [ "$(stage_status transcribe)" = "done" ] && frames_settled && return 1
+  return 0
+}
+
 branch_frames() {
-  # A finished frames stage whose manifest is gone was swept on purpose after
-  # a summary (cleanup_frames below, or a combine run's). If nothing here is
-  # going to summarize, that is fine and the stage stays done — mark_done
-  # would otherwise refuse the missing manifest and fail a run that has
-  # nothing left to do. If this run IS about to summarize, the frames are
-  # needed again, and re-extracting them is cheap (the video outlives them).
   if [ "$(stage_status frames)" = "done" ]; then
-    if [ -f "$RUN_FRAMES_DIR/manifest.json" ] || [ "$SKIP_SUMMARIZE" -eq 1 ]; then
+    if frames_settled; then
       echo "[frames] already done — skipping"
       return 0
     fi
@@ -716,7 +792,7 @@ branch_frames() {
 # Kaltura's transcribe branch needs the media file (the entry usually has no
 # captions), so the download can't sit inside the frames branch the way
 # YouTube's does — it runs here, ahead of both.
-if [ "$INPUT_TYPE" = "kaltura" ]; then
+if [ "$INPUT_TYPE" = "kaltura" ] && media_needed; then
   echo ""
   echo "==> Fetching the Kaltura entry before transcribe and frames"
   if ! ensure_video_fetched; then
@@ -733,7 +809,7 @@ fi
 # comes from captions and never opens the media at all, so making transcription
 # wait for a download and an ffmpeg pass would serialize two stages that have
 # nothing to say to each other.
-if [ -n "$CLIP" ] && [ "$INPUT_TYPE" != "youtube" ]; then
+if [ -n "$CLIP" ] && [ "$INPUT_TYPE" != "youtube" ] && media_needed; then
   echo ""
   if ! ensure_video_clipped; then
     echo "    Resume with:  ./pipeline.sh --run-id $RUN_ID" >&2
@@ -761,11 +837,11 @@ if [ "$RC_T" -ne 0 ] || [ "$RC_F" -ne 0 ]; then
   exit 1
 fi
 
-# Frames are the one artifact set that is free to regenerate: the source video
-# always outlives them (a recording in RECORDINGS_DIR, a YouTube download in
-# runs/<id>/video.mp4), and nothing downstream reads them once the PDF exists —
-# WeasyPrint embeds the image bytes into the file itself. They are also the
-# bulkiest thing a run leaves behind, so they are swept by default.
+# Frames are free to regenerate — one ffmpeg pass over the source (a recording
+# in RECORDINGS_DIR, or a download fetched again by ensure_video_fetched) —
+# and nothing downstream reads them once the PDF exists: WeasyPrint embeds
+# the image bytes into the file itself. So they are swept by default, and the
+# download they came from goes with them (sweep_run_media, below the call).
 #
 # Timing is the whole point: this runs *after* the PDF has rendered, never
 # before. If a PDF was asked for and isn't there, the render failed, and the
@@ -844,8 +920,12 @@ fi
 mark_done summarize "${SUMMARY_ARTIFACTS[@]}" || exit 1
 
 # Only ever after summarize is recorded as done — a run that dies here has to
-# stay resumable against the frames it already paid for.
+# stay resumable against the frames and the download it already paid for.
 cleanup_frames
+# The video goes whatever happened to the PDF: re-rendering one needs the
+# frames (kept above in that case), never the media. A meeting's recording is
+# not in the run dir and is not touched.
+sweep_run_media "$RUN_DIR"
 
 echo ""
 echo "=================================================================="
