@@ -99,9 +99,19 @@ apt-get install -y --no-install-recommends \
   libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b libffi-dev \
   fonts-thai-tlwg fonts-liberation fonts-noto-core fonts-cmu
 
-# fonts-cmu is CMU Serif — Computer Modern, the PDF's body face and the face
-# mathtext already sets the maths in (see summarize/pdf.py). fonts-noto-core
-# carries Noto Serif Thai, the Thai fallback behind it.
+# fonts-cmu is CMU Serif — Computer Modern, the PDF's body face for English
+# summaries and the face mathtext sets the maths in (see summarize/pdf.py).
+# fonts-noto-core carries Noto Serif Thai, the last-resort Thai fallback.
+
+# Bai Jamjuree and Sarabun — the PDF's body faces for Thai summaries
+# (SUMMARY_LANGUAGE=th) — are not in Debian's archive. They are OFL Google
+# Fonts, vendored under fonts/ (four styles each, with their licences) so
+# this step needs no network. fontconfig picks them up from
+# /usr/local/share/fonts, which is where WeasyPrint looks too.
+echo "==> Installing the vendored Thai PDF fonts (Bai Jamjuree, Sarabun)"
+install -d /usr/local/share/fonts/meeting-bot
+install -m 0644 "$SCRIPT_DIR"/fonts/*/*.ttf /usr/local/share/fonts/meeting-bot/
+fc-cache -f >/dev/null
 
 # Thai locale: Chrome is driven with locale th-TH so Thai participant names
 # render instead of boxes. See CLAUDE.md — this is deliberate, not cosmetic.

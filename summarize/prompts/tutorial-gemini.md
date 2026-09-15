@@ -85,9 +85,7 @@ content section.
    flags, and proper nouns. Infer the intended term from context and write it
    correctly. Where the frames show the real spelling of a command or
    identifier, the frames win over the transcript.
-7. **Language**: Write the guide in English even when the transcript is in
-   another language, but keep proper nouns, product names, commands, and
-   on-screen identifiers verbatim.
+7. **Language**: {language_rule}
 8. **Timestamp format**: `[mm:ss]` under 60 minutes, `[h:mm:ss]` consistently
    for anything longer.
 9. **Empty sections**: Omit a section with no applicable content entirely,

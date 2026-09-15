@@ -827,5 +827,109 @@ class BlankFrameTest(unittest.TestCase):
         self.assertEqual(list(prepared), [2])
 
 
+class BodyFontByLanguageTest(unittest.TestCase):
+    """The body face follows the language the summary was written in.
+
+    Thai gets Bai Jamjuree with Sarabun behind it (both vendored under
+    fonts/, neither in Debian's archive); English keeps CMU Serif, the face
+    the maths is set in. PDF_FONT_FAMILY overrides both. The language comes
+    from the document's own provenance first, so a Thai sheet re-rendered on
+    a box that has since been switched to English keeps its face.
+    """
+
+    def setUp(self):
+        import os
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        for key in ("PDF_FONT_FAMILY", "SUMMARY_LANGUAGE"):
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def _first(self, stack_css):
+        return stack_css.split(",")[0].strip().strip('"')
+
+    def test_thai_leads_with_bai_jamjuree_then_sarabun(self):
+        stack = pdf_export._font_stack("th")
+        names = [p.strip().strip('"') for p in stack.split(",")]
+        self.assertEqual(names[:2], ["Bai Jamjuree", "Sarabun"])
+        self.assertIn("Noto Serif Thai", names)
+
+    def test_english_keeps_computer_modern(self):
+        self.assertEqual(self._first(pdf_export._font_stack("en")), "CMU Serif")
+        # And a Thai face stays behind it: a Thai proper noun in an English
+        # summary must not render as tofu.
+        self.assertIn("Noto Serif Thai", pdf_export._font_stack("en"))
+
+    def test_the_default_language_is_thai(self):
+        self.assertEqual(self._first(pdf_export._font_stack()), "Bai Jamjuree")
+
+    def test_summary_language_env_picks_the_stack(self):
+        import os
+        os.environ["SUMMARY_LANGUAGE"] = "en"
+        self.assertEqual(self._first(pdf_export._font_stack()), "CMU Serif")
+        os.environ["SUMMARY_LANGUAGE"] = "Thai"
+        self.assertEqual(self._first(pdf_export._font_stack()), "Bai Jamjuree")
+
+    def test_pdf_font_family_overrides_both_languages(self):
+        import os
+        os.environ["PDF_FONT_FAMILY"] = "Sarabun, Noto Sans Thai, sans-serif"
+        for lang in ("th", "en"):
+            self.assertEqual(pdf_export._font_stack(lang),
+                             "Sarabun, \"Noto Sans Thai\", sans-serif")
+
+    def test_provenance_wins_over_the_environment(self):
+        import os
+        os.environ["SUMMARY_LANGUAGE"] = "en"
+        self.assertEqual(pdf_export._document_language({"language": "th"}), "th")
+        self.assertEqual(pdf_export._document_language({}), "en")
+        self.assertEqual(pdf_export._document_language(None), "en")
+
+    def test_an_unknown_language_never_fails_the_render(self):
+        import io
+        import os
+        os.environ["SUMMARY_LANGUAGE"] = "klingon"
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(pdf_export._document_language({}), "th")
+        self.assertIn("klingon", err.getvalue())
+
+    def test_css_uses_the_language_stack_for_body_and_footer(self):
+        css = pdf_export._css("th")
+        self.assertEqual(css.count('"Bai Jamjuree", Sarabun'), 2)
+        self.assertNotIn('"Bai Jamjuree"', pdf_export._css("en"))
+        # The maths fallback face stays Computer Modern in both.
+        for lang in ("th", "en"):
+            self.assertIn('.math-fallback { font-family: "CMU Serif"',
+                          pdf_export._css(lang))
+
+    @unittest.skipUnless(HAVE_RENDERER, "weasyprint/markdown not installed")
+    def test_render_reads_the_language_from_the_provenance_comment(self):
+        import os
+        import tempfile
+        captured = {}
+
+        class FakeHTML:
+            def __init__(self, string=None, base_url=None):
+                pass
+
+            def write_pdf(self, path, stylesheets=None):
+                Path(path).write_bytes(b"%PDF-1.7 stub")
+
+        class FakeCSS:
+            def __init__(self, string=None):
+                captured["css"] = string
+
+        os.environ["SUMMARY_LANGUAGE"] = "en"
+        doc = ("<!-- meeting-transcriber\n     source: x\n     language: th\n"
+               "-->\n# หัวข้อ\n\nเนื้อหา\n")
+        import weasyprint
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(weasyprint, "HTML", FakeHTML), \
+             mock.patch.object(weasyprint, "CSS", FakeCSS):
+            pdf_export.render(doc, Path(tmp) / "out.pdf")
+        self.assertIn('"Bai Jamjuree", Sarabun', captured["css"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -62,7 +62,7 @@ content section.
 4. **Conflict Handling**: If on-screen code/UI contradicts the presenter's verbal description (e.g., a typo they don't notice, or a flag they misname aloud), note the discrepancy directly rather than silently picking one version.
 5. **Uncertainty Markers**: If audio is unclear or inaudible, write `[inaudible]`. If a frame is illegible or too low-resolution to read confidently, write `[frame illegible]` rather than inventing its content.
 6. **Transcription Noise**: These transcripts come from automatic speech recognition and contain misrecognized words, especially technical terms, flags, and proper nouns. Infer the intended term from context and write it correctly (a garbled rendering of "REST API" should appear as **REST API**). Do not reproduce obvious ASR garbage verbatim. Where the frames show the real spelling of a command or identifier, the frames win over the transcript.
-7. **Language**: Write the guide in English even when the transcript is in another language, but keep proper nouns, product names, commands, and on-screen identifiers verbatim.
+7. **Language**: {language_rule}
 8. **Timestamp Format**: Use `[mm:ss]` for videos under 60 minutes. For videos 60 minutes or longer, switch to `[h:mm:ss]` consistently across the entire document.
 9. **Empty Section Handling**: Omit a section with no applicable content entirely, keeping the numbering contiguous — do not emit a heading with `None` under it.
 

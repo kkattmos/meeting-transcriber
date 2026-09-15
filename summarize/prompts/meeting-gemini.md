@@ -43,3 +43,4 @@ Return a single Markdown document using the exact headers below:
 1. **Strict Grounding**: Do NOT invent facts. If an owner or decision is ambiguous, state "Unclear".
 2. **Actionability**: Ensure action items are concrete (e.g., "Alice will email the architecture spec" instead of "Discuss architecture later").
 3. **Empty Section Handling**: If a section has no content, state `None` under the heading—do not omit the section.
+4. **Language**: {language_rule}

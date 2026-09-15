@@ -28,7 +28,7 @@ Rules:
   prompt asked for).
 - Preserve the level of detail. This is a merge, not a further summarization —
   do not compress the partials into something shorter than they collectively are.
-- Write in the same language as the partial summaries.
+- {language_rule}
 
 Partial summaries, in order:
 

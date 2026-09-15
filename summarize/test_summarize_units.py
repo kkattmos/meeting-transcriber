@@ -2068,5 +2068,121 @@ class GeminiModelChainTest(unittest.TestCase):
             "model")
 
 
+class OutputLanguageTest(unittest.TestCase):
+    """SUMMARY_LANGUAGE decides what the prompts tell the model to write in.
+
+    Every shipped template carries a {language_rule} placeholder that
+    load_prompt_template (and the merge loader) fills before the template is
+    sent anywhere. The placeholder sits in the cacheable static half on
+    purpose: the setting is per box, so the content-addressed system prompt
+    file changes once when it is flipped and then stays put.
+    """
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+    SHIPPED = ["lecture-claude.md", "lecture-gemini.md",
+               "tutorial-claude.md", "tutorial-gemini.md",
+               "meeting-claude.md", "meeting-gemini.md", "_merge.md"]
+
+    def setUp(self):
+        import language
+        self.language = language
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop("SUMMARY_LANGUAGE", None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_the_default_is_thai(self):
+        self.assertEqual(self.language.output_language(), "th")
+        self.assertEqual(self.language.language_name(), "Thai")
+
+    def test_english_is_the_switch(self):
+        os.environ["SUMMARY_LANGUAGE"] = "en"
+        self.assertEqual(self.language.output_language(), "en")
+        self.assertIn("in English", self.language.language_rule())
+
+    def test_reasonable_spellings_are_accepted(self):
+        for raw, code in (("Thai", "th"), ("th-TH", "th"), (" EN ", "en"),
+                          ("english", "en"), ("", "th"), ("ไทย", "th")):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.language.normalize(raw), code)
+
+    def test_an_unknown_language_is_an_error_not_a_guess(self):
+        os.environ["SUMMARY_LANGUAGE"] = "fr"
+        with self.assertRaises(self.language.UnknownLanguage) as cm:
+            self.language.output_language()
+        self.assertIn("SUMMARY_LANGUAGE='fr'", str(cm.exception))
+
+    def test_the_thai_rule_asks_for_terms_in_parentheses(self):
+        rule = self.language.language_rule("th")
+        self.assertIn("Thai", rule)
+        self.assertIn("English term in parentheses", rule)
+        # Code and maths are never translated, whatever the language.
+        for code in ("th", "en"):
+            self.assertIn("mathematical notation", self.language.language_rule(code))
+
+    def test_apply_fills_the_placeholder_and_leaves_other_templates_alone(self):
+        self.assertEqual(self.language.apply("a {language_rule} b", "en"),
+                         "a " + self.language.language_rule("en") + " b")
+        untouched = "No placeholder here {transcript}"
+        self.assertEqual(self.language.apply(untouched), untouched)
+
+    def test_every_shipped_template_carries_the_placeholder(self):
+        for name in self.SHIPPED:
+            with self.subTest(prompt=name):
+                text = (self.PROMPTS_DIR / name).read_text()
+                self.assertEqual(text.count(self.language.PLACEHOLDER), 1)
+
+    def test_load_prompt_template_fills_it_for_every_template(self):
+        import summarize as summarize_main
+        for name in self.SHIPPED:
+            if name.startswith("_"):
+                continue
+            for code, needle in (("th", "Thai (ภาษาไทย)"), ("en", "in English")):
+                os.environ["SUMMARY_LANGUAGE"] = code
+                with self.subTest(prompt=name, language=code):
+                    template = summarize_main.load_prompt_template(
+                        self.PROMPTS_DIR / name)
+                    self.assertNotIn("{language_rule}", template)
+                    self.assertIn(needle, template)
+                    # The template still has to survive .format(); a stray
+                    # brace in the rule text would raise here.
+                    template.format(transcript="t", frame_manifest="m")
+
+    def test_the_merge_prompt_is_told_the_language_too(self):
+        os.environ["SUMMARY_LANGUAGE"] = "en"
+        from mapreduce import load_merge_template, _default_merge_template
+        self.assertIn("in English", load_merge_template())
+        self.assertNotIn("{language_rule}", load_merge_template())
+        # The in-code fallback for a missing _merge.md carries it as well.
+        self.assertIn("{language_rule}", _default_merge_template())
+
+    def test_the_rule_lands_in_the_cacheable_half(self):
+        # Two runs on the same setting must produce the same static prompt
+        # (same bytes, same content-addressed file); flipping the setting
+        # produces a different one; and the dynamic half never changes.
+        import summarize as summarize_main
+        halves = {}
+        for code in ("th", "en"):
+            os.environ["SUMMARY_LANGUAGE"] = code
+            template = summarize_main.load_prompt_template(
+                self.PROMPTS_DIR / "lecture-claude.md")
+            halves[code] = llm_client.split_static_prompt(template)
+        self.assertIn("Thai (ภาษาไทย)", halves["th"][0])
+        self.assertIn("in English", halves["en"][0])
+        self.assertNotEqual(halves["th"][0], halves["en"][0])
+        self.assertEqual(halves["th"][1], halves["en"][1])
+
+    def test_the_document_records_its_language(self):
+        doc = document.build_document(
+            "# T\n\nbody", source="https://youtu.be/x", source_kind="youtube",
+            language="th")
+        self.assertIn("     language: th\n", doc)
+        # The wrapper's own labels stay in English whatever the language.
+        self.assertIn("Youtube Link:", doc)
+        self.assertIn("View Transcript", doc)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

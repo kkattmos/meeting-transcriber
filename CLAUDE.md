@@ -640,10 +640,11 @@ page* URL rather than the iframe src.
 
 ### Stage 3 — Summarize (`summarize/`)
 
-Split across seven modules:
+Split across eight modules:
 
 - `summarize.py` — entry point and orchestration.
 - `llm_client.py` — backend dispatch + the fallback chain.
+- `language.py` — `SUMMARY_LANGUAGE` and the `{language_rule}` the prompts carry.
 - `retry.py` — transient-failure policy (503/429/5xx).
 - `chunking.py` — splitting long transcripts, assigning frames to chunks.
 - `mapreduce.py` — parallel chunk summarization + the merge call.
@@ -845,6 +846,45 @@ citation fade and `PDF_FRAMES=contact|inline` still work for documents that
 do cite (older runs, custom prompts); they just have nothing to do on new
 ones. `_merge.md` was told to keep exactly one `# Title` at the top, since
 every partial now opens with one.
+
+### The output language is a setting, not a property of the transcript
+
+Settled with the operator 2026-09-15. `SUMMARY_LANGUAGE` (`summarize/language.py`)
+is `th` by default and `en` is the switch; anything else raises
+`UnknownLanguage`, which `summarize.py main()` turns into `SystemExit` before
+either path runs — a typo must fail at second zero, not after the first
+chunk was billed. `ASSEMBLYAI_LANGUAGE` is a different question (what the
+*audio* is in) and stays `th` independently.
+
+How it reaches the model: all six shipped templates and `_merge.md` carry a
+`{language_rule}` placeholder in their numbered rules — the old hard-coded
+"Write in English even when…" sentence (lecture/tutorial) and "same language
+as the transcript" (meeting) are gone. `language.apply()` fills it in
+`load_prompt_template` and `load_merge_template`, so both backends see the
+same rule; a template without the placeholder is returned untouched. The
+rule for `th` asks for Thai prose with the English term in parentheses on
+first use (การแปลงฟูเรียร์ (Fourier transform)) — the operator's choice over
+"English terms only" and "everything translated" — and forbids translating
+code, LaTeX, commands and on-screen identifiers. `_default_merge_template`
+(the in-code fallback for a missing `_merge.md`) carries the placeholder
+too.
+
+**The placeholder sits inside the static-prompt block on purpose.** The
+setting is per box, not per run, so filling it there changes the
+content-addressed system prompt file exactly once when the operator flips
+it. `test_the_rule_lands_in_the_cacheable_half` asserts that the two
+languages produce different static halves and identical dynamic halves.
+
+Three things deliberately stay English: the wrapper `document.py` builds
+(`Youtube Link:`, `View Transcript`, `Clip:`), the PDF's appendix headings
+and frame captions, and the provenance keys. The `.md` has to drop into the
+operator's existing course files. `build_document` records the code as
+`language:` in the provenance comment so `pdf.py` can pick the body face
+from the document itself (next section).
+
+`meeting-gemini.md` had no language rule at all before this; it got one
+appended as rule 4. The `*-old.md` templates are archives and were not
+touched.
 
 **Frames sent to the CLI are cropped to the slide and downscaled; the saved
 frames are not.** `framecrop.fit_for_llm` runs `detect_crop` in the PDF's own
@@ -1213,14 +1253,32 @@ Reworked 2026-09-13 after the operator read a real 71-page combined sheet
   still there on request (`contact`/`inline`, `hidden`/`appendix`,
   `appendix`), and `test_media_e2e.sh` exports `PDF_FRAMES=contact` because
   it asserts on frames being cropped and embedded.
-- **Body text is CMU Serif** (`fonts-cmu`) — real Computer Modern, the face
-  mathtext already sets the maths in, so `PDF_MATH_SCALE` is 1.0 now (the
-  1.15 nudge was for a sans body's taller x-height). The old stack named
-  Adwaita Sans and Arial, and neither is installable on this box —
-  `fonts-adwaita*` is not in Debian 13's archive and Arial needs the contrib
-  `ttf-mscorefonts-installer` — so every PDF had silently been Liberation
-  Sans. The operator chose CMU Serif over CMU Sans and Arial. Noto Serif Thai
-  is the Thai fallback; Computer Modern has no Thai glyphs.
+- **The body face follows the document's language** (2026-09-15;
+  `DEFAULT_FONT_STACKS` in `pdf.py`). English: CMU Serif (`fonts-cmu`) —
+  real Computer Modern, the face mathtext already sets the maths in, so
+  `PDF_MATH_SCALE` is 1.0 (the 1.15 nudge was for a sans body's taller
+  x-height). The old stack named Adwaita Sans and Arial, and neither is
+  installable on this box — `fonts-adwaita*` is not in Debian 13's archive
+  and Arial needs the contrib `ttf-mscorefonts-installer` — so every PDF had
+  silently been Liberation Sans. The operator chose CMU Serif over CMU Sans
+  and Arial. Thai: **Bai Jamjuree, then Sarabun** — the operator's order —
+  leading the stack so Latin words inside Thai sentences stay in the same
+  face. Neither is in Debian's archive (checked: only TLWG, Noto and
+  Arundina are), so four styles of each are **vendored under `fonts/`**
+  with their OFL licences and `setup.sh` installs them into
+  `/usr/local/share/fonts/meeting-bot/` + `fc-cache`; no network needed at
+  setup time. The maths is unaffected: mathtext renders to SVG paths, so
+  `pdffonts` on a Thai sheet lists Bai Jamjuree and CMU Typewriter (code)
+  and nothing for the maths, which is correct. Noto Serif Thai stays in
+  both stacks as the last-resort Thai face.
+  `_document_language()` reads the provenance's `language:` first, then
+  `SUMMARY_LANGUAGE`, then the default, and never raises — a re-render of a
+  Thai sheet on a box since switched to English keeps its face, and a typo in
+  the variable is summarize.py's to report. `PDF_FONT_FAMILY`, when set,
+  applies to both languages; **`.env.example` no longer sets it** (it used
+  to pin the CMU stack, which would have silently overridden the Thai
+  face — the operator's live `.env` had the same line and it was commented
+  out the same day).
 - **Nested bullets are re-indented before conversion**
   (`_normalize_list_indent`). Gemini indents sub-items two spaces, Claude
   often does; python-markdown nests only at four and folds anything less
@@ -1660,6 +1718,19 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   turns "the transcript travels with the PDF" into a silent half-truth.
 - **Keep a Thai face in `PDF_FONT_FAMILY`.** Computer Modern has no Thai
   glyphs.
+- **Don't set `PDF_FONT_FAMILY` in `.env.example`.** Set, it overrides the
+  per-language stacks and every Thai PDF silently goes back to Computer
+  Modern. The per-language default is the feature.
+- **`{language_rule}` stays in every shipped prompt, inside the static
+  block.** Hard-coding a language back into a template makes
+  `SUMMARY_LANGUAGE` a no-op for that prompt with nothing to report it;
+  moving the placeholder into the dynamic half costs nothing today but
+  would if the rule ever became per-run.
+- **The document wrapper's labels stay English whatever `SUMMARY_LANGUAGE`
+  says.** Settled with the operator 2026-09-15: the `.md` drops into existing
+  course files that use those labels.
+- **The vendored fonts under `fonts/` are the install source, not a
+  download.** They are OFL; keep the `OFL.txt` beside each family.
 - **The PDF defaults are the summary alone** — `PDF_FRAMES`,
   `PDF_TRANSCRIPT` and `PDF_RESOURCES` all `none`. The `.md` keeps the
   transcript. Don't turn an appendix back on by default; the operator read
@@ -1741,8 +1812,8 @@ All of these run without API keys, network, or `/opt`, against temp directories
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
-| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document | 171 |
-| `summarize/test_pdf_units.py` | crop geometry, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, real PDF render | 73 |
+| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field) | 182 |
+| `summarize/test_pdf_units.py` | crop geometry, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), real PDF render | 82 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`) | 314 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps | 119 |
@@ -1826,6 +1897,7 @@ own flags, which is everything about stage 1 except the call itself.
 ├── requirements.txt              <- generated, hash-pinned; setup.sh installs it
 ├── requirements-browser.in       <- playwright only, for the browser stages
 ├── requirements-browser.txt      <- generated
+├── fonts/                        <- vendored Bai Jamjuree + Sarabun (OFL); setup.sh installs them
 ├── source_env.sh
 ├── setup.sh                      <- Debian/apt, installs Chrome + the venv
 ├── first_time_login.sh           <- noVNC login, native Chrome
@@ -1874,6 +1946,7 @@ own flags, which is everything about stage 1 except the call itself.
     ├── chunking.py
     ├── mapreduce.py
     ├── document.py
+    ├── language.py               <- SUMMARY_LANGUAGE: the {language_rule} every prompt carries
     ├── pdf.py                    <- markdown -> PDF
     ├── framecrop.py              <- slide-region detection, blank frames
     ├── mathrender.py             <- LaTeX -> Computer Modern SVG

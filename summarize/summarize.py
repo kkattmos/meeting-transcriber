@@ -161,6 +161,7 @@ sys.path.insert(0, str(ROOT_DIR / "lib"))
 import llm_client  # noqa: E402
 from llm_client import FrameMeta, assign_numbers, summarize  # noqa: E402
 import document  # noqa: E402
+import language  # noqa: E402
 import pdf as pdf_export  # noqa: E402
 from chunking import build_chunks  # noqa: E402
 from mapreduce import summarize_chunked  # noqa: E402
@@ -315,6 +316,9 @@ def load_prompt_template(prompt_path=PROMPT_PATH):
     Otherwise the historical behaviour applies — the file is cut at its first
     `# Input` and only the tail (which carries the {transcript} and
     {frame_manifest} placeholders) is returned.
+
+    Either way the `{language_rule}` placeholder is filled from
+    SUMMARY_LANGUAGE (see language.py) before the template is returned.
     """
     text = Path(prompt_path).read_text()
     if llm_client.STATIC_PROMPT_BEGIN in text:
@@ -323,7 +327,10 @@ def load_prompt_template(prompt_path=PROMPT_PATH):
         skeleton = text.split("# Input", 1)[1]
     else:
         skeleton = text
-    return skeleton.strip() + "\n\n"
+    # The output language goes in here, before anything else touches the
+    # template: the placeholder sits in the static half, and the split that
+    # lifts that half out happens later, in the claude-cli backend.
+    return language.apply(skeleton).strip() + "\n\n"
 
 
 def extract_frames(video_path, meeting_name, frames_dir):
@@ -509,6 +516,7 @@ def _wrap_document(body, *, original_input, source_url, video_path, transcript,
         # that their timestamps are clip-relative.
         clip=clip,
         videos=videos,
+        language=language.output_language(),
     )
 
 
@@ -796,6 +804,14 @@ def main_parts(argv, options):
 
 def main():
     argv, options = _extract_flags(sys.argv)
+    # Before either path: a typo in SUMMARY_LANGUAGE is an operator error and
+    # must fail here, at second zero, not after the first chunk has been
+    # billed and the document is being wrapped.
+    try:
+        print(f"==> Output language: {language.language_name()} "
+              f"({language.output_language()})")
+    except language.UnknownLanguage as exc:
+        raise SystemExit(str(exc))
     if options.get("parts"):
         main_parts(argv, options)
         return

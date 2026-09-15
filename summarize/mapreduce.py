@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from chunking import max_parallel  # noqa: E402
+import language  # noqa: E402
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 MERGE_PROMPT_PATH = PROMPTS_DIR / "_merge.md"
@@ -63,7 +64,7 @@ def _default_merge_template():
         "dates where stated.\n"
         "- Preserve timestamp citations exactly as given.\n"
         "- Keep the section structure used by the partial summaries.\n"
-        "- Write in the same language as the source material.\n\n"
+        "- {language_rule}\n\n"
         "Partial summaries:\n\n{transcript}\n"
     )
 
@@ -72,10 +73,13 @@ def load_merge_template():
     try:
         text = MERGE_PROMPT_PATH.read_text()
     except OSError:
-        return _default_merge_template()
+        text = _default_merge_template()
     if "# Input" in text:
         text = text.split("# Input", 1)[1]
-    return text.strip() + "\n\n"
+    # The merge writes the final document, so it is told the output language
+    # outright rather than left to infer it from partials that already obey
+    # the same rule — one setting, one answer, no drift on the last call.
+    return language.apply(text).strip() + "\n\n"
 
 
 def summarize_chunked(chunks, prompt_template, summarize_fn, log=print):

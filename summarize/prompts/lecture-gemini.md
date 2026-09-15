@@ -64,9 +64,7 @@ section is the last content section.
    domain-specific language.
 2. **Strict grounding.** Never invent content. If the spoken words and what is
    on screen disagree, say so explicitly rather than silently picking one.
-3. **Language.** Write the summary in English even when the transcript is in
-   another language, but keep proper nouns, product names, and any on-screen
-   identifiers verbatim.
+3. **Language.** {language_rule}
 4. **Transcription noise.** These transcripts come from automatic speech
    recognition and contain misrecognized words, especially for technical terms
    and names. Infer the intended term from context and use the correct spelling

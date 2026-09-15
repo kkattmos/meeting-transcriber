@@ -28,11 +28,13 @@ Four things happen here that the markdown doesn't need.
     carries the transcript in its <details> block.
 
 WeasyPrint does the rendering: pip-installable, needs no browser, embeds local
-images by path, and shapes Thai correctly given a Thai font. The default face
-is CMU Serif — Computer Modern, the same face mathtext sets the maths in — at
-8pt, with Noto Serif Thai for the Thai; see DEFAULT_FONT_STACK, and note that
-dropping the Thai font from a custom PDF_FONT_FAMILY turns a Thai lecture
-into tofu boxes.
+images by path, and shapes Thai correctly given a Thai font. The body face
+follows the language the summary was written in (the provenance's
+`language`, else SUMMARY_LANGUAGE): Bai Jamjuree with Sarabun behind it for
+Thai, CMU Serif — Computer Modern, the same face mathtext sets the maths in
+— for English, both at 8pt; see DEFAULT_FONT_STACKS. A custom
+PDF_FONT_FAMILY applies to both, and dropping the Thai face from it turns a
+Thai lecture into tofu boxes.
 
 Nothing here is allowed to take the run down. `render()` raises PdfUnavailable
 when the toolchain is missing, and summarize.py turns that into a warning: the
@@ -57,14 +59,32 @@ class PdfUnavailable(RuntimeError):
     """The PDF toolchain isn't installed (weasyprint / markdown)."""
 
 
-# CMU Serif is Computer Modern (Debian: fonts-cmu, installed by setup.sh),
-# the face the maths is already set in, so text and formulae match. Latin
-# Modern is the same design under another name for a box that has that
-# instead. Noto Serif Thai has to stay in the stack: Computer Modern has no
-# Thai glyphs, and a Thai lecture summary in tofu boxes is not a PDF.
-DEFAULT_FONT_STACK = ("CMU Serif", "Latin Modern Roman", "Noto Serif Thai",
-                      "Noto Sans Thai", "Noto Serif", "Liberation Serif",
-                      "DejaVu Serif", "serif")
+# The body face is chosen by the language the summary is written in
+# (SUMMARY_LANGUAGE, recorded in the document's provenance as `language`),
+# unless PDF_FONT_FAMILY names a stack, which then applies to both.
+#
+# English: CMU Serif is Computer Modern (Debian: fonts-cmu, installed by
+# setup.sh), the face the maths is already set in, so text and formulae
+# match. Latin Modern is the same design under another name for a box that
+# has that instead. Noto Serif Thai has to stay in the stack: Computer
+# Modern has no Thai glyphs, and a Thai proper noun in tofu boxes is not a
+# PDF.
+DEFAULT_FONT_STACK_EN = ("CMU Serif", "Latin Modern Roman", "Noto Serif Thai",
+                         "Noto Sans Thai", "Noto Serif", "Liberation Serif",
+                         "DejaVu Serif", "serif")
+# Thai: Bai Jamjuree, then Sarabun — the operator's choice, in that order.
+# Both are OFL Google Fonts vendored under fonts/ and installed by setup.sh;
+# neither is in Debian's archive. They lead the stack so Latin words inside
+# a Thai sentence are set in the same face rather than flipping to a serif.
+# The maths is untouched by any of this: mathtext sets it in Computer
+# Modern and ships it as SVG (see mathrender).
+DEFAULT_FONT_STACK_TH = ("Bai Jamjuree", "Sarabun", "Noto Serif Thai",
+                         "Noto Sans Thai", "CMU Serif", "Noto Serif",
+                         "Liberation Serif", "DejaVu Serif", "serif")
+# The historical name; the English stack, which every render used before
+# SUMMARY_LANGUAGE existed.
+DEFAULT_FONT_STACK = DEFAULT_FONT_STACK_EN
+DEFAULT_FONT_STACKS = {"en": DEFAULT_FONT_STACK_EN, "th": DEFAULT_FONT_STACK_TH}
 DEFAULT_FONT_SIZE_PT = 8.0
 # Contact-sheet thumbnails are three to a row on an A4 page — about 55mm wide.
 # Anything past ~640px of source is detail the print can't show.
@@ -88,10 +108,27 @@ DETAILS_BLOCK_RE = re.compile(
     re.DOTALL | re.IGNORECASE)
 
 
-def _font_stack():
+def _document_language(provenance=None):
+    """The language the document was written in: its provenance field when
+    it has one (so a Thai sheet re-rendered on a box now set to English keeps
+    its Thai face), else SUMMARY_LANGUAGE, else the default. Never raises —
+    a typo in the variable is summarize.py's to report, not the PDF's to
+    fail on."""
+    import language
+    value = (provenance or {}).get("language") or os.environ.get(language.ENV_VAR)
+    try:
+        return language.normalize(value)
+    except language.UnknownLanguage as exc:
+        print(f"  warning: {exc}; using {language.DEFAULT}", file=sys.stderr)
+        return language.DEFAULT
+
+
+def _font_stack(lang=None):
     raw = os.environ.get("PDF_FONT_FAMILY")
     if not raw:
-        return ", ".join(f'"{f}"' if " " in f else f for f in DEFAULT_FONT_STACK)
+        stack = DEFAULT_FONT_STACKS.get(lang or _document_language(),
+                                        DEFAULT_FONT_STACK_EN)
+        return ", ".join(f'"{f}"' if " " in f else f for f in stack)
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     return ", ".join(f'"{p}"' if " " in p and not p.startswith('"') else p
                      for p in parts)
@@ -481,21 +518,22 @@ def _end_of_block(text, pos):
     return best
 
 
-def _css():
+def _css(lang=None):
     size = _font_size()
+    stack = _font_stack(lang)
     return f"""
 @page {{
     size: {_page_size()};
     margin: 18mm 16mm 20mm 16mm;
     @bottom-center {{
         content: counter(page) " / " counter(pages);
-        font-family: {_font_stack()};
+        font-family: {stack};
         font-size: 7pt;
         color: #777;
     }}
 }}
 body {{
-    font-family: {_font_stack()};
+    font-family: {stack};
     font-size: {size:g}pt;
     line-height: 1.5;
     color: #16181d;
@@ -730,6 +768,7 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
     # unrenderable frame, WeasyPrint itself — must still release it.
     try:
         body_md, transcript, provenance = _split_document(markdown_text)
+        lang = _document_language(provenance)
 
         # The document's own "# Title" line is the PDF title — the model's,
         # since 2026-09-13 — and stays in the body as the heading. The
@@ -801,7 +840,7 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
 
         try:
             HTML(string=document, base_url=str(output_path.parent)).write_pdf(
-                str(output_path), stylesheets=[CSS(string=_css())])
+                str(output_path), stylesheets=[CSS(string=_css(lang))])
         finally:
             # In a finally block so a failed render doesn't strand the directory
             # either. Best-effort: a PDF that rendered must not be reported as

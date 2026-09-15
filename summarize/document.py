@@ -155,7 +155,7 @@ def split_leading_heading(body):
 def build_document(body, *, source, source_kind, title=None, transcript="",
                    backend=None, model=None, prompt_name=None, run_id=None,
                    generated=None, include_transcript=True, clip=None,
-                   videos=None):
+                   videos=None, language=None):
     """Wrap a model-written summary body in the course-note template.
 
     `videos`, when given, is the list of sources a --combine summary was made
@@ -168,6 +168,12 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
 
     `title` is the video's, and is used only when the body has no H1 of its
     own — see the module docstring.
+
+    `language` is the SUMMARY_LANGUAGE code the body was written in. It goes
+    into the provenance comment so pdf.py can pick the matching body face
+    when the document is re-rendered later, whatever the box is set to by
+    then. The wrapper's own labels stay in English regardless: the .md has
+    to drop into the operator's existing course files.
     """
     generated = generated or date.today().isoformat()
 
@@ -178,6 +184,7 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
         prompt=prompt_name or "summarize.md",
         run_id=run_id,
         clip=clip,
+        language=language,
         generated=generated,
     )
     if videos:

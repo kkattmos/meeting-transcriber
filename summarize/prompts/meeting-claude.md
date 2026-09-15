@@ -44,7 +44,7 @@ Merge consecutive frames showing materially the same screen content into a singl
 1. **Strict Grounding**: Do NOT invent facts or assume outcomes. If an owner or decision is ambiguous, explicitly state "Unclear".
 2. **Actionability**: Ensure action items are concrete (e.g., "Alice will email the architecture spec" instead of "Discuss architecture later").
 3. **Uncertainty Markers**: If audio is unclear or inaudible, write `[inaudible]` rather than guessing. If a frame is illegible or too low-resolution to describe confidently, write `[frame illegible]` rather than inventing its content.
-4. **Language**: Write the summary in the same language as the transcript, unless the reader explicitly requests otherwise.
+4. **Language**: {language_rule}
 5. **Timestamp Format**: Use `[mm:ss]` for meetings under 60 minutes. For meetings 60 minutes or longer, switch to `[h:mm:ss]` consistently across the entire document.
 6. **Empty Section Handling**: If a section has no content (e.g., no decisions were made), state `None` under the heading—do not omit the section.
 

@@ -158,7 +158,8 @@ sudo -H ./setup.sh
 ```
 
 That installs the system packages (ffmpeg, Xvfb, PulseAudio, x11vnc/noVNC,
-poppler, Pango for the PDF renderer, Thai fonts), real `google-chrome-stable`
+poppler, Pango for the PDF renderer, Thai fonts — plus the vendored Bai
+Jamjuree and Sarabun from `fonts/`), real `google-chrome-stable`
 from Google's repository, the Python venv at `/opt/meeting-bot-venv`, yt-dlp,
 and the working directories.
 
@@ -760,6 +761,7 @@ course-note document, shaped to drop straight into a chapter file:
      model: claude-cli/opus
      prompt: lecture-claude.md
      run_id: yt_5GAfjAjLKYk_20260904_120000
+     language: th
      generated: 2026-09-04
 -->
 
@@ -849,13 +851,21 @@ The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint:
   so a single block would come back truncated with no warning; the cost is a
   couple of blank-looking pages at the back of a long lecture.
   `PDF_TRANSCRIPT=appendix` prints it as Appendix C instead.
-- **Body text is CMU Serif at 8pt** (`PDF_FONT_FAMILY`, `PDF_FONT_SIZE`) —
-  Computer Modern, the face the maths is set in, so text and formulae match
-  — with Noto Serif Thai for the Thai. Every other size in the document is
-  relative to `PDF_FONT_SIZE`, so changing it rescales headings, tables and
-  captions together. `setup.sh` installs `fonts-cmu`; without it the stack
-  falls through to Noto Serif. Keep a Thai face in any custom stack or a Thai
-  lecture renders as tofu boxes.
+- **The body face follows the summary's language, at 8pt** (`PDF_FONT_SIZE`).
+  A Thai summary (`SUMMARY_LANGUAGE=th`, the default) is set in **Bai
+  Jamjuree**, with Sarabun behind it; an English one in **CMU Serif** —
+  Computer Modern, the face the maths is set in. The maths is Computer
+  Modern in both: mathtext typesets it and ships it as SVG, so the body face
+  never touches it. The language is read from the document's own
+  provenance comment first, so a Thai sheet re-rendered later on a box
+  switched to English keeps its face. `PDF_FONT_FAMILY` replaces the stack
+  for both languages; keep a Thai face in it or Thai renders as tofu boxes.
+  Every other size in the document is relative to `PDF_FONT_SIZE`, so
+  changing it rescales headings, tables and captions together. Bai Jamjuree
+  and Sarabun are not in Debian's archive; they are OFL Google Fonts vendored
+  under `fonts/` and installed by `setup.sh` into `/usr/local/share/fonts`
+  (`fonts-cmu` and Noto Serif Thai come from apt). Without them the stack
+  falls through to Noto Serif Thai.
 
 A PDF that fails to render logs a warning and leaves the run successful — the
 Markdown is the artifact everything downstream depends on. Turn either output
@@ -943,6 +953,23 @@ end the scan.
 | `SUMMARY_PROMPT` | `summarize.md` | Prompt file; `--prompt` overrides |
 | `SUMMARY_MAX_TOKENS` | 16000 | **Gemini only.** The Claude CLI has no output cap, and output is not what spends a subscription window anyway — see below |
 | `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture-*`/`tutorial-*` output; `always`/`never` override |
+| `SUMMARY_LANGUAGE` | `th` | The language the summary is *written* in: `th` or `en`. Independent of `ASSEMBLYAI_LANGUAGE`, which is the language the audio is in — see below |
+
+**Output language.** `SUMMARY_LANGUAGE` decides what every prompt tells the
+model to write in — `th` (the default) or `en`. Every shipped template
+(`lecture-*`, `tutorial-*`, `meeting-*` and the merge prompt) carries a
+`{language_rule}` placeholder that is filled from this setting before the
+prompt is sent, on both the Claude and the Gemini backends. In Thai the
+model is asked for ordinary Thai academic prose with each technical term's
+English name in parentheses on first use — การแปลงฟูเรียร์ (Fourier
+transform) — and to leave code, LaTeX, commands and on-screen identifiers
+untranslated. The wrapper the code builds around the body (`Youtube Link:`,
+`View Transcript`, the PDF's appendix headings) stays in English either
+way, so the `.md` still drops into the existing course files. The setting
+is recorded in the document's provenance comment as `language:`, and the
+PDF picks its body face from it (see PDF export). A value other than `th`
+or `en` fails the summarize stage at startup, before anything is billed. A
+custom prompt file without the placeholder is sent exactly as written.
 
 **How the Claude backend runs.** `summarize/llm_client.py` shells out to:
 
@@ -1109,7 +1136,7 @@ provenance header (`model: claude-cli/opus`).
 | `PDF_RESOURCES` | `none` | `none` or `appendix` (the `--resources` slides as Appendix B) |
 | `PDF_HIDDEN_CHUNK_CHARS` | 40000 | Characters of hidden transcript per page; above ~50k poppler stops extracting |
 | `PDF_PAGE_SIZE` | `A4` | Any WeasyPrint page size |
-| `PDF_FONT_FAMILY` | `CMU Serif, Latin Modern Roman, Noto Serif Thai, Noto Sans Thai, Noto Serif, Liberation Serif, DejaVu Serif, serif` | Keep a Thai face in the stack |
+| `PDF_FONT_FAMILY` | by language — `th`: `Bai Jamjuree, Sarabun, Noto Serif Thai, …`; `en`: `CMU Serif, Latin Modern Roman, Noto Serif Thai, …` | Set it to use one stack for both languages. Keep a Thai face in it |
 | `PDF_FONT_SIZE` | 8 | Body size in points; everything else scales with it |
 | `PDF_MATH` | 1 | 0 leaves LaTeX as text instead of typesetting it |
 | `PDF_MATH_SCALE` | 1.0 | Maths size relative to the body text (Computer Modern both, so 1.0; a sans body wants ~1.15) |
