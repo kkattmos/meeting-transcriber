@@ -30,6 +30,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BIND_ADDR="127.0.0.1"
 BIND_MODE="localhost"
+# In the Docker image, 127.0.0.1 is the container's own loopback and the
+# published port would lead nowhere. Bind every interface INSIDE the container;
+# docker-compose.yml publishes 6080 on the host's 127.0.0.1 only, so nothing
+# beyond the machine running Docker can reach it.
+if [ "${MEETING_BOT_IN_DOCKER:-0}" = "1" ]; then
+  BIND_ADDR="0.0.0.0"
+  BIND_MODE="docker"
+fi
 NOVNC_PORT="${NOVNC_PORT:-6080}"
 VNC_PORT="${VNC_PORT:-5901}"
 SCREENSHOT_INTERVAL=0
@@ -192,6 +200,14 @@ case "$BIND_MODE" in
     echo ""
     echo "then open:"
     echo "    http://localhost:${NOVNC_PORT}/vnc.html"
+    ;;
+  docker)
+    echo "noVNC is published on the Docker host's 127.0.0.1:${NOVNC_PORT}. On the"
+    echo "machine running Docker, open:"
+    echo ""
+    echo "    http://localhost:${NOVNC_PORT}/vnc.html"
+    echo ""
+    echo "(From another machine: ssh -L ${NOVNC_PORT}:localhost:${NOVNC_PORT} <that machine>)"
     ;;
   tailscale)
     echo "noVNC is bound to this host's Tailscale address. From any machine on"

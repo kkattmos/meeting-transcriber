@@ -721,6 +721,43 @@ check "YouTube key cursor advanced" \
   "$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['YT_TRANSCRIPT_KEY'])" \
      "$CURSOR" 2>/dev/null)" "1"
 
+# The stub video's only uploaded track is English. Asked for Thai, the client
+# says so (--strict, exit 3) and transcribe.sh tries YouTube's own captions
+# through yt-dlp — a stub here, never the network.
+FAKE_YTDLP="$TESTROOT/fake-yt-dlp"
+cat > "$FAKE_YTDLP" <<'YTDLP'
+#!/bin/sh
+[ -n "$FAKE_YTDLP_FAIL" ] && { echo "ERROR: stub yt-dlp failing" >&2; exit 1; }
+case " $* " in
+  *" -J "*) echo '{"language": "th", "automatic_captions": {"th-orig": [{"ext": "json3"}], "en": [{"ext": "json3"}]}}'; exit 0 ;;
+esac
+out=""
+while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
+printf '%s' '{"events": [{"tStartMs": 1000, "dDurationMs": 3000, "segs": [{"utf8": "สวัสดีครับ วันนี้เรียนเรื่องกราฟ"}]}]}' \
+  > "$(dirname "$out")/cap.th-orig.json3"
+YTDLP
+chmod +x "$FAKE_YTDLP"
+YT_TH_BASE="$TRANSCRIPTS_DIR/yt_stub_th"
+YT_DLP_BIN="$FAKE_YTDLP" bash "$REPO/transcribe/transcribe.sh" \
+     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_th" "th" \
+     --out-base "$YT_TH_BASE" > "$TESTROOT/yt-th.log" 2>&1
+check "YouTube, no uploaded Thai track: exits 0" "$?" "0"
+grep -q "วันนี้เรียนเรื่องกราฟ" "${YT_TH_BASE}.txt" \
+  && ok "fell back to the spoken-language automatic captions" \
+  || bad "did not use yt-dlp's automatic captions: $(tail -5 "$TESTROOT/yt-th.log")"
+grep -q "00:00:01,000" "${YT_TH_BASE}.srt" \
+  && ok "automatic-caption timings preserved" || bad "automatic-caption timings lost"
+
+YT_TH2_BASE="$TRANSCRIPTS_DIR/yt_stub_th2"
+FAKE_YTDLP_FAIL=1 YT_DLP_BIN="$FAKE_YTDLP" bash "$REPO/transcribe/transcribe.sh" \
+     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_th2" "th" \
+     --out-base "$YT_TH2_BASE" > "$TESTROOT/yt-th2.log" 2>&1
+check "YouTube, no Thai track and yt-dlp down: still exits 0" "$?" "0"
+grep -q "Welcome to the lecture" "${YT_TH2_BASE}.txt" \
+  && ok "the other-language track is the last resort" || bad "last-resort track not used"
+grep -q "NOT in 'th'" "$TESTROOT/yt-th2.log" \
+  && ok "and it says so, loudly" || bad "no warning about the wrong-language track"
+
 echo ""
 echo "=================================================================="
 echo "7. The whole pipeline over a local file"

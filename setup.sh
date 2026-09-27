@@ -1,36 +1,41 @@
 #!/bin/bash
-# One-time setup for the meeting recording + transcription bot.
-# Target: Debian 13 (trixie) on Proxmox (LXC container or KVM VM), 4 vCPU / 8GB.
+# The system installer for the meeting recording + transcription bot.
 #
-# Everything runs natively on this host — there is no container split any more.
+# Since 2026-09-27 this runs INSIDE the Docker image build (see Dockerfile) —
+# `docker compose up -d --build` is the supported way to run the bot, and you
+# do not run this on your own machine. It stays a plain script rather than
+# being inlined into the Dockerfile so the dependency list lives in one place
+# with its reasons beside it. Running it directly on a Debian 13 host still
+# works, but that is no longer the supported deployment.
+#
 # Debian is glibc, so Google's own google-chrome-stable package installs and
-# runs here; the Alpine branch needed a Debian container purely because Chrome
-# has no musl build. See CLAUDE.md.
+# runs; the Alpine branch needed a Debian container purely because Chrome has
+# no musl build. See CLAUDE.md.
 #
 # Idempotent: re-running is safe and cheap. Flags:
 #   --no-chrome          skip Chrome + Playwright (stages 2 and 3 only box)
 #   --with-libreoffice   also install LibreOffice, so .pptx slides passed via
 #                        --resources can be rendered into the PDF (~700MB)
-#   --with-trigger       install and enable the systemd trigger service
-#   --with-resume-timer  install a systemd timer that runs `pipeline.sh
-#                        --resume-all` every 15 min, so a run paused on the
-#                        Claude usage window finishes without anyone watching
+#
+# The web UI / trigger server and the every-15-minutes `--resume-all` that
+# used to be systemd units are started by docker/entrypoint.sh now.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_CHROME=1
 INSTALL_LIBREOFFICE=0
-INSTALL_TRIGGER=0
-INSTALL_RESUME_TIMER=0
 
 for arg in "$@"; do
   case "$arg" in
     --no-chrome)        INSTALL_CHROME=0 ;;
     --with-libreoffice) INSTALL_LIBREOFFICE=1 ;;
-    --with-trigger)     INSTALL_TRIGGER=1 ;;
-    --with-resume-timer) INSTALL_RESUME_TIMER=1 ;;
+    --with-trigger|--with-resume-timer)
+      echo "$arg is gone: the Docker entrypoint runs the web UI and the resume" >&2
+      echo "  loop now. See README: 'Running it'." >&2
+      exit 1
+      ;;
     -h|--help)
-      sed -n '2,17p' "$0"
+      sed -n '2,22p' "$0"
       exit 0
       ;;
     *)
@@ -212,43 +217,7 @@ mkdir -p "$RECORDINGS_DIR" "$TRANSCRIPTS_DIR" "$FRAMES_DIR" \
          "$MEETING_BOT_ROOT/runs" "$MEETING_BOT_ROOT/tmp" \
          "$MEETING_BOT_ROOT/state" "$CHROME_PROFILE_DIR"
 
-if [ "$INSTALL_TRIGGER" -eq 1 ]; then
-  echo "==> Installing the systemd trigger service"
-  # Debian has systemd, so the unit that the Alpine branch kept purely for
-  # reference is usable again.
-  sed -e "s#@REPO_ROOT@#$SCRIPT_DIR#g" -e "s#@VENV@#$VENV#g" \
-    "$SCRIPT_DIR/meeting-bot-trigger.service" \
-    > /etc/systemd/system/meeting-bot-trigger.service
-  systemctl daemon-reload
-  systemctl enable --now meeting-bot-trigger.service
-  systemctl --no-pager status meeting-bot-trigger.service || true
-fi
-
-if [ "$INSTALL_RESUME_TIMER" -eq 1 ]; then
-  echo "==> Installing the resume timer"
-  # The backstop for a summarize stage that paused on the Claude usage
-  # window: the stage waits in-process first, but if that process is gone
-  # (reboot, killed terminal, the 6h wait cap) this is what finishes the run.
-  sed -e "s#@REPO_ROOT@#$SCRIPT_DIR#g" \
-    "$SCRIPT_DIR/meeting-bot-resume.service" \
-    > /etc/systemd/system/meeting-bot-resume.service
-  cp "$SCRIPT_DIR/meeting-bot-resume.timer" /etc/systemd/system/meeting-bot-resume.timer
-  systemctl daemon-reload
-  systemctl enable --now meeting-bot-resume.timer
-  systemctl --no-pager list-timers meeting-bot-resume.timer || true
-fi
-
 echo ""
 echo "==> Done."
-echo "Next steps:"
-echo "  1. cp .env.example .env && chmod 600 .env  — then fill in your API keys."
-echo "     (Anthropic key, Gemini keys 1-3, AssemblyAI keys 1-3,"
-echo "      youtube-transcript.io keys 1-10, and the five output directories.)"
-echo "  2. ./first_time_login.sh   — sign into Google/Zoom in the persistent"
-echo "     Chrome profile. It prints an SSH-tunnel command you run from your"
-echo "     own machine, since this box has no visible display."
-echo "  3. ./pipeline.sh <url-or-file>   — record, transcribe, summarize."
-echo ""
-echo "Check the configuration with:"
-echo "  $VENV/bin/python3 lib/paths.py show"
-echo "  $VENV/bin/python3 lib/keyring.py status"
+echo "The web UI, the Google/Claude sign-ins and running a pipeline are all"
+echo "described in README.md under 'Running it' (docker compose)."

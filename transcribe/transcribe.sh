@@ -134,26 +134,68 @@ SEGMENTS_FILE=""
 # --clip-captions acts on exactly this case and no other; see the header.
 SEGMENTS_ARE_CAPTIONS=0
 
-# --- YouTube path: youtube-transcript.io API -------------------------------
+# --- YouTube path: youtube-transcript.io, then YouTube's own captions -------
+# youtube-transcript.io first: it is fast and keyed. It only sees UPLOADED
+# tracks, though, and a video whose only uploaded track is some other language
+# used to be summarized from that — English lectures from Arabic community
+# captions, in the 2026-09 verify run. --strict makes the client say so (exit
+# 3, the track it found still printed); then yt_autocaptions.py asks yt-dlp for
+# an uploaded track in $LANGUAGE or the automatic captions of the language
+# actually spoken, and the other-language track is only the last resort. The
+# same fallback covers the API failing outright (no keys, all exhausted), since
+# yt-dlp needs neither. YT_AUTOCAPTIONS=0 turns the fallback off.
 if [ "$IS_YOUTUBE" -eq 1 ]; then
   echo "==> Fetching YouTube transcript via youtube-transcript.io"
   SEGMENTS_FILE="$WORK_DIR/segments.json"
+  API_FILE="$WORK_DIR/segments.api.json"
+  AUTO_FILE="$WORK_DIR/segments.auto.json"
   # $LANGUAGE only picks among the caption tracks the video already has —
   # nothing is translated or transcribed here.
-  if ! "$PYTHON_BIN" "$SCRIPT_DIR/yt_transcript_client.py" "$INPUT" "$LANGUAGE" \
-        > "$SEGMENTS_FILE" 2>"$WORK_DIR/yt-client.log"; then
+  # `|| API_RC=$?`, not a bare `API_RC=$?` on the next line: under errexit
+  # the non-zero exit would end this script before the fallback could run.
+  API_RC=0
+  "$PYTHON_BIN" "$SCRIPT_DIR/yt_transcript_client.py" "$INPUT" "$LANGUAGE" --strict \
+      > "$API_FILE" 2>"$WORK_DIR/yt-client.log" || API_RC=$?
+  count_segments() { grep -o '"text"' "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+  if [ "$API_RC" -eq 0 ] && [ "$(count_segments "$API_FILE")" -ge 1 ]; then
+    mv "$API_FILE" "$SEGMENTS_FILE"
+  else
     cat "$WORK_DIR/yt-client.log"
-    echo "ERROR: youtube-transcript.io fetch failed (see $WORK_DIR/yt-client.log)"
-    rm -rf "$WORK_DIR"
-    exit 1
-  fi
-  SEGMENT_COUNT=$(grep -c '"text"' "$SEGMENTS_FILE" || true)
-  if [ "${SEGMENT_COUNT:-0}" -lt 1 ]; then
-    echo "ERROR: youtube-transcript.io returned no usable transcript."
-    echo "       The video may have no captions or contain only placeholders."
-    echo "       Investigate (region, login state, captions availability) and re-run."
-    rm -rf "$WORK_DIR"
-    exit 2
+    if [ "$API_RC" -eq 3 ]; then
+      echo "==> No uploaded '$LANGUAGE' captions on youtube-transcript.io — trying YouTube's own captions (yt-dlp)"
+    else
+      echo "==> youtube-transcript.io gave no transcript — trying YouTube's own captions (yt-dlp)"
+    fi
+    AUTO_RC=1
+    case "$(printf '%s' "${YT_AUTOCAPTIONS:-1}" | tr 'A-Z' 'a-z')" in
+      0|false|no) echo "    (skipped: YT_AUTOCAPTIONS=0)" ;;
+      *)
+        AUTO_RC=0
+        "$PYTHON_BIN" "$SCRIPT_DIR/yt_autocaptions.py" "$INPUT" "$LANGUAGE" \
+          > "$AUTO_FILE" 2>"$WORK_DIR/yt-autocaptions.log" || AUTO_RC=$?
+        sed 's/^/    /' "$WORK_DIR/yt-autocaptions.log"
+        ;;
+    esac
+    if [ "$AUTO_RC" -eq 0 ] && [ "$(count_segments "$AUTO_FILE")" -ge 1 ]; then
+      mv "$AUTO_FILE" "$SEGMENTS_FILE"
+    elif [ "$API_RC" -eq 3 ] && [ "$(count_segments "$API_FILE")" -ge 1 ]; then
+      echo "WARNING: using a caption track that is NOT in '$LANGUAGE' — the"
+      echo "         summary will be written from it. Check the .txt."
+      mv "$API_FILE" "$SEGMENTS_FILE"
+    elif [ "$API_RC" -ne 0 ] && [ "$API_RC" -ne 3 ] \
+         && ! grep -q "no usable transcript" "$WORK_DIR/yt-client.log"; then
+      echo "ERROR: youtube-transcript.io fetch failed (see $WORK_DIR/yt-client.log),"
+      echo "       and YouTube's own captions were not available either."
+      rm -rf "$WORK_DIR"
+      exit 1
+    else
+      echo "ERROR: no usable transcript: the video has no captions, or only"
+      echo "       placeholders, on youtube-transcript.io or on YouTube itself."
+      echo "       Investigate (region, login state, captions availability) and re-run."
+      rm -rf "$WORK_DIR"
+      exit 2
+    fi
   fi
   SEGMENTS_ARE_CAPTIONS=1
 else

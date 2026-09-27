@@ -1,0 +1,74 @@
+# The meeting bot on your own machine.
+#
+#   cp .env.example .env         # keys, MEETING_BOT_TOKEN, and the HOST_* paths
+#   docker compose up -d --build
+#   open http://localhost:8765/  # the web UI
+#
+# One-time sign-ins (both are kept in named volumes, so rebuilding the image
+# never signs you out):
+#   docker compose exec -it bot claude auth login      # the Claude subscription
+#   docker compose exec -it bot ./first_time_login.sh  # Google + Zoom, via
+#                                                      # http://localhost:6080/vnc.html
+#
+# Everything else works as before, prefixed:
+#   docker compose exec bot ./pipeline.sh --list
+#
+# Compose reads .env twice: env_file hands every key to the container, and the
+# same file supplies the ${HOST_*} / ${WEB_BIND} values below. A value
+# containing "$" must be written "$$" there.
+services:
+  bot:
+    build:
+      context: .
+      args:
+        WITH_LIBREOFFICE: ${WITH_LIBREOFFICE:-0}
+    image: meeting-bot:latest
+    container_name: meeting-bot
+    restart: unless-stopped
+    env_file: .env
+    # Fixed inside the container, whatever the .env says: the .env's
+    # directory values are paths on the machine running Docker, and they
+    # arrive here through the volumes below instead.
+    environment:
+      MEETING_BOT_ROOT: /data/bot
+      CHROME_PROFILE_DIR: /data/bot/chrome-profile
+      RESOURCE_CACHE_DIR: /data/bot/resources
+      FRAMES_DIR: /data/bot/frames
+      RECORDINGS_DIR: /data/out/recordings
+      TRANSCRIPTS_DIR: /data/out/transcripts
+      SUMMARIES_DIR: /data/out/summaries
+      PDF_DIR: /data/out/pdf
+      CLAUDE_CLI_BIN: /root/.local/bin/claude
+      MEETING_BOT_BIND: 0.0.0.0
+      TZ: ${TZ:-Asia/Bangkok}
+    # Chrome needs more shared memory than Docker's 64MB default, or tabs
+    # crash mid-meeting.
+    shm_size: 2gb
+    volumes:
+      # Runs, state, the Chrome profile (Google/Zoom sign-in), frames.
+      - bot-data:/data/bot
+      # The claude CLI's subscription login.
+      - claude-config:/root/.claude
+      # The deliverables, on your disk. A SeaDrive/FUSE folder works only if
+      # it is mounted before `up` and with allow_other — see README.
+      # Required, no defaults — the same rule as the five *_DIR variables
+      # (CLAUDE.md): a default that doesn't error writes the deliverable
+      # somewhere nobody looks.
+      - ${HOST_RECORDINGS_DIR:?set HOST_RECORDINGS_DIR in .env}:/data/out/recordings
+      - ${HOST_TRANSCRIPTS_DIR:?set HOST_TRANSCRIPTS_DIR in .env}:/data/out/transcripts
+      - ${HOST_SUMMARIES_DIR:?set HOST_SUMMARIES_DIR in .env}:/data/out/summaries
+      - ${HOST_PDF_DIR:?set HOST_PDF_DIR in .env}:/data/out/pdf
+      # Lecture files and course notes you want to feed in: they appear
+      # under /data/files in the web UI and on the pipeline command line.
+      - ${HOST_FILES_DIR:-./data/files}:/data/files
+    ports:
+      # The web UI. 127.0.0.1 by default; set WEB_BIND to this machine's
+      # Tailscale address (100.x.y.z) to reach it from your tailnet.
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8765}:8765"
+      # noVNC for first_time_login.sh. Loopback only, always: it is an
+      # unauthenticated browser holding your Google session.
+      - "127.0.0.1:6080:6080"
+
+volumes:
+  bot-data:
+  claude-config:

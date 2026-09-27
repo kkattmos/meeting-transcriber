@@ -18,6 +18,7 @@
 #   ./pipeline.sh --from-file links.txt --jobs 4
 #   ./pipeline.sh "https://www.youtube.com/playlist?list=PL..." --playlist
 #   ./pipeline.sh "https://meet.google.com/abc-defg-hij" --name "Weekly Standup"
+#   ./pipeline.sh --new-meet --name "Project sync"   (the bot CREATES a Meet)
 #   ./pipeline.sh /path/to/recording.mp4 --language en
 #   ./pipeline.sh "https://youtu.be/bbb" --clip 00:05:00-01:30:00
 #
@@ -34,6 +35,9 @@
 #   ./pipeline.sh <input> --force       ignore prior state, start clean
 #   ./pipeline.sh --list                show recent runs and their stages
 #   ./pipeline.sh --status <run_id>     show one run in detail
+#   ./pipeline.sh <inputs...> --dry-run check everything (inputs, windows,
+#                                       resources) and print what would run,
+#                                       without creating or starting anything
 #
 # Options:
 #   --name N            meeting name (single input only; otherwise derived)
@@ -44,7 +48,12 @@
 #                       (optionally @branch, or a /tree/<branch>/<subdir> URL)
 #                       or a local file or folder. Repeatable. Their text is
 #                       given to the summarizer as reference material and their
-#                       slide images are embedded in the PDF.
+#                       slide images are embedded in the PDF. Every --resources
+#                       applies to every run in the invocation. A Markdown file
+#                       may start with frontmatter (course, source,
+#                       citation_label, coverage) — pair it with
+#                       --prompt lecture-reference for textbook citations.
+#                       A binary file named .md/.txt is refused up front.
 #   --clip W            summarize only part of the video: --clip 00:05:00-01:30:00
 #                       (also MM:SS, bare seconds, or an open end: 00:05:00-).
 #                       The media is cut to the window before transcription, so
@@ -60,6 +69,14 @@
 #                                       "https://youtu.be/bbb"
 #                       which keeps everything in one invocation, and so in one
 #                       --combine document.
+#   --new-meet          create a new Google Meet (meet.new) in the bot's signed-in
+#                       Chrome profile, host it, and record it. The link is
+#                       printed as soon as it exists and kept in the run
+#                       (./pipeline.sh --status <run_id>). The bot admits
+#                       everyone who asks to join, waits NEW_MEET_WAIT_MINUTES
+#                       (15) for the first one, and ends the call for everyone
+#                       once they have all left. "meet.new" as an input is the
+#                       same thing. Never auto-resumed: each one is a new call.
 #   --jobs N            how many inputs to process at once (default 2)
 #   --from-file F       read inputs from a file, one per line, # for comments
 #   --playlist          expand YouTube playlist URLs into their videos
@@ -112,6 +129,8 @@ COMBINE_FILE=""
 COMBINE_PDF=""
 COMBINE_WANT_PDF=1
 CLIP_SPEC=""
+NEW_MEET=0
+DRY_RUN=0
 declare -a POSITIONAL=()
 declare -a RESOURCE_SPECS=()
 # RESOURCES in .env is the default for every run; --resources adds to it.
@@ -122,24 +141,38 @@ if [ -n "${RESOURCES:-}" ]; then
   done < <(printf '%s\n' "$RESOURCES" | tr ',' '\n')
 fi
 
-usage() { sed -n '2,64p' "$0"; }
+# Everything from line 2 up to `set -uo pipefail`: a fixed line range went stale
+# every time an option was documented and silently cut the help short.
+usage() { awk 'NR > 1 && /^set -uo pipefail/ { exit } NR > 1' "$0"; }
+
+# Every value-taking option goes through need_value. Without it, an option left
+# last on the line ("... --combine") made `shift 2` fail with one argument left
+# — which under `set -u` without `-e` changes nothing, so this loop spun on the
+# same argument forever, printing nothing and burning a core. A value that is
+# itself an option ("--combine --jobs 1") is the same typo one step earlier.
+need_value() {
+  if [ "$2" -lt 2 ] || [ -z "$3" ] || [ "${3#--}" != "$3" ]; then
+    echo "ERROR: $1 needs a value (try --help)" >&2
+    exit 1
+  fi
+}
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --name)         NAME="${2:-}"; shift 2 ;;
-    --display-name) DISPLAY_NAME="${2:-}"; shift 2 ;;
-    --language)     LANGUAGE="${2:-}"; shift 2 ;;
-    --prompt)       PROMPT_NAME="${2:-}"; shift 2 ;;
-    --jobs)         JOBS="${2:-2}"; shift 2 ;;
-    --clip)         CLIP_SPEC="${2:-}"; shift 2 ;;
-    --from-file)    FROM_FILE="${2:-}"; shift 2 ;;
-    --combine)      COMBINE_FILE="${2:-}"; shift 2 ;;
-    --combine-pdf)  COMBINE_PDF="${2:-}"; shift 2 ;;
+    --name)         need_value "$1" "$#" "${2:-}"; NAME="$2"; shift 2 ;;
+    --display-name) need_value "$1" "$#" "${2:-}"; DISPLAY_NAME="$2"; shift 2 ;;
+    --language)     need_value "$1" "$#" "${2:-}"; LANGUAGE="$2"; shift 2 ;;
+    --prompt)       need_value "$1" "$#" "${2:-}"; PROMPT_NAME="$2"; shift 2 ;;
+    --jobs)         need_value "$1" "$#" "${2:-}"; JOBS="$2"; shift 2 ;;
+    --clip)         need_value "$1" "$#" "${2:-}"; CLIP_SPEC="$2"; shift 2 ;;
+    --from-file)    need_value "$1" "$#" "${2:-}"; FROM_FILE="$2"; shift 2 ;;
+    --combine)      need_value "$1" "$#" "${2:-}"; COMBINE_FILE="$2"; shift 2 ;;
+    --combine-pdf)  need_value "$1" "$#" "${2:-}"; COMBINE_PDF="$2"; shift 2 ;;
     --no-combine-pdf) COMBINE_WANT_PDF=0; shift ;;
-    --run-id)       EXPLICIT_RUN_ID="${2:-}"; shift 2 ;;
-    --resources)
-      [ -n "${2:-}" ] || { echo "--resources needs a value" >&2; exit 1; }
-      RESOURCE_SPECS+=("$2"); shift 2 ;;
+    --run-id)       need_value "$1" "$#" "${2:-}"; EXPLICIT_RUN_ID="$2"; shift 2 ;;
+    --resources)    need_value "$1" "$#" "${2:-}"; RESOURCE_SPECS+=("$2"); shift 2 ;;
+    --new-meet)     NEW_MEET=1; shift ;;
+    --dry-run)      DRY_RUN=1; shift ;;
     --playlist)     EXPAND_PLAYLIST=1; shift ;;
     --force)        FORCE=1; shift ;;
     --resume-last)  RESUME_LAST=1; shift ;;
@@ -162,6 +195,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+case "$JOBS" in
+  ''|*[!0-9]*|0) echo "ERROR: --jobs needs a positive whole number, got: $JOBS" >&2; exit 1 ;;
+esac
+
 # --- The clip window, settled before anything is classified ------------------
 # Parsed here and only here, so a typo costs nothing: an unreadable window must
 # fail in the first second, not after a download and an AssemblyAI charge. The
@@ -179,6 +216,14 @@ if [ -n "$CLIP_SPEC" ]; then
     exit 1
   fi
   echo "==> Clip window: $CLIP_LABEL (output timestamps are relative to it)"
+fi
+
+# --- Reference material, checked before anything is paid for ----------------
+# A missing local path, or a "notes.md" that is really a PDF, used to surface
+# in the summarize stage — after the recording, the AssemblyAI charge and the
+# frame pass. Offline: a GitHub spec is only parsed here, fetched later.
+if [ "${#RESOURCE_SPECS[@]}" -gt 0 ]; then
+  "$PYTHON_BIN" "$SCRIPT_DIR/lib/resources.py" check "${RESOURCE_SPECS[@]}" || exit 1
 fi
 
 # --- Input classification ----------------------------------------------------
@@ -199,7 +244,7 @@ classify_input() {
   local value="$1"
   if [ -f "$value" ]; then
     echo "local_file"
-  elif echo "$value" | grep -qE '(meet\.google\.com/|^https?://[^/]*zoom\.us/)'; then
+  elif echo "$value" | grep -qE '(meet\.google\.com/|^https?://meet\.new/?$|^https?://[^/]*zoom\.us/)'; then
     echo "meeting"
   elif echo "$value" | grep -qE '(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/playlist\?list=)'; then
     echo "youtube"
@@ -221,6 +266,7 @@ classify_input() {
 looks_like_input() {
   case "$1" in
     http://*|https://*) return 0 ;;
+    meet.new|meet.new/|new-meet) return 0 ;;
     *"<iframe"*) return 0 ;;
   esac
   [ -f "$1" ]
@@ -267,6 +313,17 @@ split_clip_suffix() {
   SPLIT_INPUT="$rest"
   SPLIT_CLIP_LABEL="$(printf '%s' "$json" | sed -nE 's/.*"label": "([^"]*)".*/\1/p')"
   SPLIT_CLIP_TOKEN="$(printf '%s' "$json" | sed -nE 's/.*"token": "([^"]*)".*/\1/p')"
+}
+
+# "Create a meeting" has several spellings; one canonical input string, so the
+# stored input, the run's link line and is_new_meet all agree.
+NEW_MEET_INPUT="https://meet.new"
+canonical_input() {
+  case "$1" in
+    meet.new|meet.new/|new-meet|http://meet.new|http://meet.new/|https://meet.new/)
+      echo "$NEW_MEET_INPUT" ;;
+    *) echo "$1" ;;
+  esac
 }
 
 declare -a INPUTS=()
@@ -318,6 +375,15 @@ if [ -n "$FROM_FILE" ]; then
     echo "ERROR: --from-file: no such file: $FROM_FILE" >&2
     exit 1
   fi
+  # A PDF read line by line is a list of garbage "inputs" (lost an hour to
+  # exactly that). --from-file wants a text file of links and paths; slides
+  # and notes belong in --resources.
+  if "$PYTHON_BIN" "$SCRIPT_DIR/lib/resources.py" is-binary "$FROM_FILE"; then
+    echo "ERROR: --from-file: $FROM_FILE: this looks like a binary document; convert it to Markdown first." >&2
+    echo "  --from-file takes a text file of links/paths, one per line." >&2
+    echo "  Slides and course notes go in --resources instead." >&2
+    exit 1
+  fi
   while IFS= read -r line || [ -n "$line" ]; do
     # A comment is a "#" at the start of the line or one preceded by
     # whitespace. NOT any "#" at all: that ate the "#t=" window suffix — and
@@ -330,6 +396,9 @@ if [ -n "$FROM_FILE" ]; then
     add_input "$line"
   done < "$FROM_FILE"
 fi
+
+# --new-meet is one more input, after everything else on the line.
+[ "$NEW_MEET" -eq 1 ] && add_input "$NEW_MEET_INPUT"
 
 # Legacy positional mapping, only when it's unambiguous (exactly one input).
 if [ "${#INPUTS[@]}" -eq 1 ] && [ "${#LEGACY_EXTRAS[@]}" -gt 0 ]; then
@@ -423,7 +492,11 @@ derive_safe_name() {
       sanitize "${base%.*}"
       ;;
     *)
-      sanitize "${NAME:-meeting}"
+      if [ "$input" = "$NEW_MEET_INPUT" ]; then
+        sanitize "${NAME:-new_meet}"
+      else
+        sanitize "${NAME:-meeting}"
+      fi
       ;;
   esac
 }
@@ -492,9 +565,9 @@ else
     done
     if [ "${#UNRECOGNIZED[@]}" -gt 0 ]; then
       echo "ERROR: unrecognized input: ${UNRECOGNIZED[0]}" >&2
-      echo "  Expected a Google Meet or Zoom URL, a YouTube URL, a Kaltura" >&2
-      echo "  embed (the <iframe> tag or just its src URL), or a path to a" >&2
-      echo "  local media file that exists on disk." >&2
+      echo "  Expected a Google Meet or Zoom URL (or meet.new to create one)," >&2
+      echo "  a YouTube URL, a Kaltura embed (the <iframe> tag or just its src" >&2
+      echo "  URL), or a path to a local media file that exists on disk." >&2
       echo "  (A local path is only recognized if the file is actually there —" >&2
       echo "   check for a typo in the path.)" >&2
       exit 1
@@ -503,7 +576,7 @@ else
     exit 1
   fi
   for input_idx in "${!INPUTS[@]}"; do
-    input="${INPUTS[$input_idx]}"
+    input="$(canonical_input "${INPUTS[$input_idx]}")"
     # This input's own window: its #t= suffix if it had one, otherwise the
     # invocation-wide --clip. Read by index rather than carried in $input,
     # because the input string is also the auto-resume key and the provenance
@@ -520,19 +593,29 @@ else
     fi
     if [ "$kind" = "unknown" ]; then
       echo "ERROR: unrecognized input: $input" >&2
-      echo "  Expected a Google Meet or Zoom URL, a YouTube URL, a Kaltura" >&2
-      echo "  embed (the <iframe> tag or just its src URL), or a path to a" >&2
-      echo "  local media file that exists." >&2
+      echo "  Expected a Google Meet or Zoom URL (or meet.new to create one)," >&2
+      echo "  a YouTube URL, a Kaltura embed (the <iframe> tag or just its src" >&2
+      echo "  URL), or a path to a local media file that exists." >&2
       exit 1
     fi
 
     # Auto-resume: an unfinished run for this exact input gets picked up rather
     # than duplicated. --force always starts a clean run instead.
+    # Not for a meeting the bot creates: every meet.new is a different call,
+    # and "resuming" an older one would transcribe last week's meeting in
+    # place of recording this one. Its link is in that run's state; resume it
+    # explicitly with --run-id.
     existing=""
-    if [ "$FORCE" -eq 0 ]; then
+    if [ "$FORCE" -eq 0 ] && [ "$input" != "$NEW_MEET_INPUT" ]; then
       existing="$(rs find --root "$RUNS_DIR" --input "$input" --clip "$this_clip_label" --incomplete 2>/dev/null || true)"
     fi
 
+    if [ "$DRY_RUN" -eq 1 ]; then
+      # One tab-separated line per input: what the web UI's "Check" shows.
+      printf 'ok\t%s\t%s\t%s\t%s\n' "$kind" "${this_clip_label:--}" \
+        "${existing:-new}" "$input"
+      continue
+    fi
     if [ -n "$existing" ]; then
       echo "==> Resuming unfinished run for $input"
       echo "    run id: $existing   (use --force to start over instead)"
@@ -565,6 +648,22 @@ else
     fi
     RUN_DIRS+=("$run_dir")
   done
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  if [ -n "$COMBINE_FILE" ]; then
+    combine_dir="$(dirname "$COMBINE_FILE")"
+    case "$combine_dir" in /*) ;; *) combine_dir="$PWD/$combine_dir" ;; esac
+    if [ ! -d "$combine_dir" ]; then
+      echo "ERROR: --combine: the directory does not exist: $combine_dir" >&2
+      exit 1
+    fi
+    printf 'combine\t%s\n' "$COMBINE_FILE"
+  fi
+  for run_dir in "${RUN_DIRS[@]:-}"; do
+    [ -n "$run_dir" ] && printf 'resume\t%s\n' "$(basename "$run_dir")"
+  done
+  exit 0
 fi
 
 # --- The combine run: settled before any member starts ----------------------

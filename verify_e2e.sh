@@ -157,7 +157,7 @@ echo "--- host"
 echo "--- programs"
 for cmd in ffmpeg ffprobe Xvfb x11vnc websockify pactl pulseaudio yt-dlp \
            google-chrome-stable git pdftotext pdftoppm; do
-  command -v "$cmd" >/dev/null 2>&1 && ok "$cmd" || bad "$cmd is missing (run ./setup.sh)"
+  command -v "$cmd" >/dev/null 2>&1 && ok "$cmd" || bad "$cmd is missing (rebuild the image: docker compose build)"
 done
 command -v soffice >/dev/null 2>&1 || command -v libreoffice >/dev/null 2>&1 \
   && ok "libreoffice (optional: .pptx slide images)" \

@@ -1,0 +1,13 @@
+# Never bake secrets or local state into the image: .env reaches the
+# container through compose's env_file, and runs live in the bot-data volume.
+.env
+.env.*
+!.env.example
+.git
+.claude
+old_stuff
+data
+runs
+scripts
+**/__pycache__
+**/*.py[cod]

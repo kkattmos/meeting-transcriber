@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meeting Bot</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5b6573;
+    --border: #d9dee5; --accent: #1a73e8; --accent-text: #ffffff;
+    --ok: #1e8e3e; --warn: #b06000; --bad: #c5221f; --code: #eef1f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418; --panel: #1a1e24; --text: #e6e9ee; --muted: #9aa4b2;
+      --border: #2d333b; --accent: #8ab4f8; --accent-text: #0b1b33;
+      --ok: #81c995; --warn: #fdd663; --bad: #f28b82; --code: #22272e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", "Noto Sans Thai", sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 16px; display: flex; align-items: center; gap: 10px; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+           padding: 16px; margin-bottom: 16px; }
+  label { display: block; font-weight: 600; font-size: 13px; margin: 12px 0 4px; }
+  .hint { color: var(--muted); font-size: 12px; font-weight: 400; }
+  input[type=text], input[type=password], input[type=number], select, textarea {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--text); font: inherit; }
+  textarea { min-height: 88px; font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 13px; }
+  .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0 14px; }
+  .checks { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px; }
+  .checks label { display: inline-flex; align-items: center; gap: 6px; font-weight: 400; margin: 0; }
+  button { padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border);
+           background: var(--panel); color: var(--text); font: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .msg { margin-top: 12px; white-space: pre-wrap; font-size: 13px; }
+  .msg.bad { color: var(--bad); } .msg.ok { color: var(--ok); }
+  pre { background: var(--code); padding: 10px; border-radius: 6px; overflow-x: auto;
+        font-size: 12px; max-height: 320px; white-space: pre-wrap; word-break: break-word; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr.clickable { cursor: pointer; } tr.clickable:hover { background: var(--bg); }
+  .stages { font-family: ui-monospace, Menlo, monospace; letter-spacing: 1px; white-space: nowrap; }
+  .s-done { color: var(--ok); } .s-failed { color: var(--bad); } .s-running { color: var(--warn); }
+  .s-pending { color: var(--muted); }
+  .link { font-family: ui-monospace, Menlo, monospace; font-size: 15px; word-break: break-all; }
+  .meet { display: none; margin-top: 12px; padding: 12px; border: 1px dashed var(--accent); border-radius: 8px; }
+  .badge { font-size: 11px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); }
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+  .tabs button[aria-selected=true] { border-color: var(--accent); color: var(--accent); }
+  .hidden { display: none; }
+  .table-wrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Meeting Bot <span class="badge" id="conn">not connected</span></h1>
+
+  <section class="panel" id="tokenPanel">
+    <h2>Access token</h2>
+    <label for="token">MEETING_BOT_TOKEN <span class="hint">— kept in this browser only</span></label>
+    <input type="password" id="token" autocomplete="off">
+    <div class="actions"><button class="primary" id="saveToken">Connect</button></div>
+    <div class="msg" id="tokenMsg"></div>
+  </section>
+
+  <div id="app" class="hidden">
+    <div class="tabs" role="tablist">
+      <button role="tab" aria-selected="true" data-tab="meet">New Google Meet</button>
+      <button role="tab" aria-selected="false" data-tab="summarize">Record / summarize</button>
+      <button role="tab" aria-selected="false" data-tab="runs">Runs</button>
+    </div>
+
+    <section class="panel" data-panel="meet">
+      <h2>Start a new Google Meet</h2>
+      <p class="hint">The bot creates the call in its signed-in Google account, admits everyone who
+        asks to join, records it, and ends the call once everyone has left (or nobody joins within
+        NEW_MEET_WAIT_MINUTES). Transcript and summary follow automatically.</p>
+      <div class="row">
+        <div><label for="meetName">Meeting name</label><input type="text" id="meetName" placeholder="Project sync"></div>
+        <div><label for="meetPrompt">Summary style</label><select id="meetPrompt"></select></div>
+        <div><label for="meetLang">Spoken language</label><select id="meetLang"></select></div>
+      </div>
+      <div class="actions"><button class="primary" id="startMeet">Create meeting</button></div>
+      <div class="meet" id="meetBox">
+        <div class="hint" id="meetStatus">Creating the meeting…</div>
+        <div class="link" id="meetLink"></div>
+        <div class="actions">
+          <button id="copyMeet" disabled>Copy link</button>
+          <button id="openMeet" disabled>Open</button>
+          <button id="stopMeet" disabled>End &amp; stop recording</button>
+        </div>
+      </div>
+      <div class="msg" id="meetMsg"></div>
+    </section>
+
+    <section class="panel hidden" data-panel="summarize">
+      <h2>Record or summarize</h2>
+      <label for="inputs">Inputs <span class="hint">— one per line: Meet/Zoom link, YouTube link or playlist,
+        Kaltura &lt;iframe&gt; or its src, or a file path on the server. Append
+        <code>#t=00:05:00-01:30:00</code> to summarize only part of one.</span></label>
+      <textarea id="inputs" placeholder="https://www.youtube.com/watch?v=...&#10;/data/recordings/lecture.mp4#t=00:05:00-01:30:00"></textarea>
+      <div class="row">
+        <div><label for="prompt">Summary style (prompt)</label><select id="prompt"></select></div>
+        <div><label for="language">Spoken language</label><select id="language"></select></div>
+        <div><label for="clip">Clip window for all <span class="hint">(optional)</span></label>
+          <input type="text" id="clip" placeholder="00:05:00-01:30:00"></div>
+        <div><label for="jobs">Parallel jobs</label><input type="number" id="jobs" min="1" max="8"></div>
+      </div>
+      <div class="row">
+        <div><label for="name">Name <span class="hint">(single input only)</span></label><input type="text" id="name"></div>
+        <div><label for="combine">Combine into one document <span class="hint">(optional .md path)</span></label>
+          <input type="text" id="combine" placeholder="/data/summaries/midterm-review.md"></div>
+      </div>
+      <label for="resources">Reference material <span class="hint">— one per line: a GitHub repo URL or a
+        server path to slides / notes. A Markdown file may carry course/source/citation_label
+        frontmatter (use the lecture-reference style).</span></label>
+      <textarea id="resources" style="min-height:56px"></textarea>
+      <div class="checks">
+        <label><input type="checkbox" id="playlist"> Expand YouTube playlists</label>
+        <label><input type="checkbox" id="noCombinePdf"> Combined: markdown only</label>
+        <label><input type="checkbox" id="force"> Start over (ignore earlier progress)</label>
+      </div>
+      <div class="actions">
+        <button id="check">Check</button>
+        <button class="primary" id="start" disabled>Start</button>
+      </div>
+      <div class="msg" id="checkMsg"></div>
+      <div class="table-wrap"><table id="plan" class="hidden">
+        <thead><tr><th>Type</th><th>Window</th><th>Run</th><th>Input</th></tr></thead><tbody></tbody>
+      </table></div>
+      <pre id="startLog" class="hidden"></pre>
+    </section>
+
+    <section class="panel hidden" data-panel="runs">
+      <h2>Runs <span class="hint">— stages: record · fetch · clip · transcribe · frames · summarize</span></h2>
+      <div class="table-wrap"><table id="runs">
+        <thead><tr><th>Run</th><th>Stages</th><th>Updated</th></tr></thead><tbody></tbody>
+      </table></div>
+      <div id="runDetail" class="hidden">
+        <h2 id="rdTitle" style="margin-top:16px"></h2>
+        <div id="rdInfo" class="hint"></div>
+        <div class="actions">
+          <button id="rdResume">Resume</button>
+          <button id="rdStop">Stop / leave meeting</button>
+        </div>
+        <div id="rdLogs"></div>
+      </div>
+    </section>
+  </div>
+</main>
+<script>
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  let token = "";
+  try { token = localStorage.getItem("mbToken") || ""; } catch (e) {}
+  let lastCheckKey = null;
+  let currentRun = null;
+
+  async function api(path, opts = {}) {
+    const res = await fetch(path, {
+      method: opts.method || "GET",
+      headers: Object.assign({ "Authorization": "Bearer " + token },
+                             opts.body ? { "Content-Type": "application/json" } : {}),
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) {}
+    if (res.status === 401) { showToken("The token was rejected."); throw new Error("unauthorized"); }
+    if (!res.ok && res.status !== 202) throw new Error(data.error || ("HTTP " + res.status));
+    return data;
+  }
+
+  function showToken(msg) {
+    $("tokenPanel").classList.remove("hidden");
+    $("app").classList.add("hidden");
+    $("conn").textContent = "not connected";
+    $("tokenMsg").textContent = msg || "";
+    $("tokenMsg").className = "msg bad";
+  }
+
+  function fillSelect(sel, values, chosen) {
+    sel.innerHTML = "";
+    values.forEach((v) => {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = v || "(default)";
+      if (v === chosen) o.selected = true;
+      sel.appendChild(o);
+    });
+  }
+
+  async function connect() {
+    try {
+      const opt = await api("/api/options");
+      $("tokenPanel").classList.add("hidden");
+      $("app").classList.remove("hidden");
+      $("conn").textContent = "connected";
+      const prompts = [""].concat(opt.prompts);
+      fillSelect($("prompt"), prompts, opt.default_prompt);
+      fillSelect($("meetPrompt"), prompts,
+                 opt.prompts.includes("meeting-claude") ? "meeting-claude" : opt.default_prompt);
+      fillSelect($("language"), opt.languages, opt.default_language);
+      fillSelect($("meetLang"), opt.languages, opt.default_language);
+      $("jobs").value = opt.default_jobs || 2;
+      if (opt.summaries_dir) $("combine").placeholder = opt.summaries_dir.replace(/\/$/, "") + "/combined.md";
+      refreshRuns();
+    } catch (e) {
+      if (e.message !== "unauthorized") showToken("Could not reach the server: " + e.message);
+    }
+  }
+
+  $("saveToken").onclick = () => {
+    token = $("token").value.trim();
+    try { localStorage.setItem("mbToken", token); } catch (e) {}
+    connect();
+  };
+
+  document.querySelectorAll("[data-tab]").forEach((b) => {
+    b.onclick = () => {
+      document.querySelectorAll("[data-tab]").forEach((x) => x.setAttribute("aria-selected", x === b));
+      document.querySelectorAll("[data-panel]").forEach((p) =>
+        p.classList.toggle("hidden", p.dataset.panel !== b.dataset.tab));
+      if (b.dataset.tab === "runs") refreshRuns();
+    };
+  });
+
+  // --- New Google Meet ------------------------------------------------------
+  let meetRunPoll = null;
+  $("startMeet").onclick = async () => {
+    $("startMeet").disabled = true;
+    $("meetMsg").textContent = "";
+    $("meetBox").style.display = "block";
+    $("meetStatus").textContent = "Creating the meeting… (Chrome is starting; this takes ~20s)";
+    $("meetLink").textContent = "";
+    ["copyMeet", "openMeet", "stopMeet"].forEach((id) => $(id).disabled = true);
+    try {
+      const r = await api("/trigger", { method: "POST", body: {
+        new_meet: true, name: $("meetName").value.trim() || undefined,
+        prompt: $("meetPrompt").value || undefined, language: $("meetLang").value } });
+      pollMeet(r.log_name, Date.now());
+    } catch (e) {
+      $("meetMsg").textContent = e.message; $("meetMsg").className = "msg bad";
+      $("startMeet").disabled = false;
+    }
+  };
+
+  function pollMeet(logName, started) {
+    clearInterval(meetRunPoll);
+    meetRunPoll = setInterval(async () => {
+      try {
+        const log = await api("/api/log?name=" + encodeURIComponent(logName));
+        const m = log.text.match(/New Google Meet: (https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3})/);
+        const run = log.text.match(/Run: (\S+)/);
+        if (run) currentRun = run[1];
+        if (m) {
+          $("meetLink").textContent = m[1];
+          $("meetStatus").textContent = "Meeting is live — share this link. The bot admits everyone.";
+          ["copyMeet", "openMeet"].forEach((id) => $(id).disabled = false);
+          $("stopMeet").disabled = !currentRun;
+          $("copyMeet").onclick = () => navigator.clipboard && navigator.clipboard.writeText(m[1]);
+          $("openMeet").onclick = () => window.open(m[1], "_blank", "noopener");
+        } else if (/Cannot create a meeting|meet\.new did not produce|ERROR/.test(log.text)) {
+          $("meetStatus").textContent = "Could not create the meeting:";
+          $("meetMsg").textContent = log.text.split("\n").slice(-12).join("\n");
+          $("meetMsg").className = "msg bad";
+          clearInterval(meetRunPoll); $("startMeet").disabled = false;
+        }
+        if (/All runs finished/.test(log.text)) {
+          $("meetStatus").textContent = "The meeting is over; see Runs for the summary.";
+          clearInterval(meetRunPoll); $("startMeet").disabled = false; $("stopMeet").disabled = true;
+        }
+        if (Date.now() - started > 3 * 60 * 1000 && !m) {
+          $("meetStatus").textContent = "Still no link after 3 minutes — check Runs for the log.";
+        }
+      } catch (e) { /* keep polling */ }
+    }, 3000);
+  }
+  $("stopMeet").onclick = async () => {
+    if (!currentRun || !confirm("End the call for everyone and stop recording?")) return;
+    $("stopMeet").disabled = true;
+    try { await api("/api/runs/" + currentRun + "/stop", { method: "POST" });
+          $("meetStatus").textContent = "Leaving… the recording is finalised, then transcribed."; }
+    catch (e) { $("meetMsg").textContent = e.message; $("meetMsg").className = "msg bad"; }
+  };
+
+  // --- Record / summarize ---------------------------------------------------
+  function formBody() {
+    return {
+      urls: $("inputs").value, prompt: $("prompt").value || undefined,
+      language: $("language").value, clip: $("clip").value.trim() || undefined,
+      jobs: $("jobs").value || undefined, name: $("name").value.trim() || undefined,
+      combine: $("combine").value.trim() || undefined,
+      no_combine_pdf: $("noCombinePdf").checked, resources: $("resources").value,
+      force: $("force").checked, playlist: $("playlist").checked,
+    };
+  }
+  ["inputs", "prompt", "language", "clip", "jobs", "name", "combine", "resources",
+   "noCombinePdf", "force", "playlist"].forEach((id) => $(id).addEventListener("input", () => {
+    $("start").disabled = JSON.stringify(formBody()) !== lastCheckKey;
+  }));
+
+  $("check").onclick = async () => {
+    const body = formBody();
+    $("checkMsg").textContent = "Checking…"; $("checkMsg").className = "msg";
+    $("plan").classList.add("hidden"); $("start").disabled = true;
+    try {
+      const r = await api("/api/check", { method: "POST", body });
+      const tb = $("plan").querySelector("tbody"); tb.innerHTML = "";
+      r.plan.forEach((p) => {
+        const tr = document.createElement("tr");
+        [p.kind, p.clip || "—", p.kind === "combine" ? "one document" : (p.resume ? "resume " + p.resume : "new"),
+         p.input].forEach((t) => { const td = document.createElement("td"); td.textContent = t; tr.appendChild(td); });
+        tb.appendChild(tr);
+      });
+      $("plan").classList.toggle("hidden", !r.plan.length);
+      if (r.ok) {
+        lastCheckKey = JSON.stringify(body);
+        $("start").disabled = false;
+        $("checkMsg").textContent = "Looks good." + (r.messages ? "\n" + r.messages : "") +
+          "\nEquivalent command: " + r.command.map((a) => /[\s'"<>#&]/.test(a) ? "'" + a.replace(/'/g, "'\\''") + "'" : a).join(" ");
+        $("checkMsg").className = "msg ok";
+      } else {
+        $("checkMsg").textContent = r.messages || "The pipeline refused these options.";
+        $("checkMsg").className = "msg bad";
+      }
+    } catch (e) { $("checkMsg").textContent = e.message; $("checkMsg").className = "msg bad"; }
+  };
+
+  let startPoll = null;
+  $("start").onclick = async () => {
+    $("start").disabled = true;
+    try {
+      const r = await api("/trigger", { method: "POST", body: formBody() });
+      lastCheckKey = null;
+      $("startLog").classList.remove("hidden");
+      $("startLog").textContent = "Started — " + r.log_name;
+      clearInterval(startPoll);
+      startPoll = setInterval(async () => {
+        try {
+          const log = await api("/api/log?name=" + encodeURIComponent(r.log_name));
+          $("startLog").textContent = log.text;
+          $("startLog").scrollTop = $("startLog").scrollHeight;
+          // The pipeline's final report, or a refusal before anything ran.
+          if (/All runs finished|^ERROR/m.test(log.text)) { clearInterval(startPoll); refreshRuns(); }
+        } catch (e) {}
+      }, 4000);
+    } catch (e) { $("checkMsg").textContent = e.message; $("checkMsg").className = "msg bad"; }
+  };
+
+  // --- Runs -------------------------------------------------------------------
+  const MARK = { done: "✓", failed: "✗", running: "▶", pending: "·" };
+  async function refreshRuns() {
+    if ($("app").classList.contains("hidden")) return;
+    try {
+      const r = await api("/api/runs?limit=40");
+      const tb = $("runs").querySelector("tbody"); tb.innerHTML = "";
+      r.runs.forEach((run) => {
+        const tr = document.createElement("tr"); tr.className = "clickable";
+        const a = document.createElement("td");
+        a.innerHTML = "<div></div><div class='hint'></div>";
+        a.firstChild.textContent = run.run_id + (run.active ? "  ● running" : "") + (run.paused ? "  ⏸ paused" : "");
+        a.lastChild.textContent = run.meet_url || (run.input || "").slice(0, 90);
+        const s = document.createElement("td"); s.className = "stages";
+        Object.values(run.stages).forEach((st) => {
+          const sp = document.createElement("span"); sp.className = "s-" + st;
+          sp.textContent = MARK[st] || "?"; sp.title = st; s.appendChild(sp);
+        });
+        const u = document.createElement("td"); u.className = "hint";
+        u.textContent = (run.updated_at || "").replace("T", " ").slice(0, 16);
+        tr.append(a, s, u);
+        tr.onclick = () => showRun(run.run_id);
+        tb.appendChild(tr);
+      });
+      if (currentRunDetail) showRun(currentRunDetail, true);
+    } catch (e) {}
+  }
+  let currentRunDetail = null;
+  async function showRun(id, quiet) {
+    currentRunDetail = id;
+    try {
+      const r = await api("/api/runs/" + encodeURIComponent(id));
+      $("runDetail").classList.remove("hidden");
+      $("rdTitle").textContent = id;
+      const s = r.summary, st = r.state;
+      const lines = [
+        "input: " + (s.input || "") + " (" + s.input_type + ")",
+        s.meet_url ? "meeting: " + s.meet_url : "",
+        s.clip ? "clip: " + s.clip : "",
+        "prompt: " + (st.prompt || "(default)") + "   language: " + (st.language || ""),
+        s.artifacts.md ? "summary: " + s.artifacts.md : "",
+        s.artifacts.pdf ? "pdf: " + s.artifacts.pdf : "",
+      ].filter(Boolean);
+      $("rdInfo").textContent = lines.join("\n"); $("rdInfo").style.whiteSpace = "pre-wrap";
+      const logs = $("rdLogs"); logs.innerHTML = "";
+      Object.entries(r.logs).forEach(([stage, text]) => {
+        const h = document.createElement("label"); h.textContent = stage;
+        const pre = document.createElement("pre"); pre.textContent = text || "(empty)";
+        logs.append(h, pre);
+      });
+      $("rdResume").onclick = async () => {
+        await api("/api/runs/" + encodeURIComponent(id) + "/resume", { method: "POST" });
+        setTimeout(refreshRuns, 1500);
+      };
+      $("rdStop").onclick = async () => {
+        if (!confirm("Stop run " + id + "? A meeting is left cleanly.")) return;
+        await api("/api/runs/" + encodeURIComponent(id) + "/stop", { method: "POST" });
+        setTimeout(refreshRuns, 1500);
+      };
+      if (!quiet) $("runDetail").scrollIntoView({ behavior: "smooth" });
+    } catch (e) {}
+  }
+  setInterval(refreshRuns, 10000);
+
+  if (token) { $("token").value = token; connect(); } else { showToken(""); }
+})();
+</script>
+</body>
+</html>

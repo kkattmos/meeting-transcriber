@@ -40,3 +40,6 @@ runs/
 # shell junk that lands in the repo root (the repo IS $HOME)
 .bash_history-*.tmp
 .bashrc.bak-*
+
+# docker-compose.yml's default for HOST_FILES_DIR (lecture files to feed in).
+/data/
