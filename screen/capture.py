@@ -60,6 +60,11 @@ MAX_MEETING_SECONDS = int(os.environ.get("MAX_MEETING_MINUTES", "240")) * 60
 # catches the "test call with just me" case that the mass-exit rule misses
 # (peak is 2, so 30% of peak is 0 — never triggers). Set to 0 to disable.
 IDLE_LEAVE_SECONDS = int(os.environ.get("IDLE_LEAVE_MINUTES", "5")) * 60
+# The softer auto-leave rules (idle with one other person, and "most people
+# have left") only fire once the meeting has also been silent this long —
+# settled with the operator 2026-09-29, so a 1:1 or the end of a lecture with
+# a few students left isn't cut off while someone is still talking.
+AUTO_LEAVE_SILENCE_SECONDS = int(os.environ.get("AUTO_LEAVE_SILENCE_SECONDS", "120"))
 # A meeting the bot created itself: how long to hold it open for the first
 # participant before ending it. Once somebody has joined, the ordinary
 # auto-leave rules take over.
@@ -926,6 +931,28 @@ def _sleep_hosting(page, seconds):
         time.sleep(min(HOST_ADMIT_POLL_SECONDS, max(0.0, deadline - time.time())))
 
 
+def meeting_audio_silent_for():
+    """Seconds the meeting audio has been silent, from record_screen.sh's
+    audio watcher (runs/<id>/audio_level: "<epoch> <peak dB> <silent s>").
+    None when unknown — no file, or a stale one — and then the audio gate is
+    open, i.e. the rules behave as they did before audio was measured."""
+    if not RUN_DIR:
+        return None
+    try:
+        with open(os.path.join(RUN_DIR, "audio_level")) as fh:
+            at, _peak, silent = fh.read().split()[:3]
+        if time.time() - int(at) > 60:
+            return None
+        return int(silent)
+    except (OSError, ValueError):
+        return None
+
+
+def quiet_enough():
+    silent = meeting_audio_silent_for()
+    return silent is None or silent >= AUTO_LEAVE_SILENCE_SECONDS
+
+
 def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
     """Stay in the call until it is over.
 
@@ -1058,7 +1085,8 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
                 # Hosting, a 1:1 with the bot is a meeting — only the bot alone
                 # is idle.
                 idle_counts = (1,) if host else (1, 2)
-                if IDLE_LEAVE_SECONDS > 0 and count in idle_counts:
+                # Idle needs silence too: two people talking is a meeting.
+                if IDLE_LEAVE_SECONDS > 0 and count in idle_counts and quiet_enough():
                     if idle_since_ts is None:
                         idle_since_ts = time.time()
                     elif time.time() - idle_since_ts >= IDLE_LEAVE_SECONDS:
@@ -1072,6 +1100,10 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
                 else:
                     idle_since_ts = None
 
+                # Alone is alone. "Most people left" waits for silence: the
+                # lecturer may still be talking to the few who stayed.
+                if is_mass_exodus and not is_alone and not quiet_enough():
+                    is_mass_exodus = False
                 if is_alone or is_mass_exodus:
                     low_streak += 1
                     print(f"Low participant count ({count}, peak {peak_count}) - streak {low_streak}")

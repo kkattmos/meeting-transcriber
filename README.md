@@ -1460,13 +1460,30 @@ again with `first_time_login.sh`.
 | `MAX_MEETING_MINUTES` | 240 | Hard wall-clock cap |
 | `IDLE_LEAVE_MINUTES` | 5 | Leave after this long alone (or with one other); `0` disables |
 | `NEW_MEET_WAIT_MINUTES` | 15 | A meeting the bot created: how long to wait for the first participant before ending it |
+| `AUTO_LEAVE_SILENCE_SECONDS` | 120 | The idle and "most people left" rules only fire after the meeting audio has also been silent this long |
+| `AUDIO_SILENCE_WARN_SECONDS` | 120 | Warn in the log / web UI after this long without meeting audio |
+| `TRANSCRIBE_MIN_SOUND_SECONDS` | 30 | Less sound than this in a recording → not sent to AssemblyAI |
+| `KILL_FINALISE_SECONDS` | 120 | `kill_meeting.sh`: how long to wait for the MP4 to be finalised when forcing a stop |
 | `RECORD_GEOMETRY` | `1920x1080` | Xvfb head, browser window and ffmpeg capture size — they must agree or the recording gets black edges |
 | `RECORD_FRAMERATE` | 15 | |
 | `MEETING_BOT_DISPLAY_NAME` | `Meeting Bot` | Same as `--display-name` |
 | `PIPELINE_JOBS` | 2 | Same as `--jobs` |
 
-The bot also leaves on the kill sentinel, when the page says the meeting ended,
-or when participants drop below 30% of their peak for two consecutive polls.
+When the bot leaves on its own (checked every 15 seconds):
+
+- **Everyone left** — only the bot remains on two polls (~30s): it leaves, or
+  ends the call for everyone if it created it.
+- **Nobody came** — a meeting it created with no one joining within
+  `NEW_MEET_WAIT_MINUTES`.
+- **It dropped out** — the call's controls are gone on two polls (Meet sent it
+  back to the lobby): the recording ends; `runs/<id>/left_call.png` shows why.
+- **Idle** — joining someone else's call, only the bot and one other person for
+  `IDLE_LEAVE_MINUTES` — **and** no meeting audio for
+  `AUTO_LEAVE_SILENCE_SECONDS`. A 1:1 where people talk is not idle.
+- **Most people left** — the count falls to 30% of its peak on two polls —
+  **and** the meeting has gone quiet. A lecturer still talking to the few who
+  stayed keeps the recording going.
+- The stop button / `./kill_meeting.sh`, and the `MAX_MEETING_MINUTES` cap.
 
 ---
 

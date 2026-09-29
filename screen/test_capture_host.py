@@ -54,6 +54,7 @@ class HostedMeetingTest(unittest.TestCase):
         self.left = []
         self.admit_calls = 0
         self.in_call = [True]     # is_admitted() per call; last one repeats
+        self.silent_for = None    # the audio watcher: None = unknown
         self._saved = {}
         patches = {
             ("time", "time"): self.clock.time,
@@ -65,6 +66,7 @@ class HostedMeetingTest(unittest.TestCase):
             ("capture", "block_screen_share_dialog"): lambda page: False,
             ("capture", "stop_unwanted_presenting"): lambda page: False,
             ("capture", "kill_requested"): lambda: False,
+            ("capture", "meeting_audio_silent_for"): lambda: self.silent_for,
             ("capture", "is_admitted"): lambda page: self.in_call.pop(0) if len(self.in_call) > 1 else self.in_call[0],
         }
         for (mod, name), value in patches.items():
@@ -166,6 +168,43 @@ class HostedMeetingTest(unittest.TestCase):
         capture.wait_until_meeting_ends(FakePage(), host=True)
         self.assertEqual(len(self.ended), 1, "ended by the cap, not by one bad poll")
         self.assertGreaterEqual(self.elapsed_min(self.ended[0]), 5)
+
+    def test_a_talking_one_to_one_is_not_idle(self):
+        # Joining someone's 1:1: two people, audio live — stays until the cap.
+        self.counts = [2]
+        self.silent_for = 0
+        capture.MAX_MEETING_SECONDS = 30 * 60
+        capture.wait_until_meeting_ends(FakePage(), host=False)
+        self.assertEqual(len(self.left), 1)
+        self.assertGreaterEqual(self.elapsed_min(self.left[0]), 30)
+
+    def test_a_silent_one_to_one_is_idle(self):
+        self.counts = [2]
+        self.silent_for = 300
+        capture.wait_until_meeting_ends(FakePage(), host=False)
+        self.assertLess(self.elapsed_min(self.left[0]), 6)
+
+    def test_most_people_left_but_the_lecturer_is_talking(self):
+        # Peak 40, twelve stay for questions: not the end while there's sound.
+        self.counts = [40, 40, 12]
+        self.silent_for = 0
+        capture.MAX_MEETING_SECONDS = 30 * 60
+        capture.wait_until_meeting_ends(FakePage(), host=False)
+        self.assertGreaterEqual(self.elapsed_min(self.left[0]), 30)
+
+    def test_most_people_left_and_it_went_quiet(self):
+        self.counts = [40, 40, 12]
+        self.silent_for = 180
+        capture.wait_until_meeting_ends(FakePage(), host=False)
+        self.assertLess(self.elapsed_min(self.left[0]), 2)
+
+    def test_alone_ends_even_with_sound(self):
+        # Everyone left: the bot's own page may still be making noise.
+        self.counts = [3, 1]
+        self.silent_for = 0
+        capture.wait_until_meeting_ends(FakePage(), host=True)
+        self.assertEqual(len(self.ended), 1)
+        self.assertLess(self.elapsed_min(self.ended[0]), 2)
 
 
 if __name__ == "__main__":

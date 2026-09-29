@@ -287,6 +287,17 @@ Settled with the operator after reading a real recording:
 - **A live profile lock is refused, never deleted** (`browser.ProfileInUse`):
   `clear_stale_locks` deleted the lock of an open sign-in window.
 
+### Auto-leave listens as well as counts (2026-09-29)
+
+The operator's choice after reviewing the rules: "idle" (a guest with one
+other person for IDLE_LEAVE_MINUTES) and "mass exit" (count ≤30% of peak) now
+also require AUTO_LEAVE_SILENCE_SECONDS (120) of meeting silence, read from
+the recorder's `runs/<id>/audio_level` (`meeting_audio_silent_for`; a missing
+or stale file means unknown, and unknown leaves the old behaviour). "Alone",
+"nobody came", "dropped out", kill and the cap are not gated. The earlier
+live drop-out at 15:33 coincided with the operator leaving; Meet evidently
+closed the bot's session, which the "dropped out" rule now ends cleanly.
+
 ### Stopping a recording without breaking it (2026-09-29)
 
 Two recordings were unplayable: header `mdat` size 0, no `moov`, and in the
