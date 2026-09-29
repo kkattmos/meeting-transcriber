@@ -724,6 +724,45 @@ _LAYOUT_JS = r"""() => {
 }"""
 
 
+# The bot's own floating tile, shown whenever someone else is in the call —
+# "hide tiles without video" does not cover the self view. Its menu
+# ("ตัวเลือกเพิ่มเติมสำหรับ <bot name>") offers "ย่อเล็กสุด" (Minimize),
+# found live 2026-09-29; the tile itself can't be removed in this layout.
+_MINIMIZE_SELF_JS = r"""() => {
+  const menuBtn = Array.from(document.querySelectorAll('button')).find(b =>
+      /^(ตัวเลือกเพิ่มเติมสำหรับ|More options for) /.test(b.getAttribute('aria-label') || ''));
+  if (!menuBtn) return 'no-self-menu';
+  menuBtn.click();
+  return 'opened';
+}"""
+_CLICK_MINIMIZE_JS = r"""() => {
+  const item = Array.from(document.querySelectorAll('[role=menuitem]')).find(m =>
+      /^(ย่อเล็กสุด|Minimi[sz]e)$/.test((m.getAttribute('aria-label') || m.innerText || '').trim().replace(/^close_fullscreen\s*/, '')));
+  if (!item) return 'no-minimize';
+  item.click();
+  return 'minimized';
+}"""
+_SELF_MINIMIZED = False
+
+
+def minimize_self_tile(page):
+    """Once per call, after someone else is in it: minimise the bot's tile."""
+    global _SELF_MINIMIZED
+    if _SELF_MINIMIZED:
+        return
+    try:
+        if page.evaluate(_MINIMIZE_SELF_JS) != "opened":
+            return            # alone in the call: there is no floating tile yet
+        time.sleep(1)
+        result = page.evaluate(_CLICK_MINIMIZE_JS)
+        if result != "minimized":
+            page.keyboard.press("Escape")
+        print(f"  Self tile: {result}")
+        _SELF_MINIMIZED = result == "minimized"
+    except Exception as e:
+        print(f"  WARNING: could not minimise the bot's own tile ({e})")
+
+
 def set_recording_layout(page):
     """Spotlight + hide tiles without video. Best-effort; never fails a call."""
     try:
@@ -948,6 +987,7 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
             # notice, the People panel) comes off the recording.
             if "meet.google.com" in (getattr(page, "url", "") or ""):
                 dismiss_notices(page)
+                minimize_self_tile(page)
 
             # Screen-share defenses (Layers 2 and 3). Layer 1 is the Chrome
             # flag set at launch; these two are the runtime catch-nets.

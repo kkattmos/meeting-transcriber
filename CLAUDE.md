@@ -260,9 +260,13 @@ Settled with the operator after reading a real recording:
   Order matters: "ปิดไมโครโฟน" (off) is a substring of "เปิดไมโครโฟน" (on), so
   the "already off" check must run before any "turn off" match.
 - **Layout: Spotlight + hide tiles without video** (`set_recording_layout`,
-  More options → "ปรับมุมมอง"), which removes the bot's own tile. Meet
-  remembers it for the account. The self tile can't be removed directly
-  ("นำไทล์ของคุณในเลย์เอาต์นี้ออกไม่ได้").
+  More options → "ปรับมุมมอง"). Meet remembers it for the account. It does
+  NOT remove the bot's floating self view once someone else is in the call
+  (seen live while presenting), and the tile can't be removed
+  ("นำไทล์ของคุณในเลย์เอาต์นี้ออกไม่ได้") — so `minimize_self_tile` opens the
+  tile's menu ("ตัวเลือกเพิ่มเติมสำหรับ <name>") and picks "ย่อเล็กสุด"
+  (Minimize), once per call, from the polling loop. Labels found live;
+  the click itself verified on a mock only.
 - **Notices and the People panel are closed every poll** (`dismiss_notices`,
   exact labels "รับทราบ"/"Got it"/"ปิด"/"Close"; `click_now` never waits, so
   it is cheap to repeat). Admitting someone opens the panel; it is closed
