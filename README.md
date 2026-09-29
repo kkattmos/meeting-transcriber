@@ -883,6 +883,36 @@ CPU-hungry part. Chunk concurrency is kept low on purpose — every chunk carrie
 images, and firing a dozen multi-megabyte requests is a good way to earn the
 429s you then have to sit out.
 
+### What costs CPU, and measuring it (`benchmark.sh`)
+
+`./benchmark.sh` runs synthetic media through every local stage with the
+settings the pipeline really uses, and prints wall time, CPU time and peak
+memory per stage, plus CPU-minutes per hour of media. It touches no run
+state and calls no API. `--browser` adds Firefox ESR on a hidden display
+playing a full-screen video, as a stand-in for the browser rendering a call.
+`--watch-run <run_id>` samples a recording in progress instead: CPU and
+memory of its browser, ffmpeg, Xvfb and helpers.
+
+```bash
+./benchmark.sh --browser
+```
+
+Measured on the reference PC (Core 7 150U, 12 threads), 2026-09-29:
+
+| Stage | CPU per hour of media | Can it be turned off? |
+|---|---|---|
+| Recording: browser rendering the call | ≥ 60 CPU-min (≥ 1 core, the whole meeting) | Only by not recording. `MEETING_BROWSER` picks the browser |
+| Recording: x264 encode | 20 (slides) to 56 (full-screen camera) CPU-min | No. `RECORD_FRAMERATE` scales it |
+| `--clip` with `CLIP_REENCODE=1` | ~29 CPU-min | Yes, off by default (stream copy is ~0) |
+| Frame extraction (two full decodes) | ~13 CPU-min | No. `FRAME_PERIOD_SECONDS=0` drops the periodic pass only |
+| Frame prep for the model | 0.2-0.3 CPU-s per frame | `CLAUDE_CLI_FRAME_VISION=0` skips it |
+| PDF render | ~10 CPU-s per document (half of it maths) | `--no-pdf` / `SUMMARY_WRITE_PDF=0`; `PDF_MATH=0` |
+| Silence check before upload | ~0.5 CPU-min | No, it is what stops paying for silence |
+
+The summary itself costs the Claude subscription, not local CPU: see
+[The usage window](#summarization) and each run's `state.json`
+`stages.summarize.usage`.
+
 ### Queueing across separate sessions
 
 `--jobs` only limits concurrency *inside one* `./pipeline.sh` invocation. Run

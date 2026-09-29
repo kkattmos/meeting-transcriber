@@ -540,6 +540,33 @@ errors. Nothing is reported. The operator looks in the library and the lecture
 isn't there. If this bites, the fix is a liveness check (a marker file that
 must already exist inside each configured directory) rather than a `mkdir`.
 
+### Measured compute on the PC (`benchmark.sh`, 2026-09-29)
+
+Asked by the operator: rank what uses the most computing power and say
+whether each can be switched off, with a script to run on other PCs.
+`./benchmark.sh` pushes synthetic 1920x1080@15 media through the real
+commands/modules (the recorder's ffmpeg line, extract_frames.py's two passes,
+`clip.py`, `audiocheck.py`, `framecrop`, `pdf.py`); `--browser` plays a
+full-screen 720p30 VP8 video in Firefox ESR on an Xvfb display claimed through
+`lib/xsession.sh`; `--watch-run <id>` samples a live recording's process tree
+from `record.pid`. Its commands copy the pipeline's: if the recorder's or
+extract_frames.py's ffmpeg arguments change, change the script too.
+
+Results on the Core 7 150U (12 threads), in CPU-minutes per media hour:
+browser stand-in ≥ 60 (≈1.0-1.4 cores, a floor: no WebRTC, no Meet JS),
+x264 20 (slides) / 56 (full-screen camera), `CLIP_REENCODE=1` 29, frames 13
+(scene 7 + periodic 6 — two full decodes of the same file), silence check
+0.5. Per document: PDF ≈ 10 CPU-s, ≈ 4 with `PDF_MATH=0`. Frame prep for the
+model 0.2-0.3 CPU-s per frame. A U-series laptop chip varies ±50% between
+runs (turbo/thermals); rank, don't quote to the second.
+
+The ranking that follows: a live meeting (browser + encoder, for its whole
+length) dwarfs every post-processing stage; frames are the heaviest stage
+after it and have no off switch (`FRAME_PERIOD_SECONDS=0` drops only the
+periodic pass, and the periodic pass must stay — see "MUST NOT change");
+the summary's real cost is the subscription window, not local CPU. The two
+frame passes could share one decode (`split` filter) — not done, not asked.
+
 ### API keys are numbered slots with a persisted cursor
 
 `lib/keyring.py`. `GEMINI_API_KEY_1..3`, `ASSEMBLYAI_API_KEY_1..3` and
@@ -2529,6 +2556,7 @@ own flags, which is everything about stage 1 except the call itself.
 ├── kill_meeting.sh               <- per-run or global, pid-file based
 ├── pipeline.sh                   <- multi-input orchestrator
 ├── verify_e2e.sh                 <- live checks: preflight + mp4/YouTube/Kaltura/Meet/Zoom
+├── benchmark.sh                  <- CPU/memory per local stage (synthetic media); --browser, --watch-run
 ├── trigger_server.py             <- web UI + /trigger + /api/* (stdlib only)
 ├── ecosystem.config.js           <- pm2: meeting-bot-web + meeting-bot-resume (every 15 min)
 ├── webui.sh                      <- ./webui.sh on|off|restart|status|url|logs (nothing at boot)
