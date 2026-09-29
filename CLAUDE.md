@@ -287,6 +287,27 @@ Settled with the operator after reading a real recording:
 - **A live profile lock is refused, never deleted** (`browser.ProfileInUse`):
   `clear_stale_locks` deleted the lock of an open sign-in window.
 
+### The bot's audio must not be "Firefox" (2026-09-29)
+
+Found in the sixth live test: the bot recorded silence while the meeting had
+sound, because its Firefox played the meeting into the dummy mic sink instead
+of the recording sink. PULSE_SINK is only a request — WirePlumber restores
+routing per `application.name`, and the operator's own browser is also
+"Firefox": streams moved in pavucontrol (following the MeetShare advice) were
+restored onto the bot's, and vice versa (the operator's YouTube and Meet
+ended up in the bot's sinks). Now:
+
+- record_screen.sh exports `PULSE_PROP_OVERRIDE` → the bot's client is
+  `application.name "Meeting Bot"`, `application.id "meeting-bot"` (verified:
+  libpulse honours it for Firefox), so the two never share a restore entry.
+- `lib/pinaudio.py <join pid> <sink>`, run every 10s by `audio_watch`, moves
+  any playback stream of the bot's process tree back onto the recording sink.
+- The `<sink>_mic` dummy sink and PULSE_SOURCE are gone: the browser blocks
+  the microphone, and that extra "meeting_…" device is what the operator's
+  Firefox got attached to.
+- `minimize_self_tile` retries (at most once a minute): Meet restores the
+  full tile when a presentation starts.
+
 ### Auto-leave listens as well as counts (2026-09-29)
 
 The operator's choice after reviewing the rules: "idle" (a guest with one
@@ -1964,6 +1985,8 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **The bot's mic and camera stay blocked at the browser**, and mute_av
   never clicks an "already off" label. See "What the recording shows".
 - **Silence is measured by duration, not peak**, before any AssemblyAI upload.
+- **The bot's audio client is never called "Firefox"** (PULSE_PROP_OVERRIDE
+  in record_screen.sh), and lib/pinaudio.py keeps it on the recording sink.
 - **ffmpeg gets exactly one SIGINT, and is never SIGKILLed.** A second one
   while it closes the file leaves an unplayable MP4.
 - **No awk (mawk) in a pipe that must be live.** It holds lines in its

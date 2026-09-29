@@ -747,23 +747,34 @@ _CLICK_MINIMIZE_JS = r"""() => {
   item.click();
   return 'minimized';
 }"""
-_SELF_MINIMIZED = False
+_SELF_TILE_NEXT_TRY = 0.0
 
 
 def minimize_self_tile(page):
-    """Once per call, after someone else is in it: minimise the bot's tile."""
-    global _SELF_MINIMIZED
-    if _SELF_MINIMIZED:
+    """Minimise the bot's floating tile whenever it is showing.
+
+    Not once per call: Meet restores the full tile when a presentation starts
+    (seen live 2026-09-29 — minimised while alone, back at full size once the
+    operator presented). While the tile is full-size its "more options"
+    button is present; when minimised it isn't, so this is a no-op then.
+    At most one attempt a minute, so the menu never flickers in the recording.
+    """
+    global _SELF_TILE_NEXT_TRY
+    now = time.time()
+    if now < _SELF_TILE_NEXT_TRY:
         return
+    _SELF_TILE_NEXT_TRY = now + 60
     try:
         if page.evaluate(_MINIMIZE_SELF_JS) != "opened":
-            return            # alone in the call: there is no floating tile yet
+            return
         time.sleep(1)
         result = page.evaluate(_CLICK_MINIMIZE_JS)
         if result != "minimized":
             page.keyboard.press("Escape")
+            # This layout offers no Minimize (e.g. alone in the call):
+            # look again in five minutes rather than every minute.
+            _SELF_TILE_NEXT_TRY = now + 300
         print(f"  Self tile: {result}")
-        _SELF_MINIMIZED = result == "minimized"
     except Exception as e:
         print(f"  WARNING: could not minimise the bot's own tile ({e})")
 

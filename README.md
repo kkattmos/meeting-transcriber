@@ -1612,6 +1612,14 @@ The sink wasn't wired to the browser. Check that `PULSE_SINK` reached the browse
 `pactl list short sinks` shows it. `./verify_e2e.sh --preflight` reproduces the
 whole chain in two seconds.
 
+**The meeting had sound, but the recording is silent**
+Check where the bot's browser is playing: `pactl list sink-inputs` should
+show `application.name = "Meeting Bot"` on the `meeting_<run id>` sink. The
+recorder pins it there every 10 seconds (`lib/pinaudio.py`). If your *own*
+browser's sound has gone somewhere odd after a recording, that is PipeWire
+restoring a routing it remembered for "Firefox": set it back in
+`pavucontrol` → Playback.
+
 **The recording has black bands down one edge**
 The browser window isn't filling the Xvfb head. `./verify_e2e.sh --browser-smoke`
 measures it. A band of 1px at the right and bottom is normal (the kiosk

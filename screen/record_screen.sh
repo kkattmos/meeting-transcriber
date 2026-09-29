@@ -97,10 +97,6 @@ fi
 
 RUN_ID="$(basename "$MEETING_BOT_RUN_DIR")"
 SINK_NAME="$(xsession_sink_name "$RUN_ID")"
-# A second null sink whose monitor is the browser's microphone: silence. On a
-# PC the default source is the operator's real microphone, and a bot that
-# failed to mute would otherwise broadcast the room.
-MIC_NAME="${SINK_NAME}_mic"
 
 KILLED=0
 FFMPEG_PID=""
@@ -117,6 +113,7 @@ SILENCE_WARN_SECONDS="${AUDIO_SILENCE_WARN_SECONDS:-120}"
 audio_watch() {
   local peak now silent_since="" warned=0 heard=0 silent_for
   while [ -n "$FFMPEG_PID" ] && kill -0 "$FFMPEG_PID" 2>/dev/null; do
+    [ -n "$JOIN_PID" ] && "$PYTHON_BIN" "$ROOT_DIR/lib/pinaudio.py" "$JOIN_PID" "$SINK_NAME" 2>/dev/null || true
     peak="$(timeout 8 ffmpeg -hide_banner -nostats -f pulse -i "${SINK_NAME}.monitor" \
               -t 3 -af volumedetect -f null - 2>&1 \
             | sed -n 's/.*max_volume: \(-\{0,1\}[0-9.]*\) dB.*/\1/p' | tail -n 1)" || true
@@ -175,7 +172,6 @@ cleanup() {
   # Before the sink and the display go away: ffmpeg is still reading them.
   stop_ffmpeg || true
   xsession_audio_stop "$SINK_NAME" || true
-  xsession_audio_stop "$MIC_NAME" || true
   xsession_stop_xvfb || true
   rm -f "$PID_FILE" || true
   true
@@ -202,15 +198,19 @@ echo "==> Starting virtual display :$DISPLAY_NUM ($GEOMETRY)"
 xsession_start_xvfb "$DISPLAY_NUM" "$GEOMETRY" || exit 1
 
 echo "==> Setting up virtual audio (sink: $SINK_NAME)"
-xsession_audio_start "$MIC_NAME" || exit 1
 xsession_audio_start "$SINK_NAME" || exit 1
 
-# All three are exported, so the browser — started by capture.py — renders on
-# our display, plays into our sink and hears only silence, rather than using
-# the desktop's display, speakers and microphone.
+# Exported, so the browser — started by capture.py — renders on our display
+# and plays into our sink rather than the desktop's display and speakers.
 export DISPLAY=":$DISPLAY_NUM"
 export PULSE_SINK="$SINK_NAME"
-export PULSE_SOURCE="${MIC_NAME}.monitor"
+# The bot's audio client gets its own name. WirePlumber remembers routing
+# per application name, and "Firefox" is also the operator's own browser: a
+# stream the operator moved in pavucontrol was restored onto the bot's, which
+# then played the meeting into the wrong device and recorded silence
+# (2026-09-29). audio_watch below also pins the streams (lib/pinaudio.py).
+# The microphone needs no dummy device any more: the browser blocks it.
+export PULSE_PROP_OVERRIDE='application.name="Meeting Bot" application.id="meeting-bot"'
 # On a Wayland desktop session the browser would otherwise pick Wayland over
 # DISPLAY — putting the kiosk window on the operator's screen, or (Firefox's
 # GTK, verified 2026-09-29) failing with "cannot open display" — instead of
