@@ -751,9 +751,16 @@ _SELF_MENU_CANDIDATES_JS = r"""() => {
       return {label: b.getAttribute('aria-label'), self: !!b.closest('[data-self-name]'),
               corner: r.right + r.bottom}; });
 }"""
+# The item as the operator saw it (screenshot, 2026-09-29): an icon, then
+# "ย่อเล็กสุด", among "แสดงในเลย์เอาต์แบบเรียงชิดกัน", "ปักหมุดไว้ในหน้าจอ" and
+# "แสดงวิดีโอแบบเต็มของฉันให้ผู้อื่นเห็น". The icon is a ligature whose name
+# ("close_fullscreen") is part of innerText, so any leading icon word is
+# dropped, and the aria-label and the text are each tried on their own.
 _CLICK_MINIMIZE_JS = r"""() => {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim().replace(/^[a-z_]+ /, '');
+  const isMin = s => /^(ย่อเล็กสุด|Minimi[sz]e)$/.test(clean(s));
   const item = Array.from(document.querySelectorAll('[role=menuitem]')).find(m =>
-      /^(ย่อเล็กสุด|Minimi[sz]e)$/.test((m.getAttribute('aria-label') || m.innerText || '').trim().replace(/^close_fullscreen\s*/, '')));
+      isMin(m.getAttribute('aria-label')) || isMin(m.innerText));
   if (!item) return 'no-minimize';
   item.click();
   return 'minimized';
