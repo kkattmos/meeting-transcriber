@@ -9,7 +9,7 @@ automatically after Option 1 (record) and Option 2 (transcribe).
 Usage:
     python3 summarize/summarize.py <video_or_youtube_url> <transcript_path> [<output_md_path>]
         [--prompt NAME] [--frames-manifest PATH] [--resources SPEC]
-        [--pdf-out PATH] [--no-pdf] [--no-markdown]
+        [--instructions TEXT] [--pdf-out PATH] [--no-pdf] [--no-markdown]
     python3 summarize/summarize.py --parts PARTS.json <output_md_path>
         [--prompt NAME] [--resources SPEC] [--pdf-out PATH] [--no-pdf] [--no-markdown]
 
@@ -19,10 +19,16 @@ transcript, its frames manifest and where it came from; see PARTS_FORMAT below.
 Every video keeps its own clock — the model is told which video each frame and
 each stretch of transcript belongs to, and the document says so.
 
---prompt NAME picks which file in prompts/ to use (e.g. --prompt standup
-loads prompts/standup.md). Can also be set via the SUMMARY_PROMPT env var;
-the flag takes precedence over the env var. Defaults to prompts/summarize.md
-if neither is given. NAME can be given with or without the .md suffix.
+--prompt NAME picks which file in prompts/ to use: video (the default),
+meeting, lecture or tutorial. Can also be set via the SUMMARY_PROMPT env var;
+the flag takes precedence over the env var. NAME can be given with or
+without the .md suffix, and the names from before the prompts were merged
+(lecture-claude, meeting-gemini, lecture-reference, ...) still resolve —
+see PROMPT_ALIASES.
+
+--instructions TEXT adds the operator's own instructions for this run ("focus
+on the exam hints", "skip the admin part") to the prompt, after the
+unchanging half so the cache still holds. SUMMARY_INSTRUCTIONS is the same.
 
 --frames-manifest PATH uses an already-extracted manifest.json instead of
 running extract_frames.py here. pipeline.sh passes it because it extracts
@@ -62,24 +68,30 @@ Configuration (env vars):
   SUMMARY_EFFORT         low | medium | high (default) | xhigh | max
   GEMINI_API_KEY_1..3    required when backend=gemini
   GEMINI_MODEL           default gemini-3.6-flash
-  SUMMARY_PROMPT         name of file in prompts/ to use (no .md needed);
-                         overridden by --prompt; default: summarize.md
+  SUMMARY_PROMPT         video | meeting | lecture | tutorial; overridden by
+                         --prompt; default: video
+  SUMMARY_LANGUAGE       th (default) | en — the language the notes are in
+  SUMMARY_INSTRUCTIONS   extra instructions for the model; --instructions wins
 
   PDF export — summarize/pdf.py, framecrop.py and mathrender.py:
   SUMMARY_WRITE_PDF      default 1
   SUMMARY_WRITE_MARKDOWN default 1
-  PDF_FRAMES             contact (default) | inline | none
+  PDF_FRAMES             none (default) | contact | inline
   PDF_FRAME_CROP         slide (default) | border | none
   PDF_FRAME_MAX_WIDTH    default 1280 (inline figures)
   PDF_CONTACT_MAX_WIDTH  default 640 (contact-sheet thumbnails)
-  PDF_TRANSCRIPT         hidden (default) | appendix | none
+  PDF_TRANSCRIPT         none (default) | hidden | appendix
   PDF_HIDDEN_CHUNK_CHARS default 40000
   PDF_PAGE_SIZE          default A4
-  PDF_FONT_FAMILY        default "Adwaita Sans, Arial, Liberation Sans,
-                         Noto Sans Thai, Noto Sans, DejaVu Sans"
-  PDF_FONT_SIZE          default 8 (points)
+  PDF_FONT               this run's body font (set by run_one.sh from
+                         pipeline.sh --pdf-font); see fontchoice.py
+  PDF_FONT_TH            default Thai body font: Bai Jamjuree | Sarabun
+  PDF_FONT_EN            default English body font: CMU Serif | Sarabun |
+                         Bai Jamjuree
+  PDF_FONT_FAMILY        a whole CSS stack, overriding both (no size matching)
+  PDF_FONT_SIZE          default 9.5 (points, Computer Modern-equivalent)
   PDF_MATH               1 (default) typesets LaTeX; 0 leaves it as text
-  PDF_MATH_SCALE         default 1.15 (maths size relative to the body)
+  PDF_MATH_SCALE         default 1.0 (maths size relative to the nominal size)
   PDF_MATH_FONTSET       default cm (Computer Modern)
 
   Reference material — lib/resources.py:
@@ -165,6 +177,7 @@ import llm_client  # noqa: E402
 from llm_client import FrameMeta, assign_numbers, summarize  # noqa: E402
 import document  # noqa: E402
 import language  # noqa: E402
+import fontchoice  # noqa: E402
 import pdf as pdf_export  # noqa: E402
 from chunking import build_chunks  # noqa: E402
 from mapreduce import summarize_chunked  # noqa: E402
@@ -181,7 +194,10 @@ EXIT_RATE_LIMITED = 75
 SCREEN_DIR = ROOT_DIR / "screen"
 
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
-PROMPT_PATH = PROMPTS_DIR / "summarize.md"
+# The four prompts and the old names' aliases live in promptnames.py, which
+# the web UI imports too. `video` is the default.
+from promptnames import DEFAULT_PROMPT, PROMPT_ALIASES, canonical_prompt_name  # noqa: E402,F401
+PROMPT_PATH = PROMPTS_DIR / f"{DEFAULT_PROMPT}.md"
 # YouTube downloads go under MEETING_BOT_ROOT rather than /tmp because a
 # server-side /tmp (often a small tmpfs) can fill up and starve the rest of
 # the system. The dir is created on demand.
@@ -285,20 +301,18 @@ def download_youtube_video(url, out_dir):
 def resolve_prompt_path(prompt_name):
     """Resolve a --prompt/SUMMARY_PROMPT value to a file in prompts/.
 
-    `prompt_name` may be a bare name ("standup"), a name with the .md
-    suffix ("standup.md"), or None (falls back to the default
-    prompts/summarize.md). Raises SystemExit with a helpful message,
+    `prompt_name` may be a bare name ("lecture"), a name with the .md
+    suffix ("lecture.md"), a name from before the prompts were merged
+    ("lecture-claude", see PROMPT_ALIASES), or None (the default,
+    prompts/video.md). Raises SystemExit with a helpful message,
     including the list of available prompts, if the name doesn't
     resolve to an existing file.
     """
-    if not prompt_name:
-        return PROMPT_PATH
-
-    filename = prompt_name if prompt_name.endswith(".md") else f"{prompt_name}.md"
-    path = PROMPTS_DIR / filename
+    path = PROMPTS_DIR / f"{canonical_prompt_name(prompt_name)}.md"
 
     if not path.is_file():
-        available = sorted(p.stem for p in PROMPTS_DIR.glob("*.md"))
+        available = sorted(p.stem for p in PROMPTS_DIR.glob("*.md")
+                           if not p.stem.startswith("_"))
         available_str = ", ".join(available) if available else "(none found)"
         raise SystemExit(
             f"Prompt '{prompt_name}' not found at {path}.\n"
@@ -520,12 +534,13 @@ def _wrap_document(body, *, original_input, source_url, video_path, transcript,
         clip=clip,
         videos=videos,
         language=language.output_language(),
+        font=fontchoice.chosen_font(language.output_language()),
     )
 
 
 FLAGS_WITH_VALUES = ("--prompt", "--frames-manifest", "--source-url",
                      "--title", "--format", "--run-id", "--pdf-out", "--clip",
-                     "--parts")
+                     "--parts", "--instructions")
 # Repeatable: several --resources build up a list rather than overwriting.
 REPEATABLE_FLAGS = ("--resources",)
 # Presence-only switches.
@@ -667,8 +682,51 @@ def inject_resources(prompt_template, bundle):
     return prompt_template + block
 
 
+def inject_instructions(prompt_template, instructions):
+    """Add the operator's per-run instructions (--instructions) to the prompt.
+
+    They go where the reference material goes — right after the static-prompt
+    end marker, so the static half and its cache are untouched, and ahead of
+    everything that varies between the chunks of a run, which they don't.
+    Called after inject_resources, so they land above the material. Braces
+    are doubled for the same str.format() reason as there. Unlike the
+    transcript and the material, these come from the operator, so they are
+    framed as instructions rather than data.
+    """
+    text = (instructions or "").strip()
+    if not text:
+        return prompt_template
+    safe = text.replace("{", "{{").replace("}", "}}")
+    block = (
+        "\n\n## Additional instructions for this run\n\n"
+        "The person who requested this summary added the instructions below. "
+        "Follow them; where they conflict with the default structure above, "
+        "they take precedence. The language rule, and the rule against "
+        "timestamps and frame citations, still apply unless the instructions "
+        "explicitly say otherwise.\n\n"
+        f"<operator_instructions>\n{safe}\n</operator_instructions>\n"
+    )
+    marker = llm_client.STATIC_PROMPT_END
+    at = prompt_template.find(marker)
+    if at >= 0 and prompt_template.find(llm_client.STATIC_PROMPT_BEGIN) < at:
+        cut = at + len(marker)
+        return prompt_template[:cut] + block + "\n" + prompt_template[cut:]
+    return prompt_template + block
+
+
+def run_instructions(options):
+    """--instructions, else SUMMARY_INSTRUCTIONS; printed so the log says so."""
+    text = (options.get("instructions")
+            or os.environ.get("SUMMARY_INSTRUCTIONS") or "").strip()
+    if text:
+        first = text.splitlines()[0]
+        print(f"==> Extra instructions for this run ({len(text)} chars): "
+              f"{first[:80]}{'…' if len(text) > len(first[:80]) else ''}")
+    return text
+
+
 def write_outputs(summary, output_path, *, write_markdown, write_pdf,
-                  pdf_path, frames, resources, source, title):
+                  pdf_path, frames, resources, source, title, doc_kind=None):
     """Write the markdown and/or the PDF. Returns {"md": path, "pdf": path}.
 
     The markdown goes first and unconditionally (when enabled) so a PDF
@@ -697,6 +755,7 @@ def write_outputs(summary, output_path, *, write_markdown, write_pdf,
                 resources=resources,
                 title=title,
                 source=source,
+                doc_kind=doc_kind,
             )
             written["pdf"] = str(out)
             print(f"==> Wrote PDF: {out}")
@@ -782,6 +841,8 @@ def main_parts(argv, options):
     prompt_template = load_prompt_template(prompt_path)
     resource_bundle = load_resources(resource_specs)
     prompt_template = inject_resources(prompt_template, resource_bundle)
+    prompt_template = inject_instructions(prompt_template,
+                                          run_instructions(options))
 
     _select_backend_banner()
     transcript = part_transcript(parts)
@@ -796,7 +857,7 @@ def main_parts(argv, options):
     # second time.
     title = title_override or next(
         (v["title"] for v in videos if v.get("title")), None)
-    if document.wants_wrapper(prompt_name, doc_format):
+    if document.wants_wrapper(prompt_path.stem, doc_format):
         summary = _wrap_document(
             summary,
             original_input=videos[0]["source"],
@@ -819,6 +880,7 @@ def main_parts(argv, options):
         resources=resource_bundle,
         source=videos[0]["source"],
         title=title,
+        doc_kind=prompt_path.stem,
     )
 
     preview_lines = summary.splitlines()[:30]
@@ -859,7 +921,8 @@ def main():
         print(
             f"Usage: {argv[0]} <video_or_youtube_url> <transcript_path> "
             f"[<output_md_path>] [--prompt NAME] [--frames-manifest PATH] "
-            f"[--resources SPEC] [--pdf-out PATH] [--no-pdf] [--no-markdown] "
+            f"[--resources SPEC] [--instructions TEXT] [--pdf-out PATH] "
+            f"[--no-pdf] [--no-markdown] "
             f"[--source-url URL] [--title TEXT] [--format auto|always|never] [--run-id ID]"
         f" [--clip WINDOW]"
         )
@@ -949,6 +1012,8 @@ def main():
         prompt_template = load_prompt_template(prompt_path)
         resource_bundle = load_resources(resource_specs)
         prompt_template = inject_resources(prompt_template, resource_bundle)
+        prompt_template = inject_instructions(prompt_template,
+                                              run_instructions(options))
 
         # 5. Call the LLM. Dispatch and transient-failure handling live in
         #    llm_client/retry.py; here we only decide single-call vs chunked.
@@ -964,7 +1029,7 @@ def main():
         #    the chosen prompt is one of the course-shaped ones. The link,
         #    transcript and provenance are assembled here rather than asked of
         #    the model, so they can't be hallucinated or truncated.
-        if document.wants_wrapper(prompt_name, doc_format):
+        if document.wants_wrapper(prompt_path.stem, doc_format):
             summary = _wrap_document(
                 summary,
                 original_input=original_input,
@@ -990,6 +1055,7 @@ def main():
             resources=resource_bundle,
             source=source_url or original_input,
             title=title_override,
+            doc_kind=prompt_path.stem,
         )
 
         # 8. Print a short preview to stdout.

@@ -38,9 +38,9 @@ CHUNK_PREAMBLE = (
     "recordings being summarized together — {part_label}. "
     "Cover this part thoroughly and do not speculate about what happened in the "
     "other parts. Your output will later be merged with the summaries of the "
-    "other parts, so keep timestamps and speaker attributions intact; when the "
-    "part label names a video, say which video a timestamp or frame belongs "
-    "to.\n\n"
+    "other parts, so keep speaker attributions intact, and when the part label "
+    "names a video, say which video the material comes from. The part label "
+    "is for orientation only: do not copy its times into the summary.\n\n"
 )
 
 
@@ -62,7 +62,8 @@ def _default_merge_template():
         "appear more than once.\n"
         "- Collect all action items into a single list with owners and due "
         "dates where stated.\n"
-        "- Preserve timestamp citations exactly as given.\n"
+        "- Keep callout boxes (`> [!TAG] Title`), LaTeX and code blocks "
+        "exactly as written.\n"
         "- Keep the section structure used by the partial summaries.\n"
         "- {language_rule}\n\n"
         "Partial summaries:\n\n{transcript}\n"

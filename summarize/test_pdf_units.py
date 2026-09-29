@@ -502,8 +502,8 @@ class RenderTest(unittest.TestCase):
 
     def test_the_provenance_line_sits_under_the_title(self):
         doc = self._captured_document(DocumentSplitTest.DOC)
-        self.assertLess(doc.index("<h1>"), doc.index('class="docmeta"'))
-        self.assertLess(doc.index("<h1>"), doc.index('class="source"'))
+        self.assertLess(doc.index("<h1>"), doc.index('class="docmeta'))
+        self.assertLess(doc.index("<h1>"), doc.index('class="source'))
 
     def test_a_list_straight_after_a_paragraph_is_a_list(self):
         doc = self._captured_document(
@@ -741,8 +741,8 @@ class FrameSelectionTest(unittest.TestCase):
 
     def test_font_size_rejects_nonsense(self):
         import os
-        for value, expected in (("", 8.0), ("9.5", 9.5), ("abc", 8.0),
-                                ("400", 8.0)):
+        for value, expected in (("", 9.5), ("8", 8.0), ("abc", 9.5),
+                                ("400", 9.5)):
             os.environ["PDF_FONT_SIZE"] = value
             try:
                 self.assertEqual(pdf_export._font_size(), expected)
@@ -832,7 +832,8 @@ class BodyFontByLanguageTest(unittest.TestCase):
 
     Thai gets Bai Jamjuree with Sarabun behind it (both vendored under
     fonts/, neither in Debian's archive); English keeps CMU Serif, the face
-    the maths is set in. PDF_FONT_FAMILY overrides both. The language comes
+    the maths is set in. PDF_FONT_FAMILY overrides both when no font was
+    chosen for the run (fontchoice.py; FontChoiceTest). The language comes
     from the document's own provenance first, so a Thai sheet re-rendered on
     a box that has since been switched to English keeps its face.
     """
@@ -841,7 +842,8 @@ class BodyFontByLanguageTest(unittest.TestCase):
         import os
         self._env = mock.patch.dict(os.environ, {}, clear=False)
         self._env.start()
-        for key in ("PDF_FONT_FAMILY", "SUMMARY_LANGUAGE"):
+        for key in ("PDF_FONT_FAMILY", "SUMMARY_LANGUAGE", "PDF_FONT",
+                    "PDF_FONT_TH", "PDF_FONT_EN"):
             os.environ.pop(key, None)
 
     def tearDown(self):
@@ -854,7 +856,7 @@ class BodyFontByLanguageTest(unittest.TestCase):
         stack = pdf_export._font_stack("th")
         names = [p.strip().strip('"') for p in stack.split(",")]
         self.assertEqual(names[:2], ["Bai Jamjuree", "Sarabun"])
-        self.assertIn("Noto Serif Thai", names)
+        self.assertIn("Noto Sans Thai", names)
 
     def test_english_keeps_computer_modern(self):
         self.assertEqual(self._first(pdf_export._font_stack("en")), "CMU Serif")
@@ -896,11 +898,14 @@ class BodyFontByLanguageTest(unittest.TestCase):
 
     def test_css_uses_the_language_stack_for_body_and_footer(self):
         css = pdf_export._css("th")
-        self.assertEqual(css.count('"Bai Jamjuree", Sarabun'), 2)
+        # The body and both footer boxes.
+        self.assertEqual(css.count('"Bai Jamjuree", Sarabun'), 3)
         self.assertNotIn('"Bai Jamjuree"', pdf_export._css("en"))
         # The maths fallback face stays Computer Modern in both.
         for lang in ("th", "en"):
             self.assertIn('.math-fallback { font-family: "CMU Serif"',
+                          pdf_export._css(lang))
+            self.assertIn('.msym { font-family: "CMU Serif"',
                           pdf_export._css(lang))
 
     @unittest.skipUnless(HAVE_RENDERER, "weasyprint/markdown not installed")
@@ -929,6 +934,225 @@ class BodyFontByLanguageTest(unittest.TestCase):
              mock.patch.object(weasyprint, "CSS", FakeCSS):
             pdf_export.render(doc, Path(tmp) / "out.pdf")
         self.assertIn('"Bai Jamjuree", Sarabun', captured["css"])
+
+
+class FontChoiceTest(unittest.TestCase):
+    """The per-run font (fontchoice.py): what each language offers, where
+    the default comes from, and the size matching that makes the three faces
+    look the same size. Settled with the operator 2026-09-29."""
+
+    def setUp(self):
+        import os
+        import fontchoice
+        self.fc = fontchoice
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        for key in ("PDF_FONT_FAMILY", "SUMMARY_LANGUAGE", "PDF_FONT",
+                    "PDF_FONT_TH", "PDF_FONT_EN", "PDF_FONT_SIZE"):
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_the_lists_per_language(self):
+        self.assertEqual(self.fc.CHOICES["th"], ("Bai Jamjuree", "Sarabun"))
+        self.assertEqual(self.fc.CHOICES["en"],
+                         ("CMU Serif", "Sarabun", "Bai Jamjuree"))
+
+    def test_aliases_fold_to_the_canonical_name(self):
+        for raw in ("computer modern", "CM", "cmu serif"):
+            self.assertEqual(self.fc.normalize(raw, "en"), "CMU Serif")
+        self.assertEqual(self.fc.normalize("baijamjuree", "th"), "Bai Jamjuree")
+        self.assertEqual(self.fc.normalize("  SARABUN ", "english"), "Sarabun")
+
+    def test_computer_modern_is_refused_for_thai(self):
+        # It has no Thai glyphs: a Thai sheet in it is tofu.
+        with self.assertRaises(self.fc.UnknownFont):
+            self.fc.normalize("CMU Serif", "th")
+        with self.assertRaises(self.fc.UnknownFont):
+            self.fc.normalize("Comic Sans", "en")
+
+    def test_defaults_come_from_the_env_then_the_builtin(self):
+        import os
+        self.assertEqual(self.fc.default_font("th"), "Bai Jamjuree")
+        self.assertEqual(self.fc.default_font("en"), "CMU Serif")
+        os.environ["PDF_FONT_TH"] = "Sarabun"
+        os.environ["PDF_FONT_EN"] = "bai jamjuree"
+        self.assertEqual(self.fc.default_font("th"), "Sarabun")
+        self.assertEqual(self.fc.default_font("en"), "Bai Jamjuree")
+        # A default that is not on the list is reported, not fatal.
+        os.environ["PDF_FONT_TH"] = "CMU Serif"
+        import io
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO):
+            self.assertEqual(self.fc.default_font("th"), "Bai Jamjuree")
+
+    def test_the_document_record_beats_the_run_beats_the_default(self):
+        import os
+        os.environ["PDF_FONT"] = "Sarabun"
+        self.assertEqual(self.fc.chosen_font("en"), "Sarabun")
+        self.assertEqual(self.fc.chosen_font("en", "CMU Serif"), "CMU Serif")
+
+    def test_the_faces_are_matched_on_x_height(self):
+        self.assertEqual(self.fc.size_factor("CMU Serif"), 1.0)
+        for font in ("Sarabun", "Bai Jamjuree"):
+            f = self.fc.size_factor(font)
+            self.assertTrue(0.8 < f < 0.9, (font, f))
+            # The lower-case letters come out as tall as Computer Modern's.
+            self.assertAlmostEqual(9.5 * f * self.fc.X_HEIGHT[font],
+                                   9.5 * self.fc.X_HEIGHT["CMU Serif"], 6)
+
+    def test_the_css_sets_the_scaled_size_and_the_run_font(self):
+        import os
+        os.environ["PDF_FONT"] = "Sarabun"
+        css = pdf_export._css("th")
+        self.assertIn("font-family: Sarabun,", css)
+        self.assertIn(f"font-size: {9.5 * self.fc.size_factor('Sarabun'):.2f}pt",
+                      css)
+        # Maths at the nominal size: 1/factor of the smaller body.
+        self.assertIn(f".msym {{ font-family: \"CMU Serif\"", css)
+
+    def test_the_recorded_font_beats_pdf_font_family(self):
+        import os
+        os.environ["PDF_FONT_FAMILY"] = "Liberation Serif, serif"
+        self.assertEqual(pdf_export._font_stack("en"),
+                         "\"Liberation Serif\", serif")
+        stack = pdf_export._font_stack("en", {"font": "Sarabun"})
+        self.assertTrue(stack.startswith("Sarabun"), stack)
+
+    def test_the_cli_check(self):
+        import subprocess
+        script = Path(__file__).resolve().parent / "fontchoice.py"
+        ok = subprocess.run([sys.executable, str(script), "check",
+                             "--language", "en", "--font", "cm"],
+                            capture_output=True, text=True)
+        self.assertEqual((ok.returncode, ok.stdout.strip()), (0, "CMU Serif"))
+        bad = subprocess.run([sys.executable, str(script), "check",
+                              "--language", "th", "--font", "cm"],
+                             capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("Bai Jamjuree", bad.stderr)
+
+
+class DesignTest(unittest.TestCase):
+    """The pieces of DESIGN.md that are markup, not just CSS: callout boxes,
+    the code window, maths symbols in Computer Modern, the title block."""
+
+    def test_a_tagged_quote_becomes_a_callout(self):
+        out = pdf_export._extract_callouts(
+            "Intro\n\n> [!CONCEPT] Sifting\n> * one\n> * two\n\nAfter\n")
+        self.assertIn('<div class="callout callout-concept" markdown="1">', out)
+        self.assertIn('<div class="callout-title" markdown="span">Sifting</div>',
+                      out)
+        self.assertIn("\n* one\n* two\n", out)
+        self.assertNotIn("> ", out)
+        self.assertIn("After", out)
+
+    def test_aliases_and_default_titles(self):
+        out = pdf_export._extract_callouts("> [!TIP]\n> text\n")
+        self.assertIn("callout-concept", out)
+        self.assertIn(">Key concept</div>", out)
+        self.assertIn("callout-warning",
+                      pdf_export._extract_callouts("> [!caution] x\n> y\n"))
+        self.assertIn("callout-note",
+                      pdf_export._extract_callouts("> [!whatever] x\n> y\n"))
+
+    def test_a_plain_quote_is_an_untitled_grey_box(self):
+        out = pdf_export._extract_callouts("> **From Oppenheim:** text\n")
+        self.assertIn("callout-quote", out)
+        self.assertNotIn("callout-title", out)
+
+    def test_display_maths_inside_a_callout_loses_its_quote_marks(self):
+        # Before mathrender sees it, or the formula carries "> " into LaTeX.
+        out = pdf_export._extract_callouts(
+            "> [!CONCEPT] Energy\n> $$\n> E = \\int |x|^2\n> $$\n")
+        self.assertIn("\n$$\nE = \\int |x|^2\n$$\n", out)
+
+    def test_a_quote_inside_fenced_code_is_left_alone(self):
+        text = "```bash\n> not a quote\n```\n"
+        self.assertEqual(pdf_export._extract_callouts(text), text)
+
+    def test_maths_symbols_in_prose_are_set_apart(self):
+        html_in = ('<p>ω₀ ≤ 2π and x → y</p><pre><code>a ≤ b</code></pre>'
+                   '<a title="≤">link</a>')
+        out = pdf_export._wrap_math_symbols(html_in)
+        self.assertIn('<span class="msym">ω₀</span>', out)
+        self.assertIn('<span class="msym">≤</span> 2<span class="msym">π</span>',
+                      out)
+        self.assertIn('<span class="msym">→</span>', out)
+        self.assertIn("<code>a ≤ b</code>", out)
+        self.assertIn('title="≤"', out)
+
+    def test_thai_and_plain_text_are_untouched(self):
+        text = "<p>สัญญาณคาบ (periodic) - 2 · 3</p>"
+        self.assertEqual(pdf_export._wrap_math_symbols(text), text)
+
+    def test_fence_languages_in_order(self):
+        md = "```python\nx\n```\n\n~~~\ny\n~~~\n\n```bash\nz\n```\n"
+        self.assertEqual(pdf_export._fence_languages(md), ["python", "", "bash"])
+
+    @unittest.skipUnless(HAVE_RENDERER, "weasyprint/markdown not installed")
+    def test_code_is_an_editor_window(self):
+        md = "```python\ndef f():\n    return 1\n```\n"
+        html_out = pdf_export._decorate_code(pdf_export._markdown_to_html(md),
+                                             ["python"])
+        self.assertIn('<div class="code-window"><div class="code-bar">', html_out)
+        self.assertIn('<span class="lang">python</span>', html_out)
+        if pdf_export._have_pygments():
+            self.assertIn('<span class="k">def</span>', html_out)
+            self.assertIn(".codehilite .k", pdf_export._css("en"))
+
+    def test_link_lines_move_to_the_title_block(self):
+        body, links = pdf_export._take_link_lines(
+            "# T\n\nYoutube Link: `https://youtu.be/x`\n\nClip: `a-b` of the "
+            "source.\n\nBody.\n\nYoutube Link: quoted later stays\n")
+        self.assertEqual(links, ["Youtube Link: `https://youtu.be/x`",
+                                 "Clip: `a-b` of the source."])
+        self.assertIn("Body.", body)
+        self.assertIn("quoted later stays", body)
+        html_out = pdf_export._subtitle_html(
+            {"_links": links, "prompt": "lecture.md", "generated": "2026-09-29"},
+            None, "https://youtu.be/x")
+        self.assertIn("Lecture notes · 2026-09-29", html_out)
+        self.assertIn('<a href="https://youtu.be/x">https://youtu.be/x</a>',
+                      html_out)
+        self.assertNotIn("`", html_out)
+
+    def test_the_kind_label_follows_the_prompt(self):
+        self.assertEqual(pdf_export._doc_kind_label("meeting", {}),
+                         "Meeting summary")
+        self.assertEqual(pdf_export._doc_kind_label(
+            None, {"prompt": "lecture-claude.md"}), "Lecture notes")
+        self.assertEqual(pdf_export._doc_kind_label(None, {}), "Summary")
+
+    @unittest.skipUnless(HAVE_RENDERER, "weasyprint/markdown not installed")
+    def test_render_puts_it_together(self):
+        captured = {}
+
+        class FakeHTML:
+            def __init__(self, string=None, base_url=None):
+                captured["doc"] = string
+
+            def write_pdf(self, path, stylesheets=None):
+                Path(path).write_bytes(b"%PDF-1.7 stub")
+
+        doc = ("<!-- meeting-transcriber\n     model: claude-cli/opus\n"
+               "     run_id: r1\n     language: en\n     font: Sarabun\n-->\n"
+               "# Title\n\nYoutube Link: `https://youtu.be/x`\n\nIntro ω.\n\n"
+               "## 1. Part\n\n> [!WARNING] Trap\n> * $x^2$ is not linear\n\n"
+               "```python\nprint(1)\n```\n")
+        import weasyprint
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(weasyprint, "HTML", FakeHTML):
+            pdf_export.render(doc, Path(tmp) / "out.pdf", doc_kind="lecture")
+        html_out = captured["doc"]
+        self.assertIn("callout-warning", html_out)
+        self.assertIn('class="code-window"', html_out)
+        self.assertIn('<span class="msym">ω</span>', html_out)
+        self.assertIn("Lecture notes", html_out)
+        self.assertIn('class="colophon"', html_out)
+        self.assertIn("run: r1", html_out)
+        # The link line is in the title block, not a paragraph of the body.
+        self.assertNotIn("<p>Youtube Link", html_out)
 
 
 if __name__ == "__main__":

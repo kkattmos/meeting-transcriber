@@ -43,7 +43,18 @@
 #   --name N            meeting name (single input only; otherwise derived)
 #   --display-name D    name the bot shows in the meeting (default "Meeting Bot")
 #   --language L        th (default), en, auto, or any AssemblyAI language code
-#   --prompt P          a file in summarize/prompts/ (e.g. --prompt lecture-claude)
+#   --prompt P          the summary style: video, meeting, lecture or tutorial
+#                       (a file in summarize/prompts/; the older names such as
+#                       lecture-claude still work)
+#   --summary-language L  the language the summary is WRITTEN in: th or en
+#                       (default SUMMARY_LANGUAGE). --language is the SPOKEN one.
+#   --pdf-font F        the PDF's body font. Thai: "Bai Jamjuree" or Sarabun;
+#                       English: "CMU Serif" (Computer Modern), Sarabun or
+#                       "Bai Jamjuree". Default PDF_FONT_TH / PDF_FONT_EN.
+#   --instructions T    extra instructions for the summarizer, for this run
+#                       ("focus on the exam hints", "skip the admin part").
+#                       These three are stored with the run, so a resume uses
+#                       them; given again on a resume, they replace the old ones.
 #   --resources SPEC    slides / notes for this session, as a GitHub repo
 #                       (optionally @branch, or a /tree/<branch>/<subdir> URL)
 #                       or a local file or folder. Repeatable. Their text is
@@ -51,8 +62,8 @@
 #                       slide images are embedded in the PDF. Every --resources
 #                       applies to every run in the invocation. A Markdown file
 #                       may start with frontmatter (course, source,
-#                       citation_label, coverage) — pair it with
-#                       --prompt lecture-reference for textbook citations.
+#                       citation_label, coverage) — the lecture prompt then
+#                       cites it by that label.
 #                       A binary file named .md/.txt is refused up front.
 #   --clip W            summarize only part of the video: --clip 00:05:00-01:30:00
 #                       (also MM:SS, bare seconds, or an open end: 00:05:00-).
@@ -142,6 +153,9 @@ COMBINE_WANT_PDF=1
 CLIP_SPEC=""
 NEW_MEET=0
 DRY_RUN=0
+SUMMARY_LANG_OPT=""
+PDF_FONT_OPT=""
+INSTRUCTIONS_OPT=""
 declare -a POSITIONAL=()
 declare -a RESOURCE_SPECS=()
 # RESOURCES in .env is the default for every run; --resources adds to it.
@@ -174,6 +188,9 @@ while [ "$#" -gt 0 ]; do
     --display-name) need_value "$1" "$#" "${2:-}"; DISPLAY_NAME="$2"; shift 2 ;;
     --language)     need_value "$1" "$#" "${2:-}"; LANGUAGE="$2"; shift 2 ;;
     --prompt)       need_value "$1" "$#" "${2:-}"; PROMPT_NAME="$2"; shift 2 ;;
+    --summary-language) need_value "$1" "$#" "${2:-}"; SUMMARY_LANG_OPT="$2"; shift 2 ;;
+    --pdf-font)     need_value "$1" "$#" "${2:-}"; PDF_FONT_OPT="$2"; shift 2 ;;
+    --instructions) need_value "$1" "$#" "${2:-}"; INSTRUCTIONS_OPT="$2"; shift 2 ;;
     --jobs)         need_value "$1" "$#" "${2:-}"; JOBS="$2"; shift 2 ;;
     --clip)         need_value "$1" "$#" "${2:-}"; CLIP_SPEC="$2"; shift 2 ;;
     --from-file)    need_value "$1" "$#" "${2:-}"; FROM_FILE="$2"; shift 2 ;;
@@ -210,6 +227,29 @@ done
 case "$JOBS" in
   ''|*[!0-9]*|0) echo "ERROR: --jobs needs a positive whole number, got: $JOBS" >&2; exit 1 ;;
 esac
+
+# --- The summary's language and font, settled before anything is paid for ----
+# Both are checked by the same modules summarize.py uses, so a value accepted
+# here is one the summary stage will honour. The font is checked against the
+# language the summary will actually be written in: Computer Modern has no
+# Thai, so "CMU Serif" is refused for a Thai summary here rather than being
+# swapped for the default two hours later.
+declare -a SUMMARY_INIT_ARGS=()
+if [ -n "$SUMMARY_LANG_OPT" ]; then
+  SUMMARY_LANG_OPT="$(cd "$SCRIPT_DIR/summarize" && "$PYTHON_BIN" -c \
+    'import sys, language
+try: print(language.normalize(sys.argv[1]))
+except language.UnknownLanguage as e: sys.exit(f"ERROR: --summary-language: {e}")' \
+    "$SUMMARY_LANG_OPT")" || exit 1
+  SUMMARY_INIT_ARGS+=(--summary-language "$SUMMARY_LANG_OPT")
+fi
+if [ -n "$PDF_FONT_OPT" ]; then
+  PDF_FONT_OPT="$("$PYTHON_BIN" "$SCRIPT_DIR/summarize/fontchoice.py" check \
+    --language "${SUMMARY_LANG_OPT:-${SUMMARY_LANGUAGE:-th}}" --font "$PDF_FONT_OPT")" \
+    || { echo "  (from --pdf-font)" >&2; exit 1; }
+  SUMMARY_INIT_ARGS+=(--pdf-font "$PDF_FONT_OPT")
+fi
+[ -n "$INSTRUCTIONS_OPT" ] && SUMMARY_INIT_ARGS+=(--instructions "$INSTRUCTIONS_OPT")
 
 # --- Meetings run in the background -------------------------------------------
 # A recording lasts as long as the meeting, and it must not die with the
@@ -680,6 +720,11 @@ else
       echo "==> Resuming unfinished run for $input"
       echo "    run id: $existing   (use --force to start over instead)"
       run_dir="$RUNS_DIR/$existing"
+      # Its summary has not been written yet (that is what "unfinished"
+      # means), so summary settings given now are the ones it should use.
+      if [ "${#SUMMARY_INIT_ARGS[@]}" -gt 0 ]; then
+        rs init --run-dir "$run_dir" "${SUMMARY_INIT_ARGS[@]}"
+      fi
     else
       safe="$(derive_safe_name "$input" "$kind")"
       [ -z "$safe" ] && safe="meeting"
@@ -697,6 +742,7 @@ else
         --name "${NAME:-$safe}" --safe-name "$safe"
         --language "$LANGUAGE" --prompt "$PROMPT_NAME"
         --display-name "$DISPLAY_NAME"
+        "${SUMMARY_INIT_ARGS[@]}"
       )
       [ -n "$this_clip_label" ] && init_args+=(--clip "$this_clip_label")
       [ -n "$this_clip_label" ] \
@@ -723,6 +769,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
   for run_dir in "${RUN_DIRS[@]:-}"; do
     [ -n "$run_dir" ] && printf 'resume\t%s\n' "$(basename "$run_dir")"
   done
+  # On stderr, which the web UI's Check shows under "Looks good".
+  _lang="${SUMMARY_LANG_OPT:-${SUMMARY_LANGUAGE:-th} (default)}"
+  _font="${PDF_FONT_OPT:-default}"
+  _extra=""
+  [ -n "$INSTRUCTIONS_OPT" ] && _extra=", with extra instructions (${#INSTRUCTIONS_OPT} chars)"
+  echo "Summary: prompt ${PROMPT_NAME:-video (default)}, written in $_lang, PDF font $_font$_extra" >&2
   exit 0
 fi
 
@@ -795,6 +847,7 @@ if [ -n "$COMBINE_FILE" ]; then
     --language "$LANGUAGE" --prompt "$PROMPT_NAME"
     --display-name "$DISPLAY_NAME"
     --output-md "$COMBINE_FILE"
+    "${SUMMARY_INIT_ARGS[@]}"
   )
   [ -n "$COMBINE_PDF" ] && combine_init+=(--output-pdf "$COMBINE_PDF")
   for member in "${MEMBER_IDS[@]}"; do

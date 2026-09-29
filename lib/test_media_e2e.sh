@@ -253,7 +253,7 @@ SUMMARY_PDF="$PDF_DIR/week4.pdf"
 "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$SUMMARY_MD" \
       --frames-manifest "$FRAME_OUT/manifest.json" \
       --pdf-out "$SUMMARY_PDF" \
-      --prompt lecture-claude \
+      --prompt lecture \
       --run-id week4_test > "$TESTROOT/summarize.log" 2>&1
 check "summarize.py exits 0" "$?" "0"
 [ -s "$SUMMARY_MD" ] && ok "markdown written" || bad "no markdown"
@@ -414,7 +414,7 @@ MEETING_BOT_RUN_DIR="$WAIT_RUN" FAKE_CLAUDE_MODE=rate-limited-once \
   FAKE_CLAUDE_STATE="$TESTROOT/wait.calls" FAKE_CLAUDE_RECORD="$WAIT_RECORD" \
   SUMMARY_FALLBACK_CHAIN=claude-cli,gemini GEMINI_API_KEY_1=would-be-wrong \
   "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$WAIT_MD" \
-    --frames-manifest "$FRAME_OUT/manifest.json" --no-pdf --prompt lecture-claude \
+    --frames-manifest "$FRAME_OUT/manifest.json" --no-pdf --prompt lecture \
     --run-id wait_test > "$TESTROOT/wait.log" 2>&1
 check "summarize.py exits 0 after the wait" "$?" "0"
 check "the CLI was called twice (refused, then answered)" \
@@ -481,8 +481,8 @@ grep -qi "unavailable" "$TESTROOT/noauth.log" \
   || bad "not classified as unavailable — the chain would retry pointlessly"
 
 echo "--- the unchanging instructions go in as a cacheable system prompt"
-# Claude caches an exact prefix. summarize-v2.md fences the half that never
-# varies; llm_client passes it as --append-system-prompt-file so the prefix is
+# Claude caches an exact prefix. Every prompt fences the half that never
+# varies (here meeting.md); llm_client passes it as --append-system-prompt-file so the prefix is
 # byte-identical across runs and across the chunks of one run. Anything that
 # varies leaking into that file makes the cache silently never hit.
 V2_MD="$SUMMARIES_DIR/v2.md"
@@ -490,8 +490,8 @@ V2_RECORD="$TESTROOT/claude_cli_v2.jsonl"
 FAKE_CLAUDE_RECORD="$V2_RECORD" \
   "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$V2_MD" \
     --frames-manifest "$FRAME_OUT/manifest.json" --no-pdf \
-    --prompt summarize-v2 --run-id v2_test > "$TESTROOT/v2.log" 2>&1
-check "summarize.py --prompt summarize-v2 exits 0" "$?" "0"
+    --prompt meeting --run-id v2_test > "$TESTROOT/v2.log" 2>&1
+check "summarize.py --prompt meeting exits 0" "$?" "0"
 
 V2_ARGV=$("$PY" - "$V2_RECORD" <<'PYEOF'
 import json, sys
@@ -519,7 +519,7 @@ PYEOF
 )
 [ -s "$SYSFILE" ] && ok "the system prompt file exists on disk" \
   || bad "system prompt file missing: $SYSFILE"
-grep -q "output_format" "$SYSFILE" \
+grep -q "# Output Format" "$SYSFILE" \
   && ok "it carries the output format" || bad "no output format in it"
 grep -q "Dijkstra" "$SYSFILE" \
   && bad "the transcript leaked into the cacheable prefix" \
@@ -612,7 +612,7 @@ cat > "$PARTS_JSON" <<EOF
 EOF
 FAKE_CLAUDE_RECORD="$PARTS_RECORD" \
   "$PY" "$REPO/summarize/summarize.py" --parts "$PARTS_JSON" "$PARTS_MD" \
-      --pdf-out "$PARTS_PDF" --prompt lecture-claude \
+      --pdf-out "$PARTS_PDF" --prompt lecture \
       --run-id combine_test > "$TESTROOT/parts.log" 2>&1
 check "summarize.py --parts exits 0" "$?" "0"
 [ -s "$PARTS_MD" ] && ok "combined markdown written" || bad "no combined markdown"
@@ -676,7 +676,7 @@ EOF
       "$SUMMARIES_DIR/week4_res.md" \
       --frames-manifest "$FRAME_OUT/manifest.json" \
       --pdf-out "$PDF_DIR/week4_res.pdf" \
-      --prompt lecture-claude \
+      --prompt lecture \
       --resources "$TESTROOT/course notes" > "$TESTROOT/resources.log" 2>&1
 check "summarize with --resources exits 0" "$?" "0"
 # The prompt is what the CLI is handed on stdin, so that is where the slides
@@ -762,7 +762,7 @@ echo ""
 echo "=================================================================="
 echo "7. The whole pipeline over a local file"
 echo "=================================================================="
-out=$( cd "$REPO" && bash ./pipeline.sh "$LECTURE" --prompt lecture-claude \
+out=$( cd "$REPO" && bash ./pipeline.sh "$LECTURE" --prompt lecture \
        --resources "$TESTROOT/course notes" 2>&1 )
 rc=$?
 echo "$out" > "$TESTROOT/pipeline.log"

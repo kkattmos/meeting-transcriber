@@ -47,9 +47,11 @@ from pathlib import Path
 
 SECTION_SEPARATOR = "<br><br>"
 
-# Prompts whose output is course-note shaped. meeting-* keeps the plain
-# executive summary — those don't go into the course files.
-WRAPPED_PROMPT_PREFIXES = ("lecture", "tutorial")
+# Prompts whose output gets the link line and the transcript: the course-note
+# shaped ones, and `video`, whose reader wants the link back to what was
+# summarized. `meeting` keeps the plain executive summary — those don't go
+# into the course files, and a meeting has no link worth printing.
+WRAPPED_PROMPT_PREFIXES = ("lecture", "tutorial", "video")
 
 
 def wants_wrapper(prompt_name, mode="auto"):
@@ -155,7 +157,7 @@ def split_leading_heading(body):
 def build_document(body, *, source, source_kind, title=None, transcript="",
                    backend=None, model=None, prompt_name=None, run_id=None,
                    generated=None, include_transcript=True, clip=None,
-                   videos=None, language=None):
+                   videos=None, language=None, font=None):
     """Wrap a model-written summary body in the course-note template.
 
     `videos`, when given, is the list of sources a --combine summary was made
@@ -173,7 +175,8 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
     into the provenance comment so pdf.py can pick the matching body face
     when the document is re-rendered later, whatever the box is set to by
     then. The wrapper's own labels stay in English regardless: the .md has
-    to drop into the operator's existing course files.
+    to drop into the operator's existing course files. `font` is the PDF
+    body face the run chose (fontchoice.py), recorded for the same reason.
     """
     generated = generated or date.today().isoformat()
 
@@ -181,10 +184,11 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
         source=source,
         source_type=source_kind,
         model=f"{backend}/{model}" if backend and model else (model or backend),
-        prompt=prompt_name or "summarize.md",
+        prompt=prompt_name or "video.md",
         run_id=run_id,
         clip=clip,
         language=language,
+        font=font,
         generated=generated,
     )
     if videos:

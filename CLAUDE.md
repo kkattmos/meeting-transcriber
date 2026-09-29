@@ -5,9 +5,11 @@ and non-obvious facts about this project. Read it before exploring the source
 so you don't re-derive context that's already settled. After every edit, update
 it so it stays accurate. **Always ask the user questions first.**
 
-User-facing docs (what this does, how to run it) live in `README.md` — the only
-other Markdown file in the repo, deliberately. This file is for the things that
-aren't obvious from reading code or git history.
+User-facing docs (what this does, how to run it) live in `README.md`. The
+one other Markdown file is `DESIGN.md`, the specification of the summary
+PDF's look (added at the operator's request 2026-09-29; `pdf.py`'s `_css()`
+implements it, and the two change together). This file is for the things
+that aren't obvious from reading code or git history.
 
 ### Note from AssemblyAI
 Before writing AssemblyAI code, read https://www.assemblyai.com/docs/agent-instructions.md
@@ -1200,16 +1202,16 @@ reference material, the transcript, the frame paths — stays in the piped user
 turn. Both flags exist but are undocumented in `--help`; they were verified by
 invocation (an unknown flag errors immediately, these don't).
 
-The split is **opt-in per prompt file**. `prompts/summarize-v2.md` and
-`prompts/lecture-claude.md` (the configured default) carry the markers; every
-other template splits to `(None, itself)` and is sent exactly as it always was.
+The split is **opt-in per prompt file**. All four shipped prompts
+(`video`, `meeting`, `lecture`, `tutorial`) carry the markers; a template
+without them splits to `(None, itself)` and is sent exactly as written.
 `CLAUDE_CLI_STATIC_PROMPT=0` turns the whole thing off for a CLI too old to
 know the flags. The markers are stripped in `_render` so they never reach any
 model, gemini included.
 
-For `lecture-claude.md` the split is 5,473 static characters against 346
-dynamic ones, so on a chunked lecture every chunk after the first reuses the
-whole instruction set.
+On a chunked lecture every chunk after the first reuses the whole
+instruction set — role, structure, callout vocabulary, rules and (in
+`lecture.md`) the course-reference section.
 
 Note the trap this design avoids: if the varying part label ended up inside the
 static block, every chunk would write a *different* system prompt file, the
@@ -1221,9 +1223,9 @@ only the tail — unless the static-prompt markers are present, in which case th
 file is returned whole. That legacy path is a trap, because the cut lands on
 the first *substring* match rather than on a heading:
 
-- `prompts/summarize.md` (the unused fallback default) loses its entire
-  role/format/rules section — its first match is the real `# Input` at line 46.
-- `prompts/lecture-claude.md` used to lose its opening role sentence and start
+- The old `prompts/summarize.md` lost its entire role/format/rules section —
+  its first match was the real `# Input` at line 46.
+- The old `prompts/lecture-claude.md` used to lose its opening role sentence and start
   the prompt with the orphaned word `Data`, because its first match was the
   *"# Input Data"* heading near the top. Adding the static-prompt markers
   fixed that as a side effect: the marker path returns the file whole, so
@@ -1234,17 +1236,44 @@ the first *substring* match rather than on a heading:
 Prefer the markers over relying on the cut. If you write a new prompt file
 without them, check what `load_prompt_template` actually returns.
 
-**The lecture/tutorial prompts no longer ask for frame citations or a visual
-index** (operator's call, 2026-09-13, after reading a real sheet). The
-frames are still sent — slides carry the equations and the exam notes — but
-the model is told to use them as content and never write `(Frame N @ …)`,
-and the closing "Visual & Board Work Index" table is gone from all four
-(`lecture-*`, `tutorial-*`; `meeting-*` untouched). Tutorial chapter
-timestamps (`[mm:ss]`) stay — they are navigation, not citations. The PDF's
-citation fade and `PDF_FRAMES=contact|inline` still work for documents that
-do cite (older runs, custom prompts); they just have nothing to do on new
-ones. `_merge.md` was told to keep exactly one `# Title` at the top, since
-every partial now opens with one.
+### Four prompts, no timestamps, callouts (2026-09-29)
+
+Settled with the operator 2026-09-29, after the 09-13 pass had removed frame
+citations from the lecture prompts only:
+
+- **Four prompts, one file each, shared by every backend**: `video`
+  (the in-code default — talks, news, interviews), `meeting`, `lecture`,
+  `tutorial`. The claude/gemini pairs, the `-old` archives, `summarize.md`,
+  `summarize-v2.md` and `lecture-reference.md` are gone; the course-reference
+  rules are a section of `lecture.md` that the model is told to ignore when
+  there is no `<course_reference>` block. **The old names still resolve**
+  (`promptnames.PROMPT_ALIASES`: `lecture-*` → lecture, `tutorial-*` →
+  tutorial, `meeting-*`/`summarize`/`summarize-v2` → meeting), because
+  `.env`, `state.json` of unfinished runs and phone shortcuts carry them.
+  `promptnames.py` is stdlib-only so `trigger_server.py` can use it.
+- **No timestamps and no frame citations in any prompt** — the tutorial's
+  `[mm:ss]` chapter list and the meeting's "Context Timestamp" / visuals
+  table went too (the operator: "update ALL the rest of the prompt to follow
+  the no-timestamp and frame"). A time that is content (a deadline) stays.
+  The chunk preamble tells the model the part label is orientation only, and
+  `_merge.md` no longer asks to preserve timestamp citations.
+  `PromptSetTest` holds all of it. The PDF's citation fade and
+  `PDF_FRAMES=contact|inline` still work for older documents.
+- **Callouts**: every prompt asks for `> [!CONCEPT|EXAMPLE|WARNING|IMPORTANT|NOTE] Title`
+  blockquotes, which `pdf._extract_callouts` turns into the coloured boxes of
+  DESIGN.md (and which GitHub/Obsidian still render). The vocabulary is in
+  each prompt's static half. Every formula and maths symbol is asked for
+  inside `$…$`; code in language-tagged fences.
+- **The `video` prompt gets the wrapper** (link + transcript), like lecture
+  and tutorial; `meeting` stays plain. `wants_wrapper` is now called with the
+  *resolved* prompt stem, so an alias decides like its target.
+- **`--instructions` / `SUMMARY_INSTRUCTIONS`**: the operator's free text for
+  one run (the web UI's "Extra instructions"). `inject_instructions` puts it
+  right after the static end marker — above the reference material, which
+  `inject_resources` put there first — framed as the operator's instructions
+  (not data), taking precedence over the default structure but not over the
+  language rule or the no-timestamp rule unless it says so. Braces doubled
+  for `.format()`. Never in the static half: it varies per run.
 
 ### The output language is a setting, not a property of the transcript
 
@@ -1518,7 +1547,7 @@ Two non-obvious details:
   check (`resources.py is-binary`) — the operator lost an hour to a PDF read as
   a line list.
 
-#### Frontmatter: the course reference (`--resources` + `lecture-reference`)
+#### Frontmatter: the course reference (`--resources` + the `lecture` prompt)
 
 Settled 2026-09-27, replacing the 09-26 `--context` spec: **frontmatter on
 `--resources`, not a second flag** (one channel, one state field, one prompt
@@ -1535,18 +1564,13 @@ lecture_language=…>` — `lecture_language` from `MEETING_BOT_LANGUAGE`, which
 **The metadata is never substituted into the prompt's instructions.** The
 spec asked for template slots; that would give every course its own static
 system-prompt file, so the cache would never be shared — and it would put
-per-run data in the static block, which the rule below forbids. So
-`prompts/lecture-reference.md` (= `lecture-claude.md` + six rules in the static
-half) refers to "the block's `citation_label`" generically. A file without
-frontmatter produces byte-identical output to before
+per-run data in the static block, which the rule below forbids. So the
+"Using the course reference" section of `prompts/lecture.md` (static half)
+refers to "the block's `citation_label`" generically; since 2026-09-29 it is
+part of the one lecture prompt rather than a separate `lecture-reference.md`,
+and book-only additions go in a `[!NOTE] From <citation_label>` box. A file
+without frontmatter produces byte-identical output to before
 (`test_a_reference_without_frontmatter_is_unchanged`).
-
-On this branch `lecture-reference.md` was rebuilt on 2026-09-29 from the
-*current* `lecture-claude.md` (which had since gained `{language_rule}` and
-the past-exam rule) plus the same reference section — the docker branch's
-copy predated the language change and hard-coded English. Keep the two files
-in step: `lecture-reference.md` is `lecture-claude.md` with a different role
-sentence and one extra section before the static end marker.
 
 
 ## Output document format
@@ -1587,9 +1611,9 @@ Shaped to match the user's course files (`2_Transcripts/chapter1.md`,
 - **The 4-space indent inside `<details>` is deliberate**, reproducing what the
   existing chapter files do (most renderers show it as a code block). Don't
   "fix" it.
-- Applies to `lecture-*` and `tutorial-*` prompts only (`document.wants_wrapper`);
-  `meeting-*` keeps the plain executive format. Override with
-  `--format always|never`.
+- Applies to the `lecture`, `tutorial` and `video` prompts
+  (`document.wants_wrapper`, on the resolved name); `meeting` keeps the plain
+  executive format. Override with `--format always|never`.
 - `--combine` produces one such document for several videos: one title, one
   link line per video tagged `(Video N)`, one transcript block, one body. See
   the `--combine` section below.
@@ -1737,6 +1761,59 @@ Reworked 2026-09-13 after the operator read a real 71-page combined sheet
 - **The provenance line and the source go under the title**, not over it.
 - **Environments are composed in `mathrender`** — see the LaTeX section.
 
+#### The design and the per-run font (2026-09-29)
+
+Settled with the operator 2026-09-29, with their exercise sheet
+(`Signal_Exercise_2110203`, headless-Chrome + KaTeX) as the style guide —
+**for styling only**, not its content structure. `DESIGN.md` is the spec;
+the decisions behind it:
+
+- **Title block + navy H2 banners + colour-coded callouts + tinted table
+  headers**, for all four prompt types. The wrapper's link lines
+  (`Youtube Link: …`, `Clip: …`) are lifted out of the body
+  (`_take_link_lines`) and printed grey under the title; model/prompt/run/
+  font go to a small colophon at the end instead of a line under the title.
+  `---` is not drawn (the banners separate sections).
+- **Callouts before maths.** `_extract_callouts` runs before
+  `mathrender.extract`: a `$$` block inside a quote has `> ` on every line
+  until the quote is gone. Top-level blockquotes only (≤3 spaces), fenced
+  code skipped; the result is `<div class="callout …" markdown="1">`, which
+  needs the `md_in_html` extension. A plain quote is an untitled grey box.
+- **Maths is always Computer Modern**: mathtext SVG as before, and
+  `_wrap_math_symbols` puts any ω/≤/⇒/²/ℝ typed into the prose into
+  `<span class="msym">` (CMU Serif), skipping `pre`/`code` and tag
+  attributes. It runs before `mathrender.restore` so it never scans a
+  data: URI.
+- **Code is JetBrains Mono on a dark "editor window"** — Pygments `one-dark`
+  via codehilite (Pygments is now a pinned dependency), a window bar with the
+  fence's language (`_fence_languages`, matched to the blocks by position;
+  labels dropped if the counts disagree), inline code as a dark chip. Font
+  from `fonts-jetbrains-mono` (setup.sh `--system`) or the operator's
+  JetBrainsMono Nerd Font in `~/.local`.
+- **The body font is a per-run choice from a fixed list** (`fontchoice.py`):
+  Thai — Bai Jamjuree, Sarabun; English — CMU Serif, Sarabun, Bai Jamjuree.
+  Defaults `PDF_FONT_TH` / `PDF_FONT_EN`. Precedence: the document's
+  provenance `font:` > `PDF_FONT` (run_one.sh, from state) > `PDF_FONT_FAMILY`
+  (legacy whole stack, only when nothing chose a font) > `PDF_FONT_<LANG>` >
+  built-in. An invalid choice at render time warns and falls back — the PDF
+  never fails a run; `pipeline.sh` refuses it up front instead.
+- **"The font size should be similar to all three" = x-height matching.**
+  `PDF_FONT_SIZE` (now **9.5**, the sheet's size) is the size *as Computer
+  Modern*; a face is set at `nominal × 0.431 / its x-height` (measured from
+  the font files: CMU 0.431, Sarabun 0.500, Bai Jamjuree 0.499, JetBrains
+  Mono 0.550), so Sarabun is 8.19pt. Maths stays at the nominal size and so
+  matches whatever face the text is in. `.msym`/`.math-fallback` are
+  `1/factor` em for the same reason.
+- **Summary language, font and instructions are per run** — pipeline.sh
+  `--summary-language`, `--pdf-font`, `--instructions`, validated before the
+  background detach and before anything is paid for; stored in state.json
+  (`summary_language`, `pdf_font`, `instructions`); replayed by run_one.sh as
+  `SUMMARY_LANGUAGE`, `PDF_FONT` and `--instructions`. **On a resume,
+  explicitly given ones replace the stored ones** (the summary has not been
+  written yet); `rs init` now blanks `resources` only when it names `--input`,
+  so that update can't wipe them. The web UI has all three on both tabs; the
+  font list follows the chosen language.
+
 The 2026-09-08 rework (after a real 39-page output) still stands underneath:
 
 - **Keyframes are an appendix, not illustrations.** `PDF_FRAMES=contact`
@@ -1765,10 +1842,10 @@ The 2026-09-08 rework (after a real 39-page output) still stands underneath:
   own `resources.py` shells out to `pdftotext`, a silent 40% loss was not an
   option. The cost is a couple of blank-looking pages at the back.
   `PDF_TRANSCRIPT=appendix` prints it as Appendix C.
-- **Body text is 8pt, and every other size is an `em`.** `PDF_FONT_SIZE`
-  therefore rescales headings, tables, captions and code together instead of
-  leaving them stranded at their old point sizes. **A Thai face must stay in
-  any custom stack** — Computer Modern has no Thai glyphs, and a Thai lecture
+- **Every size is an `em` of the body.** `PDF_FONT_SIZE` therefore rescales
+  headings, tables, captions and code together. (8pt until 2026-09-29, 9.5pt
+  since — see the design section below.) **A Thai face must stay in any
+  custom stack** — Computer Modern has no Thai glyphs, and a Thai lecture
   then renders as tofu.
 
 The older decisions still hold:
@@ -2199,6 +2276,20 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   limit**, and is white text in normal flow rather than `display: none`.
   Either mistake — one big block, or a display rule that emits nothing —
   turns "the transcript travels with the PDF" into a silent half-truth.
+- **The PDF look is DESIGN.md.** Change the spec and `_css()` together;
+  don't restyle one without the other.
+- **Callouts are extracted before `mathrender.extract`**, and maths symbols
+  are wrapped before `mathrender.restore`. Either order reversed breaks
+  formulas in boxes or corrupts data: URIs.
+- **Body faces are size-matched on x-height; `PDF_FONT_SIZE` is Computer
+  Modern's size.** Setting every face to the same point size is exactly what
+  the operator asked not to have.
+- **Computer Modern is never offered for Thai.** No Thai glyphs.
+- **No prompt asks for timestamps or frame citations**, and the four
+  prompts stay four, one file each for every backend. The old names stay as
+  aliases in `promptnames.py` — unfinished runs and `.env` files carry them.
+- **Per-run instructions go after the static end marker**, never inside the
+  static half.
 - **Keep a Thai face in `PDF_FONT_FAMILY`.** Computer Modern has no Thai
   glyphs.
 - **Don't set `PDF_FONT_FAMILY` in `.env.example`.** Set, it overrides the
@@ -2307,14 +2398,14 @@ without API keys or network, against temp directories
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets, frontmatter, binary files | 36 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
-| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block | 185 |
-| `summarize/test_pdf_units.py` | crop geometry, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), real PDF render | 82 |
+| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the four prompts (old names resolve, no timestamps, the callout vocabulary), `--instructions` placement | 198 |
+| `summarize/test_pdf_units.py` | crop geometry, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), real PDF render | 103 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `transcribe/test_yt_autocaptions.py` | the yt-dlp fallback: track choice (never a translation), json3, the CLI against a stub yt-dlp | 11 |
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged | 7 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
-| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, run/log path refusal | 7 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached) | 366 |
+| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, run/log path refusal, summary language/font/instructions, the options | 9 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources) | 383 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, the YouTube caption fallback through a stub yt-dlp (spoken-language auto captions; the other-language track as last resort) | 125 |
 | `verify_e2e.sh --browser-smoke` | the real browser (Firefox ESR or Chrome) under Xvfb, recorded and measured for black edges | 6 |
 
@@ -2389,7 +2480,8 @@ own flags, which is everything about stage 1 except the call itself.
 
 ```
 .
-├── README.md                     <- all user-facing docs (the only other .md)
+├── README.md                     <- all user-facing docs
+├── DESIGN.md                     <- the summary PDF's design spec; pdf.py implements it
 ├── CLAUDE.md                     <- this file
 ├── .env.example                  <- names and defaults only; prose lives in README
 ├── requirements.in               <- edit this
@@ -2454,18 +2546,18 @@ own flags, which is everything about stage 1 except the call itself.
     ├── mapreduce.py
     ├── document.py
     ├── language.py               <- SUMMARY_LANGUAGE: the {language_rule} every prompt carries
-    ├── pdf.py                    <- markdown -> PDF
+    ├── fontchoice.py             <- per-language PDF fonts, defaults, x-height size matching (+ CLI check)
+    ├── promptnames.py            <- the four prompts, the old names' aliases (stdlib only)
+    ├── pdf.py                    <- markdown -> PDF (DESIGN.md)
     ├── framecrop.py              <- slide-region detection, blank frames
     ├── mathrender.py             <- LaTeX -> Computer Modern SVG
     ├── test_summarize_units.py
     ├── test_pdf_units.py
     └── prompts/
-        ├── summarize.md          <- default (see the load_prompt_template note)
-        ├── summarize-v2.md       <- XML-tagged, worked example, cacheable prefix
-        ├── lecture-{claude,gemini}.md
-        ├── lecture-reference.md  <- lecture-claude + course-reference citation rules
-        ├── tutorial-{claude,gemini}.md
-        ├── meeting-{claude,gemini}.md
+        ├── video.md              <- the default: talks, news, interviews
+        ├── meeting.md
+        ├── lecture.md            <- study sheet + the course-reference rules
+        ├── tutorial.md
         └── _merge.md             <- internal; leading _ keeps it off the menu
 ```
 
@@ -2495,6 +2587,12 @@ keeps in `localStorage`.
   `trigger_*` and `pipeline_*`, so the UI can show either.
 - `launch()` passes `MEETING_BOT_FOREGROUND=1`: the UI's child is already
   detached and logged, and pipeline.sh must not detach a second time.
+- Both tabs carry the **Summary** fieldset (2026-09-29): style, "written
+  in" (th/en), PDF font (repopulated from `/api/options` `fonts[lang]` when
+  the language changes), and **Extra instructions**. `build_args` maps them
+  to `--summary-language`, `--pdf-font`, `--instructions` (one argv item,
+  never a shell). The default prompt shown is `canonical_prompt_name` of
+  `SUMMARY_PROMPT`, so an old name in `.env` still preselects.
 - `/trigger`'s original body contract is unchanged (phone shortcuts keep
   working); `new_meet`, `clip`, `no_combine_pdf` and `playlist` were added.
 

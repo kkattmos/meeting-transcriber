@@ -31,6 +31,9 @@
     width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
     background: var(--bg); color: var(--text); font: inherit; }
   textarea { min-height: 88px; font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 13px; }
+  textarea.prose { min-height: 64px; font-family: inherit; font-size: 14px; }
+  fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 4px 12px 12px; margin: 14px 0 0; }
+  legend { font-size: 13px; font-weight: 600; color: var(--muted); padding: 0 4px; }
   .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0 14px; }
   .checks { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px; }
   .checks label { display: inline-flex; align-items: center; gap: 6px; font-weight: 400; margin: 0; }
@@ -86,9 +89,19 @@
         NEW_MEET_WAIT_MINUTES). Transcript and summary follow automatically.</p>
       <div class="row">
         <div><label for="meetName">Meeting name</label><input type="text" id="meetName" placeholder="Project sync"></div>
-        <div><label for="meetPrompt">Summary style</label><select id="meetPrompt"></select></div>
         <div><label for="meetLang">Spoken language</label><select id="meetLang"></select></div>
       </div>
+      <fieldset>
+        <legend>Summary</legend>
+        <div class="row">
+          <div><label for="meetPrompt">Style</label><select id="meetPrompt"></select></div>
+          <div><label for="meetOutLang">Written in</label><select id="meetOutLang"></select></div>
+          <div><label for="meetFont">PDF font</label><select id="meetFont"></select></div>
+        </div>
+        <label for="meetInstructions">Extra instructions <span class="hint">(optional) — for the
+          summarizer, this run only: what to focus on, what to skip, anything to add</span></label>
+        <textarea id="meetInstructions" class="prose" placeholder="e.g. List every decision with its owner; skip the small talk at the start."></textarea>
+      </fieldset>
       <div class="actions"><button class="primary" id="startMeet">Create meeting</button></div>
       <div class="meet" id="meetBox">
         <div class="hint" id="meetStatus">Creating the meeting…</div>
@@ -109,7 +122,6 @@
         <code>#t=00:05:00-01:30:00</code> to summarize only part of one.</span></label>
       <textarea id="inputs" placeholder="https://www.youtube.com/watch?v=...&#10;/home/you/Videos/lecture.mp4#t=00:05:00-01:30:00"></textarea>
       <div class="row">
-        <div><label for="prompt">Summary style (prompt)</label><select id="prompt"></select></div>
         <div><label for="language">Spoken language</label><select id="language"></select></div>
         <div><label for="clip">Clip window for all <span class="hint">(optional)</span></label>
           <input type="text" id="clip" placeholder="00:05:00-01:30:00"></div>
@@ -122,8 +134,19 @@
       </div>
       <label for="resources">Reference material <span class="hint">— one per line: a GitHub repo URL or a
         server path to slides / notes. A Markdown file may carry course/source/citation_label
-        frontmatter (use the lecture-reference style).</span></label>
+        frontmatter; the lecture style then cites it by that label.</span></label>
       <textarea id="resources" style="min-height:56px"></textarea>
+      <fieldset>
+        <legend>Summary</legend>
+        <div class="row">
+          <div><label for="prompt">Style</label><select id="prompt"></select></div>
+          <div><label for="outLang">Written in</label><select id="outLang"></select></div>
+          <div><label for="font">PDF font</label><select id="font"></select></div>
+        </div>
+        <label for="instructions">Extra instructions <span class="hint">(optional) — for the
+          summarizer, this run only: what to focus on, what to skip, anything to add</span></label>
+        <textarea id="instructions" class="prose" placeholder="e.g. Focus on what will be on the midterm; add a worked example for each formula."></textarea>
+      </fieldset>
       <div class="checks">
         <label><input type="checkbox" id="playlist"> Expand YouTube playlists</label>
         <label><input type="checkbox" id="noCombinePdf"> Combined: markdown only</label>
@@ -189,13 +212,34 @@
     $("tokenMsg").className = "msg bad";
   }
 
-  function fillSelect(sel, values, chosen) {
+  function fillSelect(sel, values, chosen, labels) {
     sel.innerHTML = "";
     values.forEach((v) => {
       const o = document.createElement("option");
-      o.value = v; o.textContent = v || "(default)";
+      o.value = v; o.textContent = (labels && labels[v]) || v || "(default)";
       if (v === chosen) o.selected = true;
       sel.appendChild(o);
+    });
+  }
+
+  // The PDF font list depends on the language the summary is written in:
+  // Computer Modern has no Thai, so it is only offered for English.
+  let OPT = null;
+  const FONT_LABELS = { "CMU Serif": "Computer Modern (CMU Serif)" };
+  // A language change selects that language's default font (PDF_FONT_TH /
+  // PDF_FONT_EN), not whatever the other language had.
+  function fillFonts(langSel, fontSel) {
+    const lang = langSel.value;
+    const fonts = (OPT.fonts || {})[lang] || [];
+    fillSelect(fontSel, fonts, (OPT.default_fonts || {})[lang], FONT_LABELS);
+  }
+  function setupSummaryFields(langId, fontId) {
+    fillSelect($(langId), OPT.summary_languages, OPT.default_summary_language,
+               OPT.summary_language_names);
+    fillFonts($(langId), $(fontId));
+    $(langId).addEventListener("change", () => {
+      fillFonts($(langId), $(fontId));
+      $(fontId).dispatchEvent(new Event("input"));
     });
   }
 
@@ -205,10 +249,13 @@
       $("tokenPanel").classList.add("hidden");
       $("app").classList.remove("hidden");
       $("conn").textContent = "connected";
-      const prompts = [""].concat(opt.prompts);
-      fillSelect($("prompt"), prompts, opt.default_prompt);
+      OPT = opt;
+      const prompts = opt.prompts;
+      fillSelect($("prompt"), prompts, opt.default_prompt || "video");
       fillSelect($("meetPrompt"), prompts,
-                 opt.prompts.includes("meeting-claude") ? "meeting-claude" : opt.default_prompt);
+                 opt.prompts.includes("meeting") ? "meeting" : opt.default_prompt);
+      setupSummaryFields("outLang", "font");
+      setupSummaryFields("meetOutLang", "meetFont");
       fillSelect($("language"), opt.languages, opt.default_language);
       fillSelect($("meetLang"), opt.languages, opt.default_language);
       $("jobs").value = opt.default_jobs || 2;
@@ -246,7 +293,9 @@
     try {
       const r = await api("/trigger", { method: "POST", body: {
         new_meet: true, name: $("meetName").value.trim() || undefined,
-        prompt: $("meetPrompt").value || undefined, language: $("meetLang").value } });
+        prompt: $("meetPrompt").value || undefined, language: $("meetLang").value,
+        summary_language: $("meetOutLang").value, pdf_font: $("meetFont").value,
+        instructions: $("meetInstructions").value.trim() || undefined } });
       pollMeet(r.log_name, Date.now());
     } catch (e) {
       $("meetMsg").textContent = e.message; $("meetMsg").className = "msg bad";
@@ -310,6 +359,8 @@
     return {
       urls: $("inputs").value, prompt: $("prompt").value || undefined,
       language: $("language").value, clip: $("clip").value.trim() || undefined,
+      summary_language: $("outLang").value, pdf_font: $("font").value,
+      instructions: $("instructions").value.trim() || undefined,
       jobs: $("jobs").value || undefined, name: $("name").value.trim() || undefined,
       combine: $("combine").value.trim() || undefined,
       no_combine_pdf: $("noCombinePdf").checked, resources: $("resources").value,
@@ -317,6 +368,7 @@
     };
   }
   ["inputs", "prompt", "language", "clip", "jobs", "name", "combine", "resources",
+   "outLang", "font", "instructions",
    "noCombinePdf", "force", "playlist"].forEach((id) => $(id).addEventListener("input", () => {
     $("start").disabled = JSON.stringify(formBody()) !== lastCheckKey;
   }));
@@ -441,7 +493,9 @@
         "input: " + (s.input || "") + " (" + s.input_type + ")",
         s.meet_url ? "meeting: " + s.meet_url : "",
         s.clip ? "clip: " + s.clip : "",
-        "prompt: " + (st.prompt || "(default)") + "   language: " + (st.language || ""),
+        "prompt: " + (st.prompt || "(default)") + "   spoken: " + (st.language || ""),
+        "summary in: " + (st.summary_language || "(default)") + "   PDF font: " + (st.pdf_font || "(default)"),
+        st.instructions ? "instructions: " + st.instructions : "",
         s.artifacts.md ? "summary: " + s.artifacts.md : "",
         s.artifacts.pdf ? "pdf: " + s.artifacts.pdf : "",
       ].filter(Boolean);

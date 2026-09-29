@@ -367,6 +367,14 @@ def main():
     # it while the call is still going, and used as the document's link line
     # in place of "https://meet.new", which points at no meeting in particular.
     p.add_argument("--meet-url")
+    # The summary's own settings, chosen per run (pipeline.sh / the web UI):
+    # the language it is written in, the PDF's body font, and the operator's
+    # extra instructions. run_one.sh replays them into summarize.py on every
+    # attempt. An `init` carrying only these (a resume that changes them)
+    # must not blank the run's resources — see below.
+    p.add_argument("--summary-language")
+    p.add_argument("--pdf-font")
+    p.add_argument("--instructions")
 
     p = with_run_dir(sub.add_parser("status"))
     p.add_argument("--stage", required=True)
@@ -488,12 +496,15 @@ def main():
                     display_name=args.display_name, clip=args.clip,
                     combined_into=args.combined_into,
                     members=args.members, output_md=args.output_md,
-                    output_pdf=args.output_pdf, meet_url=args.meet_url)
-        # `init` with no --resources still records an empty list — except
-        # when it is only stamping --combined-into on an existing member, or
-        # --meet-url from inside a recording, neither of which may blank the
+                    output_pdf=args.output_pdf, meet_url=args.meet_url,
+                    summary_language=args.summary_language,
+                    pdf_font=args.pdf_font, instructions=args.instructions)
+        # `init` with no --resources still records an empty list — but only
+        # when it creates or refreshes a run (it names the input). Stamping
+        # --combined-into on an existing member, --meet-url from inside a
+        # recording, or new summary settings on a resume must not blank the
         # resources the run was created with.
-        if args.combined_into is None and args.meet_url is None:
+        if args.input is not None:
             meta["resources"] = args.resources or []
         state.init(**meta)
         return 0
@@ -575,6 +586,11 @@ def main():
                   "  (its summarize stage runs there, not here)")
         print(f"name:       {data.get('name')}  (safe: {data.get('safe_name')})")
         print(f"language:   {data.get('language')}   prompt: {data.get('prompt') or '(default)'}")
+        if data.get("summary_language") or data.get("pdf_font"):
+            print(f"summary:    written in {data.get('summary_language') or '(default)'}"
+                  f"   PDF font: {data.get('pdf_font') or '(default)'}")
+        if data.get("instructions"):
+            print(f"instructions: {data['instructions']}")
         print(f"created:    {data.get('created_at')}")
         print(f"updated:    {data.get('updated_at')}")
         print("stages:")

@@ -27,14 +27,21 @@ Four things happen here that the markdown doesn't need.
     transcript, is not the document the operator prints. The markdown still
     carries the transcript in its <details> block.
 
+The look — title block, navy section banners, colour-coded callout boxes,
+tables, the dark editor panel for code — is specified in DESIGN.md at the
+repository root; _css() is its implementation, and the two change together.
+The prompts write the callouts as `> [!CONCEPT] Title` blockquotes, which
+_extract_callouts turns into boxes; see there.
+
 WeasyPrint does the rendering: pip-installable, needs no browser, embeds local
-images by path, and shapes Thai correctly given a Thai font. The body face
-follows the language the summary was written in (the provenance's
-`language`, else SUMMARY_LANGUAGE): Bai Jamjuree with Sarabun behind it for
-Thai, CMU Serif — Computer Modern, the same face mathtext sets the maths in
-— for English, both at 8pt; see DEFAULT_FONT_STACKS. A custom
-PDF_FONT_FAMILY applies to both, and dropping the Thai face from it turns a
-Thai lecture into tofu boxes.
+images by path, and shapes Thai correctly given a Thai font. The body face is
+the run's choice (fontchoice.py: Bai Jamjuree or Sarabun for Thai, CMU Serif,
+Sarabun or Bai Jamjuree for English), recorded in the provenance as `font`,
+and is scaled so every choice looks the size PDF_FONT_SIZE names. Maths —
+typeset formulas and any stray ω or ≤ in the prose — is always Computer
+Modern; code is always JetBrains Mono. A custom PDF_FONT_FAMILY replaces the
+body stack wholesale, and dropping the Thai face from it turns a Thai
+lecture into tofu boxes.
 
 Nothing here is allowed to take the run down. `render()` raises PdfUnavailable
 when the toolchain is missing, and summarize.py turns that into a warning: the
@@ -51,6 +58,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import fontchoice  # noqa: E402
 import framecrop  # noqa: E402
 import mathrender  # noqa: E402
 
@@ -85,7 +93,10 @@ DEFAULT_FONT_STACK_TH = ("Bai Jamjuree", "Sarabun", "Noto Serif Thai",
 # SUMMARY_LANGUAGE existed.
 DEFAULT_FONT_STACK = DEFAULT_FONT_STACK_EN
 DEFAULT_FONT_STACKS = {"en": DEFAULT_FONT_STACK_EN, "th": DEFAULT_FONT_STACK_TH}
-DEFAULT_FONT_SIZE_PT = 8.0
+# Nominal size, as Computer Modern: the other faces are scaled to the same
+# x-height (fontchoice.size_factor). 9.5pt since 2026-09-29, after the
+# operator's exercise sheet — 8pt read as small print.
+DEFAULT_FONT_SIZE_PT = 9.5
 # Contact-sheet thumbnails are three to a row on an A4 page — about 55mm wide.
 # Anything past ~640px of source is detail the print can't show.
 DEFAULT_CONTACT_MAX_WIDTH = 640
@@ -123,15 +134,27 @@ def _document_language(provenance=None):
         return language.DEFAULT
 
 
-def _font_stack(lang=None):
+def _body_font(lang=None, provenance=None):
+    """(font name, CSS stack, size factor) for the body text.
+
+    The font is the document's own (provenance `font`), else this run's
+    (PDF_FONT, from pipeline.sh --pdf-font), else PDF_FONT_<LANG>, else the
+    built-in default — see fontchoice.chosen_font. PDF_FONT_FAMILY, the old
+    whole-stack override, applies only when nothing chose a font: it names
+    no one face, so there is nothing to size-match and the factor is 1.
+    """
+    lang = lang or _document_language(provenance)
+    recorded = (provenance or {}).get("font")
     raw = os.environ.get("PDF_FONT_FAMILY")
-    if not raw:
-        stack = DEFAULT_FONT_STACKS.get(lang or _document_language(),
-                                        DEFAULT_FONT_STACK_EN)
-        return ", ".join(f'"{f}"' if " " in f else f for f in stack)
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    return ", ".join(f'"{p}"' if " " in p and not p.startswith('"') else p
-                     for p in parts)
+    if raw and not recorded and not os.environ.get(fontchoice.RUN_ENV):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        return None, fontchoice.css_stack(parts), 1.0
+    font = fontchoice.chosen_font(lang, recorded)
+    return font, fontchoice.body_stack(font), fontchoice.size_factor(font)
+
+
+def _font_stack(lang=None, provenance=None):
+    return _body_font(lang, provenance)[1]
 
 
 def _font_size():
@@ -217,11 +240,195 @@ def _markdown_to_html(text):
         raise PdfUnavailable(
             "the `markdown` package is not installed (pip install markdown)"
         ) from exc
-    return md.markdown(
-        text,
-        extensions=["tables", "fenced_code", "sane_lists", "attr_list", "nl2br"],
-        output_format="html5",
-    )
+    extensions = ["tables", "fenced_code", "sane_lists", "attr_list",
+                  "nl2br", "md_in_html"]
+    configs = {}
+    if _have_pygments():
+        # Colour spans for fenced code; without pygments the block is plain
+        # text on the same dark panel.
+        extensions.append("codehilite")
+        configs["codehilite"] = {"css_class": "codehilite",
+                                 "guess_lang": False, "use_pygments": True}
+    return md.markdown(text, extensions=extensions,
+                       extension_configs=configs, output_format="html5")
+
+
+def _have_pygments():
+    try:
+        import pygments  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+# The editor theme for code blocks. One Dark: the colours of the operator's
+# editor, readable in print, and its background is what the panel uses.
+PYGMENTS_STYLE = "one-dark"
+
+
+def _pygments_css():
+    if not _have_pygments():
+        return ""
+    try:
+        from pygments.formatters import HtmlFormatter
+        return HtmlFormatter(style=PYGMENTS_STYLE).get_style_defs(".codehilite")
+    except Exception:  # noqa: BLE001 - an unknown style is cosmetic
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Callout boxes. The prompts write them as GitHub/Obsidian-style alerts:
+#
+#     > [!CONCEPT] Sifting property
+#     > * ...
+#
+# which any Markdown reader shows as a quote, and which this turns into
+# <div class="callout callout-concept"> before the conversion (md_in_html
+# converts the inside as ordinary Markdown). It has to run before
+# mathrender.extract: a display formula inside a quote is written with a
+# "> " on every line, and extracted with them it is no longer LaTeX.
+# A plain blockquote becomes a grey box with no title.
+CALLOUT_START_RE = re.compile(r"^ {0,3}>\s?\[!([A-Za-z]+)\][+-]?[ \t]*(.*)$")
+QUOTE_LINE_RE = re.compile(r"^ {0,3}>\s?(.*)$")
+CALLOUT_KINDS = {
+    "concept": "concept", "key": "concept", "definition": "concept",
+    "tip": "concept", "summary": "concept", "abstract": "concept",
+    "success": "concept", "formula": "concept",
+    "example": "example", "demo": "example", "question": "example",
+    "warning": "warning", "caution": "warning", "mistake": "warning",
+    "attention": "warning",
+    "important": "important", "exam": "important", "danger": "important",
+    "remember": "important", "error": "important",
+    "note": "note", "info": "note", "quote": "note", "todo": "note",
+}
+CALLOUT_DEFAULT_TITLES = {
+    "concept": "Key concept", "example": "Example", "warning": "Watch out",
+    "important": "Important", "note": "Note",
+}
+
+
+def _extract_callouts(text):
+    """Turn top-level blockquotes into callout <div>s. See above."""
+    lines = text.splitlines()
+    out, i, fence = [], 0, None
+    while i < len(lines):
+        line = lines[i]
+        f = FENCE_RE.match(line)
+        if f and not line.startswith("    "):
+            fence = None if fence == f.group(1) else (fence or f.group(1))
+            out.append(line)
+            i += 1
+            continue
+        if fence or not QUOTE_LINE_RE.match(line):
+            out.append(line)
+            i += 1
+            continue
+        group = []
+        while i < len(lines) and QUOTE_LINE_RE.match(lines[i]):
+            group.append(QUOTE_LINE_RE.match(lines[i]).group(1))
+            i += 1
+        start = CALLOUT_START_RE.match(line)
+        if start:
+            kind = CALLOUT_KINDS.get(start.group(1).lower(), "note")
+            title = start.group(2).strip() or CALLOUT_DEFAULT_TITLES[kind]
+            body = group[1:]
+        else:
+            kind, title, body = "quote", "", group
+        inner = _extract_callouts("\n".join(body)).strip("\n")
+        block = ["", f'<div class="callout callout-{kind}" markdown="1">']
+        if title:
+            block.append(f'<div class="callout-title" markdown="span">'
+                         f'{title}</div>')
+        block += ["", inner, "", "</div>", ""]
+        out.extend(block)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+# Fenced code gets a window bar with the language in it. python-markdown
+# drops the language once pygments has used it, so the fence lines are read
+# here, in order, and matched to the rendered blocks by position. Only
+# unindented fences: those are the only ones fenced_code converts.
+FENCE_OPEN_RE = re.compile(r"^(```+|~~~+)[ \t]*\{?\.?([\w+#.-]*)")
+CODE_BLOCK_RE = re.compile(r'<div class="codehilite">(.*?)</div>', re.DOTALL)
+PLAIN_PRE_RE = re.compile(r"<pre><code(?: class=\"language-([\w+#.-]+)\")?>")
+
+
+def _fence_languages(text):
+    langs, fence = [], None
+    for line in text.splitlines():
+        m = FENCE_OPEN_RE.match(line)
+        if not m:
+            continue
+        if fence is None:
+            fence = m.group(1)[0]
+            langs.append(m.group(2))
+        elif m.group(1)[0] == fence and not m.group(2):
+            fence = None
+    return langs
+
+
+def _code_bar(lang):
+    label = html.escape(lang) if lang else ""
+    return ('<div class="code-bar"><span class="dot r"></span>'
+            '<span class="dot y"></span><span class="dot g"></span>'
+            f'<span class="lang">{label}</span></div>')
+
+
+def _decorate_code(html_body, langs):
+    """Wrap every code block in the editor-window chrome."""
+    blocks = list(CODE_BLOCK_RE.finditer(html_body))
+    if blocks:
+        labels = langs if len(langs) == len(blocks) else [""] * len(blocks)
+        out, last = [], 0
+        for match, lang in zip(blocks, labels):
+            out.append(html_body[last:match.start()])
+            out.append(f'<div class="code-window">{_code_bar(lang)}'
+                       f'<div class="codehilite">{match.group(1)}</div></div>')
+            last = match.end()
+        out.append(html_body[last:])
+        return "".join(out)
+    # No pygments: fenced_code's own <pre><code class="language-x">.
+    if not PLAIN_PRE_RE.search(html_body):
+        return html_body
+    html_body = PLAIN_PRE_RE.sub(
+        lambda m: (f'<div class="code-window">{_code_bar(m.group(1) or "")}'
+                   f'<div class="codehilite"><pre><code>'), html_body)
+    return html_body.replace("</code></pre>", "</code></pre></div></div>")
+
+
+# Mathematical symbols typed straight into the prose — ω, ≤, ⇒, ∑, ², ℝ —
+# rather than inside $...$. They are set in Computer Modern like the typeset
+# maths, never in the body face. Greek, the arrow and operator blocks, the
+# letter-like maths letters, super/subscripts, primes, × ÷ ± ¬.
+MATH_SYMBOL_RE = re.compile(
+    "[\u0391-\u03a9\u03b1-\u03c9\u03d1\u03d5\u03d6\u03f5"
+    "\u2032-\u2037\u2070-\u209f\u00b2\u00b3\u00b9\u00d7\u00f7\u00b1\u00ac"
+    "\u2102\u2107\u210b-\u2113\u2115\u2119-\u211d\u2124\u2128"
+    "\u212c\u212d\u212f-\u2131\u2133-\u2138"
+    "\u2190-\u21ff\u2200-\u22ff\u2308-\u230b\u27c0-\u27ff"
+    "\u2900-\u2aff]+")
+_TAG_RE = re.compile(r"(<[^>]*>)")
+_SKIP_TAGS = ("pre", "code", "title", "style", "script")
+
+
+def _wrap_math_symbols(html_body):
+    """Put every run of maths symbols in the text into <span class="msym">."""
+    out, skip = [], 0
+    for piece in _TAG_RE.split(html_body):
+        if piece.startswith("<"):
+            m = re.match(r"<(/?)([a-zA-Z0-9]+)", piece)
+            if m and m.group(2).lower() in _SKIP_TAGS:
+                if m.group(1):
+                    skip = max(0, skip - 1)
+                elif not piece.endswith("/>"):
+                    skip += 1
+            out.append(piece)
+        elif skip or not piece:
+            out.append(piece)
+        else:
+            out.append(MATH_SYMBOL_RE.sub(
+                lambda s: f'<span class="msym">{s.group(0)}</span>', piece))
+    return "".join(out)
 
 
 def _fmt_timestamp(seconds):
@@ -264,8 +471,27 @@ def _split_document(text):
 
     text = DETAILS_BLOCK_RE.sub(_take, text)
     text = _drop_legacy_header(text)
+    text, links = _take_link_lines(text)
+    if links:
+        provenance["_links"] = links
 
     return text.strip(), "\n\n".join(transcripts), provenance
+
+
+def _take_link_lines(text):
+    """Lift the wrapper's link lines ("Youtube Link: `…`", "Clip: …") out of
+    the body. They head the document, between the title and the first line
+    of the model's own text; the PDF prints them in the title block, as
+    plain grey lines, instead of as a paragraph of code chips."""
+    lines, links, out, head = text.splitlines(), [], [], True
+    for line in lines:
+        if head and LINK_LINE_RE.match(line.strip()):
+            links.append(line.strip())
+            continue
+        if head and line.strip() and not H1_RE.match(line):
+            head = False
+        out.append(line)
+    return "\n".join(out), links
 
 
 # What document.py used to put above the body, until 2026-09-13: a chapter
@@ -518,60 +744,173 @@ def _end_of_block(text, pos):
     return best
 
 
-def _css(lang=None):
-    size = _font_size()
-    stack = _font_stack(lang)
+# Design tokens — DESIGN.md is the specification; keep the two in step.
+INK = "#1b1f27"
+MUTED = "#5f6875"
+FAINT = "#8a93a0"
+HAIRLINE = "#d3d9e1"
+NAVY = "#1f3a5f"
+NAVY_INK = "#16233a"
+LINK = "#2d5b8f"
+TABLE_HEAD = "#e9eef5"
+# (fill, rule, title) per callout kind.
+CALLOUT_COLOURS = {
+    "concept": ("#edf5ef", "#2f7d4f", "#1e6a3d"),
+    "example": ("#edf3fa", "#2f6aa3", "#1f578c"),
+    "warning": ("#fcf4e5", "#c7811f", "#8a5810"),
+    "important": ("#fcefef", "#b3373b", "#9c2b30"),
+    "note": ("#f4f6f8", "#9aa4b1", "#46505d"),
+    "quote": ("#f4f6f8", "#9aa4b1", "#46505d"),
+}
+CODE_BG = "#1e2229"
+CODE_BAR = "#2b313b"
+CODE_INK = "#e3e7ee"
+# Thai needs the taller line: its vowels and tone marks stack above and
+# below the letters.
+LINE_HEIGHT = {"th": 1.62, "en": 1.42}
+
+
+def _css(lang=None, provenance=None):
+    lang = lang or _document_language(provenance)
+    nominal = _font_size()
+    _font, stack, factor = _body_font(lang, provenance)
+    body_pt = nominal * factor
+    # Relative to the body, so they follow it into headings and tables:
+    # maths at Computer Modern's nominal size, code at the x-height of the
+    # text (JetBrains Mono's letters are taller than CM's at the same size).
+    math_em = 1.0 / factor
+    mono_em = fontchoice.mono_factor() / factor
+    mono = fontchoice.css_stack(fontchoice.MONO_STACK)
+    maths = fontchoice.css_stack(fontchoice.MATH_STACK)
+    callouts = "\n".join(
+        f".callout-{kind} {{ background: {fill}; border-left-color: {rule}; }}\n"
+        f".callout-{kind} .callout-title {{ color: {title}; }}"
+        for kind, (fill, rule, title) in CALLOUT_COLOURS.items())
     return f"""
 @page {{
     size: {_page_size()};
-    margin: 18mm 16mm 20mm 16mm;
-    @bottom-center {{
+    margin: 16mm 15mm 18mm 15mm;
+    @bottom-left {{
+        content: string(doctitle);
+        font-family: {stack};
+        font-size: {7 * factor:.2f}pt;
+        color: {FAINT};
+    }}
+    @bottom-right {{
         content: counter(page) " / " counter(pages);
         font-family: {stack};
-        font-size: 7pt;
-        color: #777;
+        font-size: {7 * factor:.2f}pt;
+        color: {FAINT};
     }}
 }}
 body {{
     font-family: {stack};
-    font-size: {size:g}pt;
-    line-height: 1.5;
-    color: #16181d;
+    font-size: {body_pt:.2f}pt;
+    line-height: {LINE_HEIGHT.get(lang, 1.45)};
+    color: {INK};
 }}
-h1 {{ font-size: 1.9em; margin: 0 0 4pt 0; line-height: 1.25; }}
-h2 {{ font-size: 1.35em; margin: 14pt 0 5pt 0; border-bottom: 1px solid #d8dbe0;
-      padding-bottom: 3pt; break-after: avoid; }}
-h3 {{ font-size: 1.12em; margin: 10pt 0 3pt 0; break-after: avoid; }}
-h4 {{ font-size: 1em; margin: 8pt 0 3pt 0; break-after: avoid; }}
-p, li {{ orphans: 2; widows: 2; }}
-ul, ol {{ margin: 4pt 0 4pt 16pt; padding: 0; }}
-code {{ font-family: "CMU Typewriter Text", "DejaVu Sans Mono", monospace;
-        font-size: 0.92em;
-        background: #f2f3f5; padding: 0 2px; border-radius: 2px; }}
-pre {{ background: #f2f3f5; padding: 6pt; border-radius: 3px;
-       font-size: 0.88em; white-space: pre-wrap; word-wrap: break-word; }}
-table {{ border-collapse: collapse; width: 100%; margin: 8pt 0;
-         font-size: 0.95em; }}
-th, td {{ border: 1px solid #d8dbe0; padding: 3pt 5pt; text-align: left;
-          vertical-align: top; }}
-th {{ background: #f2f3f5; }}
-hr {{ border: none; border-top: 1px solid #d8dbe0; margin: 12pt 0; }}
-figure.frame {{ margin: 10pt 0; text-align: center; break-inside: avoid; }}
-figure.frame img {{ max-width: 100%; max-height: 105mm;
-                    border: 1px solid #d8dbe0; border-radius: 3px; }}
-figure.frame figcaption {{ font-size: 0.9em; color: #666; margin-top: 3pt; }}
-.docmeta {{ font-size: 0.9em; color: #666; margin: 0 0 10pt 0; }}
-.docmeta span {{ margin-right: 10pt; }}
-.source {{ font-size: 0.95em; color: #333; margin: 0 0 12pt 0;
+
+/* Title block */
+h1 {{ string-set: doctitle content(); font-size: 2.0em; font-weight: 700;
+      color: {NAVY_INK}; margin: 0 0 3pt 0; line-height: 1.2; }}
+.docmeta {{ font-size: 0.95em; color: {MUTED}; margin: 0 0 1pt 0; }}
+.source {{ font-size: 0.85em; color: {MUTED}; margin: 0 0 1pt 0;
            word-break: break-all; }}
+.source:last-of-type, .source.last {{ margin-bottom: 12pt; }}
+.source a {{ color: {MUTED}; text-decoration: none; }}
+
+/* Sections: a navy banner, like the exercise sheet's */
+h2 {{ background: {NAVY}; color: #ffffff; font-size: 1.2em; font-weight: 700;
+      padding: 4pt 9pt; border-radius: 3pt; margin: 16pt 0 8pt 0;
+      line-height: 1.35; break-after: avoid; }}
+h3 {{ font-size: 1.1em; font-weight: 700; color: {NAVY_INK};
+      margin: 11pt 0 4pt 0; break-after: avoid; }}
+h4 {{ font-size: 1em; font-weight: 700; color: #3a4452;
+      margin: 8pt 0 3pt 0; break-after: avoid; }}
+
+/* Running text */
+p {{ margin: 0 0 5pt 0; orphans: 2; widows: 2; }}
+ul, ol {{ margin: 2pt 0 6pt 0; padding-left: 15pt; }}
+li {{ margin: 1.5pt 0; orphans: 2; widows: 2; }}
+li > ul, li > ol {{ margin: 1pt 0 2pt 0; }}
+strong {{ font-weight: 700; color: #111722; }}
+a {{ color: {LINK}; text-decoration: none; }}
+/* The banners separate the sections; a --- between them would be a second
+   rule under the first. */
+hr {{ border: none; margin: 4pt 0; }}
+
+/* Tables */
+table {{ border-collapse: collapse; width: 100%; margin: 6pt 0 9pt 0;
+         font-size: 0.93em; }}
+th, td {{ border: 0.6pt solid {HAIRLINE}; padding: 3.5pt 6pt; text-align: left;
+          vertical-align: top; }}
+th {{ background: {TABLE_HEAD}; font-weight: 700; color: {NAVY_INK}; }}
+tr {{ break-inside: avoid; }}
+
+/* Callout boxes: a tinted panel with a rule down the left */
+.callout {{ margin: 8pt 0 10pt 0; padding: 6pt 10pt 4pt 10pt;
+            border-left: 3pt solid; border-radius: 0 3pt 3pt 0; }}
+.callout-title {{ font-weight: 700; margin: 0 0 3pt 0; }}
+.callout p:last-child, .callout ul:last-child, .callout ol:last-child,
+.callout table:last-child {{ margin-bottom: 2pt; }}
+.callout table {{ background: #ffffff; }}
+{callouts}
+/* The must-remember box is framed all round, as on the sheet. */
+.callout-important {{ border: 0.8pt solid #deaaac; border-left: 3pt solid #b3373b;
+                      border-radius: 3pt; }}
+.callout-quote {{ font-style: normal; }}
+
+/* Code: an editor window — dark panel, window bar, JetBrains Mono */
+code {{ font-family: {mono}; font-size: {mono_em:.3f}em;
+        background: #262b34; color: {CODE_INK};
+        padding: 0.4pt 3pt; border-radius: 2.5pt; }}
+.code-window {{ margin: 7pt 0 10pt 0; background: {CODE_BG};
+                border-radius: 5pt; break-inside: avoid; }}
+.code-bar {{ background: {CODE_BAR}; border-radius: 5pt 5pt 0 0;
+             padding: 3pt 8pt; font-family: {mono};
+             font-size: {mono_em * 0.85:.3f}em; color: #9aa4b2;
+             line-height: 1.3; }}
+.code-bar .dot {{ display: inline-block; width: 5.5pt; height: 5.5pt;
+                  border-radius: 2.75pt; margin-right: 3pt; }}
+.code-bar .r {{ background: #ff5f57; }}
+.code-bar .y {{ background: #febc2e; }}
+.code-bar .g {{ background: #28c840; }}
+.code-bar .lang {{ float: right; }}
+{_pygments_css()}
+.codehilite {{ background: {CODE_BG}; border-radius: 0 0 5pt 5pt; }}
+.codehilite pre {{ margin: 0; padding: 7pt 10pt 8pt 10pt; background: {CODE_BG};
+                   color: {CODE_INK}; font-family: {mono};
+                   font-size: {mono_em:.3f}em; line-height: 1.45;
+                   white-space: pre-wrap; word-wrap: break-word; }}
+pre code {{ font-size: 1em; background: none; padding: 0; border-radius: 0;
+            color: inherit; }}
+
+/* Maths. Typeset formulas are SVG sized in points by mathrender; symbols
+   typed into the prose (ω, ≤, ⇒) are set in Computer Modern too. */
+img.math {{ margin: 0; }}
+.math-block {{ display: block; text-align: center; margin: 7pt 0;
+               break-inside: avoid; }}
+.math-line {{ display: block; margin: 2pt 0; }}
+.math-fallback {{ font-family: {maths}; font-style: italic;
+                  font-size: {math_em:.3f}em; }}
+.msym {{ font-family: {maths}; font-size: {math_em:.3f}em; }}
+
+/* Small print */
+.colophon {{ margin-top: 16pt; padding-top: 4pt;
+             border-top: 0.6pt solid {HAIRLINE};
+             font-size: 0.78em; color: {FAINT}; }}
+.notes {{ font-size: 0.9em; color: #8a6d3b; }}
+/* Frame citations, in older documents: kept, faded (70% transparent). */
+.cite {{ opacity: 0.3; }}
+
+/* Appendices */
 .appendix {{ break-before: page; }}
 .transcript {{ font-size: 0.9em; line-height: 1.45; color: #333;
                white-space: pre-wrap; }}
-.notes {{ font-size: 0.9em; color: #8a6d3b; }}
-/* Frame citations: kept, so the reader can scrub to the moment, but faded so
-   the notes read as notes. 70% transparent. */
-.cite {{ opacity: 0.3; }}
-
+figure.frame {{ margin: 10pt 0; text-align: center; break-inside: avoid; }}
+figure.frame img {{ max-width: 100%; max-height: 105mm;
+                    border: 1px solid {HAIRLINE}; border-radius: 3px; }}
+figure.frame figcaption {{ font-size: 0.9em; color: #666; margin-top: 3pt; }}
 /* Contact sheet: three thumbnails to a row, inline-block rather than grid
    because that lays out identically on every WeasyPrint version we might
    meet on the box. */
@@ -579,18 +918,9 @@ figure.frame figcaption {{ font-size: 0.9em; color: #666; margin-top: 3pt; }}
 figure.thumb {{ display: inline-block; width: 31.5%; margin: 0 1% 8pt 0;
                 text-align: center; vertical-align: top;
                 break-inside: avoid; }}
-figure.thumb img {{ width: 100%; border: 1px solid #d8dbe0;
+figure.thumb img {{ width: 100%; border: 1px solid {HAIRLINE};
                     border-radius: 2px; }}
 figure.thumb figcaption {{ font-size: 0.85em; color: #666; margin-top: 2pt; }}
-
-/* Maths. The images carry their own width/height/vertical-align in points,
-   computed from what mathtext reported, so there is nothing to size here. */
-img.math {{ margin: 0; }}
-.math-block {{ display: block; text-align: center; margin: 7pt 0;
-               break-inside: avoid; }}
-.math-line {{ display: block; margin: 2pt 0; }}
-.math-fallback {{ font-family: "CMU Serif", "Latin Modern Roman",
-                  "DejaVu Serif", serif; font-style: italic; }}
 
 /* The transcript layer. White on white at 1pt: no reader sees it, every text
    extractor gets it. Not display:none — WeasyPrint would then put nothing in
@@ -602,16 +932,63 @@ img.math {{ margin: 0; }}
 """
 
 
-def _meta_html(provenance, extra_meta):
+# What the subtitle calls the document, by prompt. English whatever the
+# summary language is, like the rest of the wrapper (see language.py).
+KIND_LABELS = {
+    "lecture": "Lecture notes", "tutorial": "Tutorial guide",
+    "meeting": "Meeting summary", "video": "Video summary",
+}
+
+
+def _doc_kind_label(doc_kind, provenance):
+    name = (doc_kind or provenance.get("prompt") or "").lower()
+    name = Path(name).stem if name else ""
+    for key, label in KIND_LABELS.items():
+        if name.startswith(key):
+            return label
+    return "Summary"
+
+
+def _link_line_html(line):
+    """One wrapper link line, backticks dropped and the URL made a link."""
+    text = html.escape(line.replace("`", ""))
+    return re.sub(r"(https?://[^\s<]+)", r'<a href="\1">\1</a>', text)
+
+
+def _subtitle_html(provenance, doc_kind, source):
+    """The grey lines under the title: what this is, when, and from where."""
+    generated = provenance.get("generated") or date.today().isoformat()
+    bits = [_doc_kind_label(doc_kind, provenance), generated]
+    if provenance.get("clip"):
+        bits.append(f"clip {provenance['clip']}")
+    if provenance.get("videos"):
+        bits.append(f"{provenance['videos']} videos")
+    parts = [f'<p class="docmeta subtitle">'
+             f'{" · ".join(html.escape(str(b)) for b in bits)}</p>']
+    links = provenance.get("_links") or []
+    if links:
+        parts += [f'<p class="source">{_link_line_html(ln)}</p>'
+                  for ln in links]
+        parts[-1] = parts[-1].replace('class="source"', 'class="source last"')
+    elif source:
+        src = html.escape(str(source))
+        link = (f'<a href="{src}">{src}</a>'
+                if re.match(r"https?://", str(source)) else src)
+        parts.append(f'<p class="source">Source: {link}</p>')
+    return "".join(parts)
+
+
+def _colophon_html(provenance):
+    """The small print at the end: which model wrote it, for which run."""
     bits = []
-    for key in ("model", "prompt", "run_id", "generated", "source_type"):
-        value = provenance.get(key) or extra_meta.get(key)
-        if value:
-            bits.append(f"<span><b>{html.escape(key)}:</b> "
-                        f"{html.escape(str(value))}</span>")
+    for key, label in (("model", "model"), ("prompt", "prompt"),
+                       ("run_id", "run"), ("font", "font")):
+        if provenance.get(key):
+            bits.append(f"{label}: {html.escape(str(provenance[key]))}")
     if not bits:
         return ""
-    return f'<p class="docmeta">{"".join(bits)}</p>'
+    return ('<p class="colophon">Generated by meeting-transcriber · '
+            + " · ".join(bits) + "</p>")
 
 
 def _appendix_transcript(transcript):
@@ -737,7 +1114,7 @@ def collect_slide_images(bundle, limit=60):
 
 def render(markdown_text, output_path, *, frames=(), work_dir=None,
            resources=None, title=None, source=None, crop_mode=None,
-           max_width=None):
+           max_width=None, doc_kind=None):
     """Render `markdown_text` to a PDF at `output_path`. Returns the path.
 
     Raises PdfUnavailable if weasyprint/markdown aren't installed.
@@ -780,6 +1157,9 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
 
         slide_images = collect_slide_images(resources)
 
+        # Callouts first: a formula inside a quote carries "> " on every line
+        # until the quote markers are gone. See _extract_callouts.
+        body_md = _extract_callouts(body_md)
         # Maths comes out of the markdown *before* the HTML conversion: python-
         # markdown would eat the underscores and backslashes otherwise. It goes
         # back in after the citation passes, so those never have to step over a
@@ -790,6 +1170,7 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
         body_md = _normalize_list_indent(body_md)
 
         body_html = _markdown_to_html(body_md)
+        body_html = _decorate_code(body_html, _fence_languages(body_md))
 
         mode = frames_mode()
         if mode == "inline":
@@ -806,21 +1187,18 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
             frame_appendix = _appendix_frames(prepared)
 
         body_html = _fade_citations(body_html)
+        # Before the maths goes back in: its tokens are plain letters, and a
+        # restored formula is an <img> whose data: URI must not be scanned.
+        body_html = _wrap_math_symbols(body_html)
         body_html = mathrender.restore(
             body_html,
             mathrender.render_all(math_exprs, size_pt=_font_size()))
 
-        source_line = ""
-        src = source or provenance.get("source")
-        if src:
-            source_line = (f'<p class="source"><b>Source:</b> '
-                           f'{html.escape(str(src))}</p>')
-
-        # The provenance line and the source go under the title, not over
-        # it: this is a study sheet, and the first thing on the page is what
-        # it is about.
-        meta = (_meta_html(provenance, {'generated': date.today().isoformat()})
-                + source_line)
+        # What it is, when and from where go under the title, not over it:
+        # this is a study sheet, and the first thing on the page is what it
+        # is about. Which model and run made it is small print at the end.
+        meta = _subtitle_html(provenance, doc_kind,
+                              source or provenance.get("source"))
         if "</h1>" in body_html:
             body_html = body_html.replace("</h1>", "</h1>" + meta, 1)
         else:
@@ -831,6 +1209,7 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
             f"<html><head><meta charset='utf-8'>"
             f"<title>{html.escape(doc_title)}</title></head><body>"
             f"{body_html}"
+            f"{_colophon_html(provenance)}"
             f"{frame_appendix}"
             f"{_appendix_resources(resources, slide_images) if resources_mode() == 'appendix' else ''}"
             f"{_appendix_transcript(transcript) if t_mode == 'appendix' else ''}"
@@ -840,7 +1219,8 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
 
         try:
             HTML(string=document, base_url=str(output_path.parent)).write_pdf(
-                str(output_path), stylesheets=[CSS(string=_css(lang))])
+                str(output_path),
+                stylesheets=[CSS(string=_css(lang, provenance))])
         finally:
             # In a finally block so a failed render doesn't strand the directory
             # either. Best-effort: a PDF that rendered must not be reported as

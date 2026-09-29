@@ -51,3 +51,7 @@ pillow
 # summarize/mathrender.py degrades to cleaned-up text and the run still ends
 # with a PDF.
 matplotlib
+# Syntax colours for code blocks in the PDF (python-markdown's codehilite).
+# Pure Python. Without it code still prints in JetBrains Mono on the dark
+# panel, just without the colours.
+pygments

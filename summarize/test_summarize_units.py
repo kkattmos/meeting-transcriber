@@ -312,11 +312,20 @@ class MapReduceTest(unittest.TestCase):
 
 
 class DocumentTest(unittest.TestCase):
-    def test_wrapper_applies_to_lecture_and_tutorial_only(self):
-        self.assertTrue(document.wants_wrapper("lecture-gemini"))
-        self.assertTrue(document.wants_wrapper("tutorial-claude.md"))
-        self.assertFalse(document.wants_wrapper("meeting-gemini"))
+    def test_wrapper_applies_to_lecture_tutorial_and_video(self):
+        self.assertTrue(document.wants_wrapper("lecture"))
+        self.assertTrue(document.wants_wrapper("tutorial.md"))
+        self.assertTrue(document.wants_wrapper("video"))
+        self.assertFalse(document.wants_wrapper("meeting"))
         self.assertFalse(document.wants_wrapper(None))
+        # Older names still decide the same way.
+        self.assertTrue(document.wants_wrapper("lecture-gemini"))
+        self.assertFalse(document.wants_wrapper("meeting-gemini"))
+
+    def test_the_document_records_its_font(self):
+        out = document.build_document("# T\n\nbody", source="x.mp4",
+                                      source_kind="local_file", font="Sarabun")
+        self.assertIn("     font: Sarabun\n", out)
 
     def test_format_override(self):
         self.assertTrue(document.wants_wrapper("meeting-gemini", "always"))
@@ -1437,8 +1446,8 @@ class ShippedMarkedPromptsTest(unittest.TestCase):
 
     def test_the_expected_files_carry_the_markers(self):
         names = {path.name for path, _ in self._marked()}
-        self.assertIn("summarize-v2.md", names)
-        self.assertIn("lecture-claude.md", names)
+        self.assertEqual(names, {"lecture.md", "tutorial.md", "meeting.md",
+                                 "video.md"})
 
     def test_each_splits_cleanly(self):
         for path, text in self._marked():
@@ -1457,14 +1466,14 @@ class ShippedMarkedPromptsTest(unittest.TestCase):
         # lecture-claude.md used to lose it: load_prompt_template cut at the
         # first "# Input", which matched the "# Input Data" heading near the
         # top, so the prompt began with the orphaned word "Data".
-        text = (self.PROMPTS_DIR / "lecture-claude.md").read_text()
+        text = (self.PROMPTS_DIR / "lecture.md").read_text()
         static, _ = llm_client.split_static_prompt(text)
         self.assertTrue(static.startswith("You are an expert academic tutor"))
 
     def test_load_prompt_template_keeps_a_marked_file_whole(self):
         import summarize as summarize_main
         template = summarize_main.load_prompt_template(
-            self.PROMPTS_DIR / "lecture-claude.md")
+            self.PROMPTS_DIR / "lecture.md")
         self.assertIn("You are an expert academic tutor", template)
         self.assertIn("# Execution Rules", template)
         self.assertIn("{transcript}", template)
@@ -1976,6 +1985,115 @@ class PromptOrderForCachingTest(unittest.TestCase):
         self.assertNotIn("{", static.replace("{{", ""), "no format slots in the static half")
 
 
+class PromptSetTest(unittest.TestCase):
+    """The four prompts (2026-09-29): one file per kind of recording, shared
+    by every backend, none asking for timestamps or frame citations, all
+    speaking the callout vocabulary the PDF styles (DESIGN.md)."""
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+
+    def test_exactly_four_selectable_prompts(self):
+        names = sorted(p.stem for p in self.PROMPTS_DIR.glob("*.md")
+                       if not p.stem.startswith("_"))
+        self.assertEqual(names, ["lecture", "meeting", "tutorial", "video"])
+
+    def test_old_names_resolve_to_their_replacements(self):
+        for old, new in (("lecture-claude", "lecture"),
+                         ("lecture-gemini.md", "lecture"),
+                         ("lecture-reference", "lecture"),
+                         ("tutorial-gemini", "tutorial"),
+                         ("meeting-claude", "meeting"),
+                         ("summarize-v2", "meeting"), ("summarize", "meeting"),
+                         (None, "video"), ("", "video"), ("tutorial", "tutorial")):
+            with self.subTest(name=old):
+                self.assertEqual(self.sm.resolve_prompt_path(old).name,
+                                 f"{new}.md")
+
+    def test_an_unknown_prompt_lists_the_four(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.sm.resolve_prompt_path("nope")
+        self.assertIn("lecture, meeting, tutorial, video", str(cm.exception))
+
+    def test_no_prompt_asks_for_timestamps_or_frame_citations(self):
+        for path in sorted(self.PROMPTS_DIR.glob("*.md")):
+            text = path.read_text()
+            with self.subTest(prompt=path.name):
+                for asks in ("Timestamp Format", "[mm:ss]`", "Visual Index",
+                             "Frame / Index", "Context Timestamp",
+                             "Preserve timestamp citations"):
+                    self.assertNotIn(asks, text)
+                if not path.name.startswith("_"):
+                    self.assertIn("never cite them", text)
+                    self.assertIn("no timestamps", text)
+
+    def test_every_prompt_speaks_the_callout_vocabulary(self):
+        for name in ("lecture", "tutorial", "meeting", "video"):
+            text = (self.PROMPTS_DIR / f"{name}.md").read_text()
+            with self.subTest(prompt=name):
+                for tag in ("[!CONCEPT]", "[!EXAMPLE]", "[!WARNING]",
+                            "[!IMPORTANT]", "[!NOTE]"):
+                    self.assertIn(tag, text)
+                static, _ = llm_client.split_static_prompt(text)
+                self.assertIn("[!CONCEPT]", static)
+
+    def test_the_lecture_prompt_carries_the_course_reference_rules(self):
+        static, _ = llm_client.split_static_prompt(
+            (self.PROMPTS_DIR / "lecture.md").read_text())
+        self.assertIn("Cite only what is in the excerpt", static)
+        self.assertIn("If there is none, ignore this section entirely", static)
+
+
+class InstructionsTest(unittest.TestCase):
+    """--instructions: the operator's own words for one run, after the
+    static half (so the cache holds) and above the reference material."""
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+        self.marked = (f"{llm_client.STATIC_PROMPT_BEGIN}\nRULES\n"
+                       f"{llm_client.STATIC_PROMPT_END}\n\n# Input\n{{transcript}}\n")
+
+    def test_nothing_given_changes_nothing(self):
+        self.assertEqual(self.sm.inject_instructions(self.marked, ""), self.marked)
+        self.assertEqual(self.sm.inject_instructions(self.marked, "  \n"),
+                         self.marked)
+
+    def test_they_go_after_the_static_half(self):
+        out = self.sm.inject_instructions(self.marked, "Focus on exam hints.")
+        static, dynamic = llm_client.split_static_prompt(out)
+        self.assertNotIn("exam hints", static)
+        self.assertIn("<operator_instructions>\nFocus on exam hints.\n"
+                      "</operator_instructions>", dynamic)
+        self.assertLess(dynamic.index("exam hints"), dynamic.index("{transcript}"))
+
+    def test_they_sit_above_the_reference_material(self):
+        out = self.sm.inject_resources(self.marked, None)
+        with_material = out.replace(llm_client.STATIC_PROMPT_END,
+                                    llm_client.STATIC_PROMPT_END + "\nMATERIAL", 1)
+        out = self.sm.inject_instructions(with_material, "Be brief.")
+        self.assertLess(out.index("Be brief."), out.index("MATERIAL"))
+
+    def test_braces_survive_format(self):
+        out = self.sm.inject_instructions(self.marked, "Use {x} and }{")
+        filled = out.format(transcript="T")
+        self.assertIn("Use {x} and }{", filled)
+
+    def test_a_template_without_markers_is_appended_to(self):
+        out = self.sm.inject_instructions("PLAIN {transcript}", "Be brief.")
+        self.assertTrue(out.startswith("PLAIN {transcript}"))
+        self.assertIn("Be brief.", out)
+
+    def test_the_flag_wins_over_the_environment(self):
+        with mock.patch.dict(os.environ, {"SUMMARY_INSTRUCTIONS": "env"}):
+            self.assertEqual(self.sm.run_instructions({"instructions": "flag"}),
+                             "flag")
+            self.assertEqual(self.sm.run_instructions({}), "env")
+
+
 def summarize_main_load(name):
     import summarize as summarize_main
     return summarize_main.load_prompt_template(summarize_main.resolve_prompt_path(name))
@@ -2123,9 +2241,8 @@ class OutputLanguageTest(unittest.TestCase):
     """
 
     PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
-    SHIPPED = ["lecture-claude.md", "lecture-gemini.md",
-               "tutorial-claude.md", "tutorial-gemini.md",
-               "meeting-claude.md", "meeting-gemini.md", "_merge.md"]
+    SHIPPED = ["lecture.md", "tutorial.md", "meeting.md", "video.md",
+               "_merge.md"]
 
     def setUp(self):
         import language
@@ -2211,7 +2328,7 @@ class OutputLanguageTest(unittest.TestCase):
         for code in ("th", "en"):
             os.environ["SUMMARY_LANGUAGE"] = code
             template = summarize_main.load_prompt_template(
-                self.PROMPTS_DIR / "lecture-claude.md")
+                self.PROMPTS_DIR / "lecture.md")
             halves[code] = llm_client.split_static_prompt(template)
         self.assertIn("Thai (ภาษาไทย)", halves["th"][0])
         self.assertIn("in English", halves["en"][0])

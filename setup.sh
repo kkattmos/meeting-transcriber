@@ -87,11 +87,14 @@ if [ "$MODE" = "system" ]; then
     poppler-utils \
     libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b \
     fonts-thai-tlwg fonts-liberation fonts-noto-core fonts-cmu \
+    fonts-jetbrains-mono \
     nodejs npm
 
   # fonts-cmu is CMU Serif — Computer Modern, the PDF's body face for English
   # summaries and the face mathtext sets the maths in (see summarize/pdf.py).
   # fonts-noto-core carries Noto Serif Thai, the last-resort Thai fallback.
+  # fonts-jetbrains-mono is the face every code block and inline `code` is
+  # set in (DESIGN.md); a JetBrainsMono Nerd Font in ~/.local also works.
   # Bai Jamjuree and Sarabun (the Thai body faces) are vendored under fonts/
   # and installed per user by the user step.
 

@@ -326,11 +326,16 @@ usage window once it resets.
   link to share, admits everyone, records, and summarizes. **End & stop
   recording** ends it early. See [Hosting a new Google Meet](#hosting-a-new-google-meet).
 - **Record / summarize** — the pipeline's options as a form: inputs one per
-  line (with `#t=` windows), summary style, language, clip, combine, reference
+  line (with `#t=` windows), spoken language, clip, combine, reference
   material. **Check** runs `pipeline.sh --dry-run` with exactly those options
   — the real parser, so a typo is caught before anything is downloaded or
   billed — and shows what would run and the equivalent command. **Start** only
   unlocks once the current form has passed a check.
+- **Summary**, on both tabs: the style (`video`, `meeting`, `lecture`,
+  `tutorial`), the language it is written in (Thai or English), the PDF
+  font (only the ones that language offers; defaults from `PDF_FONT_TH` /
+  `PDF_FONT_EN`), and a free-text **Extra instructions** box for this run
+  ("focus on the exam hints", "list every decision with its owner").
 - **Runs** — every run with its stages (`✓` done, `✗` failed, `▶` running),
   the created meeting's link, the tail of each stage log, and **Resume** /
   **Stop**.
@@ -429,7 +434,7 @@ Summarize several videos **as one lecture** — one document, one study guide,
 the model reads every transcript:
 
 ```bash
-./pipeline.sh --from-file chapter3_links.txt --prompt lecture-claude \
+./pipeline.sh --from-file chapter3_links.txt --prompt lecture \
   --combine ~/courses/2_Transcripts/chapter3.md
 ```
 
@@ -487,7 +492,10 @@ keeps the frames too).
 | `--name N` | Meeting name (single input only; otherwise derived) |
 | `--display-name D` | Name the bot shows in the meeting (default `Meeting Bot`) |
 | `--language L` | `th` (default), `en`, `auto`, or any AssemblyAI code |
-| `--prompt P` | A file in `summarize/prompts/`, e.g. `--prompt lecture-claude` |
+| `--prompt P` | The summary style: `video` (default), `meeting`, `lecture` or `tutorial` — see [Summary styles](#summary-styles) |
+| `--summary-language L` | The language the summary is **written** in: `th` or `en` (default `SUMMARY_LANGUAGE`) |
+| `--pdf-font F` | The PDF's body font: `"Bai Jamjuree"` or `Sarabun` for Thai; `"CMU Serif"` (Computer Modern), `Sarabun` or `"Bai Jamjuree"` for English (default `PDF_FONT_TH` / `PDF_FONT_EN`) |
+| `--instructions T` | Extra instructions for the summarizer, this run only — e.g. `"Focus on what will be on the midterm"` |
 | `--clip W` | Summarize only part of the video, e.g. `--clip 00:05:00-01:30:00` (see below) |
 | `<input>#t=W` | Not a flag: a per-input window, overriding `--clip` for that input |
 | `--resources SPEC` | Slides / notes for this session; repeatable (see below) |
@@ -731,8 +739,8 @@ chunk, so a large reference is a large part of every request).
 ### A textbook excerpt with citations
 
 For a course with a textbook, give the reference a small header and use the
-`lecture-reference` prompt. Nothing in the code is course-specific: the same
-two steps work for any subject.
+`lecture` prompt. Nothing in the code is course-specific: the same two steps
+work for any subject.
 
 1. Turn the chapters you need into Markdown, e.g.:
 
@@ -763,16 +771,17 @@ two steps work for any subject.
 
    ```bash
    ./pipeline.sh ~/Videos/Week03.mp4 \
-       --resources ~/notes/kurose-ch1-3.md --prompt lecture-reference
+       --resources ~/notes/kurose-ch1-3.md --prompt lecture
    ```
 
 The file's text reaches the model inside
 `<course_reference course="…" source="…" citation_label="…" coverage="…" lecture_language="th">`,
-and `lecture-reference` (the `lecture-claude` study guide plus six rules)
-tells it: the transcript decides what was taught; cite only headings that are
-actually in the excerpt, and say *"not in the provided Kurose excerpt"* rather
-than recall a section number; fix transcription garble the book disambiguates;
-put book-only additions in a `> **From Kurose:**` blockquote; report
+and the `lecture` prompt's six course-reference rules (which it ignores when
+there is no such block) tell it: the transcript decides what was taught; cite
+only headings that are actually in the excerpt, and say *"not in the provided
+Kurose excerpt"* rather than recall a section number; fix transcription garble
+the book disambiguates; put book-only additions in a `> [!NOTE] From Kurose`
+box; report
 lecturer/book contradictions as contradictions; and give the lecturer's spoken
 term in parentheses on first mention when the lecture language differs.
 
@@ -918,9 +927,35 @@ queue can't wedge permanently and needs no cleanup daemon.
 
 ## Output format
 
+### Summary styles
+
+There are four prompts, one per kind of recording, shared by the Claude and
+the Gemini backends (`summarize/prompts/`):
+
+| `--prompt` | For | What it writes |
+|---|---|---|
+| `video` (default) | talks, news, interviews, documentaries | key points, then the video's topics in order, speakers attributed |
+| `meeting` | calls | decisions, an action-item table (task, owner, due, priority), the discussion by topic, open questions |
+| `lecture` | classes | a study sheet: what the instructor flagged, then numbered sections with key concepts, worked examples and common mistakes; cites a `--resources` textbook excerpt when it has frontmatter |
+| `tutorial` | walkthroughs, coding videos | prerequisites and takeaways, then the steps with every command and code block verbatim, and a quick-reference table |
+
+None of them writes timestamps or frame citations: the notes stand on their
+own. All four mark their key points with callout boxes that the PDF styles
+(see [DESIGN.md](DESIGN.md)). The names from before the merge
+(`lecture-claude`, `lecture-gemini`, `lecture-reference`, `meeting-claude`,
+`tutorial-gemini`, `summarize`, …) still work and resolve to the new file, so
+an older `.env` or a resumed run keeps working.
+
+**Per-run settings.** `--summary-language`, `--pdf-font` and `--instructions`
+(and the matching fields on both tabs of the web UI) are stored with the run,
+so a resume summarizes the same way; given again on a resume, they replace
+the stored ones. `--instructions` is free text for the summarizer: it goes in
+after the prompt's cached half, and takes precedence over the default
+structure.
+
 ### Markdown
 
-Summaries from `lecture-*` and `tutorial-*` prompts are wrapped in a
+Summaries from the `lecture`, `tutorial` and `video` prompts are wrapped in a
 course-note document, shaped to drop straight into a chapter file:
 
 ```markdown
@@ -928,9 +963,10 @@ course-note document, shaped to drop straight into a chapter file:
      source: https://www.youtube.com/watch?v=5GAfjAjLKYk
      source_type: youtube
      model: claude-cli/opus
-     prompt: lecture-claude.md
+     prompt: lecture.md
      run_id: yt_5GAfjAjLKYk_20260904_120000
      language: th
+     font: Bai Jamjuree
      generated: 2026-09-04
 -->
 
@@ -963,14 +999,31 @@ Youtube Link: `https://www.youtube.com/watch?v=5GAfjAjLKYk`
   video's transcript in input order, and one model-written body. See the
   `--combine` section above for how timestamps and frame numbers work there.
 
-`meeting-*` prompts keep the plain executive-summary format — no wrapper.
-
-Available prompts: `ls summarize/prompts/`. Pick one with `--prompt <name>`
-(no `.md` needed). `_merge.md` is internal and not selectable.
+The `meeting` prompt keeps the plain executive-summary format — no wrapper.
+`_merge.md` is internal and not selectable.
 
 ### PDF
 
-The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint:
+The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint. Its
+look is specified in [DESIGN.md](DESIGN.md), after the operator's exercise
+sheet: a title with a grey subtitle and source line, navy section banners,
+colour-coded callout boxes (green key concepts, blue examples, amber
+mistakes, red must-remember, grey notes), tinted table headers, and code in
+a dark editor window.
+
+- **Callout boxes.** The prompts write `> [!CONCEPT] Title` blockquotes
+  (also `[!EXAMPLE]`, `[!WARNING]`, `[!IMPORTANT]`, `[!NOTE]`); the export
+  turns them into the coloured boxes. In any other Markdown reader they are
+  ordinary quotes, and GitHub and Obsidian show NOTE, WARNING and IMPORTANT
+  as their own alerts.
+- **Code is JetBrains Mono on a dark panel**, with a window bar naming the
+  language and Pygments `one-dark` syntax colours. Inline `code` is a dark
+  chip in the same face. `fonts-jetbrains-mono` is installed by `setup.sh
+  --system`; a JetBrainsMono Nerd Font already in `~/.local/share/fonts` is
+  used as well.
+- **Maths is always Computer Modern**, including symbols the model typed
+  straight into the prose (ω, ≤, ⇒, ∑, ²), which are picked out and set in
+  CMU Serif.
 
 - **LaTeX is typeset, in Computer Modern.** The model writes maths as `$L/R$`
   and `$$...$$`; markdown readers render that, and a PDF renderer with no
@@ -989,12 +1042,11 @@ The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint:
 - **Nested bullets nest.** The model indents sub-items by two spaces, which
   every markdown reader accepts and python-markdown flattens; the export
   re-indents them before conversion so a three-level outline stays one.
-- **Frame citations, where a prompt produces them, are faded.** The bundled
-  `lecture-*` and `tutorial-*` prompts no longer ask for `(Frame N @ …)`
-  citations or the closing visual-index table — the frames still inform the
-  notes, they are just not indexed. A document that does cite (an older run,
-  a custom prompt) keeps the citations at 30% opacity so the notes read as
-  notes.
+- **Frame citations, where a document has them, are faded.** None of the
+  four prompts asks for `(Frame N @ …)` citations, timestamps or a visual
+  index — the frames still inform the notes, they are just not indexed. A
+  document that does cite (an older run, a custom prompt) keeps the
+  citations at 30% opacity so the notes read as notes.
 - **The sheet is the summary alone.** No keyframe appendix, no reference
   slides, no transcript layer by default; the `.md` beside it still carries
   the transcript in its `<details>` block. Each comes back on request:
@@ -1020,21 +1072,23 @@ The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint:
   so a single block would come back truncated with no warning; the cost is a
   couple of blank-looking pages at the back of a long lecture.
   `PDF_TRANSCRIPT=appendix` prints it as Appendix C instead.
-- **The body face follows the summary's language, at 8pt** (`PDF_FONT_SIZE`).
-  A Thai summary (`SUMMARY_LANGUAGE=th`, the default) is set in **Bai
-  Jamjuree**, with Sarabun behind it; an English one in **CMU Serif** —
-  Computer Modern, the face the maths is set in. The maths is Computer
-  Modern in both: mathtext typesets it and ships it as SVG, so the body face
-  never touches it. The language is read from the document's own
-  provenance comment first, so a Thai sheet re-rendered later on a box
-  switched to English keeps its face. `PDF_FONT_FAMILY` replaces the stack
-  for both languages; keep a Thai face in it or Thai renders as tofu boxes.
-  Every other size in the document is relative to `PDF_FONT_SIZE`, so
-  changing it rescales headings, tables and captions together. Bai Jamjuree
-  and Sarabun are not in Debian's archive; they are OFL Google Fonts vendored
-  under `fonts/` and installed by `setup.sh` into `/usr/local/share/fonts`
-  (`fonts-cmu` and Noto Serif Thai come from apt). Without them the stack
-  falls through to Noto Serif Thai.
+- **The body font is chosen per run, and every choice looks the same
+  size.** A Thai summary offers **Bai Jamjuree** (default, `PDF_FONT_TH`) or
+  **Sarabun**; an English one **CMU Serif** — Computer Modern, the face the
+  maths is set in (default, `PDF_FONT_EN`) — Sarabun or Bai Jamjuree.
+  Computer Modern has no Thai glyphs, so it is not offered for Thai. Pick one
+  with `--pdf-font` or in the web UI. `PDF_FONT_SIZE` (9.5) is the size *as
+  Computer Modern*; Sarabun and Bai Jamjuree are scaled to the same
+  x-height, so they come out at about 8.2pt and look just as big. The
+  language and font are read from the document's own provenance comment
+  first, so a sheet re-rendered later keeps its face. `PDF_FONT_FAMILY`
+  replaces the whole stack for both languages when no font was chosen for
+  the run (no size matching then); keep a Thai face in it or Thai renders as
+  tofu boxes. Every other size is relative to the body, so changing
+  `PDF_FONT_SIZE` rescales headings, tables and captions together. Bai
+  Jamjuree and Sarabun are not in Debian's archive; they are OFL Google
+  Fonts vendored under `fonts/` and installed by `setup.sh` (`fonts-cmu` and
+  Noto come from apt).
 
 A PDF that fails to render logs a warning and leaves the run successful — the
 Markdown is the artifact everything downstream depends on. Turn either output
@@ -1126,14 +1180,15 @@ end the scan.
 | `CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS` | 600 | Retry interval when the CLI reports a hit window without a reset time |
 | `GEMINI_API_KEY_1..3` | — | For the `gemini` fallback |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | A comma-separated list is a fallback chain: every key is tried on the first model, then the next model (`gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash` in `.env.example`). A rate-limited key moves on at once; an unknown model is skipped. Pin real versions, not `-latest` aliases |
-| `SUMMARY_PROMPT` | `summarize.md` | Prompt file; `--prompt` overrides |
+| `SUMMARY_PROMPT` | `video` | `video`, `meeting`, `lecture` or `tutorial` (`lecture` in `.env.example`); `--prompt` overrides. Older names still resolve |
+| `SUMMARY_INSTRUCTIONS` | — | Extra instructions for every summary; `--instructions` (or the web UI's field) overrides it per run |
 | `SUMMARY_MAX_TOKENS` | 16000 | **Gemini only.** The Claude CLI has no output cap, and output is not what spends a subscription window anyway — see below |
-| `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture-*`/`tutorial-*` output; `always`/`never` override |
-| `SUMMARY_LANGUAGE` | `th` | The language the summary is *written* in: `th` or `en`. Independent of `ASSEMBLYAI_LANGUAGE`, which is the language the audio is in — see below |
+| `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture`/`tutorial`/`video` output; `always`/`never` override |
+| `SUMMARY_LANGUAGE` | `th` | The language the summary is *written* in: `th` or `en`; `--summary-language` overrides it per run. Independent of `ASSEMBLYAI_LANGUAGE`, which is the language the audio is in — see below |
 
 **Output language.** `SUMMARY_LANGUAGE` decides what every prompt tells the
 model to write in — `th` (the default) or `en`. Every shipped template
-(`lecture-*`, `tutorial-*`, `meeting-*` and the merge prompt) carries a
+(`video`, `meeting`, `lecture`, `tutorial` and the merge prompt) carries a
 `{language_rule}` placeholder that is filled from this setting before the
 prompt is sent, on both the Claude and the Gemini backends. In Thai the
 model is asked for ordinary Thai academic prose with each technical term's
@@ -1186,12 +1241,12 @@ system prompt too. Everything that varies — the chunk label, your slides, the
 transcript, the frame paths — stays on stdin. On a long lecture split into
 several chunks, every chunk after the first reuses the same cached prefix.
 
-`prompts/lecture-claude.md` (the default in `.env.example`) and
-`prompts/summarize-v2.md` both carry the fences — for `lecture-claude` that is
-5,473 cached characters against 346 sent per call. Any other prompt file has no
-markers, is sent exactly as before, and gets no caching benefit; copy the
-fences into your own prompt if you want it. `CLAUDE_CLI_STATIC_PROMPT=0` turns
-it off entirely.
+All four shipped prompts carry the fences, so the instructions (role, output
+format, callout vocabulary, rules) are cached and only the transcript, the
+frames, your slides and any `--instructions` are sent per call. A prompt file
+of your own without markers is sent exactly as written and gets no caching
+benefit; copy the fences into it if you want it. `CLAUDE_CLI_STATIC_PROMPT=0`
+turns it off entirely.
 
 **Frames are sent inline, in one turn.** `--input-format stream-json` lets
 the user message carry base64 image blocks, the same shape the Messages API
@@ -1312,10 +1367,12 @@ provenance header (`model: claude-cli/opus`).
 | `PDF_RESOURCES` | `none` | `none` or `appendix` (the `--resources` slides as Appendix B) |
 | `PDF_HIDDEN_CHUNK_CHARS` | 40000 | Characters of hidden transcript per page; above ~50k poppler stops extracting |
 | `PDF_PAGE_SIZE` | `A4` | Any WeasyPrint page size |
-| `PDF_FONT_FAMILY` | by language — `th`: `Bai Jamjuree, Sarabun, Noto Serif Thai, …`; `en`: `CMU Serif, Latin Modern Roman, Noto Serif Thai, …` | Set it to use one stack for both languages. Keep a Thai face in it |
-| `PDF_FONT_SIZE` | 8 | Body size in points; everything else scales with it |
+| `PDF_FONT_TH` | `Bai Jamjuree` | Default body font for Thai summaries: `Bai Jamjuree` or `Sarabun` |
+| `PDF_FONT_EN` | `CMU Serif` | Default body font for English summaries: `CMU Serif`, `Sarabun` or `Bai Jamjuree` |
+| `PDF_FONT_FAMILY` | — | A whole CSS font stack for both languages, used only when no font was chosen for the run; no size matching. Keep a Thai face in it |
+| `PDF_FONT_SIZE` | 9.5 | Body size in points, as Computer Modern — the other faces are scaled to look the same size. Everything else scales with it |
 | `PDF_MATH` | 1 | 0 leaves LaTeX as text instead of typesetting it |
-| `PDF_MATH_SCALE` | 1.0 | Maths size relative to the body text (Computer Modern both, so 1.0; a sans body wants ~1.15) |
+| `PDF_MATH_SCALE` | 1.0 | Maths size relative to `PDF_FONT_SIZE`; the body faces are already matched to Computer Modern, so 1.0 |
 | `PDF_MATH_FONTSET` | `cm` | matplotlib mathtext font set (`cm` is Computer Modern) |
 
 ### Reference material
@@ -1502,14 +1559,14 @@ python3 lib/test_keyring.py                  # numbered keys + rotation cursor (
 python3 lib/test_resources.py                # resource specs, extraction, GitHub, frontmatter, binary files (36)
 python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions, retries (51)
 python3 lib/test_clip.py                     # --clip parsing, the cut, caption windowing (33)
-python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain, the course reference, the output language (185)
-python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, PDF render (82)
+python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain, the course reference, the output language, the four prompts, --instructions (198)
+python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, the design (callouts, code, maths symbols), font choice and size matching, PDF render (103)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
 python3 transcribe/test_yt_autocaptions.py   # the yt-dlp caption fallback: track choice, json3 (11)
 python3 screen/test_capture_host.py          # hosting a created Meet: when it ends, and when it must not (7)
 python3 screen/test_browser.py               # browser choice, fake devices, the bot-account check (16)
-python3 test_trigger_server.py               # the web UI API: argument mapping, auth, dry-run check, paths (7)
-bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings (366)
+python3 test_trigger_server.py               # the web UI API: argument mapping, auth, dry-run check, paths, summary settings (9)
+bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings, summary settings (383)
 bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (125)
 ```
 

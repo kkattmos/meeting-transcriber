@@ -145,6 +145,10 @@ while i < len(argv):
 # Record what we were handed so the tests can assert on it.
 with open(os.environ["STUB_SUMMARIZE_ARGS"], "w") as fh:
     fh.write("\n".join(argv))
+# The per-run summary settings reach summarize.py as the variables it reads.
+with open(os.environ["STUB_SUMMARIZE_ARGS"] + ".env", "w") as fh:
+    for key in ("SUMMARY_LANGUAGE", "PDF_FONT"):
+        fh.write(f"{key}={os.environ.get(key, '')}\n")
 if "--parts" in flags:
     # The --combine path: one call over every member's transcript + frames.
     # The parts file is what the tests inspect; the "summary" it writes
@@ -1378,7 +1382,7 @@ check "--from-file with a binary file: exits 1" "$?" "1"
 echo "$out" | grep -q "Slides and course notes go in --resources" \
   && ok "--from-file: points at --resources" || bad "--from-file: unhelpful error: $out"
 printf -- '---\ncourse: Networks\nsource: Kurose\n---\n# 2.4 DNS\n' > "$TESTROOT/ref.md"
-out=$(pipeline "https://youtu.be/fmtest00001" --resources "$TESTROOT/ref.md" --prompt lecture-reference 2>&1)
+out=$(pipeline "https://youtu.be/fmtest00001" --resources "$TESTROOT/ref.md" --prompt lecture 2>&1)
 check "a frontmatter reference runs end to end" "$?" "0"
 
 echo ""
@@ -1394,6 +1398,59 @@ ls -d "$RUNS"/yt_dryrun00001_* >/dev/null 2>&1 \
   && bad "dry-run created a run" || ok "dry-run creates nothing"
 out=$(pipeline "https://youtu.be/dryrun00001" --combine "$TESTROOT/no such dir/x.md" --dry-run 2>&1)
 check "dry-run: a --combine into a missing directory is refused" "$?" "1"
+
+echo "--- Summary language, PDF font and extra instructions, per run"
+out=$(pipeline "https://youtu.be/sumset00001" --summary-language fr --dry-run 2>&1)
+check "summary: an unknown output language is refused" "$?" "1"
+out=$(pipeline "https://youtu.be/sumset00001" --summary-language th \
+      --pdf-font "CMU Serif" --dry-run 2>&1)
+check "summary: Computer Modern is refused for a Thai summary" "$?" "1"
+echo "$out" | grep -q "Bai Jamjuree, Sarabun" \
+  && ok "summary: the refusal names the Thai choices" \
+  || bad "summary: refusal without the choices: $out"
+out=$(pipeline "https://youtu.be/sumset00001" --summary-language English \
+      --pdf-font cm --dry-run 2>&1)
+check "summary: aliases are accepted" "$?" "0"
+echo "$out" | grep -q "written in en, PDF font CMU Serif" \
+  && ok "summary: dry-run reports the canonical language and font" \
+  || bad "summary: dry-run line missing: $out"
+out=$(pipeline "https://youtu.be/sumset00001" --instructions 2>&1)
+check "summary: --instructions without a value is refused" "$?" "1"
+out=$(pipeline "https://youtu.be/sumset00001" --summary-language en \
+      --pdf-font sarabun --instructions "Focus on the exam." 2>&1)
+check "summary: run exits 0" "$?" "0"
+run=$(latest_run)
+check "summary: language stored" \
+  "$(state get --run-dir "$RUNS/$run" --key summary_language)" "en"
+check "summary: font stored canonically" \
+  "$(state get --run-dir "$RUNS/$run" --key pdf_font)" "Sarabun"
+check "summary: instructions stored" \
+  "$(state get --run-dir "$RUNS/$run" --key instructions)" "Focus on the exam."
+grep -qx -- "--instructions" "$STUB_SUMMARIZE_ARGS" \
+  && grep -qx -- "Focus on the exam." "$STUB_SUMMARIZE_ARGS" \
+  && ok "summary: instructions passed to summarize.py" \
+  || bad "summary: instructions not passed: $(cat "$STUB_SUMMARIZE_ARGS")"
+grep -qx "SUMMARY_LANGUAGE=en" "$STUB_SUMMARIZE_ARGS.env" \
+  && grep -qx "PDF_FONT=Sarabun" "$STUB_SUMMARIZE_ARGS.env" \
+  && ok "summary: language and font exported to summarize.py" \
+  || bad "summary: env not exported: $(cat "$STUB_SUMMARIZE_ARGS.env")"
+
+echo "--- New summary settings on a resume replace the old ones, nothing else"
+touch "$STUB_FAIL_SUMMARIZE"
+pipeline "https://youtu.be/sumset00002" --instructions "old words" \
+         --resources "$TESTROOT/slides deck" >/dev/null 2>&1
+run=$(latest_run)
+rm -f "$STUB_FAIL_SUMMARIZE"
+out=$(pipeline "https://youtu.be/sumset00002" --instructions "new words" 2>&1)
+check "summary: the resume exits 0" "$?" "0"
+check "summary: the same run was resumed" "$(latest_run)" "$run"
+check "summary: the new instructions replaced the old" \
+  "$(state get --run-dir "$RUNS/$run" --key instructions)" "new words"
+check "summary: the run's resources survived the update" \
+  "$(state get --run-dir "$RUNS/$run" --key resources)" "$TESTROOT/slides deck"
+grep -qx -- "new words" "$STUB_SUMMARIZE_ARGS" \
+  && ok "summary: the resume summarized with the new instructions" \
+  || bad "summary: resume used stale instructions"
 
 echo ""
 echo "--- --new-meet: the bot creates the meeting, records it, cites the real link"

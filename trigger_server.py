@@ -20,13 +20,15 @@ POST /trigger          (Authorization: Bearer <token>)
     {"url": "<meeting_or_youtube_url>", "name": "Weekly Standup"}
   or several at once:
     {"urls": ["https://youtu.be/a", "https://youtu.be/b"], "jobs": 2,
-     "language": "th", "prompt": "lecture-gemini"}
+     "language": "th", "prompt": "lecture"}
   or a new meeting the bot creates and hosts:
     {"new_meet": true, "name": "Project sync"}
 
-  Optional fields: name, language, prompt, jobs, display_name, clip, combine,
-  no_combine_pdf, resources (a GitHub repo or local path, or a list of them),
-  playlist, and force.
+  Optional fields: name, language (spoken), prompt (video | meeting | lecture |
+  tutorial), summary_language (th | en, what the notes are written in),
+  pdf_font, instructions (extra instructions for the summarizer), jobs,
+  display_name, clip, combine, no_combine_pdf, resources (a GitHub repo or
+  local path, or a list of them), playlist, and force.
 
   Responds 202 immediately; pipeline.sh runs detached. Its output goes to
   $MEETING_BOT_ROOT/logs/trigger_<timestamp>.log — the response carries the
@@ -36,7 +38,7 @@ POST /trigger          (Authorization: Bearer <token>)
 POST /api/check        the same body; runs `pipeline.sh --dry-run` — the real
                        parser and classifier, so the form cannot disagree with
                        the pipeline — and returns what would run, or the error.
-GET  /api/options      prompts, languages and defaults for the form
+GET  /api/options      prompts, languages, fonts and defaults for the form
 GET  /api/runs         recent runs with their stage status
 GET  /api/runs/<id>    one run: state.json plus the tail of each stage log
 POST /api/runs/<id>/resume   ./pipeline.sh --run-id <id>, detached
@@ -63,6 +65,15 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+import sys
+
+# Stdlib-only helpers shared with the summarizer, so the form offers exactly
+# what summarize.py accepts: the four prompts and their old names, the output
+# languages, and the fonts each language may use.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "summarize"))
+import fontchoice  # noqa: E402
+import language  # noqa: E402
+from promptnames import canonical_prompt_name  # noqa: E402
 
 REPO = Path(__file__).resolve().parent
 TOKEN = os.environ.get("MEETING_BOT_TOKEN")
@@ -114,6 +125,8 @@ def build_args(body):
         args += ["--name", str(name)]
     for field, flag in (("language", "--language"),
                         ("prompt", "--prompt"),
+                        ("summary_language", "--summary-language"),
+                        ("pdf_font", "--pdf-font"),
                         ("display_name", "--display-name"),
                         ("jobs", "--jobs"),
                         ("clip", "--clip"),
@@ -121,6 +134,11 @@ def build_args(body):
         value = body.get(field)
         if value not in (None, ""):
             args += [flag, str(value).strip()]
+    # Free text, possibly several lines: passed as one argument, never
+    # through a shell. pipeline.sh stores it with the run.
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        args += ["--instructions", instructions.strip()]
     if body.get("no_combine_pdf"):
         args.append("--no-combine-pdf")
     # `resources` may be a single spec, a list, or newline-separated text;
@@ -228,9 +246,22 @@ def run_summary(run_dir, data):
 
 def options():
     prompts = sorted(p.stem for p in PROMPTS_DIR.glob("*.md") if not p.stem.startswith("_"))
+    default_prompt = canonical_prompt_name(os.environ.get("SUMMARY_PROMPT", ""))
+    try:
+        default_summary_language = language.output_language()
+    except language.UnknownLanguage:
+        # A typo in SUMMARY_LANGUAGE must not take the page down; the
+        # pipeline reports it properly on Check.
+        default_summary_language = language.DEFAULT
+    codes = sorted(fontchoice.CHOICES)
     return {
         "prompts": prompts,
-        "default_prompt": os.environ.get("SUMMARY_PROMPT", ""),
+        "default_prompt": default_prompt if default_prompt in prompts else "",
+        "summary_languages": codes,
+        "summary_language_names": {c: language.language_name(c) for c in codes},
+        "default_summary_language": default_summary_language,
+        "fonts": {c: list(fontchoice.CHOICES[c]) for c in codes},
+        "default_fonts": {c: fontchoice.default_font(c) for c in codes},
         "languages": ["th", "en", "auto"],
         "default_language": os.environ.get("ASSEMBLYAI_LANGUAGE", "th"),
         "default_jobs": os.environ.get("PIPELINE_JOBS", "2"),

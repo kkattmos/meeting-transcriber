@@ -130,6 +130,15 @@ while IFS= read -r _spec; do
   [ -n "$_spec" ] && RESOURCE_SPECS+=("$_spec")
 done < <(rs get --run-dir "$RUN_DIR" --key resources 2>/dev/null || true)
 [ -n "$DISPLAY_NAME" ] || DISPLAY_NAME="Meeting Bot"
+# The summary's own settings (pipeline.sh --summary-language / --pdf-font /
+# --instructions, or the web UI). Unset means .env's defaults apply; set, they
+# are exported to summarize.py as the variables it already reads, so a resume
+# writes the same language in the same face.
+SUMMARY_LANG_CFG="$(cfg summary_language)"
+PDF_FONT_CFG="$(cfg pdf_font)"
+INSTRUCTIONS="$(cfg instructions)"
+[ -n "$SUMMARY_LANG_CFG" ] && export SUMMARY_LANGUAGE="$SUMMARY_LANG_CFG"
+[ -n "$PDF_FONT_CFG" ] && export PDF_FONT="$PDF_FONT_CFG"
 
 # What the summary document cites as its source. For every other input type
 # that is the input itself; a Kaltura input may be a 900-character <iframe>
@@ -336,6 +345,7 @@ do_summarize_combined() {
     args+=(--no-pdf)
   fi
   [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
+  [ -n "$INSTRUCTIONS" ] && args+=(--instructions "$INSTRUCTIONS")
   local spec
   for spec in "${RESOURCE_SPECS[@]:-}"; do
     [ -n "$spec" ] && args+=(--resources "$spec")
@@ -612,6 +622,7 @@ do_summarize() {
   # way to tell that "0:00:00" in this summary is 00:05:00 in the source.
   [ -n "$CLIP" ] && args+=(--clip "$CLIP")
   [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
+  [ -n "$INSTRUCTIONS" ] && args+=(--instructions "$INSTRUCTIONS")
   # Kaltura has no yt-dlp to ask for a title, so the entry's own name (read at
   # fetch time into kaltura.json) is passed explicitly. Best-effort: a run
   # whose fetch predates this file just falls back to the meeting name.
@@ -659,6 +670,7 @@ echo "=================================================================="
 echo "Run: $RUN_ID"
 echo "  input:    $INPUT ($INPUT_TYPE)"
 echo "  language: $LANGUAGE   prompt: ${PROMPT_NAME:-(default)}"
+echo "  summary:  in ${SUMMARY_LANGUAGE:-th}, PDF font ${PDF_FONT:-(default)}${INSTRUCTIONS:+, with extra instructions}"
 [ -n "$CLIP" ] && echo "  clip:     $CLIP  (output timestamps are relative to it)"
 echo "=================================================================="
 

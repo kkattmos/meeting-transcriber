@@ -89,6 +89,30 @@ echo "argv: $*"
         self.assertEqual(args, ["--new-meet", "--name", "Sync"])
         self.assertIsNotNone(self.ts.build_args({})[1])
 
+    def test_summary_settings_and_instructions(self):
+        args, err = self.ts.build_args({
+            "new_meet": True, "prompt": "meeting", "summary_language": "en",
+            "pdf_font": "CMU Serif",
+            "instructions": "  List every decision.\nSkip the small talk.  "})
+        self.assertIsNone(err)
+        self.assertEqual(args, [
+            "--new-meet", "--prompt", "meeting", "--summary-language", "en",
+            "--pdf-font", "CMU Serif",
+            "--instructions", "List every decision.\nSkip the small talk."])
+        # Blank instructions are not an argument at all.
+        args, _ = self.ts.build_args({"url": "https://youtu.be/a",
+                                      "instructions": "  "})
+        self.assertEqual(args, ["https://youtu.be/a"])
+
+    def test_options_offer_the_four_prompts_and_the_fonts(self):
+        status, opt = self.call("/api/options")
+        self.assertEqual(status, 200)
+        self.assertEqual(opt["prompts"], ["lecture", "meeting", "tutorial", "video"])
+        self.assertEqual(opt["summary_languages"], ["en", "th"])
+        self.assertEqual(opt["fonts"]["th"], ["Bai Jamjuree", "Sarabun"])
+        self.assertIn("CMU Serif", opt["fonts"]["en"])
+        self.assertIn(opt["default_fonts"]["th"], opt["fonts"]["th"])
+
     def test_the_page_needs_no_token_but_the_api_does(self):
         with urllib.request.urlopen(self.base + "/") as res:
             self.assertIn(b"Meeting Bot", res.read())
