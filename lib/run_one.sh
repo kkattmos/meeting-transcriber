@@ -79,7 +79,7 @@ RUNSTATE="$SCRIPT_DIR/runstate.py"
 EXIT_PAUSED=75
 SLOTQUEUE="$SCRIPT_DIR/slotqueue.py"
 
-PYTHON_BIN="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
+PYTHON_BIN="${MEETING_BOT_VENV:-$LOADER_DIR/.venv}/bin/python3"
 [ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"
 
 RUN_DIR=""
@@ -195,6 +195,9 @@ SUMMARY_PDF="${PDF_DIR}/${RUN_ID}.pdf"
 paths_mkdir RECORDINGS_DIR TRANSCRIPTS_DIR FRAMES_DIR SUMMARIES_DIR PDF_DIR
 
 export MEETING_BOT_RUN_DIR="$RUN_DIR"
+# The lecture's language, for summarize.py's <course_reference> attribute —
+# the reference prompt's bilingual rule reads it rather than hardcoding a pair.
+export MEETING_BOT_LANGUAGE="$LANGUAGE"
 
 # --- Stage helper ------------------------------------------------------------
 # Runs a stage unless it's already done, streaming its output to both the run
@@ -650,6 +653,12 @@ if [ "$INPUT_TYPE" = "meeting" ]; then
     exit 1
   fi
   mark_done record "video=$MP4_FILE" || exit 1
+  # A meeting the bot created (meet.new): capture.py stored the real link the
+  # moment it existed. That, not "https://meet.new", is what the document
+  # should cite. Read from state rather than from the recorder's output so a
+  # resume after the call gets the same link.
+  _created_meet="$(cfg meet_url)"
+  [ -n "$_created_meet" ] && SOURCE_URL="$_created_meet"
 else
   echo "[record] skipped — $INPUT_TYPE input has no meeting to join"
 fi

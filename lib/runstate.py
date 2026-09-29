@@ -4,7 +4,7 @@ Per-run state for the pipeline: what stage got how far, and where its output
 landed. This is what makes `pipeline.sh` resumable and safe to run twice at
 once.
 
-State lives at /opt/meeting-bot/runs/<run_id>/state.json. One directory per
+State lives at $MEETING_BOT_ROOT/runs/<run_id>/state.json. One directory per
 run holds everything mutable about it:
 
     runs/<run_id>/
@@ -70,7 +70,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_ROOT = Path(os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot")) / "runs"
+DEFAULT_ROOT = Path(os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot"))) / "runs"
 
 # Declared in dependency order for display purposes only; the actual DAG lives
 # in pipeline.sh. `fetch_video` exists so the YouTube download can run in
@@ -362,6 +362,11 @@ def main():
     # summarize stage is deliberately left pending — the combine run is what
     # summarizes it — and this is how --resume-all knows not to "finish" it.
     p.add_argument("--combined-into")
+    # A run started from meet.new: the meeting the bot created and hosted.
+    # Written by capture.py the moment the link exists, so --status can show
+    # it while the call is still going, and used as the document's link line
+    # in place of "https://meet.new", which points at no meeting in particular.
+    p.add_argument("--meet-url")
 
     p = with_run_dir(sub.add_parser("status"))
     p.add_argument("--stage", required=True)
@@ -483,11 +488,12 @@ def main():
                     display_name=args.display_name, clip=args.clip,
                     combined_into=args.combined_into,
                     members=args.members, output_md=args.output_md,
-                    output_pdf=args.output_pdf)
+                    output_pdf=args.output_pdf, meet_url=args.meet_url)
         # `init` with no --resources still records an empty list — except
-        # when it is only stamping --combined-into on an existing member,
-        # which must not blank the resources that member was created with.
-        if args.combined_into is None:
+        # when it is only stamping --combined-into on an existing member, or
+        # --meet-url from inside a recording, neither of which may blank the
+        # resources the run was created with.
+        if args.combined_into is None and args.meet_url is None:
             meta["resources"] = args.resources or []
         state.init(**meta)
         return 0
@@ -553,6 +559,8 @@ def main():
             return 1
         print(f"run_id:     {data.get('run_id')}")
         print(f"input:      {data.get('input')}  ({data.get('input_type')})")
+        if data.get("meet_url"):
+            print(f"meeting:    {data['meet_url']}  (created and hosted by the bot)")
         if data.get("clip"):
             print(f"clip:       {data.get('clip')}"
                   "  (output timestamps are relative to it)")

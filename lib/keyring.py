@@ -58,7 +58,7 @@ def _state_dir():
     MEETING_BOT_ROOT holds only run bookkeeping (runs/, tmp/, state/) now that
     the media directories are configured independently — see lib/paths.py.
     """
-    root = os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot")
+    root = os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot"))
     return Path(os.environ.get("MEETING_BOT_STATE_DIR", str(Path(root) / "state")))
 
 

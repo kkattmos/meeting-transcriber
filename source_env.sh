@@ -45,11 +45,22 @@ _find_env() {
   return 1
 }
 
+# Per-user defaults, applied AFTER .env so a value there (or an exported one)
+# always wins. The bot runs as the desktop user, not root: its bookkeeping
+# lives under XDG data, and the venv is the uv-built `.venv` in the repo, so
+# `rm -rf .venv` removes every Python dependency in one go.
+_meeting_bot_defaults() {
+  : "${MEETING_BOT_ROOT:=${XDG_DATA_HOME:-$HOME/.local/share}/meeting-bot}"
+  : "${MEETING_BOT_VENV:=$LOADER_DIR/.venv}"
+  export MEETING_BOT_ROOT MEETING_BOT_VENV
+}
+
 ENV_FILE="$(_find_env || true)"
 # No .env found: silently return so callers in set -e scripts don't blow up.
 # `return` works here even when this script is sourced because the
 # `return` builtin is permitted at the top level of a sourced file.
 if [ -z "$ENV_FILE" ]; then
+  _meeting_bot_defaults
   return 0 2>/dev/null || true
   # Fallback for the rare case where return is somehow blocked
   # (e.g. POSIX sh that has no `return` outside functions). The caller
@@ -82,6 +93,9 @@ while IFS= read -r line || [ -n "$line" ]; do
   key="$(printf '%s' "$key" | tr -d '[:space:]')"
   val="${val%$'\r'}"
   val="$(_strip_quotes "$val")"
+  # "~/..." means the home directory — the bot runs as the desktop user, so
+  # .env.example can ship per-user paths without naming anyone's $HOME.
+  case "$val" in "~/"*) val="$HOME/${val#\~/}" ;; esac
 
   # Already exported? Skip — caller override wins.
   # Use `printenv` so we don't false-positive on a same-name local var.
@@ -90,3 +104,4 @@ while IFS= read -r line || [ -n "$line" ]; do
   fi
   export "$key=$val"
 done < "$ENV_FILE"
+_meeting_bot_defaults

@@ -40,3 +40,6 @@ runs/
 # shell junk that lands in the repo root (the repo IS $HOME)
 .bash_history-*.tmp
 .bashrc.bak-*
+
+# The uv-built project venv (setup.sh). Delete it to remove every Python dep.
+/.venv/

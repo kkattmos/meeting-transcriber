@@ -1,7 +1,7 @@
 #!/bin/bash
 # Stage 1: screen-record a meeting to MP4 (video + audio), natively.
 #
-# Xvfb -> audio sink -> real Google Chrome (via capture.py) -> ffmpeg x11grab.
+# Xvfb -> audio sink -> the browser (Firefox ESR or Chrome, via capture.py) -> ffmpeg x11grab.
 # On the Alpine branch all of this lived in a Debian container because Chrome
 # has no musl build; the host is Debian 13 now, so it runs here directly and
 # there is no docker daemon, no image to build, and no bind mounts to keep in
@@ -71,18 +71,36 @@ ADMITTED_MARKER="$MEETING_BOT_RUN_DIR/admitted"
 PID_FILE="$MEETING_BOT_RUN_DIR/record.pid"
 rm -f "$KILL_SENTINEL" "$ADMITTED_MARKER"
 
-xsession_require_tools Xvfb ffmpeg pactl google-chrome-stable || exit 1
-
-PYTHON_BIN="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
+PYTHON_BIN="${MEETING_BOT_VENV:-$LOADER_DIR/.venv}/bin/python3"
 [ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"
-if ! "$PYTHON_BIN" -c "import playwright" >/dev/null 2>&1; then
-  echo "ERROR: playwright is not installed in $PYTHON_BIN." >&2
-  echo "  Run ./setup.sh — it installs playwright and Chrome's shared libs." >&2
+
+# MEETING_BROWSER (screen/browser.py): firefox-esr by default, chrome as the
+# fallback. Each needs a different binary and a different Python driver.
+BROWSER_KIND="$("$PYTHON_BIN" "$SCRIPT_DIR/browser.py" info 2>/dev/null \
+                | awk '/^browser:/ {print $2}')"
+if [ "$BROWSER_KIND" = "chrome" ]; then
+  xsession_require_tools Xvfb ffmpeg pactl google-chrome-stable || exit 1
+  DRIVER_MODULE="playwright"
+else
+  xsession_require_tools Xvfb ffmpeg pactl || exit 1
+  if ! "$PYTHON_BIN" "$SCRIPT_DIR/browser.py" info | grep -q '^binary:  /'; then
+    echo "ERROR: firefox-esr not found (sudo apt-get install firefox-esr, or set FIREFOX_BIN)." >&2
+    exit 1
+  fi
+  DRIVER_MODULE="selenium"
+fi
+if ! "$PYTHON_BIN" -c "import $DRIVER_MODULE" >/dev/null 2>&1; then
+  echo "ERROR: $DRIVER_MODULE is not installed in $PYTHON_BIN." >&2
+  echo "  Run ./setup.sh — it builds the project .venv with uv." >&2
   exit 1
 fi
 
 RUN_ID="$(basename "$MEETING_BOT_RUN_DIR")"
 SINK_NAME="$(xsession_sink_name "$RUN_ID")"
+# A second null sink whose monitor is the browser's microphone: silence. On a
+# PC the default source is the operator's real microphone, and a bot that
+# failed to mute would otherwise broadcast the room.
+MIC_NAME="${SINK_NAME}_mic"
 
 KILLED=0
 FFMPEG_PID=""
@@ -95,6 +113,7 @@ cleanup() {
   [ -n "$FFMPEG_PID" ] && kill -INT "$FFMPEG_PID" 2>/dev/null || true
   [ -n "$JOIN_PID" ] && kill "$JOIN_PID" 2>/dev/null || true
   xsession_audio_stop "$SINK_NAME" || true
+  xsession_audio_stop "$MIC_NAME" || true
   xsession_stop_xvfb || true
   rm -f "$PID_FILE" || true
   true
@@ -121,12 +140,21 @@ echo "==> Starting virtual display :$DISPLAY_NUM ($GEOMETRY)"
 xsession_start_xvfb "$DISPLAY_NUM" "$GEOMETRY" || exit 1
 
 echo "==> Setting up virtual audio (sink: $SINK_NAME)"
+xsession_audio_start "$MIC_NAME" || exit 1
 xsession_audio_start "$SINK_NAME" || exit 1
 
-# Both are exported, so Chrome — started by capture.py — renders on our
-# display and plays into our sink rather than the box's default.
+# All three are exported, so the browser — started by capture.py — renders on
+# our display, plays into our sink and hears only silence, rather than using
+# the desktop's display, speakers and microphone.
 export DISPLAY=":$DISPLAY_NUM"
 export PULSE_SINK="$SINK_NAME"
+export PULSE_SOURCE="${MIC_NAME}.monitor"
+# On a Wayland desktop session the browser would otherwise pick Wayland over
+# DISPLAY — putting the kiosk window on the operator's screen, or (Firefox's
+# GTK, verified 2026-09-29) failing with "cannot open display" — instead of
+# drawing on the Xvfb head ffmpeg records.
+unset WAYLAND_DISPLAY XDG_SESSION_TYPE
+export GDK_BACKEND=x11 MOZ_ENABLE_WAYLAND=0
 
 echo "==> Joining meeting: $MEETING_URL"
 "$PYTHON_BIN" "$SCRIPT_DIR/capture.py" "$MEETING_URL" "$DISPLAY_NAME" &

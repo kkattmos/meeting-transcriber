@@ -1936,6 +1936,50 @@ class PromptOrderForCachingTest(unittest.TestCase):
         self.assertTrue(out.startswith("RULES"))
         self.assertGreater(out.index("Week 4"), out.index("{transcript}"))
 
+    def test_frontmatter_reference_is_tagged_and_keeps_its_braces_safe(self):
+        import summarize as summarize_main
+        import resources as botresources
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "kurose.md"
+            ref.write_text("---\ncourse: Networks\nsource: Kurose & Ross\n"
+                           "citation_label: Kurose\n---\n# 2.4 DNS\nuses {x}\n")
+            bundle = botresources.collect([str(ref)], cache_root=tmp, want_images=False)
+            template = f"{BEGIN}\nRULES\n{END}\n# Input\n{{transcript}}\n"
+            with mock.patch.dict(os.environ, {"MEETING_BOT_LANGUAGE": "th"}):
+                out = summarize_main.inject_resources(template, bundle)
+        static, dynamic = llm_client.split_static_prompt(out)
+        self.assertNotIn("Networks", static, "per-course metadata must stay dynamic")
+        self.assertIn('<course_reference course="Networks" source="Kurose &amp; Ross" '
+                      'citation_label="Kurose" lecture_language="th">', dynamic)
+        self.assertNotIn("---", dynamic.split("<course_reference")[1],
+                         "the frontmatter itself is stripped")
+        self.assertEqual(dynamic.format(transcript="T").count("uses {x}"), 1)
+
+    def test_a_reference_without_frontmatter_is_unchanged(self):
+        import summarize as summarize_main
+        import resources as botresources
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "notes.md"
+            ref.write_text("# Notes\nplain\n")
+            bundle = botresources.collect([str(ref)], cache_root=tmp, want_images=False)
+            with mock.patch.dict(os.environ, {"MEETING_BOT_LANGUAGE": "th"}):
+                out = summarize_main.inject_resources("RULES\n{transcript}", bundle)
+        self.assertNotIn("course_reference", out)
+        self.assertNotIn("lecture_language", out)
+        self.assertIn("### notes.md\n\n# Notes\nplain", out)
+
+    def test_lecture_reference_prompt_keeps_its_rules_static(self):
+        template = summarize_main_load("lecture-reference")
+        static, dynamic = llm_client.split_static_prompt(template)
+        self.assertIn("Cite only what is in the excerpt", static)
+        self.assertIn("{transcript}", dynamic)
+        self.assertNotIn("{", static.replace("{{", ""), "no format slots in the static half")
+
+
+def summarize_main_load(name):
+    import summarize as summarize_main
+    return summarize_main.load_prompt_template(summarize_main.resolve_prompt_path(name))
+
 
 class GeminiModelChainTest(unittest.TestCase):
     """GEMINI_MODEL as a chain: every key on a model, then the next model.

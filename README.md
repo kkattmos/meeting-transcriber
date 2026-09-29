@@ -1,13 +1,16 @@
 # meeting-transcriber
 
-A meeting/lecture bot for a Proxmox box running **Debian 13 (trixie)**. It joins
-a Google Meet or Zoom call in a real signed-in Chrome, records the screen and
-audio to MP4, transcribes it, and writes an AI summary — as Markdown **and as a
-PDF with the slides from the video inlined** — combining the transcript with
-keyframes pulled from the recording. It also works on YouTube links, on Kaltura
-lecture-capture embeds (paste the `<iframe>` from your LMS), and on video
-files you already have, and it can read the lecturer's own slides from a GitHub
-repo or a folder and use them as reference material.
+A meeting/lecture bot that runs on your own **Debian 13 (trixie) PC**, as your
+own user. It joins a Google Meet or Zoom call — or creates a new Google Meet and
+hosts it — in a signed-in **Firefox ESR** (Chrome is the fallback), on a hidden
+display so it never takes over your screen, records the screen and audio to
+MP4 **in the background**, transcribes it, and writes an AI summary — as
+Markdown **and as a PDF** — combining the transcript with keyframes pulled from
+the recording. It also works on YouTube links, on Kaltura lecture-capture
+embeds (paste the `<iframe>` from your LMS), and on video files you already
+have, and it can read the lecturer's own slides from a GitHub repo or a folder
+and use them as reference material. A small web UI, run by pm2 and off until
+you switch it on, does all of that from a browser.
 
 The three stages are independent — each has its own entry script and runs
 without the others — and `pipeline.sh` chains them.
@@ -15,20 +18,22 @@ without the others — and `pipeline.sh` chains them.
 - **Everything you run day to day is in [Commands](#commands).**
 - Architectural decisions and the reasons behind them live in `CLAUDE.md`.
 
-> **Coming from the Alpine version?** That tree is preserved on the
-> `alpinelinux` branch. This branch runs everything natively on Debian: no
-> Docker, no container image, no bind mounts. See
-> [What changed on Debian 13](#what-changed-on-debian-13).
+> **Other versions.** The same system as a root install on a Proxmox VM (with
+> `/opt`, systemd units and Chrome) is on the `debian13-in-proxmox` branch; the
+> one-container Docker build is on `docker`; the Alpine host + Debian container
+> is on `alpinelinux`.
 
 ---
 
 ## Table of contents
 
 - [How it works](#how-it-works)
-- [What changed on Debian 13](#what-changed-on-debian-13)
+- [Running on a PC](#running-on-a-pc)
 - [Install](#install)
-- [First-time login (you can't see a window)](#first-time-login-you-cant-see-a-window)
+- [First-time login](#first-time-login)
+- [Web UI](#web-ui)
 - [Commands](#commands)
+- [Hosting a new Google Meet](#hosting-a-new-google-meet)
 - [Summarizing part of a video](#summarizing-part-of-a-video)
 - [Slides and reference material](#slides-and-reference-material)
 - [Resuming a failed run](#resuming-a-failed-run)
@@ -52,9 +57,9 @@ flowchart LR
         MP4[".mp4 on disk"]
     end
 
-    REC["record<br/>(Chrome + Xvfb + PulseAudio + ffmpeg)"]
+    REC["record<br/>(Firefox ESR + Xvfb + PipeWire/Pulse + ffmpeg)"]
     FETCH["fetch_video<br/>(yt-dlp / Kaltura API)"]
-    TR["transcribe<br/>(AssemblyAI / youtube-transcript.io / Kaltura captions)"]
+    TR["transcribe<br/>(AssemblyAI / YouTube captions / Kaltura captions)"]
     FR["frames<br/>(ffmpeg scene-change + periodic)"]
     RES["resources<br/>(GitHub repo / folder)"]
     SUM["summarize<br/>(claude CLI, falling back to Gemini)"]
@@ -88,15 +93,15 @@ downloaded file and `fetch_video` runs first, ahead of both branches.
 
 | Stage | Does | Needs |
 |---|---|---|
-| `record` | Joins the call, records screen + audio to MP4 | Chrome, Xvfb, PulseAudio, a signed-in profile |
+| `record` | Joins (or creates) the call, records screen + audio to MP4, in the background | Firefox ESR (or Chrome), Xvfb, `pactl`, a profile signed in as `BOT_GOOGLE_ACCOUNT` |
 | `fetch_video` | Downloads a YouTube video (for frames only) or a Kaltura entry (for frames *and* audio) | yt-dlp / nothing (Kaltura needs no key) |
-| `transcribe` | Local file → AssemblyAI; YouTube → youtube-transcript.io captions; Kaltura → its own captions if it has any, else AssemblyAI | `ASSEMBLYAI_API_KEY_1..3` / `YT_TRANSCRIPT_KEY_1..10` |
+| `transcribe` | Local file → AssemblyAI; YouTube → youtube-transcript.io captions, else YouTube's own (yt-dlp); Kaltura → its own captions if it has any, else AssemblyAI | `ASSEMBLYAI_API_KEY_1..3` / `YT_TRANSCRIPT_KEY_1..10` (optional for YouTube) |
 | `frames` | Scene-change + periodic keyframes → `manifest.json` | ffmpeg |
 | `summarize` | Transcript + frames (+ slides) → Markdown + PDF | the `claude` CLI signed into your Claude subscription / `GEMINI_API_KEY_1..3` |
 
 Where the outputs go is **configured, not assumed** — the five directories are
-independent variables, so summaries can sit on a NAS while recordings stay on
-the big local disk:
+independent variables, so summaries can sit in a synced library (SeaDrive, a
+NAS) while frames stay on the local disk:
 
 ```
 $RECORDINGS_DIR/<run_id>.mp4            screen + audio
@@ -105,100 +110,94 @@ $FRAMES_DIR/<run_id>/                   keyframes + manifest.json
 $SUMMARIES_DIR/<run_id>.md              the deliverable
 $PDF_DIR/<run_id>.pdf                   the readable deliverable
 
-$MEETING_BOT_ROOT/                      the pipeline's own bookkeeping
+$MEETING_BOT_ROOT/                      the pipeline's own bookkeeping (~/.local/share/meeting-bot)
 ├── runs/<run_id>/                       state.json, logs/, kill, admitted, record.pid,
 │                                        and the YouTube/Kaltura download while the run
 │                                        is in progress (deleted once it is summarized)
+├── logs/                                a background meeting's pipeline_*.log, web UI trigger_*.log
 ├── state/keycursor.json                 API-key rotation cursor
 ├── tmp/                                 claude CLI scratch cwd + cached system prompts
 ├── resources/                           cached slide repos + rendered slides
-└── chrome-profile/                      persistent Google/Zoom login
+├── firefox-profile/                     persistent Google/Zoom login (MEETING_BROWSER=firefox-esr)
+└── chrome-profile/                      the same, for MEETING_BROWSER=chrome
 ```
 
 ---
 
-## What changed on Debian 13
+## Running on a PC
 
-The Alpine build could not run Chrome: Alpine is musl, Google ships no musl
-build, and Playwright doesn't support Alpine for its bundled browsers. So the
-browser half lived in a Debian container on an Alpine host. Debian 13 is glibc,
-so **that split is gone** and everything runs natively.
+Settled 2026-09-29. The system used to live on a Proxmox VM, as root, with
+everything under `/opt` (that version is on the `debian13-in-proxmox` branch).
+On a desktop PC it runs as **you**:
 
-| | `alpinelinux` branch | this branch |
+| | Proxmox VM (`debian13-in-proxmox`) | This PC (`debian13`) |
 |---|---|---|
-| Host | Alpine (musl) | Debian 13 (glibc) |
-| Browser stages | Debian container via Docker | Native |
-| Docker | Required | Not used at all |
-| Per-run isolation | Container namespaces (`:99`, `meeting_sink` hardcoded) | Display + PulseAudio sink allocated per run (`lib/xsession.sh`) |
-| Init system | OpenRC (no systemd) | systemd — `setup.sh --with-trigger` installs the trigger unit, `--with-resume-timer` the resume timer |
-| Summarizer | Gemini first, API key | **Claude first, on your subscription** via the `claude` CLI; Gemini as fallback |
-| Keys | One each; YouTube tokens in a JSON file | **Numbered slots in `.env`**, round-robin (3 Gemini, 3 AssemblyAI, 10 YouTube) |
-| Output | Markdown, fixed layout under `/opt/meeting-bot` | Markdown **+ PDF**, five independently configured directories |
-| Slides | — | `--resources` pulls a GitHub repo or folder into the prompt and the PDF |
+| User | root | your own account; `sudo` only for `setup.sh --system` |
+| Bot state | `/opt/meeting-bot` | `~/.local/share/meeting-bot` |
+| Python | `/opt/meeting-bot-venv` | `.venv` in the repo, built by **uv** — `rm -rf .venv` removes it |
+| Browser | google-chrome-stable via Playwright | **Firefox ESR** via Selenium + geckodriver; Chrome selectable |
+| Sign-in | noVNC | a window on your desktop (noVNC still available) |
+| Bot account | whatever the profile held | **`BOT_GOOGLE_ACCOUNT` only** — anything else is refused |
+| A meeting | ran in your terminal | **runs in the background**; the command returns at once |
+| Services | systemd trigger unit + resume timer | **pm2**: `./webui.sh on` / `off`, nothing at boot |
+| Camera/mic | none on the VM | the PC's real ones are never given to the browser |
 
-Two consequences worth knowing:
-
-- **Per-run isolation is now explicit.** `lib/xsession.sh` claims a free
-  display number by creating `/tmp/.X<n>-lock` with `O_EXCL` (so two runs
-  starting in the same second can't pick the same one) and loads a null sink
-  named after the run. Chrome is pointed at that sink with `PULSE_SINK` — the
-  default sink is *never* changed, because that is global state and flipping it
-  would move another meeting's audio into this recording.
-- **Recording is no longer isolated by a container.** Two concurrent recordings
-  are still fine, but they share one PulseAudio daemon and one X server.
+Per-run isolation is unchanged: `lib/xsession.sh` claims a free display number
+for each recording and loads a PulseAudio null sink named after the run, and
+the browser is pointed at that sink with `PULSE_SINK` — so a recording never
+touches your desktop's screen or speakers, and two recordings never share a
+sink. On the PC it also loads a second, silent sink whose monitor is the
+browser's **microphone**, so a bot that failed to mute can't broadcast your
+room, and the browser's camera is refused outright.
 
 ---
 
 ## Install
 
-Target: Debian 13 (trixie) on Proxmox (LXC container or KVM VM), 4 vCPU / 8 GB.
+Target: Debian 13 (trixie) desktop, as a normal user with `sudo`.
 
 ```bash
-sudo -H ./setup.sh
+sudo ./setup.sh --system
 ```
 
-That installs the system packages (ffmpeg, Xvfb, PulseAudio, x11vnc/noVNC,
-poppler, Pango for the PDF renderer, Thai fonts — plus the vendored Bai
-Jamjuree and Sarabun from `fonts/`), real `google-chrome-stable`
-from Google's repository, the Python venv at `/opt/meeting-bot-venv`, yt-dlp,
-and the working directories.
+```bash
+./setup.sh
+```
+
+The first installs the apt packages — ffmpeg, Xvfb, `pactl`
+(`pulseaudio-utils`; not the PulseAudio daemon, since the desktop runs
+PipeWire), x11vnc/noVNC, **firefox-esr**, poppler, Pango for the PDF renderer,
+Thai fonts, nodejs/npm and the Thai locale. Add `--with-chrome` for
+`google-chrome-stable` (only for `MEETING_BROWSER=chrome`) and
+`--with-libreoffice` so `.pptx` slides can be rendered into the PDF (~700MB).
+
+The second runs as you, with no sudo, and puts everything else in your home
+directory or the repo:
+
+- **uv** (from astral.sh, into `~/.local/bin`) and the project venv at
+  **`.venv`**, built by uv from the hash-pinned lockfiles. Deleting `.venv`
+  removes every Python dependency; `./setup.sh` rebuilds it in seconds.
+- **geckodriver** (Mozilla's release) and **yt-dlp** (latest release) in
+  `~/.local/bin`.
+- The vendored Bai Jamjuree and Sarabun fonts in `~/.local/share/fonts`.
+- **pm2** (npm, into `~/.local`) — nothing is registered to start at boot.
+- A `.env` from `.env.example` with a fresh `MEETING_BOT_TOKEN`, if you don't
+  have one yet.
+
+`--no-browser` skips the recorder's Python drivers (Selenium, Playwright) for a
+box that only transcribes and summarizes.
 
 **Python dependencies are pinned.** `requirements.txt` (and
-`requirements-browser.txt`, which is skipped by `--no-chrome`) hold every
-package and transitive dependency at an exact version with a SHA-256 hash. Both
-are generated from the `requirements.in` files beside them. This is what stops
-two boxes built months apart from getting different SDK versions — the failure
-mode there is an SDK that quietly changes its request surface and turns a
-working install into a 400 on every summary.
-
-**uv is optional but worth installing** — same pinned result, ~40x faster
-(measured on this target: 4s versus 2m43s):
+`requirements-browser.txt`) hold every package and transitive dependency at an
+exact version with a SHA-256 hash, generated from the `requirements.in` files
+beside them. To change a dependency, edit the `.in` file, then:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-`setup.sh` uses it automatically when it's on `PATH` and falls back to pip
-otherwise; both verify the lockfile's hashes, so the venv is identical either
-way. uv is not in Debian's archive, which is why it stays optional.
-
-To change a dependency, edit `requirements.in`, then regenerate (needs uv):
-
-```bash
-uv pip compile --generate-hashes requirements.in -o requirements.txt
+uv pip compile --generate-hashes --python-version 3.13 --python-platform x86_64-unknown-linux-gnu requirements.in -o requirements.txt
 ```
 
 ```bash
-uv pip compile --generate-hashes -c requirements.txt requirements-browser.in -o requirements-browser.txt
-```
-
-Useful flags:
-
-```bash
-sudo -H ./setup.sh --no-chrome          # transcribe/summarize box only
-sudo -H ./setup.sh --with-libreoffice   # so .pptx slides can be rendered into the PDF (~700MB)
-sudo -H ./setup.sh --with-trigger       # install + enable the systemd trigger service
-sudo -H ./setup.sh --with-resume-timer  # every 15 min, resume runs paused on the Claude usage window
+uv pip compile --generate-hashes --python-version 3.13 --python-platform x86_64-unknown-linux-gnu -c requirements.txt requirements-browser.in -o requirements-browser.txt
 ```
 
 ### Sign the summarizer in
@@ -212,90 +211,149 @@ curl -fsSL https://claude.ai/install.sh | bash
 ```
 
 ```bash
-claude auth login
+~/.local/bin/claude auth login
 ```
 
-`claude auth login` opens a browser flow. On this box there is no browser you
-can see, so either run it through the same noVNC session
-[`first_time_login.sh`](#first-time-login-you-cant-see-a-window) sets up, or
-generate a long-lived token on a machine you *can* see and paste it in:
+`.env.example` already points `CLAUDE_CLI_BIN` at `~/.local/bin/claude`, where
+that installer puts it — set explicitly because pm2 and background runs don't
+always inherit your shell's `PATH`. (The Claude desktop app's bundled CLI is
+not the same install and is not signed in on its own.) Check it any time with:
 
 ```bash
-claude setup-token
+~/.local/bin/claude auth status
 ```
 
-`setup.sh` does not install the CLI: it comes from Anthropic's own installer
-rather than apt, and it is per-user state (the login lives in `~/.claude`),
-so it is not part of a root system bootstrap. Check it any time with:
-
-```bash
-claude auth status
-```
-
-If the CLI is missing or signed out, the summarize stage says so and falls
-through to Gemini rather than failing the run — but the summaries you get are
-Gemini's, so it is worth checking. `./verify_e2e.sh --preflight` reports it.
+If the CLI is missing or signed out, the summarize stage falls through to
+Gemini (if you have Gemini keys) — the provenance header of every document says
+which model wrote it. `./verify_e2e.sh --preflight` reports it too.
 
 Then configure:
 
 ```bash
-cp .env.example .env && chmod 600 .env
 $EDITOR .env
 ```
 
-Fill in the API keys (Gemini, AssemblyAI, youtube-transcript.io — Claude
-needs none) and the five output directories. Check them with:
+Set **`BOT_GOOGLE_ACCOUNT`** (the Google address the bot signs in as), the API
+keys (Gemini, AssemblyAI, youtube-transcript.io — Claude needs none) and the
+five output directories. `~/` at the start of a value means your home
+directory. Check them with:
 
 ```bash
-/opt/meeting-bot-venv/bin/python3 lib/paths.py show
-/opt/meeting-bot-venv/bin/python3 lib/keyring.py status    # counts keys, never prints them
-./verify_e2e.sh --preflight                                # everything, including a real 2s capture
+.venv/bin/python3 lib/paths.py show
+.venv/bin/python3 lib/keyring.py status    # counts keys, never prints them
+./verify_e2e.sh --preflight                # everything, including a real 2s capture
 ```
-
-> **Running in an LXC container?** No nesting flag is needed any more (that was
-> for Docker). The container does need `/dev/shm` of a sane size for Chrome —
-> the default 64MB is enough here because Chrome runs with
-> `--disable-dev-shm-usage`.
 
 ---
 
-## First-time login (you can't see a window)
+## First-time login
 
-Run this once, and again whenever your Google or Zoom session expires. It opens
-a real Chrome on a headless display using the same persistent profile the
-recorder reuses, and exposes it to **you** over noVNC.
+Run this once, and again whenever the bot's Google or Zoom session expires:
 
 ```bash
 ./first_time_login.sh
 ```
 
-It prints an `ssh -L ...` command to run on your own machine, then you open
-`http://localhost:6080/vnc.html` and sign in. Nothing is exposed to the network.
+It opens the bot's own browser — a separate Firefox ESR instance on the bot's
+profile, not your everyday Firefox — as a window on your desktop, on Google's
+sign-in page with **`BOT_GOOGLE_ACCOUNT` already filled in**. Sign in as that
+account only (sign out of any other that appears), then open `zoom.us` in the
+same window and sign in there too if you record Zoom calls. Close the window
+when you're done.
 
-Other ways in:
+When the window closes, the script checks which Google accounts the profile
+holds and exits 1 unless `BOT_GOOGLE_ACCOUNT` is among them. The recorder makes
+the same check before every Google Meet — a profile signed in as anyone else
+(or signed out) is refused with a `wrong_account.png` in the run — and it
+opens the meeting with `authuser=<BOT_GOOGLE_ACCOUNT>`, so Meet uses that
+account even if the profile holds another. Check it any time with:
 
 ```bash
-./first_time_login.sh --tailscale      # bind to this host's tailnet IP instead
+./first_time_login.sh --check
+```
+
+From another machine, or on a box with no desktop, the old noVNC path is still
+there:
+
+```bash
+./first_time_login.sh --novnc          # headless Xvfb + noVNC on localhost:6080
+./first_time_login.sh --tailscale      # noVNC on this host's tailnet IP
 ./first_time_login.sh --bind 0.0.0.0   # every interface (see the warning it prints)
-./first_time_login.sh --screenshot     # also dump the display to a PNG every 10s
+./first_time_login.sh --screenshot     # (noVNC) also dump the display to a PNG every 10s
 ./first_time_login.sh --url https://zoom.us/signin
 ```
 
-`--screenshot` is the fallback for when noVNC can't reach at all: it writes
-`$MEETING_BOT_ROOT/login-screenshots/latest.png`, which you can `scp` down to
-see what's actually on screen.
-
-Sign into Google, then open `zoom.us` in the same window and sign in there too.
-Both land in the shared profile at `$CHROME_PROFILE_DIR`. Press `Ctrl+C` when
-done.
-
-> The VNC session has no password and fronts a browser holding your Google
+> The VNC session has no password and fronts a browser holding the bot's Google
 > session. The default localhost binding is the safe one; only use `--bind` on a
 > network you trust, and stop the script as soon as you're signed in.
 
-Chrome is launched **directly** here, not through Playwright: even with
-`channel="chrome"`, Playwright sets automation flags that Google's sign-in flow
-rejects with "This browser or app may not be secure".
+The browser is launched **directly** here, never through Selenium or
+Playwright: a driven browser sets `navigator.webdriver`, and Google's sign-in
+flow rejects that with "This browser or app may not be secure". (The recorder
+*is* driven, and Firefox ESR 140 still exposes `navigator.webdriver` there —
+joining a Meet with an already-signed-in profile is a different check from
+signing in, but it is the first suspect if Meet ever starts refusing the bot;
+`MEETING_BROWSER=chrome` is the fallback.)
+
+---
+
+## Web UI
+
+Off until you switch it on, and off again after a reboot — pm2 runs it, but
+nothing registers it to start at boot:
+
+```bash
+./webui.sh on       # start the web UI and the 15-minute resume loop
+```
+
+```bash
+./webui.sh off      # stop both
+```
+
+`./webui.sh on` prints the address(es) to open with the token already in them
+(`http://localhost:8765/#token=…` — the part after `#` never reaches the
+server or any log; the page keeps it in that browser). It listens on
+`MEETING_BOT_BIND` = `127.0.0.1,tailscale` by default: this machine, plus this
+PC's Tailscale address for your phone (skipped with a warning if Tailscale is
+down). `./webui.sh status`, `./webui.sh url` and `./webui.sh logs` do what
+they say.
+
+The second pm2 process, `meeting-bot-resume`, runs `pipeline.sh --resume-all`
+every 15 minutes — the backstop that finishes a summary paused on the Claude
+usage window once it resets.
+
+- **New Google Meet** — one button: the bot creates a meeting, shows you the
+  link to share, admits everyone, records, and summarizes. **End & stop
+  recording** ends it early. See [Hosting a new Google Meet](#hosting-a-new-google-meet).
+- **Record / summarize** — the pipeline's options as a form: inputs one per
+  line (with `#t=` windows), summary style, language, clip, combine, reference
+  material. **Check** runs `pipeline.sh --dry-run` with exactly those options
+  — the real parser, so a typo is caught before anything is downloaded or
+  billed — and shows what would run and the equivalent command. **Start** only
+  unlocks once the current form has passed a check.
+- **Runs** — every run with its stages (`✓` done, `✗` failed, `▶` running),
+  the created meeting's link, the tail of each stage log, and **Resume** /
+  **Stop**.
+
+The same server takes scripted requests (a phone shortcut, say):
+
+```bash
+curl -X POST http://localhost:8765/trigger \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"url": "https://meet.google.com/abc-defg-hij", "name": "Client Call",
+       "resources": "https://github.com/me/course@week4"}'
+```
+
+```bash
+curl -X POST http://localhost:8765/trigger \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"new_meet": true, "name": "Project sync"}'
+```
+
+Both return `202` at once and run `pipeline.sh` in the background, logging to
+`$MEETING_BOT_ROOT/logs/trigger_<timestamp>.log`. The endpoints are listed at
+the top of `trigger_server.py`. A meeting started from the command line shows
+up in **Runs** too, and its `pipeline_*.log` is readable there.
 
 ---
 
@@ -306,9 +364,27 @@ rejects with "This browser or app may not be secure".
 ```bash
 ./pipeline.sh "https://meet.google.com/abc-defg-hij" --name "Weekly Standup"
 ./pipeline.sh "https://zoom.us/j/1234567890" --name "Client Call"
+./pipeline.sh --new-meet --name "Project sync"      # the bot creates the meeting
 ./pipeline.sh "https://www.youtube.com/watch?v=5GAfjAjLKYk"
-./pipeline.sh /srv/recordings/existing.mp4
+./pipeline.sh ~/Videos/existing.mp4
 ```
+
+**A meeting runs in the background.** Anything that records (a Meet or Zoom
+link, `--new-meet`) detaches into its own session and the command returns at
+once:
+
+```
+==> Recording in the background (pid 41233). Closing this terminal won't stop it.
+    Log:    tail -f '~/.local/share/meeting-bot/logs/pipeline_20260929_140501_41230.log'
+    Run:    Weekly_Standup_20260929_140501
+    Status: ./pipeline.sh --list    (or ./pipeline.sh --status <run id>)
+    Stop:   ./kill_meeting.sh --run-id <run id>   (leaves the call cleanly)
+```
+
+The whole run — recording, then transcription and the summary — carries on in
+the background; the browser is on a hidden display, so nothing appears on your
+screen. `--foreground` (or `MEETING_BOT_FOREGROUND=1`) keeps the old attached
+behaviour. YouTube, Kaltura and local files still run in the foreground.
 
 A Kaltura lecture can be given either way — paste the whole `<iframe>` your LMS
 shows you, or just its `src`. Quote it: the tag contains spaces.
@@ -421,12 +497,19 @@ keeps the frames too).
 | `--combine F` | Summarize all the inputs together, as one document (no per-input summaries) |
 | `--combine-pdf F` | Where the combined PDF goes (default: `--combine`'s path with `.pdf`) |
 | `--no-combine-pdf` | Write only the combined markdown |
+| `--new-meet` | Create a new Google Meet, host it and record it (also: `meet.new` as an input) — see [Hosting a new Google Meet](#hosting-a-new-google-meet) |
+| `--foreground` | Don't detach a meeting into the background (see above) |
+| `--dry-run` | Check every input, window and reference file, print what would run, start nothing |
 | `--force` | Ignore prior state, start clean |
 | `--run-id ID` / `--resume-last` / `--resume-all` | Resume (see below) |
 | `--list` / `--status ID` | Inspect runs |
 
 The legacy positional form still works when unambiguous:
 `./pipeline.sh <input> [name] [display_name] [language] [prompt]`.
+
+An option that needs a value and doesn't get one (`... --combine` as the last
+argument, or `--combine --jobs 1`) is an error naming the option. It used to
+make `pipeline.sh` loop forever without printing anything.
 
 ### Individual stages
 
@@ -443,7 +526,7 @@ python3 lib/kaltura.py info "<iframe or src url>"
 python3 lib/kaltura.py download "<iframe or src url>" /tmp/lecture.mp4
 
 # 3 — summarize only
-/opt/meeting-bot-venv/bin/python3 ./summarize/summarize.py \
+.venv/bin/python3 ./summarize/summarize.py \
     <video_or_youtube_url> <transcript.txt> [out.md] \
     [--prompt NAME] [--frames-manifest PATH] [--resources SPEC] \
     [--pdf-out PATH] [--no-pdf] [--no-markdown] [--source-url URL] [--title TEXT]
@@ -452,7 +535,7 @@ python3 lib/kaltura.py download "<iframe or src url>" /tmp/lecture.mp4
 python3 screen/extract_frames.py <video> <out_dir> ["name"]
 
 # PDF only, from a summary you already have
-/opt/meeting-bot-venv/bin/python3 summarize/pdf.py summary.md out.pdf \
+.venv/bin/python3 summarize/pdf.py summary.md out.pdf \
     --frames-manifest "$FRAMES_DIR/<run_id>/manifest.json"
 ```
 
@@ -470,25 +553,46 @@ having the browser killed under it. Only if a recorder is still alive after the
 grace period (25s) does `kill_meeting.sh` escalate to signals, and even then
 ffmpeg gets `SIGINT` first so the MP4 is finalised and playable.
 
-### Remote trigger (start a run from your phone over Tailscale)
-
-Debian has systemd, so the bundled unit is usable directly:
+## Hosting a new Google Meet
 
 ```bash
-sudo -H ./setup.sh --with-trigger
-echo "MEETING_BOT_TOKEN=$(openssl rand -hex 24)" | sudo tee -a /etc/meeting-bot.env
-sudo systemctl restart meeting-bot-trigger
+./pipeline.sh --new-meet --name "Project sync"
 ```
 
-```bash
-curl -X POST http://<tailscale-host>:8765/trigger \
-  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-  -d '{"url": "https://meet.google.com/abc-defg-hij", "name": "Client Call",
-       "resources": "https://github.com/me/course@week4"}'
-```
+(or the **New Google Meet** button in the web UI). The bot opens `meet.new` in
+its signed-in browser profile, so **the meeting belongs to
+`BOT_GOOGLE_ACCOUNT`** (it opens `meet.google.com/new?authuser=…` when that is
+set). Then:
 
-Returns `202` immediately and runs `pipeline.sh` in the background, logging to
-`$MEETING_BOT_ROOT/logs/trigger_<timestamp>.log`.
+1. **The link is announced the moment it exists** — printed as
+   `New Google Meet: https://meet.google.com/xxx-xxxx-xxx`, written to
+   `runs/<run_id>/meet_url`, stored in the run (`--status` shows it) and shown
+   in the web UI with a copy button. Share it however you like.
+2. **Everyone who asks to join is admitted**, checked every 3 seconds.
+3. **Recording starts at once** — the bot is the host, so there is no waiting
+   room for it.
+4. **It waits `NEW_MEET_WAIT_MINUTES` (15) for the first participant.** An
+   empty call it just created is not a meeting that ended, so the idle rules
+   don't apply until someone has joined; if nobody comes, it ends the call.
+5. **Once people have joined, it ends the call for everyone when they've all
+   left** — about 30 seconds after the last one goes. A 1:1 (you and the bot)
+   is a real meeting here, not an idle test call. `MAX_MEETING_MINUTES` and
+   **End & stop recording** / `./kill_meeting.sh --run-id <id>` still work.
+6. Transcription and the summary follow as for any meeting; the summary cites
+   the real `meet.google.com` link.
+
+Every `--new-meet` is a new call: it is never auto-resumed into an earlier run
+(re-running the command creates another meeting). A run whose *recording*
+finished but whose summary failed resumes with `--run-id` as usual.
+
+If the profile isn't signed in as `BOT_GOOGLE_ACCOUNT`, the run fails in
+seconds and says so — run `first_time_login.sh`.
+
+> **Verify on a live call before relying on it.** The admit and "end the call
+> for everyone" buttons are found by their labels, in English and Thai (the
+> bot's browser runs in `th-TH`); the Thai admit labels in particular have not
+> yet been checked against a real call. If knockers are left waiting, the
+> labels in `HOST_ADMIT_LABELS` in `screen/capture.py` are the place to look.
 
 ---
 
@@ -612,9 +716,74 @@ What happens to it:
   against the same material the first attempt used.
 
 A GitHub source that can't be fetched degrades the summary and is reported —
-it doesn't fail the run. A *local* path that doesn't exist fails immediately,
-because that is always a typo, and finding out after paying for a summary is
-worse.
+it doesn't fail the run. A *local* path that doesn't exist fails immediately —
+in `pipeline.sh`, before anything is recorded or transcribed — because that is
+always a typo, and finding out after paying for a summary is worse. So does a
+**binary file with a text name** (a PDF saved as `notes.md`, a `.docx` renamed
+`.txt`): *"this looks like a binary document; convert it to Markdown first."*
+A real `.pdf` is fine; it is read with `pdftotext`. `--from-file` gets the same
+check, since a PDF read as a list of links is a list of garbage inputs.
+
+Every `--resources` applies to every run in the invocation, and the size of
+the text actually sent is printed once per summarize (it goes with every
+chunk, so a large reference is a large part of every request).
+
+### A textbook excerpt with citations
+
+For a course with a textbook, give the reference a small header and use the
+`lecture-reference` prompt. Nothing in the code is course-specific: the same
+two steps work for any subject.
+
+1. Turn the chapters you need into Markdown, e.g.:
+
+   ```bash
+   pdftotext -layout -f 25 -l 110 kurose.pdf kurose-ch1-3.md
+   ```
+
+   Trim it to what the lectures cover — `RESOURCE_MAX_CHARS` (40,000) is the
+   cap, and a focused excerpt beats a truncated book.
+
+2. Put frontmatter at the top:
+
+   ```yaml
+   ---
+   course: Computer Networks I
+   source: "Kurose & Ross, Computer Networking: A Top-Down Approach (7th ed.)"
+   citation_label: Kurose      # the notes cite "(Kurose §2.4)"
+   coverage: "Chapters 1-3 only"
+   ---
+   ```
+
+   `course` and `source` are expected (a missing `course` falls back to the
+   file name, with a warning); `citation_label` defaults to `course`;
+   `coverage` is optional; unknown keys are ignored. Malformed lines are
+   reported and skipped — never fatal.
+
+3. Run with it:
+
+   ```bash
+   ./pipeline.sh ~/Videos/Week03.mp4 \
+       --resources ~/notes/kurose-ch1-3.md --prompt lecture-reference
+   ```
+
+The file's text reaches the model inside
+`<course_reference course="…" source="…" citation_label="…" coverage="…" lecture_language="th">`,
+and `lecture-reference` (the `lecture-claude` study guide plus six rules)
+tells it: the transcript decides what was taught; cite only headings that are
+actually in the excerpt, and say *"not in the provided Kurose excerpt"* rather
+than recall a section number; fix transcription garble the book disambiguates;
+put book-only additions in a `> **From Kurose:**` blockquote; report
+lecturer/book contradictions as contradictions; and give the lecturer's spoken
+term in parentheses on first mention when the lecture language differs.
+
+A Markdown file *without* frontmatter behaves exactly as before.
+
+**Caching:** the rules are in the prompt's static half — one system-prompt file
+for every course — and the reference sits at the top of the per-run half,
+before anything that changes between chunks. So every chunk after the first,
+and every lecture of the same course within the CLI's cache window, reads the
+reference from cache. `cache_read_input_tokens` in `--status`'s usage line is
+where that shows.
 
 ---
 
@@ -891,7 +1060,7 @@ overrides work: `SUMMARY_EFFORT=max ./pipeline.sh ...`.
 | `FRAMES_DIR` | `<run_id>/` — keyframes and `manifest.json` |
 | `SUMMARIES_DIR` | `<run_id>.md` |
 | `PDF_DIR` | `<run_id>.pdf` |
-| `MEETING_BOT_ROOT` | The pipeline's own bookkeeping only: `runs/`, `state/`, `tmp/`, `resources/`, `chrome-profile/` |
+| `MEETING_BOT_ROOT` | The pipeline's own bookkeeping only (default `~/.local/share/meeting-bot`): `runs/`, `state/`, `tmp/`, `logs/`, `resources/`, the browser profiles |
 
 They are independent of each other and of `MEETING_BOT_ROOT` — point any of
 them anywhere, including a mount with spaces in the path. An unset one is a
@@ -899,8 +1068,15 @@ hard error naming the variable, rather than a silent default: with independent
 paths, a wrong default doesn't fail, it just puts your lecture summaries
 somewhere you'll never look.
 
-`CHROME_PROFILE_DIR` (default `$MEETING_BOT_ROOT/chrome-profile`) and
-`RESOURCE_CACHE_DIR` (default `$MEETING_BOT_ROOT/resources`) can also be moved.
+`FIREFOX_PROFILE_DIR` / `CHROME_PROFILE_DIR` (default `$MEETING_BOT_ROOT/firefox-profile`,
+`.../chrome-profile`) and `RESOURCE_CACHE_DIR` (default
+`$MEETING_BOT_ROOT/resources`) can also be moved.
+
+**On a synced library (SeaDrive here), check the mount, not just the path.** If
+the drive is not mounted when a run starts, the path is an ordinary empty
+directory, the run writes into it, and the files vanish from view when the
+mount comes back. `./verify_e2e.sh --preflight` shows where each directory
+points.
 
 ### API keys — numbered slots, rotated round-robin
 
@@ -922,7 +1098,7 @@ duplicates are skipped; a gap (`_1` and `_3` set, `_2` commented out) doesn't
 end the scan.
 
 ```bash
-/opt/meeting-bot-venv/bin/python3 lib/keyring.py status   # counts and the next slot
+.venv/bin/python3 lib/keyring.py status   # counts and the next slot
 ```
 
 > **Moved from the Alpine version:** youtube-transcript.io tokens used to live
@@ -1185,8 +1361,18 @@ immediately rather than burning the full retry schedule first.
 | `ASSEMBLYAI_API_KEY_1..3` | — | Required for local files |
 | `ASSEMBLYAI_LANGUAGE` | `th` | `en`, `auto`, or any AssemblyAI code |
 | `ASSEMBLYAI_MODEL` | SDK chain `universal-3-5-pro`, `universal-2` | Overrides the leading entry |
-| `YT_TRANSCRIPT_KEY_1..10` | — | Required for YouTube inputs |
+| `YT_TRANSCRIPT_KEY_1..10` | — | YouTube captions, first choice |
+| `YT_AUTOCAPTIONS` | 1 | `0` turns off the yt-dlp caption fallback below |
 | `TRANSCRIBE_BACKEND` | `assemblyai` | YouTube URLs always use captions regardless |
+
+**YouTube captions come from two places.** youtube-transcript.io first; it
+only sees *uploaded* caption tracks. When none of them is in the requested
+language — or the API fails, or no keys are configured — yt-dlp asks YouTube
+itself: an uploaded track in that language if there is one, otherwise
+YouTube's **automatic captions of the language actually spoken**. Never one of
+YouTube's machine translations. A track in some other language is only the
+last resort, and is announced as such (the 2026-09 verify run summarized
+English lectures from their only uploaded track — an Arabic translation).
 
 Kaltura entries need no key at all. When the entry carries a caption track in
 the requested language it is used and AssemblyAI is skipped; most
@@ -1245,13 +1431,36 @@ Needs Pillow — without it the originals are sent, with a warning. This
 changes how much each frame costs; the duplicate pass and
 `CLAUDE_CLI_MAX_FRAMES` change how many there are.
 
+### The bot's browser and account
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BOT_GOOGLE_ACCOUNT` | — | The only Google account the bot joins Meet as. Prefilled by `first_time_login.sh`, checked before every Meet, passed as `authuser=`. Unset: nothing is checked (a warning says so) |
+| `MEETING_BROWSER` | `firefox-esr` | `firefox-esr` (Selenium + geckodriver) or `chrome` (Playwright, `google-chrome-stable`) |
+| `FIREFOX_PROFILE_DIR` | `$MEETING_BOT_ROOT/firefox-profile` | Firefox's persistent login |
+| `CHROME_PROFILE_DIR` | `$MEETING_BOT_ROOT/chrome-profile` | Chrome's |
+| `FIREFOX_BIN` / `GECKODRIVER_BIN` / `CHROME_BIN` | from `PATH` | Override the binaries |
+
+Each browser has its own profile: switching `MEETING_BROWSER` means signing in
+again with `first_time_login.sh`.
+
+### Web UI
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MEETING_BOT_TOKEN` | generated by `setup.sh` | Shared secret for every `/api` call and `/trigger` |
+| `MEETING_BOT_BIND` | `127.0.0.1,tailscale` | Comma-separated listen addresses; `tailscale` = this PC's Tailscale IPv4 |
+| `MEETING_BOT_PORT` | 8765 | |
+| `MEETING_BOT_FOREGROUND` | 0 | `1` = never detach a meeting into the background (same as `--foreground`) |
+
 ### Meeting behaviour
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `MAX_MEETING_MINUTES` | 240 | Hard wall-clock cap |
 | `IDLE_LEAVE_MINUTES` | 5 | Leave after this long alone (or with one other); `0` disables |
-| `RECORD_GEOMETRY` | `1920x1080` | Xvfb head, Chrome window and ffmpeg capture size — they must agree or the recording gets black edges |
+| `NEW_MEET_WAIT_MINUTES` | 15 | A meeting the bot created: how long to wait for the first participant before ending it |
+| `RECORD_GEOMETRY` | `1920x1080` | Xvfb head, browser window and ffmpeg capture size — they must agree or the recording gets black edges |
 | `RECORD_FRAMERATE` | 15 | |
 | `MEETING_BOT_DISPLAY_NAME` | `Meeting Bot` | Same as `--display-name` |
 | `PIPELINE_JOBS` | 2 | Same as `--jobs` |
@@ -1263,22 +1472,28 @@ or when participants drop below 30% of their peak for two consecutive polls.
 
 ## Tests
 
-Everything except `verify_e2e.sh` runs with no API keys, no network access and
-no `/opt` — against temporary directories, including one with a space in its
+Run them with the project venv (`.venv/bin/python3`, or
+`MEETING_BOT_VENV=$PWD/.venv bash lib/...` for the shell suites).
+Everything except `verify_e2e.sh` runs with no API keys and no network access
+— against temporary directories, including one with a space in its
 path so quoting mistakes surface.
 
 ```bash
 python3 lib/test_runstate.py                 # run state, resume, concurrency, the pause (19)
 python3 lib/test_slotqueue.py                # cross-session component queue (23)
 python3 lib/test_keyring.py                  # numbered keys + rotation cursor (22)
-python3 lib/test_resources.py                # resource specs, extraction, GitHub (27)
+python3 lib/test_resources.py                # resource specs, extraction, GitHub, frontmatter, binary files (36)
 python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions, retries (51)
 python3 lib/test_clip.py                     # --clip parsing, the cut, caption windowing (33)
-python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain (171)
-python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, PDF render (73)
+python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain, the course reference, the output language (185)
+python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, PDF render (82)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
-bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (281)
-bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (119)
+python3 transcribe/test_yt_autocaptions.py   # the yt-dlp caption fallback: track choice, json3 (11)
+python3 screen/test_capture_host.py          # hosting a created Meet: when it ends, and when it must not (7)
+python3 screen/test_browser.py               # browser choice, fake devices, the bot-account check (16)
+python3 test_trigger_server.py               # the web UI API: argument mapping, auth, dry-run check, paths (7)
+bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings (366)
+bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (125)
 ```
 
 Two of those are worth understanding:
@@ -1302,25 +1517,26 @@ Two of those are worth understanding:
   instead of being retried, that the key cursor advances, and that the PDF comes
   out with cropped frames in it.
 
-Neither proves Chrome can join a live Meet call, that your real keys work, or
+Neither proves the browser can join a live Meet call, that your real keys work, or
 that your Claude subscription still has quota.
 That is what `verify_e2e.sh` is for:
 
 ```bash
 ./verify_e2e.sh --preflight                    # tools, packages, keys, profile,
                                                # and a real 2-second Xvfb+Pulse+ffmpeg capture
-./verify_e2e.sh --browser-smoke                # real Chrome on Xvfb, recorded — no meeting, no spend
+./verify_e2e.sh --browser-smoke                # the real browser on Xvfb, recorded — no meeting, no spend
 ./verify_e2e.sh --mp4 /path/to/recording.mp4   # real AssemblyAI + real summarizer
 ./verify_e2e.sh --youtube "<url>"              # real captions + real summarizer
 ./verify_e2e.sh --kaltura "<iframe or url>"    # real Kaltura download + summarizer
-./verify_e2e.sh --meet "<url>" --minutes 3     # real Chrome joins, records, leaves
+./verify_e2e.sh --meet "<url>" --minutes 3     # the real browser joins, records, leaves
 ./verify_e2e.sh --zoom "<url>" --minutes 3
 ```
 
 `--browser-smoke` is worth running after any change to the recording path: it
-launches Chrome through Playwright with the recorder's exact flags
-(`screen/browser_smoke.py` imports them from `capture.py`), records eight
-seconds of it, and then **measures the recorded frame for black bands**. That
+launches the configured browser through `browser.open_page()` — the
+recorder's own launch — records fourteen seconds of it, and then **measures a
+late recorded frame for black bands** (late, because Firefox through
+geckodriver takes a few seconds to map its window). That
 check is what caught Chrome placing its kiosk window at (10,10) — a 10-pixel
 black band down the left and top of every recording that comparing window sizes
 would have missed.
@@ -1336,35 +1552,52 @@ summary.
 ## Troubleshooting
 
 **`missing required program(s): ...`**
-`sudo -H ./setup.sh`. The browser stages run natively now, so Xvfb, PulseAudio,
-x11vnc and Chrome all have to be present on the host itself.
+`sudo ./setup.sh --system`, then `./setup.sh`. Xvfb, `pactl` and the browser
+all have to be present on the PC itself.
 
 **`no free X display between :90 and :119`**
-Stale locks from a crashed run: `ls -l /tmp/.X*-lock`, and remove the ones with
-no matching process.
+Stale claims from a crashed run: `ls -l /tmp/.meeting-bot-X*.claim /tmp/.X*-lock`.
+A claim or lock whose pid is gone is taken over automatically; remove any that
+aren't.
 
 **`PulseAudio did not start (pactl info fails)`**
-The daemon runs per-user and this runs as root. `pulseaudio -D
---exit-idle-time=-1` by hand will show the real error; in a locked-down LXC it
-usually needs `/dev/shm` and a writable `$HOME`.
+On the desktop PipeWire's pulse socket answers `pactl`; `pactl info` in your own
+terminal shows whether it is up. A background run started from a login shell
+with no `XDG_RUNTIME_DIR` can't find it — start it from your desktop session.
+
+**Firefox: `Error: cannot open display`, or its window appears on your screen**
+The browser picked Wayland over the hidden X display. `record_screen.sh` unsets
+`WAYLAND_DISPLAY` and exports `GDK_BACKEND=x11` for exactly this; if you launch
+`screen/capture.py` by hand, do the same.
+
+**`Cannot join: the browser profile is signed in as …, not …`**
+The profile holds a different Google account from `BOT_GOOGLE_ACCOUNT` (or none:
+"not signed into Google"). Run `./first_time_login.sh`, sign out of the other
+account, sign in as the bot. `runs/<run_id>/wrong_account.png` shows what the
+bot saw.
 
 **Google says "This browser or app may not be secure"**
-The login must go through `first_time_login.sh`, which launches Chrome directly.
-Playwright sets automation flags Google detects, even with `channel="chrome"`.
+The login must go through `first_time_login.sh`, which launches the browser
+directly. Selenium and Playwright both set automation flags Google detects.
+
+**Google Meet says "You can't join this video call"**
+Meet refuses guests while the organizer isn't in the call, and refuses accounts
+that weren't invited to a restricted meeting. Sign the bot in (`BOT_GOOGLE_ACCOUNT`)
+and invite that account, or be in the call to let it in.
 
 **The bot never gets admitted**
 Check `runs/<run_id>/join_failed.png` or `not_admitted.png`, and
 `runs/<run_id>/logs/record.log`.
 
 **The MP4 has video but no sound**
-The sink wasn't wired to the browser. Check that `PULSE_SINK` reached Chrome
+The sink wasn't wired to the browser. Check that `PULSE_SINK` reached the browser
 (`runs/<run_id>/record.pid` records the sink name) and that
 `pactl list short sinks` shows it. `./verify_e2e.sh --preflight` reproduces the
 whole chain in two seconds.
 
 **The recording has black bands down one edge**
-The Chrome window isn't filling the Xvfb head. `./verify_e2e.sh --browser-smoke`
-measures it. A band of 1px at the right and bottom is normal (Chrome's kiosk
+The browser window isn't filling the Xvfb head. `./verify_e2e.sh --browser-smoke`
+measures it. A band of 1px at the right and bottom is normal (the kiosk
 viewport is a pixel under the window); anything thicker means `RECORD_GEOMETRY`,
 `--window-size` and `--window-position` disagree.
 
@@ -1376,14 +1609,14 @@ didn't come up.
 The renderer is optional at runtime by design. The warning names what's
 missing — usually `weasyprint` or its Pango libraries. Install the system half
 with `sudo apt-get install libpango-1.0-0 libpangoft2-1.0-0`, then re-run
-`sudo -H ./setup.sh` to restore the Python half from the lockfile. (Installing
-individual packages by hand with `/opt/meeting-bot-venv/bin/pip install
-weasyprint` works too, but leaves the venv out of step with
-`requirements.txt`.)
+`./setup.sh` to restore the Python half from the lockfile (or `rm -rf .venv`
+first for a clean rebuild). Installing individual packages by hand with
+`.venv/bin/pip install weasyprint` works too, but leaves the venv out of step
+with `requirements.txt`.
 
 **The PDF prints raw LaTeX instead of formulas**
 matplotlib isn't installed in the venv, so `summarize/mathrender.py` fell back
-to plain text. Re-run `sudo -H ./setup.sh` to restore the venv from the
+to plain text. Re-run `./setup.sh` to restore the venv from the
 lockfile. If a *particular* expression is the only one showing as text, it is
 one mathtext can't parse (environments other than `aligned`-style ones,
 `\substack`, and similar) — the fallback is deliberate, and the formula is
@@ -1403,7 +1636,7 @@ python3 lib/kaltura.py info "<iframe or src url>"
 ```
 
 "exposes no playable source" is the other case: the entry is not playable
-without a logged-in LMS session. There is no fallback for that — the Chrome
+without a logged-in LMS session. There is no fallback for that — the browser
 profile is not involved on this path, so signing it in would not help, and
 browser-recording a private entry is not implemented. Download the file from
 the LMS yourself and feed the pipeline the local `.mp4`.
@@ -1419,8 +1652,8 @@ it. Check both — the first is easy to miss because an interactive shell can
 find `claude` when the pipeline cannot.
 
 *The binary isn't on the pipeline's PATH.* `claude` installs to
-`~/.local/bin`, which a minimal root `.profile` never adds to `PATH`, and a
-systemd unit or cron job gets an even barer environment. `_claude_cli_bin()`
+`~/.local/bin`, which pm2, cron and a background run don't necessarily have on
+`PATH`. `_claude_cli_bin()`
 then returns `None`, the backend raises `BackendUnavailable`, and the chain
 falls through to Gemini without anything looking broken. **Set
 `CLAUDE_CLI_BIN` to the absolute path in `.env`** rather than relying on
@@ -1431,8 +1664,7 @@ while the operator believed they were spending a Claude subscription.
 *Or the CLI isn't logged in.* `claude auth status` — if it says
 `"loggedIn": false`, run `claude auth login` (or `claude setup-token` on a
 headless box) *as the user the pipeline runs as*; the login lives in that
-user's `~/.claude`, so a login as yourself doesn't help a systemd unit running
-as root. `./verify_e2e.sh --preflight` checks this. The summarize log names the
+user's `~/.claude`. `./verify_e2e.sh --preflight` checks this. The summarize log names the
 reason on the `!! claude-cli unavailable:` line, and the finished document's
 provenance header records which backend actually answered.
 

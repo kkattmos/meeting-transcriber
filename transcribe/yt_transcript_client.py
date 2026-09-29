@@ -182,8 +182,11 @@ def _clean_caption_text(text):
     return text.strip()
 
 
-def _pick_track(entry, prefer_language=None):
+def _pick_track(entry, prefer_language=None, report=None):
     """Return the transcript segment list from an entry's `tracks`, or None.
+
+    `report`, when given, gets report["matched"] = whether the track used is
+    in `prefer_language` (True when no language was asked for).
 
     The current API shape (verified 2026-09) is:
 
@@ -221,13 +224,15 @@ def _pick_track(entry, prefer_language=None):
                    for c in candidates):
                 chosen = t
                 break
+    if report is not None:
+        report["matched"] = chosen is not None or not prefer_language
     if chosen is None:
         chosen = tracks[0]
     segments = chosen.get("transcript")
     return segments if isinstance(segments, list) else None
 
 
-def _normalise_segments(raw, prefer_language=None):
+def _normalise_segments(raw, prefer_language=None, report=None):
     """Convert the API's response shape into a flat list of segments.
 
     The API's exact field names are documented to drift between versions, so
@@ -244,7 +249,7 @@ def _normalise_segments(raw, prefer_language=None):
         # its flat `text` field, producing ONE segment holding the entire
         # transcript with no timing at all — which is exactly what happened
         # before this branch existed.
-        segments = _pick_track(entry, prefer_language)
+        segments = _pick_track(entry, prefer_language, report)
         if segments is None:
             # Older/other shapes: segments under 'transcripts' or 'segments',
             # or the entry itself.
@@ -282,7 +287,7 @@ def _normalise_segments(raw, prefer_language=None):
     return out
 
 
-def fetch_transcript(video_id, prefer_language=None, ring=None):
+def fetch_transcript(video_id, prefer_language=None, ring=None, report=None):
     """Fetch a transcript for `video_id`, trying each configured key in
     round-robin order until one succeeds.
 
@@ -319,7 +324,7 @@ def fetch_transcript(video_id, prefer_language=None, ring=None):
         # different account.
         ring.commit(slot)
 
-        segments = _normalise_segments(raw, prefer_language)
+        segments = _normalise_segments(raw, prefer_language, report)
         if not segments:
             # The API returned 200 but no usable segments. Don't bother
             # retrying on a different key — every key hits the same
@@ -374,19 +379,31 @@ def main():
 
     Prints the segments as JSON to stdout (so the bash wrapper can pipe it
     to the writer). Exits non-zero on failure.
+
+    --strict: when a language was asked for and the video has no uploaded
+    track in it, still print the track that WAS used, but exit 3. That is
+    transcribe.sh's cue to try YouTube's own captions of the spoken audio
+    (yt_autocaptions.py) before settling for a track in another language.
     """
-    if len(sys.argv) not in (2, 3):
-        print(f"Usage: {sys.argv[0]} <youtube_url> [<language>]",
+    args = [a for a in sys.argv[1:] if a != "--strict"]
+    strict = len(args) != len(sys.argv) - 1
+    if len(args) not in (1, 2):
+        print(f"Usage: {sys.argv[0]} <youtube_url> [<language>] [--strict]",
               file=sys.stderr)
         sys.exit(1)
-    video_id = extract_video_id(sys.argv[1])
+    video_id = extract_video_id(args[0])
     # "auto" means "whatever the video has" — same as passing nothing.
-    prefer = sys.argv[2] if len(sys.argv) == 3 else None
+    prefer = args[1] if len(args) == 2 else None
     if prefer in ("auto", ""):
         prefer = None
-    segments = fetch_transcript(video_id, prefer_language=prefer)
+    report = {}
+    segments = fetch_transcript(video_id, prefer_language=prefer, report=report)
     json.dump(segments, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
+    if strict and report.get("matched") is False:
+        print(f"  no uploaded {prefer!r} track; the one above is another "
+              f"language", file=sys.stderr)
+        sys.exit(3)
 
 
 if __name__ == "__main__":

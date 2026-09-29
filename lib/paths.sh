@@ -17,7 +17,7 @@ fi
 
 # MEETING_BOT_ROOT is no longer the parent of the media dirs — it holds only
 # the pipeline's own bookkeeping (runs/, tmp/, state/, chrome-profile/).
-MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-/opt/meeting-bot}"
+MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-$HOME/.local/share/meeting-bot}"
 export MEETING_BOT_ROOT
 
 _paths_describe() {

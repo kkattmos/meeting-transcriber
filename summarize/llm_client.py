@@ -661,7 +661,7 @@ def _claude_cli_cwd():
     have nothing to do with summarizing a lecture. --safe-mode also suppresses
     that, but controlling the cwd doesn't depend on a flag name staying put.
     """
-    root = Path(os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot"))
+    root = Path(os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot")))
     cwd = root / "tmp" / "claude-cli-cwd"
     try:
         cwd.mkdir(parents=True, exist_ok=True)
@@ -737,7 +737,7 @@ def _static_prompt_file(text):
     sending the instructions inline.
     """
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-    root = Path(os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot"))
+    root = Path(os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot")))
     path = root / "tmp" / "claude-cli-prompts" / f"{digest}.md"
     try:
         if path.is_file() and path.read_text() == text:

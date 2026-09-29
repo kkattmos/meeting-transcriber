@@ -26,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/source_env.sh"
 
-MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-/opt/meeting-bot}"
+MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-$HOME/.local/share/meeting-bot}"
 RUNS_DIR="$MEETING_BOT_ROOT/runs"
 LEGACY_SENTINEL="/tmp/meeting_bot_kill"
 GRACE_SECONDS="${KILL_GRACE_SECONDS:-25}"

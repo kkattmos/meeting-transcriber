@@ -14,7 +14,7 @@ layout under one root:
 That means any of them can point at a different disk or a network mount
 (summaries on a NAS, recordings on the big spindle) without moving the others.
 MEETING_BOT_ROOT is NOT their parent any more; it holds only bookkeeping that
-the pipeline itself owns — runs/, tmp/, state/, chrome-profile/.
+the pipeline itself owns — runs/, tmp/, state/, logs/, the browser profiles.
 
 All five are REQUIRED. An unset one raises a message naming it rather than
 quietly writing to a default nobody configured — with independent paths, a
@@ -103,7 +103,7 @@ def all_dirs(env=None, create=False):
 def bot_root(env=None):
     """Where the pipeline's own bookkeeping lives (runs/, tmp/, state/)."""
     env = os.environ if env is None else env
-    return Path(env.get("MEETING_BOT_ROOT", "/opt/meeting-bot")).expanduser()
+    return Path(env.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot"))).expanduser()
 
 
 def _main(argv):

@@ -33,6 +33,10 @@ export TRANSCRIPTS_DIR="$TESTROOT/opt/transcripts"
 export FRAMES_DIR="$TESTROOT/opt/frames"
 export SUMMARIES_DIR="$TESTROOT/opt/summaries"
 export PDF_DIR="$TESTROOT/opt/pdf"
+# A meeting input detaches into the background by default; these tests assert
+# on its outcome right after the call returns, so they stay attached. The
+# detach itself has its own section at the end.
+export MEETING_BOT_FOREGROUND=1
 FAKE_BIN="$TESTROOT/bin"
 STAGING="$TESTROOT/repo"
 PASS=0
@@ -57,6 +61,12 @@ cat > "$STAGING/screen/record_screen.sh" <<'STUB'
 # stub recorder: writes an "MP4" at the path the orchestrator chose
 [ -f "$STUB_FAIL_RECORD" ] && { echo "stub: record failing on purpose" >&2; exit 1; }
 mkdir -p "$(dirname "$4")"; echo "fake mp4 for $1" > "$4"
+# A meeting the bot created: capture.py stores the real link in state.json the
+# moment meet.new redirects. Do the same, so the orchestration around it runs.
+if [ "$1" = "https://meet.new" ]; then
+  python3 "$STUB_RUNSTATE" init --run-dir "$MEETING_BOT_RUN_DIR" \
+    --meet-url "https://meet.google.com/stb-hostd-mtg"
+fi
 echo "stub: recorded $4"
 STUB
 
@@ -1325,6 +1335,134 @@ tparts="$(ls -d "$RUNS"/combine_3x_* | while read -r d; do
 check "t=/combine: clip labels reach parts.json" \
   "$(python3 -c 'import json,sys; print(" ".join(str(p["clip"]) for p in json.load(open(sys.argv[1]))["parts"]))' "$tparts")" \
   "00:00:00-01:16:04 None 00:00:00-00:23:00"
+
+echo ""
+echo "--- An option left without its value errors instead of hanging"
+# Found 2026-09-23: "... --combine" as the last argument made `shift 2` a
+# no-op and the parse loop spun forever, silently, on one core.
+for opt in --combine --jobs --name --display-name --language --prompt --clip \
+           --from-file --combine-pdf --run-id --resources; do
+  out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" "$2"' _ "$STAGING" "$opt" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 124 ]; then
+    bad "$opt with no value: still hangs"
+  else
+    check "$opt with no value: exits 1" "$rc" "1"
+  fi
+done
+out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" --combine --jobs 1' _ "$STAGING" 2>&1)
+check "an option taken as another option's value is refused" "$?" "1"
+echo "$out" | grep -q -- "--combine needs a value" \
+  && ok "the error names the option" || bad "the error does not name --combine: $out"
+out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" --jobs abc' _ "$STAGING" 2>&1)
+check "--jobs that is not a number is refused" "$?" "1"
+ls -d "$RUNS"/yt_hangtest001_* >/dev/null 2>&1 \
+  && bad "a refused command still created a run" || ok "a refused command creates no run"
+help="$(pipeline --help)"
+echo "$help" | grep -q -- "--no-combine-pdf" \
+  && ok "--help is not cut short" || bad "--help stops before --no-combine-pdf"
+
+echo ""
+echo "--- Binary files are refused before anything is paid for"
+printf '%%PDF-1.4\n\000binary' > "$TESTROOT/kurose.md"
+out=$(pipeline "https://youtu.be/binarytest01" --resources "$TESTROOT/kurose.md" 2>&1)
+check "--resources with a PDF named .md: exits 1" "$?" "1"
+echo "$out" | grep -q "convert it to Markdown first" \
+  && ok "--resources: says to convert it" || bad "--resources: unhelpful error: $out"
+out=$(pipeline "https://youtu.be/binarytest01" --resources "$TESTROOT/no such notes.md" 2>&1)
+check "--resources with a missing file: exits 1 at once" "$?" "1"
+ls -d "$RUNS"/yt_binarytest01_* >/dev/null 2>&1 \
+  && bad "a refused --resources still created a run" || ok "a refused --resources creates no run"
+out=$(pipeline --from-file "$TESTROOT/kurose.md" 2>&1)
+check "--from-file with a binary file: exits 1" "$?" "1"
+echo "$out" | grep -q "Slides and course notes go in --resources" \
+  && ok "--from-file: points at --resources" || bad "--from-file: unhelpful error: $out"
+printf -- '---\ncourse: Networks\nsource: Kurose\n---\n# 2.4 DNS\n' > "$TESTROOT/ref.md"
+out=$(pipeline "https://youtu.be/fmtest00001" --resources "$TESTROOT/ref.md" --prompt lecture-reference 2>&1)
+check "a frontmatter reference runs end to end" "$?" "0"
+
+echo ""
+echo "--- --dry-run: what the web UI's Check runs"
+out=$(pipeline "https://youtu.be/dryrun00001#t=5:00-90:00" meet.new --dry-run 2>&1)
+check "dry-run: exits 0" "$?" "0"
+echo "$out" | grep -qP '^ok\tyoutube\t00:05:00-01:30:00\tnew\thttps://youtu.be/dryrun00001$' \
+  && ok "dry-run: the window is canonical and the input split off" \
+  || bad "dry-run: unexpected plan line: $out"
+echo "$out" | grep -qP '^ok\tmeeting\t-\tnew\thttps://meet.new$' \
+  && ok "dry-run: meet.new canonicalised" || bad "dry-run: meet.new line missing: $out"
+ls -d "$RUNS"/yt_dryrun00001_* >/dev/null 2>&1 \
+  && bad "dry-run created a run" || ok "dry-run creates nothing"
+out=$(pipeline "https://youtu.be/dryrun00001" --combine "$TESTROOT/no such dir/x.md" --dry-run 2>&1)
+check "dry-run: a --combine into a missing directory is refused" "$?" "1"
+
+echo ""
+echo "--- --new-meet: the bot creates the meeting, records it, cites the real link"
+out=$(pipeline --new-meet --name "Project sync" 2>&1)
+check "new-meet: exits 0" "$?" "0"
+nm_dir="$(ls -1d "$RUNS"/Project_sync_* | head -n 1)"
+[ -n "$nm_dir" ] && ok "new-meet: run named after --name" || bad "new-meet: no Project_sync run: $out"
+check "new-meet: canonical input" "$(state get --run-dir "$nm_dir" --key input)" "https://meet.new"
+check "new-meet: classified as a meeting" "$(state get --run-dir "$nm_dir" --key input_type)" "meeting"
+check "new-meet: record ran" "$(state status --run-dir "$nm_dir" --stage record)" "done"
+check "new-meet: the created link is stored" \
+  "$(state get --run-dir "$nm_dir" --key meet_url)" "https://meet.google.com/stb-hostd-mtg"
+grep -A1 -- "--source-url" "$STUB_SUMMARIZE_ARGS" | grep -q "stb-hostd-mtg" \
+  && ok "new-meet: the document cites the real meeting, not meet.new" \
+  || bad "new-meet: summarize got the wrong --source-url"
+state show --run-dir "$nm_dir" | grep -q "meeting:    https://meet.google.com/stb-hostd-mtg" \
+  && ok "new-meet: --status shows the link" || bad "new-meet: --status has no link"
+
+echo "--- meet.new as an input is the same thing, and is never auto-resumed"
+touch "$STUB_FAIL_TRANSCRIBE"
+out=$(pipeline meet.new 2>&1)
+rm -f "$STUB_FAIL_TRANSCRIBE"
+first="$(ls -1d "$RUNS"/new_meet_* | head -n 1)"
+[ -n "$first" ] && ok "meet.new: default run name new_meet" || bad "meet.new: no new_meet run: $out"
+sleep 1
+out=$(pipeline "https://meet.new/" 2>&1)
+check "meet.new: second call exits 0" "$?" "0"
+check "meet.new: an unfinished earlier call is not resumed — a new run instead" \
+  "$(ls -1d "$RUNS"/new_meet_* | wc -l | tr -d ' ')" "2"
+out=$(pipeline meet.new --clip 00:01:00-00:02:00 2>&1)
+check "meet.new: a clip window is refused (no source to cut)" "$?" "1"
+
+echo "--- A meeting runs in the background by default"
+bg_before="$(ls -1d "$RUNS"/bg_meeting_* 2>/dev/null | wc -l | tr -d ' ')"
+t0=$(date +%s)
+out=$(MEETING_BOT_FOREGROUND=0 pipeline "https://meet.google.com/bgr-ound-tst" --name "BG Meeting" 2>&1)
+rc=$?
+check "background: the command returns 0" "$rc" "0"
+[ $(( $(date +%s) - t0 )) -lt 15 ] && ok "background: it returns without waiting for the run" \
+  || bad "background: took $(( $(date +%s) - t0 ))s to return"
+echo "$out" | grep -q "Recording in the background" \
+  && ok "background: says so" || bad "background: no notice: $out"
+bg_log="$(echo "$out" | sed -nE "s/.*tail -f '([^']+)'.*/\1/p")"
+[ -n "$bg_log" ] && [ -f "$bg_log" ] && ok "background: the log it names exists" \
+  || bad "background: no log file: $out"
+echo "$out" | grep -qE 'Run: +BG_Meeting_' \
+  && ok "background: prints the run id" || bad "background: no run id: $out"
+bg_dir=""
+for _ in $(seq 1 60); do
+  bg_dir="$(ls -1d "$RUNS"/BG_Meeting_* 2>/dev/null | head -n 1)"
+  [ -n "$bg_dir" ] && [ "$(state status --run-dir "$bg_dir" --stage summarize)" = "done" ] && break
+  sleep 0.5
+done
+check "background: the detached run finishes on its own" \
+  "$(state status --run-dir "$bg_dir" --stage summarize 2>/dev/null)" "done"
+grep -q "^Run: " "$bg_log" 2>/dev/null && ok "background: the run's output is in the log" \
+  || bad "background: log has no run output"
+out=$(MEETING_BOT_FOREGROUND=0 pipeline "https://meet.google.com/fgr-ound-tst" --foreground 2>&1)
+check "--foreground: exits 0" "$?" "0"
+echo "$out" | grep -q "Recording in the background" \
+  && bad "--foreground: detached anyway" || ok "--foreground: stays attached"
+echo "$out" | grep -q "^Run: " && ok "--foreground: the run's output is inline" \
+  || bad "--foreground: no run output inline: $out"
+out=$(MEETING_BOT_FOREGROUND=0 pipeline "https://meet.google.com/dry-ound-tst" --dry-run 2>&1)
+echo "$out" | grep -qP '^ok\tmeeting\t' && ok "--dry-run: never detaches" \
+  || bad "--dry-run: $out"
+out=$(MEETING_BOT_FOREGROUND=0 pipeline "https://youtu.be/bgnotmeet01" 2>&1)
+echo "$out" | grep -q "Recording in the background" \
+  && bad "background: a YouTube input detached" || ok "background: only meetings detach"
 
 echo ""
 echo "=================================================================="

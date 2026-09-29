@@ -17,21 +17,32 @@ it), the kill/admitted sentinels live in that run's directory rather than in
 killing one recording kills every recording. The /tmp paths remain the default
 so a bare `python3 screen/capture.py <url>` still works.
 
+It can also HOST: given "meet.new" (or https://meet.new) as the URL, it creates
+a new Google Meet in the signed-in profile, announces the link (stdout, the
+run dir's meet_url file, and state.json), admits everyone who knocks, and ends
+the call for everyone once they have all left — see host_* below.
+
 Usage:
     python3 screen/capture.py "<meeting_url>" ["Display Name"]
+    python3 screen/capture.py meet.new ["Display Name"]
 """
+import subprocess
 import sys
 import os
 import re
 import time
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# The persistent Chrome profile, shared with first_time_login.sh. It lives
-# under MEETING_BOT_ROOT (not a user's $HOME) so it survives reinstalls and is
-# the same profile whichever script opens it.
-_BOT_ROOT = os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot")
-PROFILE_DIR = os.environ.get("CHROME_PROFILE_DIR",
-                             os.path.join(_BOT_ROOT, "chrome-profile"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import browser  # noqa: E402  (screen/browser.py: which browser, how launched)
+
+# Playwright's TimeoutError and the Firefox adapter's, as one `except` target.
+PWTimeout = browser.timeout_errors()
+
+# The persistent browser profile, shared with first_time_login.sh. It lives
+# under MEETING_BOT_ROOT so it survives reinstalls and is the same profile
+# whichever script opens it. One per browser (MEETING_BROWSER).
+_BOT_ROOT = os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot"))
+PROFILE_DIR = browser.profile_dir()
 SCREENSHOT_DIR = os.environ.get("RECORDINGS_DIR",
                                 os.path.join(_BOT_ROOT, "recordings"))
 
@@ -49,47 +60,24 @@ MAX_MEETING_SECONDS = int(os.environ.get("MAX_MEETING_MINUTES", "240")) * 60
 # catches the "test call with just me" case that the mass-exit rule misses
 # (peak is 2, so 30% of peak is 0 — never triggers). Set to 0 to disable.
 IDLE_LEAVE_SECONDS = int(os.environ.get("IDLE_LEAVE_MINUTES", "5")) * 60
+# A meeting the bot created itself: how long to hold it open for the first
+# participant before ending it. Once somebody has joined, the ordinary
+# auto-leave rules take over.
+NEW_MEET_WAIT_SECONDS = int(os.environ.get("NEW_MEET_WAIT_MINUTES", "15")) * 60
+# As host, how often to look for people knocking. Much shorter than
+# POLL_SECONDS: a knocker left waiting 15s assumes nobody is there.
+HOST_ADMIT_POLL_SECONDS = 3
+NEW_MEET_RE = re.compile(r"^(https?://)?meet\.new/?$", re.I)
+MEET_LINK_RE = re.compile(r"https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}")
 # Sentinels. Per-run when MEETING_BOT_RUN_DIR is set (the pipeline always sets
 # it), so concurrent recordings don't share a kill switch; /tmp otherwise, which
 # keeps a standalone `python3 screen/capture.py <url>` working as before.
-# Chrome's window has to match the Xvfb head exactly or the recording gets
-# black edges; record_screen.sh sets RECORD_GEOMETRY for both.
-WINDOW_SIZE = (os.environ.get("RECORD_GEOMETRY", "1920x1080")
-               .lower().replace("x", ","))
-# The Chrome command line, in one place so screen/browser_smoke.py can launch
-# an identical browser without a live meeting — a flag that breaks recording
-# should break the smoke test too.
-#
-# --kiosk launches Chrome in true fullscreen with no chrome (no tab bar, no
-# address bar, no system UI). The window fills the Xvfb head, so ffmpeg's
-# x11grab captures only the meeting UI - no black edges. --kiosk also disables
-# F11-toggle, which keeps the unattended recording from accidentally leaving
-# fullscreen. --window-size pins the drawable area to the head size; without it
-# some Xvfb/Chrome combinations leave a few px of margin on the right and
-# bottom (Chrome auto-sizes the window slightly smaller than the display in
-# --kiosk mode). The matching Xvfb geometry and ffmpeg -video_size come from
-# RECORD_GEOMETRY in screen/record_screen.sh.
-#
-# --no-sandbox is required because the pipeline runs as root; without it Chrome
-# aborts with "Running as root without --no-sandbox is not supported" before
-# the page ever loads.
-#
-# --disable-features=ScreenCapture is layer 1 of the screen-share defense: it
-# disables the getDisplayMedia API entirely. The bot has no legitimate reason
-# to share its screen; if Chrome ever renames this feature flag, layers 2 and 3
-# (in wait_until_meeting_ends) are the runtime catch-nets.
-CHROME_ARGS = [
-    "--kiosk",
-    f"--window-size={WINDOW_SIZE}",
-    # Without this Chrome places its window at (10,10) even in kiosk mode, and
-    # every recording gets a 10px black band down the left and top edges —
-    # found by verify_e2e.sh --browser-smoke, which measures the captured
-    # frame rather than trusting the window size.
-    "--window-position=0,0",
-    "--no-sandbox",
-    "--use-fake-ui-for-media-stream",
-    "--disable-features=ScreenCapture",
-]
+# The browser window has to match the Xvfb head exactly or the recording gets
+# black edges; record_screen.sh sets RECORD_GEOMETRY for both. The command
+# line lives in screen/browser.py (CHROME_ARGS / FIREFOX_PREFS) and is
+# re-exported here for screen/browser_smoke.py, so a flag that breaks
+# recording breaks the smoke test too.
+CHROME_ARGS = browser.CHROME_ARGS
 
 RUN_DIR = os.environ.get("MEETING_BOT_RUN_DIR", "")
 if RUN_DIR:
@@ -110,10 +98,12 @@ def kill_requested():
     return os.path.exists(KILL_SENTINEL)
 
 
-def click_first_match(page, labels, timeout=3000):
+def click_first_match(page, labels, timeout=3000, exact=False):
+    # exact=True for short labels that are a substring of something else — the
+    # Thai "ปิด" (Close) is the start of "ปิดกล้อง" (turn off camera).
     for label in labels:
         try:
-            btn = page.get_by_role("button", name=label)
+            btn = page.get_by_role("button", name=label, exact=exact)
             if btn.is_visible(timeout=timeout):
                 btn.click()
                 print(f"Clicked '{label}'")
@@ -226,8 +216,11 @@ def prejoin_mute_and_join_google_meet(page, display_name):
     return False
 
 
-def join_google_meet(page, url, display_name):
-    page.goto(url, wait_until="domcontentloaded")
+def join_google_meet(page, url, display_name, navigate=True):
+    # navigate=False when host_create_google_meet has already landed on this
+    # meeting's pre-join page; loading it a second time only costs seconds.
+    if navigate:
+        page.goto(url, wait_until="domcontentloaded")
     page.wait_for_timeout(3000)
     # Diagnostic: log the actual viewport / screen size. If --window-size
     # plus --kiosk aren't matching the Xvfb head (1920x1080), this prints
@@ -282,6 +275,142 @@ def join_zoom(page, url, display_name):
     except PWTimeout:
         pass
     return click_first_match(page, ["Join", "Join from Your Browser"], timeout=4000)
+
+
+# --- Hosting a meeting the bot created (meet.new) ----------------------------
+# The bot's own Google account owns the call, so there is no organizer to wait
+# for and nobody to admit the bot — but everybody else now knocks on the bot.
+# All of these labels are English + Thai like the rest of this file. The Thai
+# admit/end labels are best-effort and are the first thing to check against a
+# live call if knockers are left waiting.
+
+# Exact matches: "Admit" would otherwise match any button containing the word.
+HOST_ADMIT_LABELS = [
+    "Admit all", "Admit",
+    "ยอมรับทั้งหมด", "ยอมรับ", "อนุญาตทั้งหมด", "อนุญาต", "รับเข้าทั้งหมด", "รับเข้า",
+]
+# Several people knocking at once collapse into "View all"; the Admit all
+# button is inside the panel that opens.
+HOST_VIEW_ALL_LABELS = ["View all", "ดูทั้งหมด"]
+HOST_END_FOR_ALL_LABELS = [
+    "End the call for everyone", "End call for everyone", "End call for all",
+    "สิ้นสุดการโทรสำหรับทุกคน", "วางสายสำหรับทุกคน", "ปิดการโทรสำหรับทุกคน",
+]
+
+
+def is_new_meet(url):
+    return bool(NEW_MEET_RE.match(url.strip()))
+
+
+def announce_meet_link(link):
+    """Make the new link findable everywhere the operator might look.
+
+    stdout (the stage log and the terminal), a meet_url file in the run dir
+    (what a web UI or a script can poll), and state.json (what --status
+    shows, and what run_one.sh cites as the document's source). Each is
+    best-effort: failing to record the link must not end a call that exists.
+    """
+    print("=" * 66)
+    print(f"  New Google Meet: {link}")
+    print("  Share this link. The bot admits everyone who asks to join.")
+    print("=" * 66, flush=True)
+    if not RUN_DIR:
+        return
+    try:
+        with open(os.path.join(RUN_DIR, "meet_url"), "w") as fh:
+            fh.write(link + "\n")
+    except OSError as e:
+        print(f"WARNING: could not write meet_url ({e})")
+    runstate = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "lib", "runstate.py")
+    try:
+        subprocess.run([sys.executable, runstate, "init", "--run-dir", RUN_DIR,
+                        "--meet-url", link], check=True, timeout=30)
+    except Exception as e:
+        print(f"WARNING: could not store the link in state.json ({e})")
+
+
+def host_create_google_meet(page):
+    """Open meet.new and return the new meeting's link, or None.
+
+    meet.new redirects a signed-in account straight to a fresh
+    meet.google.com/xxx-xxxx-xxx pre-join page. A signed-out profile lands on
+    accounts.google.com instead, which is the one failure worth naming.
+    """
+    print("Creating a new Google Meet (meet.new)...")
+    page.goto(browser.with_authuser("https://meet.google.com/new",
+                                    browser.expected_account())
+              if browser.expected_account() else "https://meet.new",
+              wait_until="domcontentloaded")
+    try:
+        page.wait_for_url(lambda u: bool(MEET_LINK_RE.search(u)), timeout=45000)
+    except PWTimeout:
+        if "accounts.google.com" in page.url:
+            print("Cannot create a meeting: the Chrome profile is not signed "
+                  "into Google. Run ./first_time_login.sh and sign in first.")
+        else:
+            print(f"meet.new did not produce a meeting link (landed on {page.url}).")
+        return None
+    link = MEET_LINK_RE.search(page.url).group(0)
+    announce_meet_link(link)
+    return link
+
+
+def host_dismiss_ready_dialog(page):
+    """Close the "Your meeting's ready" card that covers part of the call."""
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    click_first_match(page, ["Close", "ปิด"], timeout=1500, exact=True)
+
+
+def host_admit_waiting(page):
+    """Admit anyone knocking. Returns True if a button was clicked."""
+    def click_visible(labels):
+        for label in labels:
+            try:
+                btn = page.get_by_role("button", name=label, exact=True).first
+                if btn.is_visible():
+                    btn.click()
+                    return label
+            except Exception:
+                continue
+        return None
+
+    clicked = click_visible(HOST_ADMIT_LABELS)
+    if not clicked and click_visible(HOST_VIEW_ALL_LABELS):
+        time.sleep(1)
+        clicked = click_visible(HOST_ADMIT_LABELS)
+    if not clicked:
+        return False
+    print(f"Admitted waiting participant(s) ('{clicked}').")
+    # "Admit all" asks for confirmation with a second "Admit all".
+    time.sleep(1)
+    click_visible(HOST_ADMIT_LABELS)
+    return True
+
+
+def host_end_call(page):
+    """Leave as host, ending the call for everyone still in it.
+
+    Meet asks the host whether to end the call for everyone only when
+    others are still there; alone, hanging up already ends it.
+    """
+    print("Ending the call for everyone (the bot is the host).")
+    click_first_match(
+        page,
+        ["Leave call", "Leave meeting", "ออกจากการโทร", "ออกจากการประชุม"],
+        timeout=3000,
+    )
+    time.sleep(1)
+    if click_first_match(page, HOST_END_FOR_ALL_LABELS, timeout=2000):
+        return
+    click_first_match(
+        page,
+        ["Leave meeting", "Leave", "ออกจากการประชุม", "ออกจากการโทร"],
+        timeout=2000,
+    )
 
 
 def is_admitted(page):
@@ -563,21 +692,49 @@ def stop_unwanted_presenting(page):
     return False
 
 
-def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS):
+def _sleep_hosting(page, seconds):
+    """Sleep, but keep admitting knockers and honour the kill switch."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if kill_requested():
+            return
+        try:
+            host_admit_waiting(page)
+        except Exception:
+            pass
+        time.sleep(min(HOST_ADMIT_POLL_SECONDS, max(0.0, deadline - time.time())))
+
+
+def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
+    """Stay in the call until it is over.
+
+    host=True is a meeting the bot created: knockers are admitted while it
+    waits, nobody-has-joined-yet is not "the meeting emptied" (it waits
+    NEW_MEET_WAIT_SECONDS for the first one), a 1:1 with the bot is a real
+    meeting rather than an idle test call, and every exit ends the call for
+    everyone instead of just leaving it.
+    """
     print("In meeting. Monitoring participant count and end state...")
+    leave = host_end_call if host else leave_meeting
     peak_count = None
     low_streak = 0
     idle_since_ts = None    # first poll at which count was in (1, 2)
     start_ts = time.time()  # for the hard max-duration timeout backstop
+    someone_joined = False  # host mode: has anyone but the bot been in?
+    count_ever_read = False
+    warned_unreadable = False
 
     while True:
         try:
-            time.sleep(poll_seconds)
+            if host:
+                _sleep_hosting(page, poll_seconds)
+            else:
+                time.sleep(poll_seconds)
 
             if kill_requested():
                 print("Kill signal received - leaving the meeting cleanly.")
                 try:
-                    leave_meeting(page)
+                    leave(page)
                 except Exception as e:
                     print(f"Clean leave failed ({e}) - exiting anyway.")
                 return
@@ -600,7 +757,7 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS):
                 cap = MAX_MEETING_SECONDS // 60
                 print(f"Hard timeout reached ({minutes}m elapsed, cap {cap}m) - leaving.")
                 try:
-                    leave_meeting(page)
+                    leave(page)
                 except Exception as e:
                     print(f"Clean leave failed ({e}) - exiting anyway.")
                 return
@@ -611,6 +768,30 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS):
             stop_unwanted_presenting(page)
 
             count = get_participant_count(page)
+            if host:
+                if count is not None:
+                    count_ever_read = True
+                    if count >= 2 and not someone_joined:
+                        someone_joined = True
+                        print(f"First participant joined (count={count}).")
+                if not someone_joined:
+                    # An empty call it just created is not a meeting that
+                    # ended. Only the wait for the first participant can end
+                    # it — and only when the count is actually readable: a
+                    # participant chip Meet has renamed must not end a call
+                    # people are in; MAX_MEETING_MINUTES still bounds it.
+                    waited = time.time() - start_ts
+                    if count_ever_read and waited >= NEW_MEET_WAIT_SECONDS:
+                        print(f"Nobody joined within {int(waited // 60)}m - "
+                              "ending the call.")
+                        leave(page)
+                        return
+                    if (not count_ever_read and not warned_unreadable
+                            and waited >= NEW_MEET_WAIT_SECONDS):
+                        warned_unreadable = True
+                        print("WARNING: cannot read the participant count; "
+                              "staying until MAX_MEETING_MINUTES or a kill.")
+                    continue
             if count is not None:
                 peak_count = count if peak_count is None else max(peak_count, count)
                 is_alone = count <= 1
@@ -619,7 +800,10 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS):
                 # Idle auto-leave: only the bot (count==1) or only the bot
                 # + one other person (count==2) for IDLE_LEAVE_SECONDS.
                 # Independent of mass-exit; both can fire on the same call.
-                if IDLE_LEAVE_SECONDS > 0 and count in (1, 2):
+                # Hosting, a 1:1 with the bot is a meeting — only the bot alone
+                # is idle.
+                idle_counts = (1,) if host else (1, 2)
+                if IDLE_LEAVE_SECONDS > 0 and count in idle_counts:
                     if idle_since_ts is None:
                         idle_since_ts = time.time()
                     elif time.time() - idle_since_ts >= IDLE_LEAVE_SECONDS:
@@ -628,7 +812,7 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS):
                             f"Idle threshold reached ({mins}m, count={count}, "
                             f"peak={peak_count}) - leaving."
                         )
-                        leave_meeting(page)
+                        leave(page)
                         return
                 else:
                     idle_since_ts = None
@@ -641,7 +825,7 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS):
 
                 if low_streak >= LOW_COUNT_CONFIRMATIONS:
                     print("Confirmed most/all participants have left - leaving.")
-                    leave_meeting(page)
+                    leave(page)
                     return
 
         except KeyboardInterrupt:
@@ -650,6 +834,36 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS):
         except Exception as e:
             print(f"Page unreachable ({e}) - assuming meeting ended.")
             return
+
+
+class _PageCloser:
+    """browser.open_page() owns the browser; `context.close()` is a no-op."""
+
+    def close(self):
+        pass
+
+
+def ensure_bot_account(page, expected):
+    """Refuse to join a Google Meet from any account but BOT_GOOGLE_ACCOUNT.
+
+    Unset: nothing is checked (a warning says so). Set: the profile must be
+    signed in and the account must be among those it holds; the Meet URL then
+    carries authuser=<account>, so Meet picks it even beside another one.
+    An unreadable answer (Google changed the endpoint) is a warning, not a
+    refusal — the authuser parameter still steers Meet to the right account.
+    """
+    accounts = browser.read_signed_in_accounts(page) if expected else None
+    verdict, message = browser.account_verdict(accounts, expected)
+    if verdict in ("ok", "unchecked"):
+        print(("Bot account: " if verdict == "ok" else "WARNING: bot account: ")
+              + message)
+        return True
+    print(f"Cannot join: {message}")
+    try:
+        page.screenshot(path=os.path.join(SCREENSHOT_DIR, "wrong_account.png"))
+    except Exception:
+        pass
+    return False
 
 
 def main():
@@ -667,38 +881,28 @@ def main():
     if os.path.exists(KILL_SENTINEL):
         os.remove(KILL_SENTINEL)
 
-    # Chrome's SingletonLock encodes the hostname and pid of whoever last held
-    # the profile. A run killed before its cleanup ran (SIGKILL, reboot,
-    # Ctrl+C racing the trap) leaves one behind, and the next Chrome refuses to
-    # launch at all — "the profile appears to be in use by another computer".
-    # Any lock still present here is stale by definition: this process is about
-    # to be the only user of the profile.
-    for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-        lock_path = os.path.join(PROFILE_DIR, lock_name)
-        if os.path.exists(lock_path) or os.path.islink(lock_path):
-            os.remove(lock_path)
+    # The browser's own profile lock is cleared by browser.open_page(): a run
+    # killed before its cleanup leaves one behind, and the next launch then
+    # refuses the profile as "in use".
+    with browser.open_page(headless=False) as page:
+        context = _PageCloser()
+        expected = browser.expected_account()
+        if is_new_meet(url) or "meet.google.com" in url:
+            if not ensure_bot_account(page, expected):
+                return
+            if not is_new_meet(url):
+                url = browser.with_authuser(url, expected)
 
-    with sync_playwright() as p:
-        # channel="chrome" forces real Google Chrome (installed by setup.sh)
-        # rather than Playwright's bundled unbranded Chromium. Google blocks
-        # sign-in on the unbranded build ("This browser or app may not be
-        # secure"), and Meet itself is more reliable on the real browser.
-        context = p.chromium.launch_persistent_context(
-            PROFILE_DIR,
-            headless=False,
-            channel="chrome",
-            # --no-sandbox is required because record_screen.sh runs
-            # the whole pipeline as root (sudo -H, matching setup.sh). Without
-            # it, Chrome aborts with "Running as root without --no-sandbox is
-            # not supported" before the page ever loads.
-            args=CHROME_ARGS,
-            permissions=["camera", "microphone"],
-            no_viewport=True,
-            locale="th-TH",  # renders Thai participant names/chat correctly
-        )
-        page = context.new_page()
-
-        if "meet.google.com" in url:
+        host = is_new_meet(url)
+        if host:
+            created = host_create_google_meet(page)
+            if not created:
+                page.screenshot(path=os.path.join(SCREENSHOT_DIR, "create_failed.png"))
+                context.close()
+                return
+            url = created
+            clicked = join_google_meet(page, url, display_name, navigate=False)
+        elif "meet.google.com" in url:
             clicked = join_google_meet(page, url, display_name)
         elif "zoom.us" in url:
             clicked = join_zoom(page, url, display_name)
@@ -742,6 +946,8 @@ def main():
             mute_av(page, platform)
         except Exception as e:
             print(f"WARNING: mute_av raised {e} - continuing anyway.")
+        if host:
+            host_dismiss_ready_dialog(page)
 
         # Signal the orchestrator (record_screen.sh) that it's safe to start
         # recording now - we're actually in the call, not a lobby.
@@ -749,7 +955,7 @@ def main():
             f.write(str(time.time()))
 
         try:
-            wait_until_meeting_ends(page)
+            wait_until_meeting_ends(page, host=host)
         finally:
             if os.path.exists(ADMITTED_MARKER):
                 os.remove(ADMITTED_MARKER)
