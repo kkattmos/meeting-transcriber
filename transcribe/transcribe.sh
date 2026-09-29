@@ -288,9 +288,14 @@ else
     # successful, run_one.sh marked the stage done, and it recorded .txt/.srt
     # artifacts that had never been written. (runstate's on-disk artifact check
     # caught it after the fact, but only on the next resume.)
+    # `|| EXIT_CODE=$?`, not a bare `EXIT_CODE=$?` on the next line: this
+    # script is `set -e`, so a failing client aborted right here and the
+    # lines below that print its error never ran — a failed transcription
+    # left only "==> Transcribing with AssemblyAI" in the stage log (found
+    # live 2026-09-29, twice, before anyone could see why).
+    EXIT_CODE=0
     "$PYTHON_BIN" "$SCRIPT_DIR/assemblyai_client.py" "$AUDIO_FILE" "$LANGUAGE" \
-          > "$SEGMENTS_FILE" 2>"$WORK_DIR/assemblyai-client.log"
-    EXIT_CODE=$?
+          > "$SEGMENTS_FILE" 2>"$WORK_DIR/assemblyai-client.log" || EXIT_CODE=$?
     if [ "$EXIT_CODE" -ne 0 ]; then
       cat "$WORK_DIR/assemblyai-client.log"
       echo "ERROR: AssemblyAI transcription failed (see $WORK_DIR/assemblyai-client.log)"
