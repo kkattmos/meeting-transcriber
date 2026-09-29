@@ -118,10 +118,24 @@ def provenance_comment(**fields):
     return "\n".join(lines)
 
 
+# A recorded call's link. Not "Source File": the first live guest recording
+# (2026-09-29) cited its Meet link as a local file, because anything that was
+# neither YouTube nor Kaltura fell through to that label.
+MEETING_URL_RE = re.compile(
+    r"^https?://(meet\.google\.com|([\w-]+\.)?zoom\.us|teams\.(microsoft|live)\.com|meet\.new)",
+    re.IGNORECASE)
+
+
+def looks_like_meeting(source):
+    return bool(MEETING_URL_RE.match(str(source or "").strip()))
+
+
 def _source_line(source, source_kind, tag=""):
     """The clickable (or at least copyable) line naming where a video came from."""
     if source_kind == "youtube":
         return f"Youtube Link{tag}: `{source}`"
+    if source_kind == "meeting" or looks_like_meeting(source):
+        return f"Meeting Link{tag}: `{source}`"
     if source_kind == "kaltura":
         # Not "Source File" — a Kaltura lecture is a link like the YouTube one,
         # and the reader needs to be able to click it.

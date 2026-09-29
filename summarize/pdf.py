@@ -499,7 +499,7 @@ def _take_link_lines(text):
 # H1 over the model's own. Files written before then still carry them.
 LEGACY_CHAPTER_LINE = "Chapter N — <topic> (<date>)"
 LINK_LINE_RE = re.compile(
-    r"^(?:(?:Youtube Link|Video Link|Source File|Clip)(?: \(Video \d+\))?:"
+    r"^(?:(?:Youtube Link|Video Link|Meeting Link|Source File|Clip)(?: \(Video \d+\))?:"
     r"|Summarized from \d+ videos as one\.)")
 H1_RE = re.compile(r"^#\s+\S")
 

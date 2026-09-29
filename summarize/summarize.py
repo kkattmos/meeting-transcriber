@@ -463,6 +463,7 @@ def load_parts(parts_path):
         kind = entry.get("kind") or (
             "youtube" if is_youtube_url(source)
             else "kaltura" if kaltura.looks_like_kaltura(source)
+            else "meeting" if document.looks_like_meeting(source)
             else "local_file")
         title = entry.get("title")
         if not title and kind == "youtube":
@@ -503,6 +504,8 @@ def _wrap_document(body, *, original_input, source_url, video_path, transcript,
         source_kind = "youtube"
     elif kaltura.looks_like_kaltura(str(source)):
         source_kind = "kaltura"
+    elif document.looks_like_meeting(source):
+        source_kind = "meeting"
     else:
         source_kind = "local_file"
 

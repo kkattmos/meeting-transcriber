@@ -276,6 +276,20 @@ Settled with the operator after reading a real recording:
   tile's menu ("ตัวเลือกเพิ่มเติมสำหรับ <name>") and picks "ย่อเล็กสุด"
   (Minimize), once per call, from the polling loop. Labels found live;
   the click itself verified on a mock only.
+- **As a guest, pick the right button among several** (first live guest
+  join, 2026-09-29, the operator presenting: "no 'Adjust view' menu item"
+  and "Self tile: no-minimize"). A call already under way has a "More
+  options" button per tile, and the code took the first in DOM order — a
+  tile's, whose menu has neither item. When hosting, the bot is alone when
+  it looks, so there was only one. Now `set_recording_layout` clicks the
+  *lowest* exact "ตัวเลือกเพิ่มเติม"/"More options" (the toolbar), and
+  `minimize_self_tile` tries, in order: a button inside `[data-self-name]`,
+  the label that worked earlier in this call, then the candidates nearest
+  the bottom-right corner (where the floating self view sits), at most 4,
+  remembering the one whose menu offered Minimize so later tries open only
+  it. Both log the menu items they saw and save `layout_menu.png` /
+  `self_tile.png` in the run dir when they fail. Verified in headless Firefox
+  on a mock of that DOM; not yet on a live guest join.
 - **Notices and the People panel are closed every poll** (`dismiss_notices`,
   exact labels "รับทราบ"/"Got it"/"ปิด"/"Close"; `click_now` never waits, so
   it is cheap to repeat). Admitting someone opens the panel; it is closed
@@ -1600,6 +1614,9 @@ Shaped to match the user's course files (`2_Transcripts/chapter1.md`,
 - **Code builds the wrapper, the model writes only the body.** The link,
   transcript and provenance can then never be hallucinated or truncated, and an
   ~80KB transcript doesn't round-trip through the model just to be echoed back.
+- **A recorded call's link is a `Meeting Link:`** (`document.looks_like_meeting`:
+  Meet, Zoom, Teams), `source_type: meeting`. It used to fall through to
+  `Source File:` — seen on the first live guest recording, 2026-09-29.
 - **Provenance is an HTML comment**, so it survives being pasted into a bigger
   chapter file without adding visual noise. Values are escaped so a `-->` in a
   source can't terminate the comment early.
@@ -2409,7 +2426,7 @@ without API keys or network, against temp directories
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), real PDF render | 103 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `transcribe/test_yt_autocaptions.py` | the yt-dlp fallback: track choice (never a translation), json3, the CLI against a stub yt-dlp | 11 |
-| `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged | 7 |
+| `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own | 18 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
 | `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, run/log path refusal, summary language/font/instructions, the options | 9 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources) | 383 |

@@ -322,6 +322,21 @@ class DocumentTest(unittest.TestCase):
         self.assertTrue(document.wants_wrapper("lecture-gemini"))
         self.assertFalse(document.wants_wrapper("meeting-gemini"))
 
+    def test_a_meeting_link_is_labelled_as_one(self):
+        # The first live guest recording cited its Meet link as "Source File".
+        for url in ("https://meet.google.com/xbm-ryat-jch",
+                    "https://us02web.zoom.us/j/123456"):
+            with self.subTest(url=url):
+                out = document.build_document(
+                    "# T\n\nbody", source=url, source_kind="local_file")
+                self.assertIn(f"Meeting Link: `{url}`", out)
+                self.assertNotIn("Source File", out)
+        out = document.build_document("# T\n\nbody", source="/rec/a.mp4",
+                                      source_kind="local_file")
+        self.assertIn("Source File: `/rec/a.mp4`", out)
+        self.assertTrue(document.looks_like_meeting("https://meet.google.com/abc-defg-hij"))
+        self.assertFalse(document.looks_like_meeting("https://youtu.be/x"))
+
     def test_the_document_records_its_font(self):
         out = document.build_document("# T\n\nbody", source="x.mp4",
                                       source_kind="local_file", font="Sarabun")

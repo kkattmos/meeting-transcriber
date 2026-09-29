@@ -1117,6 +1117,12 @@ class DesignTest(unittest.TestCase):
                       html_out)
         self.assertNotIn("`", html_out)
 
+    def test_a_meeting_link_line_moves_to_the_title_block_too(self):
+        body, links = pdf_export._take_link_lines(
+            "# T\n\nMeeting Link: `https://meet.google.com/a-b-c`\n\nBody.\n")
+        self.assertEqual(links, ["Meeting Link: `https://meet.google.com/a-b-c`"])
+        self.assertNotIn("Meeting Link", body)
+
     def test_the_kind_label_follows_the_prompt(self):
         self.assertEqual(pdf_export._doc_kind_label("meeting", {}),
                          "Meeting summary")

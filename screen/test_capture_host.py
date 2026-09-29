@@ -207,5 +207,37 @@ class HostedMeetingTest(unittest.TestCase):
         self.assertLess(self.elapsed_min(self.ended[0]), 2)
 
 
+class SelfTileChoiceTest(unittest.TestCase):
+    """Which "More options for …" menu is the bot's own. The first live
+    guest join (2026-09-29) opened the operator's tile menu, because the
+    first in DOM order was taken; the bot's floating tile sits bottom-right."""
+
+    OTHER = {"label": "ตัวเลือกเพิ่มเติมสำหรับ Khattiya", "self": False, "corner": 400}
+    SELF = {"label": "ตัวเลือกเพิ่มเติมสำหรับ Meeting transcriber", "self": False,
+            "corner": 2300}
+    PRES = {"label": "ตัวเลือกเพิ่มเติมสำหรับ การนำเสนอ", "self": False, "corner": 900}
+
+    def test_nearest_the_bottom_right_first(self):
+        order = capture._self_menu_order([self.OTHER, self.PRES, self.SELF])
+        self.assertEqual(order[0], self.SELF["label"])
+        self.assertEqual(len(order), 3)
+
+    def test_the_doms_self_marker_wins(self):
+        marked = dict(self.OTHER, self=True)
+        self.assertEqual(capture._self_menu_order([marked, self.SELF]),
+                         [marked["label"]])
+
+    def test_a_remembered_label_is_the_only_one_tried(self):
+        self.assertEqual(
+            capture._self_menu_order([self.OTHER, self.SELF], self.OTHER["label"]),
+            [self.OTHER["label"]])
+
+    def test_probes_are_bounded(self):
+        many = [{"label": f"More options for P{i}", "corner": i} for i in range(9)]
+        self.assertEqual(len(capture._self_menu_order(many)),
+                         capture._SELF_MENU_MAX_PROBES)
+        self.assertEqual(capture._self_menu_order([]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,7 @@ Usage:
     python3 screen/capture.py "<meeting_url>" ["Display Name"]
     python3 screen/capture.py meet.new ["Display Name"]
 """
+import json
 import subprocess
 import sys
 import os
@@ -708,7 +709,7 @@ _LAYOUT_JS = r"""() => {
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   const dlg = Array.from(document.querySelectorAll('[role=dialog]')).filter(vis)
-    .find(d => /ปรับมุมมอง|Adjust view|Change layout/.test(d.innerText));
+    .find(d => /ปรับมุมมอง|เปลี่ยนเลย์เอาต์|Adjust view|Change layout/.test(d.innerText));
   if (!dlg) return 'no-dialog';
   const out = [];
   const label = Array.from(dlg.querySelectorAll('label')).find(l => /^(สปอตไลท์|Spotlight)$/.test(norm(l.innerText)));
@@ -733,12 +734,22 @@ _LAYOUT_JS = r"""() => {
 # "hide tiles without video" does not cover the self view. Its menu
 # ("ตัวเลือกเพิ่มเติมสำหรับ <bot name>") offers "ย่อเล็กสุด" (Minimize),
 # found live 2026-09-29; the tile itself can't be removed in this layout.
-_MINIMIZE_SELF_JS = r"""() => {
-  const menuBtn = Array.from(document.querySelectorAll('button')).find(b =>
-      /^(ตัวเลือกเพิ่มเติมสำหรับ|More options for) /.test(b.getAttribute('aria-label') || ''));
-  if (!menuBtn) return 'no-self-menu';
-  menuBtn.click();
-  return 'opened';
+#
+# Which "More options for …" button is the bot's? Every tile has one, and the
+# first live GUEST join (2026-09-29, with the operator presenting) opened
+# someone else's — "Self tile: no-minimize" — because the code took the first
+# in DOM order. When hosting, the bot is alone when it looks, so there was
+# only one. Now: a button inside Meet's self tile ([data-self-name]) if the
+# DOM marks it; else the label that worked before in this call; else the
+# candidates nearest the bottom-right corner first (where the floating self
+# view sits), opening each menu until one offers Minimize — and that label is
+# remembered, so later tries open only the bot's own menu.
+_SELF_MENU_CANDIDATES_JS = r"""() => {
+  return Array.from(document.querySelectorAll('button'))
+    .filter(b => /^(ตัวเลือกเพิ่มเติมสำหรับ|More options for) /.test(b.getAttribute('aria-label') || ''))
+    .map(b => { const r = b.getBoundingClientRect();
+      return {label: b.getAttribute('aria-label'), self: !!b.closest('[data-self-name]'),
+              corner: r.right + r.bottom}; });
 }"""
 _CLICK_MINIMIZE_JS = r"""() => {
   const item = Array.from(document.querySelectorAll('[role=menuitem]')).find(m =>
@@ -747,7 +758,35 @@ _CLICK_MINIMIZE_JS = r"""() => {
   item.click();
   return 'minimized';
 }"""
+_MENU_ITEMS_JS = r"""() => Array.from(document.querySelectorAll('[role=menuitem]'))
+    .filter(m => m.getBoundingClientRect().width > 0)
+    .map(m => (m.getAttribute('aria-label') || m.innerText || '').replace(/\s+/g, ' ').trim())"""
 _SELF_TILE_NEXT_TRY = 0.0
+_SELF_MENU_LABEL = None
+_SELF_TILE_DIAGNOSED = False
+# Opening someone else's menu shows in the recording for a second; bound it.
+_SELF_MENU_MAX_PROBES = 4
+
+
+def _click_button_with_label_js(label):
+    return ("() => { const b = Array.from(document.querySelectorAll('button'))"
+            f".find(b => b.getAttribute('aria-label') === {json.dumps(label)});"
+            " if (b) b.click(); return !!b; }")
+
+
+def _self_menu_order(candidates, remembered=None):
+    """The labels to try, best first: the DOM's self tile, the label that
+    worked before, then nearest the bottom-right corner."""
+    if not candidates:
+        return []
+    marked = [c["label"] for c in candidates if c.get("self")]
+    if marked:
+        return marked[:1]
+    labels = [c["label"] for c in candidates]
+    if remembered in labels:
+        return [remembered]
+    ordered = sorted(candidates, key=lambda c: -(c.get("corner") or 0))
+    return [c["label"] for c in ordered][:_SELF_MENU_MAX_PROBES]
 
 
 def minimize_self_tile(page):
@@ -759,40 +798,78 @@ def minimize_self_tile(page):
     button is present; when minimised it isn't, so this is a no-op then.
     At most one attempt a minute, so the menu never flickers in the recording.
     """
-    global _SELF_TILE_NEXT_TRY
+    global _SELF_TILE_NEXT_TRY, _SELF_MENU_LABEL, _SELF_TILE_DIAGNOSED
     now = time.time()
     if now < _SELF_TILE_NEXT_TRY:
         return
     _SELF_TILE_NEXT_TRY = now + 60
     try:
-        if page.evaluate(_MINIMIZE_SELF_JS) != "opened":
+        candidates = page.evaluate(_SELF_MENU_CANDIDATES_JS) or []
+        order = _self_menu_order(candidates, _SELF_MENU_LABEL)
+        if not order:
             return
-        time.sleep(1)
-        result = page.evaluate(_CLICK_MINIMIZE_JS)
-        if result != "minimized":
+        if _SELF_MENU_LABEL and _SELF_MENU_LABEL not in order:
+            # The remembered tile is gone: already minimised. Nothing to do,
+            # and no reason to open anyone else's menu.
+            return
+        result, seen_items = "no-minimize", []
+        for label in order:
+            if not page.evaluate(_click_button_with_label_js(label)):
+                continue
+            time.sleep(1)
+            result = page.evaluate(_CLICK_MINIMIZE_JS)
+            if result == "minimized":
+                _SELF_MENU_LABEL = label
+                break
+            seen_items.append((label, page.evaluate(_MENU_ITEMS_JS) or []))
             page.keyboard.press("Escape")
-            # This layout offers no Minimize (e.g. alone in the call):
-            # look again in five minutes rather than every minute.
+            time.sleep(0.5)
+        if result != "minimized":
+            # Look again in five minutes rather than every minute.
             _SELF_TILE_NEXT_TRY = now + 300
+            if not _SELF_TILE_DIAGNOSED:
+                _SELF_TILE_DIAGNOSED = True
+                print(f"  Self tile diagnostics: menus opened {seen_items!r}")
+                if RUN_DIR:
+                    page.screenshot(path=os.path.join(RUN_DIR, "self_tile.png"))
         print(f"  Self tile: {result}")
     except Exception as e:
         print(f"  WARNING: could not minimise the bot's own tile ({e})")
 
 
+# The toolbar's "More options" — not a tile's. Several buttons can carry the
+# exact label (a presentation's tile has one too), and the first live guest
+# join clicked a tile's, whose menu has no "Adjust view". The toolbar sits at
+# the bottom of the window, so take the lowest.
+_OPEN_TOOLBAR_MORE_JS = r"""() => {
+  const b = Array.from(document.querySelectorAll('button'))
+    .filter(b => /^(ตัวเลือกเพิ่มเติม|More options)$/.test((b.getAttribute('aria-label') || '').trim()))
+    .filter(b => b.getBoundingClientRect().width > 0)
+    .sort((a, c) => c.getBoundingClientRect().top - a.getBoundingClientRect().top)[0];
+  if (!b) return false;
+  b.click();
+  return true;
+}"""
+_OPEN_ADJUST_VIEW_JS = r"""() => { const m = Array.from(document.querySelectorAll('[role=menuitem]'))
+    .find(e => /ปรับมุมมอง|เปลี่ยนเลย์เอาต์|Adjust view|Change layout/.test(e.innerText));
+  if (m) m.click(); return !!m; }"""
+
+
 def set_recording_layout(page):
     """Spotlight + hide tiles without video. Best-effort; never fails a call."""
     try:
-        if not click_now(page, ["ตัวเลือกเพิ่มเติม", "More options"]):
+        opened_menu = page.evaluate(_OPEN_TOOLBAR_MORE_JS)
+        if not opened_menu and not click_now(page, ["ตัวเลือกเพิ่มเติม", "More options"]):
             print("  Layout: no 'More options' button - left as is.")
             return
         time.sleep(1)
-        opened = page.evaluate(
-            "() => { const m = Array.from(document.querySelectorAll('[role=menuitem]'))"
-            ".find(e => /ปรับมุมมอง|Adjust view|Change layout/.test(e.innerText));"
-            " if (m) m.click(); return !!m; }")
-        if not opened:
+        if not page.evaluate(_OPEN_ADJUST_VIEW_JS):
+            items = page.evaluate(_MENU_ITEMS_JS) or []
             page.keyboard.press("Escape")
-            print("  Layout: no 'Adjust view' menu item - left as is.")
+            print(f"  Layout: no 'Adjust view' menu item - left as is. "
+                  f"Menu offered: {items!r}")
+            if RUN_DIR:
+                page.screenshot(path=os.path.join(RUN_DIR, "layout_menu.png"))
             return
         time.sleep(1.5)
         result = page.evaluate(_LAYOUT_JS)
