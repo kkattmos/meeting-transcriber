@@ -310,6 +310,10 @@ nothing registers it to start at boot:
 ./webui.sh off      # stop both
 ```
 
+```bash
+./webui.sh restart  # after editing .env — a plain `pm2 restart` does not re-read it
+```
+
 `./webui.sh on` prints the address(es) to open with the token already in them
 (`http://localhost:8765/#token=…` — the part after `#` never reaches the
 server or any log; the page keeps it in that browser). It listens on

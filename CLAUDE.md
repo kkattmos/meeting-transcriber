@@ -141,9 +141,16 @@ desktop. The decisions, each asked and answered:
 - **pm2, off at boot.** `ecosystem.config.js` defines `meeting-bot-web`
   (`web/serve.sh` → `trigger_server.py`, loading `.env`) and
   `meeting-bot-resume` (`pipeline.sh --resume-all`, `cron_restart */15`,
-  replacing the systemd timer). `./webui.sh on|off|status|url|logs`. Nothing
-  calls `pm2 startup` or `pm2 save`; don't add either. The three systemd unit
-  files are gone from this branch (they are on `debian13-in-proxmox`).
+  replacing the systemd timer). `./webui.sh on|off|restart|status|url|logs`.
+  Nothing calls `pm2 startup` or `pm2 save`; don't add either. The three
+  systemd unit files are gone from this branch (they are on
+  `debian13-in-proxmox`). **`webui.sh` starts pm2 with the `.env` keys
+  unset** (`start_clean`, delete-then-start): pm2 replays the environment of
+  the `pm2 start` call on every restart, and `serve.sh` fills in only unset
+  variables, so a snapshot taken after sourcing `.env` froze it — found
+  2026-09-29 when the UI kept `PDF_FONT_SIZE=8` after `.env` said 9.5, and
+  every run it started inherited that. It also keeps the API keys out of
+  pm2's process list. An `.env` edit now takes effect on any restart.
 - **The web UI listens on localhost + Tailscale**: `MEETING_BOT_BIND` is a
   comma list and the word `tailscale` resolves to `tailscale ip -4` at start
   (skipped with a warning when Tailscale is down); one `ThreadingHTTPServer`
@@ -2497,7 +2504,7 @@ own flags, which is everything about stage 1 except the call itself.
 ├── verify_e2e.sh                 <- live checks: preflight + mp4/YouTube/Kaltura/Meet/Zoom
 ├── trigger_server.py             <- web UI + /trigger + /api/* (stdlib only)
 ├── ecosystem.config.js           <- pm2: meeting-bot-web + meeting-bot-resume (every 15 min)
-├── webui.sh                      <- ./webui.sh on|off|status|url|logs (nothing at boot)
+├── webui.sh                      <- ./webui.sh on|off|restart|status|url|logs (nothing at boot)
 ├── test_trigger_server.py
 ├── web/
 │   ├── index.html                <- the UI page (no external scripts)

@@ -3,6 +3,7 @@
 #
 #   ./webui.sh on        start meeting-bot-web + meeting-bot-resume
 #   ./webui.sh off       stop them and remove them from pm2
+#   ./webui.sh restart   off + on — use this after editing .env (see below)
 #   ./webui.sh status    pm2's view of both
 #   ./webui.sh url       the address(es) to open, with the token filled in
 #   ./webui.sh logs      follow the web UI's log
@@ -23,6 +24,29 @@ if [ -z "$PM2" ]; then
   exit 1
 fi
 APPS=(meeting-bot-web meeting-bot-resume)
+
+# pm2 snapshots the environment of the `pm2 start` call and replays it on
+# every restart. This script has sourced .env (for the token and the bind
+# address), so a plain start would freeze every .env value into pm2 — and
+# web/serve.sh, which fills in only variables that are unset, would never see
+# a later .env edit, not even after `pm2 restart`. Found 2026-09-29: the web
+# UI kept PDF_FONT_SIZE=8 and SUMMARY_PROMPT=lecture-claude after .env said
+# otherwise, and every run it started inherited them. So pm2 is started with
+# the .env keys removed, and serve.sh reads .env afresh on every (re)start.
+# An app pm2 already knows keeps its old snapshot, hence delete-then-start.
+start_clean() {
+  local key
+  for app in "${APPS[@]}"; do "$PM2" delete "$app" >/dev/null 2>&1 || true; done
+  (
+    if [ -f "$SCRIPT_DIR/.env" ]; then
+      while IFS= read -r key; do
+        unset "$key" 2>/dev/null || true
+      done < <(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' \
+                 "$SCRIPT_DIR/.env")
+    fi
+    exec "$PM2" start "$SCRIPT_DIR/ecosystem.config.js" >/dev/null
+  )
+}
 
 print_urls() {
   local port="${MEETING_BOT_PORT:-8765}" addr host
@@ -46,7 +70,7 @@ case "${1:-status}" in
       echo "ERROR: MEETING_BOT_TOKEN is not set in .env (./setup.sh generates one)." >&2
       exit 1
     fi
-    "$PM2" start "$SCRIPT_DIR/ecosystem.config.js" >/dev/null
+    start_clean
     "$PM2" ls
     echo ""
     echo "Web UI is on. Open:"
@@ -57,9 +81,10 @@ case "${1:-status}" in
     for app in "${APPS[@]}"; do "$PM2" delete "$app" >/dev/null 2>&1 || true; done
     echo "Web UI and resume loop are off."
     ;;
+  restart) exec "$0" on ;;
   status) "$PM2" ls ;;
   url) print_urls ;;
   logs) exec "$PM2" logs meeting-bot-web ;;
-  -h|--help) sed -n '2,13p' "$0" ;;
-  *) echo "Usage: $0 on|off|status|url|logs" >&2; exit 1 ;;
+  -h|--help) sed -n '2,14p' "$0" ;;
+  *) echo "Usage: $0 on|off|restart|status|url|logs" >&2; exit 1 ;;
 esac
