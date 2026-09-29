@@ -285,12 +285,20 @@ else
     # AssemblyAI bills the upload and answers "no usable transcript", and the
     # resume job would pay again every 15 minutes. lib/audiocheck.py measures
     # how much of the file has sound (not the loudest point — Meet's join
-    # chimes peak at -14 dB in an otherwise silent call). Exit 2 = could not
-    # analyse: left for AssemblyAI to judge.
+    # chimes peak at -14 dB in an otherwise silent call). Exit 2 = ffmpeg can't
+    # read the file at all — an unfinalised MP4 (no moov) — which AssemblyAI
+    # can't either: it was uploaded anyway once and answered "Transcoding
+    # failed". Every format this branch accepts is one ffmpeg reads.
     AUDIO_RC=0
     AUDIO_REPORT="$("$PYTHON_BIN" "$ROOT_DIR/lib/audiocheck.py" "$AUDIO_FILE" \
                      --min-sound-seconds "${TRANSCRIBE_MIN_SOUND_SECONDS:-30}")" || AUDIO_RC=$?
     echo "==> Audio check: $AUDIO_REPORT"
+    if [ "$AUDIO_RC" -eq 2 ]; then
+      echo "ERROR: $MEDIA_INPUT can't be read (an unfinished or corrupt file) -"
+      echo "       not sending it to AssemblyAI. Check it with: ffprobe \"$MEDIA_INPUT\""
+      rm -rf "$WORK_DIR"
+      exit 1
+    fi
     if [ "$AUDIO_RC" -eq 3 ]; then
       echo "ERROR: the audio is effectively silent - not sending it to AssemblyAI"
       echo "       (it would bill the upload and return nothing)."

@@ -287,6 +287,33 @@ Settled with the operator after reading a real recording:
 - **A live profile lock is refused, never deleted** (`browser.ProfileInUse`):
   `clear_stale_locks` deleted the lock of an open sign-in window.
 
+### Stopping a recording without breaking it (2026-09-29)
+
+Two recordings were unplayable: header `mdat` size 0, no `moov`, and in the
+ffmpeg log "Error closing file: Immediate exit requested" right before
+"Exiting normally, received signal 2". ffmpeg aborts its remaining writes on a
+SECOND SIGINT while closing the file, and both runs got two: one from
+kill_meeting.sh's escalation, one from record_screen.sh. Now:
+
+- record_screen.sh `stop_ffmpeg`: exactly one SIGINT, then a loop until
+  ffmpeg has really exited (a trapped TERM interrupts `wait`), and it runs
+  before the sink and display are torn down. The finished MP4 is checked with
+  ffprobe; an unreadable one fails the record stage there, with the reason.
+- kill_meeting.sh's escalation TERMs only the browser driver, gives it 15s,
+  then waits up to KILL_FINALISE_SECONDS (120) for record_screen.sh to
+  finalise; it signals ffmpeg itself only when record_screen.sh is gone, and
+  never SIGKILLs it. Verified live on SeaDrive with KILL_GRACE_SECONDS=1.
+- capture.py turns SIGTERM into SystemExit, so `open_page()` quits geckodriver
+  and Firefox. The old SIGKILL orphaned both; the orphan's zombie Firefox kept
+  the profile lock "alive" and blocked the next recording. `_pid_alive`
+  treats a zombie as dead.
+- transcribe.sh refuses a file lib/audiocheck.py can't read (exit 2) instead
+  of uploading it.
+- The bot also ends a recording when it is no longer in the call (in-call
+  controls gone on two polls): it was once found back on the pre-join page,
+  filming an empty lobby, cause unknown. Its leave() skips clicking when
+  there is no call, which used to outlast kill_meeting.sh's grace period.
+
 ### The bot account (`BOT_GOOGLE_ACCOUNT`)
 
 The operator's words: "use the account … only (do not hardcode the email)".
@@ -1926,6 +1953,8 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **The bot's mic and camera stay blocked at the browser**, and mute_av
   never clicks an "already off" label. See "What the recording shows".
 - **Silence is measured by duration, not peak**, before any AssemblyAI upload.
+- **ffmpeg gets exactly one SIGINT, and is never SIGKILLed.** A second one
+  while it closes the file leaves an unplayable MP4.
 - **No awk (mawk) in a pipe that must be live.** It holds lines in its
   input buffer; the meeting link never reached the web UI. Use a bash
   `while read` loop.

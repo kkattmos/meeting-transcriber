@@ -145,13 +145,35 @@ audio_watch() {
   done
 }
 
+# Stop ffmpeg with exactly ONE SIGINT and wait until it has really exited.
+# A second SIGINT while ffmpeg is closing the file makes it abandon the final
+# writes — "Error closing file: Immediate exit requested" in its log, a file
+# with an mdat of size 0 and no moov, unplayable — while it still prints
+# "Exiting normally". Two recordings were lost that way on 2026-09-29, when
+# kill_meeting.sh signalled ffmpeg and this script signalled it again. The
+# wait is a loop because a trapped signal (TERM from kill_meeting.sh)
+# interrupts `wait` without ffmpeg having finished.
+FFMPEG_SIGNALLED=0
+stop_ffmpeg() {
+  [ -n "$FFMPEG_PID" ] || return 0
+  if [ "$FFMPEG_SIGNALLED" -eq 0 ]; then
+    kill -INT "$FFMPEG_PID" 2>/dev/null || true
+    FFMPEG_SIGNALLED=1
+  fi
+  while kill -0 "$FFMPEG_PID" 2>/dev/null; do
+    wait "$FFMPEG_PID" 2>/dev/null || sleep 0.5
+  done
+  FFMPEG_PID=""
+}
+
 cleanup() {
   # `|| true` on every line — see lib/xsession.sh's note: a failing command in
   # an EXIT trap under errexit becomes the script's exit status, which once
   # made every successful recording look like a failed `record` stage.
   [ -n "$AUDIO_WATCH_PID" ] && kill "$AUDIO_WATCH_PID" 2>/dev/null || true
-  [ -n "$FFMPEG_PID" ] && kill -INT "$FFMPEG_PID" 2>/dev/null || true
   [ -n "$JOIN_PID" ] && kill "$JOIN_PID" 2>/dev/null || true
+  # Before the sink and the display go away: ffmpeg is still reading them.
+  stop_ffmpeg || true
   xsession_audio_stop "$SINK_NAME" || true
   xsession_audio_stop "$MIC_NAME" || true
   xsession_stop_xvfb || true
@@ -249,19 +271,30 @@ audio_watch &
 AUDIO_WATCH_PID=$!
 
 echo "==> Recording. Waiting for the meeting to end..."
-wait "$JOIN_PID" || true
+# A loop, not one `wait`: a trapped TERM (kill_meeting.sh) interrupts `wait`
+# while the bot is still leaving the call.
+while kill -0 "$JOIN_PID" 2>/dev/null; do
+  wait "$JOIN_PID" 2>/dev/null || true
+done
 
 echo "==> Meeting ended (or the join script exited). Stopping the recording."
 # -INT lets ffmpeg finalize the MP4 cleanly; -KILL would truncate it.
 kill "$AUDIO_WATCH_PID" 2>/dev/null || true
 AUDIO_WATCH_PID=""
-kill -INT "$FFMPEG_PID" 2>/dev/null || true
-wait "$FFMPEG_PID" 2>/dev/null || true
-FFMPEG_PID=""
+stop_ffmpeg
 
 if [ ! -s "$MP4_FILE" ]; then
   echo "ERROR: MP4 is empty or missing — the recording failed." >&2
   echo "  See $FFMPEG_LOG for details." >&2
+  exit 1
+fi
+# A file with bytes in it is not necessarily a playable one (see stop_ffmpeg).
+# Say so here, where the cause is known, rather than let transcription upload
+# it and get "Transcoding failed" back.
+if ! ffprobe -v error -show_entries format=duration -of csv=p=0 "$MP4_FILE" >/dev/null 2>&1; then
+  echo "ERROR: the recording was not finalised and can't be read: $MP4_FILE" >&2
+  grep -a "Error closing file" "$FFMPEG_LOG" >&2 || true
+  echo "  See $FFMPEG_LOG." >&2
   exit 1
 fi
 

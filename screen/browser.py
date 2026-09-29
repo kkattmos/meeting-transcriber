@@ -165,12 +165,20 @@ def _lock_owner_pid(path):
 
 
 def _pid_alive(pid):
+    """True for a running process. A zombie (exited, not yet reaped by an
+    orphaned parent) counts as dead: kill -0 succeeds on it, and that made a
+    dead recording's Firefox block the next one (2026-09-29)."""
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            state = fh.read().rsplit(")", 1)[1].split()[0]
+        return state != "Z"
+    except (OSError, IndexError):
         return True
 
 

@@ -53,6 +53,7 @@ class HostedMeetingTest(unittest.TestCase):
         self.ended = []
         self.left = []
         self.admit_calls = 0
+        self.in_call = [True]     # is_admitted() per call; last one repeats
         self._saved = {}
         patches = {
             ("time", "time"): self.clock.time,
@@ -64,6 +65,7 @@ class HostedMeetingTest(unittest.TestCase):
             ("capture", "block_screen_share_dialog"): lambda page: False,
             ("capture", "stop_unwanted_presenting"): lambda page: False,
             ("capture", "kill_requested"): lambda: False,
+            ("capture", "is_admitted"): lambda page: self.in_call.pop(0) if len(self.in_call) > 1 else self.in_call[0],
         }
         for (mod, name), value in patches.items():
             target = capture.time if mod == "time" else capture
@@ -143,6 +145,27 @@ class HostedMeetingTest(unittest.TestCase):
         self.assertEqual(len(self.left), 1)
         self.assertLess(self.elapsed_min(self.left[0]), 6)
         self.assertEqual(self.admit_calls, 0, "a guest never clicks Admit")
+
+    def test_dropping_out_of_the_call_ends_the_recording(self):
+        # Live 2026-09-29: the bot fell back to the pre-join page and the
+        # recorder filmed an empty lobby. Two polls without the in-call
+        # controls end it — with nothing to click, since there is no call.
+        self.counts = [3]
+        # is_admitted is asked on each poll, and once more by leave().
+        self.in_call = [True, True, False, False]
+        capture.wait_until_meeting_ends(FakePage(), host=True)
+        self.assertEqual(self.ended, [], "no Leave/End clicks outside a call")
+        self.assertLess(self.elapsed_min(self.clock.now), 2)
+
+    def test_a_single_missed_reading_is_not_the_end(self):
+        # One poll without the controls (a re-render) and it's back: the call
+        # goes on until the hard cap, which then ends it the normal way.
+        self.counts = [3]
+        self.in_call = [True, False, True]
+        capture.MAX_MEETING_SECONDS = 5 * 60
+        capture.wait_until_meeting_ends(FakePage(), host=True)
+        self.assertEqual(len(self.ended), 1, "ended by the cap, not by one bad poll")
+        self.assertGreaterEqual(self.elapsed_min(self.ended[0]), 5)
 
 
 if __name__ == "__main__":

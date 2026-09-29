@@ -936,7 +936,17 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
     everyone instead of just leaving it.
     """
     print("In meeting. Monitoring participant count and end state...")
-    leave = host_end_call if host else leave_meeting
+    _leave = host_end_call if host else leave_meeting
+
+    def leave(page):
+        # Out of the call already (the lobby page, "you left the meeting"):
+        # there is nothing to click, and hunting for Leave buttons that don't
+        # exist took longer than kill_meeting.sh's grace period (2026-09-29).
+        if is_admitted(page):
+            _leave(page)
+        else:
+            print("Not in the call any more - nothing to leave.")
+    out_of_call = 0
     peak_count = None
     low_streak = 0
     idle_since_ts = None    # first poll at which count was in (1, 2)
@@ -982,6 +992,24 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
                 except Exception as e:
                     print(f"Clean leave failed ({e}) - exiting anyway.")
                 return
+
+            # Dropped out of the call without the page saying "ended": seen
+            # live 2026-09-29, the bot back on the pre-join page ("พร้อมจะ
+            # เข้าร่วมไหม") while the recorder kept filming an empty lobby for
+            # what would have been hours. Two polls in a row without the
+            # in-call controls is the end of this recording.
+            if is_admitted(page):
+                out_of_call = 0
+            else:
+                out_of_call += 1
+                if out_of_call >= 2:
+                    print("No longer in the call (its controls are gone) - "
+                          "ending the recording.")
+                    try:
+                        page.screenshot(path=os.path.join(SCREENSHOT_DIR, "left_call.png"))
+                    except Exception:
+                        pass
+                    return
 
             # Anything Meet has put over the call since the last poll (a
             # notice, the People panel) comes off the recording.
@@ -1093,7 +1121,18 @@ def ensure_bot_account(page, expected):
     return False
 
 
+def _exit_on_term(signum, frame):
+    # kill_meeting.sh / record_screen.sh stop this process with SIGTERM.
+    # Unhandled, SIGTERM ends Python on the spot: browser.open_page()'s
+    # cleanup never runs and geckodriver + Firefox are orphaned, still holding
+    # the profile (two were found on 2026-09-29, and the next recording
+    # couldn't start). As SystemExit, the `with` blocks unwind and quit them.
+    raise SystemExit(128 + signum)
+
+
 def main():
+    import signal
+    signal.signal(signal.SIGTERM, _exit_on_term)
     if len(sys.argv) < 2:
         print("Usage: capture.py <meeting_url> [display_name]")
         sys.exit(1)
