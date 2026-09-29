@@ -775,6 +775,12 @@ _SELF_TILE_DIAGNOSED = False
 _SELF_MENU_MAX_PROBES = 4
 
 
+def self_tile_retry_now():
+    """Let the next poll try to minimise the self view straight away."""
+    global _SELF_TILE_NEXT_TRY
+    _SELF_TILE_NEXT_TRY = 0.0
+
+
 def _click_button_with_label_js(label):
     return ("() => { const b = Array.from(document.querySelectorAll('button'))"
             f".find(b => b.getAttribute('aria-label') === {json.dumps(label)});"
@@ -1076,8 +1082,17 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
     someone_joined = False  # host mode: has anyone but the bot been in?
     count_ever_read = False
     warned_unreadable = False
+    # The count at the previous poll. While the bot is alone there is no
+    # floating self view to minimise — its own tile IS the stage, and that
+    # menu has no Minimize — so the attempt waits for company. Mostly a
+    # hosted call's first minutes: trying then cost a failed menu in the
+    # recording and a five-minute back-off, which left the first guest
+    # looking at the bot's full-size tile.
+    last_count = None
+    polls = 0
 
     while True:
+        polls += 1
         try:
             if host:
                 _sleep_hosting(page, poll_seconds)
@@ -1137,7 +1152,11 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
             # notice, the People panel) comes off the recording.
             if "meet.google.com" in (getattr(page, "url", "") or ""):
                 dismiss_notices(page)
-                minimize_self_tile(page)
+                # An unreadable count (Meet renamed the chip) must not stop
+                # it for good: after a few polls it tries regardless.
+                if (last_count is not None and last_count >= 2) or \
+                        (last_count is None and polls > 3):
+                    minimize_self_tile(page)
 
             # Screen-share defenses (Layers 2 and 3). Layer 1 is the Chrome
             # flag set at launch; these two are the runtime catch-nets.
@@ -1145,6 +1164,12 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
             stop_unwanted_presenting(page)
 
             count = get_participant_count(page)
+            if count is not None:
+                if count >= 2 and (last_count is not None and last_count < 2):
+                    # Someone just arrived and the floating self view with
+                    # them: minimise it at the next poll, not after a back-off.
+                    self_tile_retry_now()
+                last_count = count
             if host:
                 if count is not None:
                     count_ever_read = True

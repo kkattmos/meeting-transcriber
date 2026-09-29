@@ -289,7 +289,17 @@ Settled with the operator after reading a real recording:
   remembering the one whose menu offered Minimize so later tries open only
   it. Both log the menu items they saw and save `layout_menu.png` /
   `self_tile.png` in the run dir when they fail. Verified in headless Firefox
-  on a mock of that DOM; not yet on a live guest join.
+  on a mock of that DOM; not yet on a live guest join. The Minimize item is
+  matched on its aria-label or its text, with the icon ligature word
+  ("close_fullscreen") dropped — the menu, from the operator's screenshot:
+  "แสดงในเลย์เอาต์แบบเรียงชิดกัน", "ย่อเล็กสุด", "ปักหมุดไว้ในหน้าจอ",
+  "แสดงวิดีโอแบบเต็มของฉันให้ผู้อื่นเห็น".
+- **The self view is only minimised with company** (`last_count` in
+  `wait_until_meeting_ends`). Alone — a hosted call's first minutes — the
+  bot's tile is the stage and its menu has no Minimize; trying put a menu in
+  the recording and a 5-minute back-off in front of the first guest. Now it
+  waits for a count ≥ 2 (or, if the count is unreadable, tries from the 4th
+  poll on), and a count rising to 2 lifts the back-off (`self_tile_retry_now`).
 - **Notices and the People panel are closed every poll** (`dismiss_notices`,
   exact labels "รับทราบ"/"Got it"/"ปิด"/"Close"; `click_now` never waits, so
   it is cheap to repeat). Admitting someone opens the panel; it is closed
@@ -2426,7 +2436,7 @@ without API keys or network, against temp directories
 | `summarize/test_pdf_units.py` | crop geometry, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), real PDF render | 103 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `transcribe/test_yt_autocaptions.py` | the yt-dlp fallback: track choice (never a translation), json3, the CLI against a stub yt-dlp | 11 |
-| `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own | 18 |
+| `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
 | `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, run/log path refusal, summary language/font/instructions, the options | 9 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources) | 383 |

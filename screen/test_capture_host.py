@@ -97,6 +97,30 @@ class HostedMeetingTest(unittest.TestCase):
     def elapsed_min(self, ts):
         return (ts - 1_000_000.0) / 60
 
+    def test_the_self_view_is_minimised_only_with_company(self):
+        # Alone, the bot's tile is the stage and has no Minimize; trying
+        # then only put a menu in the recording and backed off five minutes.
+        calls = []
+
+        class MeetPage(FakePage):
+            url = "https://meet.google.com/abc-defg-hij"
+
+        saved = (capture.minimize_self_tile, capture.dismiss_notices)
+        capture.minimize_self_tile = lambda page: calls.append(self.clock.now)
+        capture.dismiss_notices = lambda page: []
+        capture._SELF_TILE_NEXT_TRY = 999e12
+        try:
+            self.counts = [1] * 10 + [2] * 10 + [1]
+            capture.wait_until_meeting_ends(MeetPage(), host=True)
+        finally:
+            capture.minimize_self_tile, capture.dismiss_notices = saved
+        self.assertTrue(calls, "never tried once someone was there")
+        first_guest_poll = 1_000_000.0 + 10 * capture.POLL_SECONDS
+        self.assertGreater(calls[0], first_guest_poll - 1,
+                           "tried while the bot was alone")
+        # And the back-off was lifted the moment the guest arrived.
+        self.assertEqual(capture._SELF_TILE_NEXT_TRY, 0.0)
+
     def test_recognises_every_spelling_of_meet_new(self):
         for url in ("meet.new", "https://meet.new", "http://meet.new/", "MEET.NEW"):
             self.assertTrue(capture.is_new_meet(url), url)
