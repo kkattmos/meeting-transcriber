@@ -736,8 +736,14 @@ first participant, then end the call for everyone when it empties**.
 - Admit buttons are matched with `exact=True` — "Admit" would match anything
   containing the word, and `click_first_match` gained `exact=` because the
   Thai "ปิด" (Close, for the "meeting's ready" card) is a prefix of "ปิดกล้อง"
-  (turn off camera). **The Thai admit / end-for-everyone labels are unverified
-  against a live call**; they are the first suspects if knockers wait.
+  (turn off camera). **The first live hosted call (2026-09-29) left its guest waiting**: Meet
+  shows the host a green chip labelled with the count, "ยอมรับผู้เข้าร่วม 1
+  คน" ("Admit 1 participant"), which no exact label could match. The chip is
+  now matched as a substring (`HOST_WAITING_CHIP_LABELS`) and clicked to open
+  the panel, then the exact "ยอมรับ"/"Admit" inside it. If that panel's
+  button isn't found, `_log_admit_candidates` logs every admit-looking button
+  name once and saves `runs/<id>/host_admit.png`. The end-for-everyone Thai
+  labels are still unverified.
 
 ### Stage 2 — Transcribe (`transcribe/transcribe.sh`)
 

@@ -292,6 +292,17 @@ HOST_ADMIT_LABELS = [
 # Several people knocking at once collapse into "View all"; the Admit all
 # button is inside the panel that opens.
 HOST_VIEW_ALL_LABELS = ["View all", "ดูทั้งหมด"]
+# The green chip Meet shows the host at the top right while someone waits.
+# Its label carries the count ("ยอมรับผู้เข้าร่วม 1 คน" — "Admit 1
+# participant", verified live 2026-09-29), so it can only be matched as a
+# substring; clicking it opens the panel with the per-person Admit buttons.
+# Missing this chip is why the first live hosted call left its guest waiting.
+HOST_WAITING_CHIP_LABELS = [
+    "ยอมรับผู้เข้าร่วม", "Admit 1", "Admit 2", "Admit 3", "Admit guest",
+    "Admit people", "people waiting", "someone wants to join",
+]
+# Notices that sit over the call and should just be acknowledged.
+HOST_DISMISS_LABELS = ["Got it", "Dismiss", "รับทราบ"]
 HOST_END_FOR_ALL_LABELS = [
     "End the call for everyone", "End call for everyone", "End call for all",
     "สิ้นสุดการโทรสำหรับทุกคน", "วางสายสำหรับทุกคน", "ปิดการโทรสำหรับทุกคน",
@@ -363,6 +374,31 @@ def host_dismiss_ready_dialog(page):
     except Exception:
         pass
     click_first_match(page, ["Close", "ปิด"], timeout=1500, exact=True)
+    # "Use Meet safely" and similar notices ("รับทราบ" = Got it).
+    click_first_match(page, HOST_DISMISS_LABELS, timeout=1500, exact=True)
+
+
+_ADMIT_DIAGNOSED = False
+
+
+def _log_admit_candidates(page):
+    """Once per call: name every visible button that looks like an admit
+    control, and save a screenshot — the data needed when Meet renames one."""
+    global _ADMIT_DIAGNOSED
+    if _ADMIT_DIAGNOSED:
+        return
+    _ADMIT_DIAGNOSED = True
+    try:
+        names = page.evaluate(
+            "() => Array.from(document.querySelectorAll('button,[role=button]'))"
+            ".filter(b => b.getBoundingClientRect().width > 0)"
+            ".map(b => (b.getAttribute('aria-label') || b.innerText || '').replace(/\\s+/g, ' ').trim())"
+            ".filter(n => /admit|ยอมรับ|อนุญาต|รับเข้า|wait|รอ/i.test(n))") or []
+        print(f"  Admit diagnostics: candidate buttons {names!r}")
+        if RUN_DIR:
+            page.screenshot(path=os.path.join(RUN_DIR, "host_admit.png"))
+    except Exception as e:
+        print(f"  Admit diagnostics failed ({e})")
 
 
 def host_admit_waiting(page):
@@ -378,10 +414,27 @@ def host_admit_waiting(page):
                 continue
         return None
 
+    def click_containing(labels):
+        for label in labels:
+            try:
+                btn = page.get_by_role("button", name=label, exact=False).first
+                if btn.is_visible():
+                    btn.click()
+                    return label
+            except Exception:
+                continue
+        return None
+
     clicked = click_visible(HOST_ADMIT_LABELS)
-    if not clicked and click_visible(HOST_VIEW_ALL_LABELS):
-        time.sleep(1)
-        clicked = click_visible(HOST_ADMIT_LABELS)
+    if not clicked:
+        opener = (click_visible(HOST_VIEW_ALL_LABELS)
+                  or click_containing(HOST_WAITING_CHIP_LABELS))
+        if opener:
+            print(f"Someone is waiting — opened the admit panel ('{opener}').")
+            time.sleep(1.5)
+            clicked = click_visible(HOST_ADMIT_LABELS)
+            if not clicked:
+                _log_admit_candidates(page)
     if not clicked:
         return False
     print(f"Admitted waiting participant(s) ('{clicked}').")
