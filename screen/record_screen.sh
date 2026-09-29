@@ -105,11 +105,51 @@ MIC_NAME="${SINK_NAME}_mic"
 KILLED=0
 FFMPEG_PID=""
 JOIN_PID=""
+AUDIO_WATCH_PID=""
+AUDIO_LEVEL_FILE="$MEETING_BOT_RUN_DIR/audio_level"
+SILENCE_WARN_SECONDS="${AUDIO_SILENCE_WARN_SECONDS:-120}"
+
+# While recording: sample 3s of the meeting audio every 10s. A presentation
+# shared without its tab audio records nine minutes of digital zero and
+# nothing says so until transcription fails (2026-09-29) — this says so while
+# the call is still on, in the stage log and in runs/<id>/audio_level
+# ("<epoch> <peak dB> <seconds silent>"), which the web UI shows.
+audio_watch() {
+  local peak now silent_since="" warned=0 heard=0 silent_for
+  while [ -n "$FFMPEG_PID" ] && kill -0 "$FFMPEG_PID" 2>/dev/null; do
+    peak="$(timeout 8 ffmpeg -hide_banner -nostats -f pulse -i "${SINK_NAME}.monitor" \
+              -t 3 -af volumedetect -f null - 2>&1 \
+            | sed -n 's/.*max_volume: \(-\{0,1\}[0-9.]*\) dB.*/\1/p' | tail -n 1)" || true
+    now="$(date +%s)"
+    if [ -n "$peak" ]; then
+      # Below -60 dB is silence (Meet's own silence is -91, digital zero).
+      if [ "${peak%%.*}" -lt -60 ] 2>/dev/null; then
+        [ -n "$silent_since" ] || silent_since="$now"
+        silent_for=$(( now - silent_since ))
+        if [ "$warned" -eq 0 ] && [ "$silent_for" -ge "$SILENCE_WARN_SECONDS" ]; then
+          echo "WARNING: the meeting audio has been silent for $(( silent_for / 60 )) min."
+          echo "         Presenting? Share a Chrome/Edge TAB with 'Also share tab audio'."
+          warned=1
+        fi
+      else
+        silent_for=0
+        if [ "$heard" -eq 0 ] || [ "$warned" -eq 1 ]; then
+          echo "==> Hearing meeting audio (peak ${peak} dB)."
+        fi
+        heard=1; warned=0; silent_since=""
+      fi
+      printf '%s %s %s\n' "$now" "$peak" "$silent_for" > "$AUDIO_LEVEL_FILE.tmp" \
+        && mv -f "$AUDIO_LEVEL_FILE.tmp" "$AUDIO_LEVEL_FILE"
+    fi
+    sleep 10
+  done
+}
 
 cleanup() {
   # `|| true` on every line — see lib/xsession.sh's note: a failing command in
   # an EXIT trap under errexit becomes the script's exit status, which once
   # made every successful recording look like a failed `record` stage.
+  [ -n "$AUDIO_WATCH_PID" ] && kill "$AUDIO_WATCH_PID" 2>/dev/null || true
   [ -n "$FFMPEG_PID" ] && kill -INT "$FFMPEG_PID" 2>/dev/null || true
   [ -n "$JOIN_PID" ] && kill "$JOIN_PID" 2>/dev/null || true
   xsession_audio_stop "$SINK_NAME" || true
@@ -205,12 +245,16 @@ ffmpeg -y \
 FFMPEG_PID=$!
 printf 'record=%s\njoin=%s\nffmpeg=%s\ndisplay=%s\nsink=%s\n' \
   "$$" "$JOIN_PID" "$FFMPEG_PID" "$DISPLAY_NUM" "$SINK_NAME" > "$PID_FILE"
+audio_watch &
+AUDIO_WATCH_PID=$!
 
 echo "==> Recording. Waiting for the meeting to end..."
 wait "$JOIN_PID" || true
 
 echo "==> Meeting ended (or the join script exited). Stopping the recording."
 # -INT lets ffmpeg finalize the MP4 cleanly; -KILL would truncate it.
+kill "$AUDIO_WATCH_PID" 2>/dev/null || true
+AUDIO_WATCH_PID=""
 kill -INT "$FFMPEG_PID" 2>/dev/null || true
 wait "$FFMPEG_PID" 2>/dev/null || true
 FFMPEG_PID=""

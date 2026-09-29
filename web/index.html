@@ -397,7 +397,13 @@
         const tr = document.createElement("tr"); tr.className = "clickable";
         const a = document.createElement("td");
         a.innerHTML = "<div></div><div class='hint'></div>";
-        a.firstChild.textContent = run.run_id + (run.active ? "  ● running" : "") + (run.paused ? "  ⏸ paused" : "");
+        let audio = "";
+        if (run.active && run.audio && Date.now() / 1000 - run.audio.at < 60) {
+          audio = run.audio.silent_for >= 60
+            ? "  🔇 no meeting audio for " + Math.floor(run.audio.silent_for / 60) + " min"
+            : (run.audio.silent_for > 0 ? "  🔈 quiet" : "  🔊 hearing audio (" + Math.round(run.audio.peak_db) + " dB)");
+        }
+        a.firstChild.textContent = run.run_id + (run.active ? "  ● running" : "") + (run.paused ? "  ⏸ paused" : "") + audio;
         if (run.meet_url && MEET_RE.test(run.meet_url)) {
           a.lastChild.appendChild(meetAnchor(run.meet_url));
           if (run.active) {

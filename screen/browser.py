@@ -53,10 +53,14 @@ _W, _H = (int(v) for v in GEOMETRY.split("x", 1))
 # --window-position=0,0 stops Chrome placing the window at (10,10), which left
 # a 10px black band on every recording (found by verify_e2e.sh --browser-smoke).
 #
-# Media devices. On the Proxmox VM there were none, so auto-accepting the
-# camera/mic prompt was harmless. On a PC it would hand Meet the operator's
-# real webcam and microphone. So the browser gets FAKE devices fed from files
-# that are black and silent (make_blank_media), and never sees the real ones.
+# Media devices: BLOCKED, both of them (operator's decision, 2026-09-29). The
+# bot only listens and watches; it never needs a microphone or a camera, and
+# on a PC the real ones must never reach Meet. A blocked device can't be
+# turned on by a mis-aimed mute click either — which happened live, when the
+# "already muted?" check clicked "turn mic ON". Chrome denies every prompt
+# (--deny-permission-prompts, and no permissions granted); Firefox denies by
+# default without asking. Listening (audio OUTPUT to the per-run sink) is
+# unaffected.
 #
 # --disable-features=ScreenCapture is layer 1 of the screen-share defense;
 # layers 2 and 3 are in capture.wait_until_meeting_ends.
@@ -64,8 +68,7 @@ CHROME_ARGS = [
     "--kiosk",
     f"--window-size={_W},{_H}",
     "--window-position=0,0",
-    "--use-fake-ui-for-media-stream",
-    "--use-fake-device-for-media-stream",
+    "--deny-permission-prompts",
     "--disable-features=ScreenCapture",
 ]
 
@@ -75,12 +78,13 @@ FIREFOX_PREFS = {
     # Meet's UI in Thai, so Thai participant names render — the Chrome path's
     # locale="th-TH". capture.py carries English + Thai labels either way.
     "intl.accept_languages": "th-TH, th, en-US, en",
-    # Media: no permission prompt for the microphone (a prompt in a kiosk
-    # window would be recorded and never answered), camera refused outright.
-    # The microphone the browser opens is this run's silent source
-    # (PULSE_SOURCE, set by record_screen.sh), never the PC's real one.
-    "media.navigator.permission.disabled": True,
-    "permissions.default.microphone": 1,
+    # Media: microphone and camera both denied without a prompt (a prompt in
+    # a kiosk window would be recorded and never answered). NOT
+    # media.navigator.permission.disabled — that one skips the check and
+    # GRANTS access. record_screen.sh still points PULSE_SOURCE at a silent
+    # sink as a second line of defence.
+    "media.navigator.permission.disabled": False,
+    "permissions.default.microphone": 2,
     "permissions.default.camera": 2,
     "media.navigator.video.enabled": False,
     # Layer 1 of the screen-share defense.
@@ -103,6 +107,12 @@ FIREFOX_PREFS = {
     "datareporting.policy.dataSubmissionEnabled": False,
     "toolkit.telemetry.reportingpolicy.firstRun": False,
     "signon.rememberSignons": False,
+    # Ignore per-site zoom saved in the profile. The sign-in window is an
+    # ordinary browser, and a Ctrl+- there was remembered for meet.google.com
+    # at 50% (found 2026-09-29: devicePixelRatio 0.5, a 3840x2160 CSS
+    # viewport on the 1920x1080 head) — every recording would have shown
+    # Meet at half size.
+    "browser.zoom.siteSpecific": False,
     # Raw text for JSON responses — the account check reads ListAccounts'
     # body, and the JSON viewer would hand it a UI instead.
     "devtools.jsonview.enabled": False,
@@ -139,14 +149,48 @@ def browser_binary(kind=None):
             or shutil.which("firefox"))
 
 
+class ProfileInUse(RuntimeError):
+    """The profile's lock names a browser that is still running."""
+
+
+def _lock_owner_pid(path):
+    """The pid a browser lock names, or None. Firefox: `lock -> host:+PID`;
+    Chrome: `SingletonLock -> host-PID`."""
+    try:
+        target = os.readlink(path)
+    except OSError:
+        return None
+    m = re.search(r"[+-](\d+)$", target)
+    return int(m.group(1)) if m else None
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def clear_stale_locks(kind, profile):
-    """Remove a lock left by a killed browser.
+    """Remove a lock left by a killed browser — and ONLY a dead one.
 
     Chrome's Singleton* and Firefox's lock/.parentlock encode the owner; a run
     killed before its cleanup leaves one behind and the next launch refuses
-    ("profile appears to be in use"). Called only by a process that is about
-    to be the profile's sole user.
+    ("profile appears to be in use"). A lock whose pid is alive belongs to a
+    running browser — first_time_login.sh's window, or another recording —
+    and deleting it would let two browsers write one profile. That happened
+    on 2026-09-29 (the sign-in window was still open); now it is refused.
     """
+    main = "SingletonLock" if kind == "chrome" else "lock"
+    owner = _lock_owner_pid(os.path.join(profile, main))
+    if owner and owner != os.getpid() and _pid_alive(owner):
+        raise ProfileInUse(
+            f"the {kind} profile {profile} is in use by pid {owner} — close the "
+            "browser window using it (a first_time_login.sh window?) or wait for "
+            "the recording that holds it to finish")
     names = (("SingletonLock", "SingletonSocket", "SingletonCookie")
              if kind == "chrome" else ("lock", ".parentlock"))
     for name in names:
@@ -156,35 +200,6 @@ def clear_stale_locks(kind, profile):
                 os.remove(path)
             except OSError:
                 pass
-
-
-def make_blank_media():
-    """Black video + silent audio files for Chrome's fake capture devices.
-
-    Made once under MEETING_BOT_ROOT/tmp. Returns (y4m, wav), or (None, None)
-    when ffmpeg is unavailable — Chrome's built-in fake devices (a test
-    pattern and a beep) are then used, and mute_av turning them off matters.
-    """
-    d = os.path.join(_BOT_ROOT, "tmp", "fake-media")
-    y4m, wav = os.path.join(d, "black.y4m"), os.path.join(d, "silence.wav")
-    if os.path.exists(y4m) and os.path.exists(wav):
-        return y4m, wav
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        return None, None
-    import subprocess
-    os.makedirs(d, exist_ok=True)
-    try:
-        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
-                        "-i", "color=c=black:s=640x360:r=5", "-t", "1",
-                        "-pix_fmt", "yuv420p", y4m], check=True, timeout=60)
-        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
-                        "-i", "anullsrc=r=48000:cl=mono", "-t", "1", wav],
-                       check=True, timeout=60)
-    except Exception as e:
-        print(f"WARNING: could not make blank fake-device media ({e})")
-        return None, None
-    return y4m, wav
 
 
 # --- Timeouts ----------------------------------------------------------------
@@ -452,10 +467,6 @@ def open_page(headless=False, kind=None):
 def _open_chrome(profile, headless):
     from playwright.sync_api import sync_playwright
     args = list(CHROME_ARGS)
-    y4m, wav = make_blank_media()
-    if y4m:
-        args += [f"--use-file-for-fake-video-capture={y4m}",
-                 f"--use-file-for-fake-audio-capture={wav}"]
     # Chrome refuses to start as root without --no-sandbox; as a normal user
     # (the PC setup) the sandbox stays on.
     if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -465,7 +476,7 @@ def _open_chrome(profile, headless):
         # which Google's sign-in refuses. See CLAUDE.md.
         context = p.chromium.launch_persistent_context(
             profile, headless=headless, channel="chrome", args=args,
-            permissions=["camera", "microphone"], no_viewport=True,
+            permissions=[], no_viewport=True,
             locale="th-TH")
         try:
             yield context.new_page()

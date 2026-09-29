@@ -202,8 +202,17 @@ def run_summary(run_dir, data):
             active = True
         except OSError:
             pass
+    # The recorder's live audio check (record_screen.sh audio_watch):
+    # "<epoch> <peak dB> <seconds silent>".
+    audio = None
+    try:
+        at, peak, silent = (run_dir / "audio_level").read_text().split()[:3]
+        audio = {"at": int(at), "peak_db": float(peak), "silent_for": int(silent)}
+    except (OSError, ValueError):
+        pass
     return {
         "run_id": run_dir.name,
+        "audio": audio,
         "name": data.get("name"),
         "input": data.get("input"),
         "input_type": data.get("input_type"),

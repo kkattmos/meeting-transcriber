@@ -41,11 +41,15 @@ class BrowserChoiceTest(unittest.TestCase):
             self.assertNotEqual(browser.profile_dir("chrome"),
                                 browser.profile_dir("firefox"))
 
-    def test_real_devices_are_never_offered(self):
-        # A PC has a webcam and a microphone; the recorder must not use them.
-        self.assertIn("--use-fake-device-for-media-stream", browser.CHROME_ARGS)
+    def test_mic_and_camera_are_blocked(self):
+        # The bot only listens. A PC has a webcam and a microphone; neither
+        # may ever reach Meet, and a blocked device can't be clicked on.
+        self.assertIn("--deny-permission-prompts", browser.CHROME_ARGS)
+        self.assertNotIn("--use-fake-ui-for-media-stream", browser.CHROME_ARGS)
         self.assertEqual(browser.FIREFOX_PREFS["permissions.default.camera"], 2)
-        self.assertFalse(browser.FIREFOX_PREFS["media.navigator.video.enabled"])
+        self.assertEqual(browser.FIREFOX_PREFS["permissions.default.microphone"], 2)
+        # This pref would skip the check and GRANT access.
+        self.assertFalse(browser.FIREFOX_PREFS["media.navigator.permission.disabled"])
 
     def test_chrome_sandbox_stays_on_unless_root(self):
         # --no-sandbox is added at launch for root only.
@@ -54,6 +58,14 @@ class BrowserChoiceTest(unittest.TestCase):
     def test_screen_share_layer_one_in_both(self):
         self.assertIn("--disable-features=ScreenCapture", browser.CHROME_ARGS)
         self.assertFalse(browser.FIREFOX_PREFS["media.getdisplaymedia.enabled"])
+
+    def test_a_live_lock_is_refused_not_deleted(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            os.symlink(f"127.0.1.1:+{os.getppid()}", os.path.join(d, "lock"))
+            with self.assertRaises(browser.ProfileInUse):
+                browser.clear_stale_locks("firefox", d)
+            self.assertTrue(os.path.lexists(os.path.join(d, "lock")))
 
     def test_stale_firefox_lock_is_cleared(self):
         import tempfile

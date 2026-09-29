@@ -280,6 +280,26 @@ else
         ;;
     esac
 
+    # Silence costs money and can never succeed: a presentation shared
+    # without its tab audio records digital zero (found live 2026-09-29),
+    # AssemblyAI bills the upload and answers "no usable transcript", and the
+    # resume job would pay again every 15 minutes. lib/audiocheck.py measures
+    # how much of the file has sound (not the loudest point — Meet's join
+    # chimes peak at -14 dB in an otherwise silent call). Exit 2 = could not
+    # analyse: left for AssemblyAI to judge.
+    AUDIO_RC=0
+    AUDIO_REPORT="$("$PYTHON_BIN" "$ROOT_DIR/lib/audiocheck.py" "$AUDIO_FILE" \
+                     --min-sound-seconds "${TRANSCRIBE_MIN_SOUND_SECONDS:-30}")" || AUDIO_RC=$?
+    echo "==> Audio check: $AUDIO_REPORT"
+    if [ "$AUDIO_RC" -eq 3 ]; then
+      echo "ERROR: the audio is effectively silent - not sending it to AssemblyAI"
+      echo "       (it would bill the upload and return nothing)."
+      echo "       A meeting: when presenting, share a Chrome/Edge TAB with"
+      echo "       'Also share tab audio' ticked, or speak with the microphone on."
+      rm -rf "$WORK_DIR"
+      exit 1
+    fi
+
     echo "==> Transcribing with AssemblyAI (language: $LANGUAGE)"
     SEGMENTS_FILE="$WORK_DIR/segments.json"
     # Run it plainly and capture $? on the next line. Inside `if ! cmd; then`,

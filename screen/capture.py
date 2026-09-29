@@ -467,6 +467,9 @@ def host_admit_waiting(page):
     # "Admit all" asks for confirmation with a second "Admit all".
     time.sleep(1)
     click_visible(HOST_ADMIT_LABELS)
+    # Opening the chip left the People panel over a third of the recording.
+    time.sleep(1)
+    dismiss_notices(page)
     return True
 
 
@@ -652,61 +655,161 @@ def leave_meeting(page):
     )
 
 
+def click_now(page, labels, exact=True):
+    """Click the first visible button among labels, without waiting.
+
+    For things polled every few seconds (notices, the side panel): the
+    waiting variant, click_first_match, would spend its timeout on every
+    label that isn't there, every poll.
+    """
+    for label in labels:
+        try:
+            btn = page.get_by_role("button", name=label, exact=exact).first
+            if btn.is_visible():
+                btn.click()
+                return label
+        except Exception:
+            continue
+    return None
+
+
+# Pop-ups and cards that sit over the meeting and are just acknowledged or
+# closed: "Got it" on "Use Meet safely", the "Your meeting's ready" card's
+# close, the People panel's close (opened by admitting someone). Exact labels
+# only — "ปิด" (close) is also the start of "ปิดกล้อง"/"ปิดไมโครโฟน".
+NOTICE_LABELS = ["รับทราบ", "Got it", "Dismiss", "ปิด", "Close"]
+
+
+def dismiss_notices(page):
+    """Close whatever is covering the call. Cheap enough to run every poll."""
+    closed = []
+    for _ in range(3):
+        label = click_now(page, NOTICE_LABELS)
+        if not label:
+            break
+        closed.append(label)
+        time.sleep(0.5)
+    if closed:
+        print(f"Closed {', '.join(repr(c) for c in closed)} over the call.")
+    return closed
+
+
+# The recording's layout: Spotlight (one big tile — the presentation, or the
+# person speaking) with "hide tiles without video" on, which takes the bot's
+# own tile (it has no camera) out of the picture. Found live 2026-09-29 under
+# More options → "ปรับมุมมอง" (Adjust view); Meet remembers the choice for the
+# account's later meetings, so this is idempotent.
+_LAYOUT_JS = r"""() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const dlg = Array.from(document.querySelectorAll('[role=dialog]')).filter(vis)
+    .find(d => /ปรับมุมมอง|Adjust view|Change layout/.test(d.innerText));
+  if (!dlg) return 'no-dialog';
+  const out = [];
+  const label = Array.from(dlg.querySelectorAll('label')).find(l => /^(สปอตไลท์|Spotlight)$/.test(norm(l.innerText)));
+  if (label) { label.click(); out.push('spotlight'); } else out.push('no-spotlight');
+  const hide = Array.from(dlg.querySelectorAll('label,span,div')).find(l =>
+      /^(ซ่อนหน้าต่างโดยไม่มีวิดีโอ|ซ่อนไทล์ที่ไม่มีวิดีโอ|Hide tiles without video|Hide tiles with no video)$/.test(norm(l.innerText)));
+  let sw = null;
+  if (hide) {
+    const forId = hide.getAttribute('for');
+    sw = forId ? document.getElementById(forId) : null;
+    if (!sw) { let p = hide.parentElement; for (let i = 0; i < 4 && p && !sw; i++, p = p.parentElement) sw = p.querySelector('[role=switch]'); }
+  }
+  if (sw) {
+    if (sw.getAttribute('aria-checked') !== 'true') { sw.click(); out.push('hide-no-video:on'); }
+    else out.push('hide-no-video:already');
+  } else out.push('no-hide-switch');
+  return out.join(',');
+}"""
+
+
+def set_recording_layout(page):
+    """Spotlight + hide tiles without video. Best-effort; never fails a call."""
+    try:
+        if not click_now(page, ["ตัวเลือกเพิ่มเติม", "More options"]):
+            print("  Layout: no 'More options' button - left as is.")
+            return
+        time.sleep(1)
+        opened = page.evaluate(
+            "() => { const m = Array.from(document.querySelectorAll('[role=menuitem]'))"
+            ".find(e => /ปรับมุมมอง|Adjust view|Change layout/.test(e.innerText));"
+            " if (m) m.click(); return !!m; }")
+        if not opened:
+            page.keyboard.press("Escape")
+            print("  Layout: no 'Adjust view' menu item - left as is.")
+            return
+        time.sleep(1.5)
+        result = page.evaluate(_LAYOUT_JS)
+        print(f"  Layout: {result}")
+        time.sleep(0.5)
+        # The dialog's close is "Close" / "ปิดกล่องโต้ตอบ"; Escape as backup.
+        if not click_now(page, ["Close", "ปิดกล่องโต้ตอบ", "ปิด"]):
+            page.keyboard.press("Escape")
+    except Exception as e:
+        print(f"  WARNING: could not set the recording layout ({e})")
+
+
+def _any_visible(page, labels, exact=False):
+    """The first label whose button is visible — WITHOUT clicking it."""
+    for label in labels:
+        try:
+            if page.get_by_role("button", name=label, exact=exact).first.is_visible():
+                return label
+        except Exception:
+            continue
+    return None
+
+
 def mute_av(page, platform):
-    """Turn off camera and microphone so other participants can't see/hear the bot.
+    """Make sure the bot's camera and microphone are off.
 
-    Strategy:
-      1) Try keyboard shortcuts (Meet: Ctrl+E / Ctrl+D, Zoom: Alt+V / Alt+A).
-         The user explicitly suggested these as a fast path.
-      2) Fall back to clicking aria-label buttons: "Turn off camera" /
-         "Mute microphone" (also accept the inverse "Turn on camera" /
-         "Unmute" — if those are showing, the device is already off).
+    The browser blocks both devices (screen/browser.py), so normally there is
+    nothing to turn off and Meet shows "microphone/camera has a problem" —
+    that is the expected state and nothing is clicked. Only a device that is
+    actually ON (its "turn off" button is showing) gets clicked.
 
-    Best-effort: on any failure we log a warning and continue. Failing the
-    recording because the UI heuristic missed would block real meetings; the
-    bot's screen capture is the real product here.
+    Two earlier behaviours are gone on purpose, both seen live 2026-09-29:
+      * The "already off?" check CLICKED the label it found — "เปิดไมโครโฟน"
+        (turn mic ON) — so the check itself unmuted the bot.
+      * Blind Ctrl+E / Ctrl+D toggles: with a blocked device they open Meet's
+        device-problem dialog, and on a live device they flip whatever state
+        it was in.
+
+    Best-effort: a miss is a warning, never a failed recording.
     """
     if platform == "google_meet":
-        shortcuts = [("camera", "Control+e"), ("microphone", "Control+d")]
-        # English + Thai button labels.
-        # NOTE: Meet's already-off buttons are "Turn on camera" / "Unmute" —
-        # if we see those, the device is already off (we leave it alone).
-        camera_off = ["Turn off camera", "ปิดกล้อง"]
-        mic_off = ["Mute microphone", "ปิดไมโครโฟน"]
-        camera_already_off = ["Turn on camera", "เปิดกล้อง", "Camera is off"]
-        mic_already_off = ["Unmute", "เปิดไมโครโฟน", "Microphone is off"]
+        blocked = {"camera": ["กล้องมีปัญหา", "camera problem", "Camera is blocked",
+                              "Allow camera"],
+                   "microphone": ["ไมโครโฟนมีปัญหา", "microphone problem",
+                                  "Microphone is blocked", "Allow microphone"]}
+        on = {"camera": ["Turn off camera", "ปิดกล้อง"],
+              "microphone": ["Turn off microphone", "Mute microphone", "ปิดไมโครโฟน"]}
+        off = {"camera": ["Turn on camera", "เปิดกล้อง", "Camera is off"],
+               "microphone": ["Turn on microphone", "Unmute", "เปิดไมโครโฟน",
+                              "Microphone is off"]}
     elif platform == "zoom":
-        shortcuts = [("camera", "Alt+v"), ("microphone", "Alt+a")]
-        camera_off = ["Stop video", "Mute video"]
-        mic_off = ["Mute", "Mute microphone"]
-        camera_already_off = ["Start video"]
-        mic_already_off = ["Unmute"]
+        blocked = {"camera": [], "microphone": []}
+        on = {"camera": ["Stop video", "Mute video"], "microphone": ["Mute", "Mute microphone"]}
+        off = {"camera": ["Start video"], "microphone": ["Unmute"]}
     else:
         print(f"WARNING: unknown platform {platform!r} - skipping mute.")
         return
 
-    print(f"Muting camera + mic on {platform}...")
-    for kind, shortcut in shortcuts:
-        try:
-            page.keyboard.press(shortcut)
-            print(f"  Tried shortcut {shortcut} for {kind}.")
-        except Exception as e:
-            print(f"  Shortcut {shortcut} for {kind} failed: {e}")
-
-    # Brief settle, then verify + fall back to clicking aria-labels.
-    time.sleep(1)
-    for kind, off_labels, already_off_labels in [
-        ("camera", camera_off, camera_already_off),
-        ("microphone", mic_off, mic_already_off),
-    ]:
-        # If the already-off label is visible, we're done for this device.
-        if click_first_match(page, already_off_labels, timeout=800):
-            print(f"  {kind} already off (via already-off label).")
+    print(f"Checking camera + mic on {platform}...")
+    for kind in ("camera", "microphone"):
+        label = _any_visible(page, blocked[kind])
+        if label:
+            print(f"  {kind}: blocked by the browser ('{label}') - nothing to turn off.")
             continue
-        if click_first_match(page, off_labels, timeout=1500):
-            print(f"  Clicked {kind} off (via aria-label).")
+        label = _any_visible(page, off[kind])
+        if label:
+            print(f"  {kind}: already off ('{label}').")
             continue
-        print(f"  WARNING: could not confirm {kind} is off - check the recording.")
+        if click_first_match(page, on[kind], timeout=1500):
+            print(f"  {kind}: was ON - turned it off.")
+            continue
+        print(f"  WARNING: could not tell whether the {kind} is off - check the recording.")
 
 
 def block_screen_share_dialog(page):
@@ -840,6 +943,11 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
                 except Exception as e:
                     print(f"Clean leave failed ({e}) - exiting anyway.")
                 return
+
+            # Anything Meet has put over the call since the last poll (a
+            # notice, the People panel) comes off the recording.
+            if "meet.google.com" in (getattr(page, "url", "") or ""):
+                dismiss_notices(page)
 
             # Screen-share defenses (Layers 2 and 3). Layer 1 is the Chrome
             # flag set at launch; these two are the runtime catch-nets.
@@ -1025,8 +1133,13 @@ def main():
             mute_av(page, platform)
         except Exception as e:
             print(f"WARNING: mute_av raised {e} - continuing anyway.")
-        if host:
-            host_dismiss_ready_dialog(page)
+        if platform == "google_meet":
+            # A clean picture for the recording: close the cards Meet opens
+            # on arrival, then Spotlight with tiles-without-video hidden
+            # (which removes the bot's own tile), then close anything left.
+            dismiss_notices(page)
+            set_recording_layout(page)
+            dismiss_notices(page)
 
         # Signal the orchestrator (record_screen.sh) that it's safe to start
         # recording now - we're actually in the call, not a lobby.

@@ -244,6 +244,45 @@ link as a link plus a **Join** button while the run is active, and times are
 shown in the browser's local zone (state.json is UTC). Only a URL matching
 `https://meet.google.com/xxx-xxxx-xxx` becomes an href.
 
+### What the recording shows, and hears (2026-09-29, after three live calls)
+
+Settled with the operator after reading a real recording:
+
+- **Mic and camera are BLOCKED, not muted.** Firefox: both
+  `permissions.default.*=2` and `media.navigator.permission.disabled=False`
+  (True would skip the check and *grant*). Chrome: `--deny-permission-prompts`
+  and no permissions granted; the fake-device files are gone. Meet then shows
+  "ไมโครโฟนมีปัญหา / กล้องมีปัญหา" (device has a problem) with a "!" —
+  expected. `mute_av` now only LOOKS: blocked → nothing; "turn on" label
+  showing → already off; only a visible "turn off" is clicked. It used to
+  test "already off" by clicking the label it found, which clicked
+  "เปิดไมโครโฟน" (turn mic ON) live, and it pressed blind Ctrl+E/D toggles.
+  Order matters: "ปิดไมโครโฟน" (off) is a substring of "เปิดไมโครโฟน" (on), so
+  the "already off" check must run before any "turn off" match.
+- **Layout: Spotlight + hide tiles without video** (`set_recording_layout`,
+  More options → "ปรับมุมมอง"), which removes the bot's own tile. Meet
+  remembers it for the account. The self tile can't be removed directly
+  ("นำไทล์ของคุณในเลย์เอาต์นี้ออกไม่ได้").
+- **Notices and the People panel are closed every poll** (`dismiss_notices`,
+  exact labels "รับทราบ"/"Got it"/"ปิด"/"Close"; `click_now` never waits, so
+  it is cheap to repeat). Admitting someone opens the panel; it is closed
+  right after.
+- **Per-site zoom is ignored** (`browser.zoom.siteSpecific=False`): the
+  sign-in window had saved meet.google.com at 50%, which rendered every call
+  at half size (devicePixelRatio 0.5, a 3840x2160 CSS viewport).
+- **Live audio check** (`audio_watch` in record_screen.sh): 3s of the sink
+  monitor every 10s → `runs/<id>/audio_level` ("<epoch> <peak dB> <seconds
+  silent>"), "Hearing meeting audio" / a warning after
+  `AUDIO_SILENCE_WARN_SECONDS` (120) of silence in the log, and a 🔊/🔇 badge
+  on the web UI's Runs row. Cause of the third call's failure: a
+  presentation shared without "Also share tab audio" is picture only.
+- **No AssemblyAI upload of silence** (`lib/audiocheck.py`, run by
+  transcribe.sh): sums ffmpeg silencedetect and requires
+  `TRANSCRIBE_MIN_SOUND_SECONDS` (30) of sound. NOT the peak level — the
+  silent call peaked at −14 dB from Meet's join/leave chimes.
+- **A live profile lock is refused, never deleted** (`browser.ProfileInUse`):
+  `clear_stale_locks` deleted the lock of an open sign-in window.
+
 ### The bot account (`BOT_GOOGLE_ACCOUNT`)
 
 The operator's words: "use the account … only (do not hardcode the email)".
@@ -1880,6 +1919,9 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   `rs init`, or twice, makes duplicate runs (two calls, for meet.new).
 - **pm2 never starts anything at boot.** No `pm2 startup`, no `pm2 save` in
   any script. The operator asked for the web UI to be off by default.
+- **The bot's mic and camera stay blocked at the browser**, and mute_av
+  never clicks an "already off" label. See "What the recording shows".
+- **Silence is measured by duration, not peak**, before any AssemblyAI upload.
 - **No awk (mawk) in a pipe that must be live.** It holds lines in its
   input buffer; the meeting link never reached the web UI. Use a bash
   `while read` loop.
