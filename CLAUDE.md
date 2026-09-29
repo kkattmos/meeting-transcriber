@@ -742,8 +742,14 @@ first participant, then end the call for everyone when it empties**.
   now matched as a substring (`HOST_WAITING_CHIP_LABELS`) and clicked to open
   the panel, then the exact "ยอมรับ"/"Admit" inside it. If that panel's
   button isn't found, `_log_admit_candidates` logs every admit-looking button
-  name once and saves `runs/<id>/host_admit.png`. The end-for-everyone Thai
-  labels are still unverified.
+  name once and saves `runs/<id>/host_admit.png`. That diagnostic, on the
+  second live call, showed the panel's button is the verb plus the person's
+  name — "ยอมรับ 03_ด.ช. …" — beside a look-alike toggle
+  "อยู่ระหว่างรอการยอมรับ 1"; `_ADMIT_PERSON_JS` matches `^(ยอมรับ|Admit) `
+  by prefix and excludes the chip. Verified on a mock of that DOM, not yet on
+  a live call. The end-for-everyone Thai labels are still unverified.
+  Workaround meanwhile: join as the bot account from another browser and set
+  Host controls → Meeting access → Open (per meeting; only the host can).
 
 ### Stage 2 — Transcribe (`transcribe/transcribe.sh`)
 

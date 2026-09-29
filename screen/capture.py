@@ -301,6 +301,24 @@ HOST_WAITING_CHIP_LABELS = [
     "ยอมรับผู้เข้าร่วม", "Admit 1", "Admit 2", "Admit 3", "Admit guest",
     "Admit people", "people waiting", "someone wants to join",
 ]
+# Inside the panel, each knocker gets their own button whose label is the verb
+# PLUS the person's name — "ยอมรับ 03_ด.ช. ขัตติยะ …" (verified live
+# 2026-09-29), so neither an exact nor a substring match on "ยอมรับ" works
+# (the substring also hits "อยู่ระหว่างรอการยอมรับ 1", the waiting-list
+# toggle). Matched by prefix-with-a-space in the page instead; the chip
+# ("ยอมรับผู้เข้าร่วม…", "Admit 1 guest") is excluded by the second pattern.
+_ADMIT_PERSON_JS = r"""() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const isPerson = n => /^(ยอมรับ|Admit) \S/.test(n) && !/^Admit \d/.test(n)
+                        && !/^(Admit all|ยอมรับทั้งหมด)/.test(n);
+  const btn = Array.from(document.querySelectorAll('button,[role=button]'))
+    .filter(b => b.getBoundingClientRect().width > 0)
+    .find(b => isPerson(norm(b.getAttribute('aria-label') || b.innerText)));
+  if (!btn) return null;
+  btn.click();
+  return norm(btn.getAttribute('aria-label') || btn.innerText);
+}"""
+
 # Notices that sit over the call and should just be acknowledged.
 HOST_DISMISS_LABELS = ["Got it", "Dismiss", "รับทราบ"]
 HOST_END_FOR_ALL_LABELS = [
@@ -425,14 +443,22 @@ def host_admit_waiting(page):
                 continue
         return None
 
-    clicked = click_visible(HOST_ADMIT_LABELS)
+    def click_person():
+        try:
+            return page.evaluate(_ADMIT_PERSON_JS)
+        except Exception:
+            return None
+
+    # The panel may already be open from the previous poll — clicking the chip
+    # again would close it — so try the buttons inside it first.
+    clicked = click_visible(HOST_ADMIT_LABELS) or click_person()
     if not clicked:
         opener = (click_visible(HOST_VIEW_ALL_LABELS)
                   or click_containing(HOST_WAITING_CHIP_LABELS))
         if opener:
             print(f"Someone is waiting — opened the admit panel ('{opener}').")
             time.sleep(1.5)
-            clicked = click_visible(HOST_ADMIT_LABELS)
+            clicked = click_visible(HOST_ADMIT_LABELS) or click_person()
             if not clicked:
                 _log_admit_candidates(page)
     if not clicked:
