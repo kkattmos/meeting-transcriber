@@ -223,6 +223,27 @@ Non-obvious details, all found live on 2026-09-29:
   cleared by `open_page()`; `first_time_login.sh` refuses a profile whose lock
   names a live pid (a recording in progress).
 
+### Live output: no awk in a pipe, no buffered Python (2026-09-29)
+
+Found on the first `--new-meet` from the web UI: the page never showed the
+link. `run_one.sh` prefixed stage output with `awk '{…; fflush()}'`, and
+Debian's awk is **mawk**, which reads a pipe in blocks — `fflush()` flushes
+its *output*, but a line waits in its *input* buffer until more text arrives.
+The recorder prints the link and then nothing for the whole meeting, so the
+line never reached the trigger log the page polls (the VM evidently had gawk).
+Both prefixers (`run_one.sh` `prefix_lines`, `pipeline.sh`'s multi-run
+prefix) are bash `while read` loops now; don't put awk back in a live pipe.
+`run_one.sh` also exports `PYTHONUNBUFFERED=1` and `record_screen.sh` runs
+`capture.py -u`, or its progress lines sit in Python's buffer until exit.
+The page additionally falls back to `/api/runs/<id>`'s `meet_url` when the
+log has no link line.
+
+The operator gets into a created meeting **from the web page**, not by
+invitation (settled the same day): the Runs list and the run detail show the
+link as a link plus a **Join** button while the run is active, and times are
+shown in the browser's local zone (state.json is UTC). Only a URL matching
+`https://meet.google.com/xxx-xxxx-xxx` becomes an href.
+
 ### The bot account (`BOT_GOOGLE_ACCOUNT`)
 
 The operator's words: "use the account … only (do not hardcode the email)".
@@ -1847,6 +1868,9 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   `rs init`, or twice, makes duplicate runs (two calls, for meet.new).
 - **pm2 never starts anything at boot.** No `pm2 startup`, no `pm2 save` in
   any script. The operator asked for the web UI to be off by default.
+- **No awk (mawk) in a pipe that must be live.** It holds lines in its
+  input buffer; the meeting link never reached the web UI. Use a bash
+  `while read` loop.
 - **Display numbers are claimed with our own claim file, not Xvfb's lock.**
   A non-root Xvfb ignores `-nolock` and refuses a lock that names a live pid.
 - **`--window-position=0,0` stays in `CHROME_ARGS`.** Without it Chrome places

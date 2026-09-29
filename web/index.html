@@ -50,6 +50,8 @@
   .s-done { color: var(--ok); } .s-failed { color: var(--bad); } .s-running { color: var(--warn); }
   .s-pending { color: var(--muted); }
   .link { font-family: ui-monospace, Menlo, monospace; font-size: 15px; word-break: break-all; }
+  a.meetlink { color: var(--accent); }
+  button.join { padding: 2px 10px; font-size: 12px; margin-left: 6px; }
   .meet { display: none; margin-top: 12px; padding: 12px; border: 1px dashed var(--accent); border-radius: 8px; }
   .badge { font-size: 11px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); }
   .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
@@ -147,6 +149,7 @@
         <h2 id="rdTitle" style="margin-top:16px"></h2>
         <div id="rdInfo" class="hint"></div>
         <div class="actions">
+          <button id="rdJoin" class="primary hidden">Join meeting</button>
           <button id="rdResume">Resume</button>
           <button id="rdStop">Stop / leave meeting</button>
         </div>
@@ -256,11 +259,23 @@
     meetRunPoll = setInterval(async () => {
       try {
         const log = await api("/api/log?name=" + encodeURIComponent(logName));
-        const m = log.text.match(/New Google Meet: (https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3})/);
+        let m = log.text.match(/New Google Meet: (https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3})/);
         const run = log.text.match(/Run: (\S+)/);
         if (run) currentRun = run[1];
+        // The link is also stored in the run the moment it exists; use that
+        // if the log hasn't carried it (yet).
+        if (!m && currentRun) {
+          try {
+            const d = await api("/api/runs/" + encodeURIComponent(currentRun));
+            const u = d.summary && d.summary.meet_url;
+            if (u) m = [null, u];
+          } catch (e) {}
+        }
         if (m) {
-          $("meetLink").textContent = m[1];
+          if (MEET_RE.test(m[1]) && $("meetLink").textContent !== m[1]) {
+            $("meetLink").textContent = "";
+            $("meetLink").appendChild(meetAnchor(m[1]));
+          }
           $("meetStatus").textContent = "Meeting is live — share this link. The bot admits everyone.";
           ["copyMeet", "openMeet"].forEach((id) => $(id).disabled = false);
           $("stopMeet").disabled = !currentRun;
@@ -356,6 +371,23 @@
 
   // --- Runs -------------------------------------------------------------------
   const MARK = { done: "✓", failed: "✗", running: "▶", pending: "·" };
+  // Only a real Meet link ever becomes a clickable href.
+  const MEET_RE = /^https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
+  function meetAnchor(url) {
+    const link = document.createElement("a");
+    link.href = url; link.target = "_blank"; link.rel = "noopener";
+    link.textContent = url; link.className = "meetlink";
+    link.onclick = (e) => e.stopPropagation();   // don't also open the run detail
+    return link;
+  }
+  // state.json stamps are UTC; show this browser's local time.
+  function fmtTime(iso) {
+    const d = new Date(iso || "");
+    if (isNaN(d)) return (iso || "").replace("T", " ").slice(0, 16);
+    const p = (n) => String(n).padStart(2, "0");
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+           " " + p(d.getHours()) + ":" + p(d.getMinutes());
+  }
   async function refreshRuns() {
     if ($("app").classList.contains("hidden")) return;
     try {
@@ -366,14 +398,24 @@
         const a = document.createElement("td");
         a.innerHTML = "<div></div><div class='hint'></div>";
         a.firstChild.textContent = run.run_id + (run.active ? "  ● running" : "") + (run.paused ? "  ⏸ paused" : "");
-        a.lastChild.textContent = run.meet_url || (run.input || "").slice(0, 90);
+        if (run.meet_url && MEET_RE.test(run.meet_url)) {
+          a.lastChild.appendChild(meetAnchor(run.meet_url));
+          if (run.active) {
+            const j = document.createElement("button");
+            j.textContent = "Join"; j.className = "primary join";
+            j.onclick = (e) => { e.stopPropagation(); window.open(run.meet_url, "_blank", "noopener"); };
+            a.lastChild.append(" ", j);
+          }
+        } else {
+          a.lastChild.textContent = (run.input || "").slice(0, 90);
+        }
         const s = document.createElement("td"); s.className = "stages";
         Object.values(run.stages).forEach((st) => {
           const sp = document.createElement("span"); sp.className = "s-" + st;
           sp.textContent = MARK[st] || "?"; sp.title = st; s.appendChild(sp);
         });
         const u = document.createElement("td"); u.className = "hint";
-        u.textContent = (run.updated_at || "").replace("T", " ").slice(0, 16);
+        u.textContent = fmtTime(run.updated_at);
         tr.append(a, s, u);
         tr.onclick = () => showRun(run.run_id);
         tb.appendChild(tr);
@@ -404,6 +446,9 @@
         const pre = document.createElement("pre"); pre.textContent = text || "(empty)";
         logs.append(h, pre);
       });
+      const joinable = s.meet_url && MEET_RE.test(s.meet_url) && s.active;
+      $("rdJoin").classList.toggle("hidden", !joinable);
+      $("rdJoin").onclick = () => window.open(s.meet_url, "_blank", "noopener");
       $("rdResume").onclick = async () => {
         await api("/api/runs/" + encodeURIComponent(id) + "/resume", { method: "POST" });
         setTimeout(refreshRuns, 1500);

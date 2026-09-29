@@ -157,7 +157,9 @@ unset WAYLAND_DISPLAY XDG_SESSION_TYPE
 export GDK_BACKEND=x11 MOZ_ENABLE_WAYLAND=0
 
 echo "==> Joining meeting: $MEETING_URL"
-"$PYTHON_BIN" "$SCRIPT_DIR/capture.py" "$MEETING_URL" "$DISPLAY_NAME" &
+# -u: unbuffered, so the join/admit/mute progress reaches the stage log as it
+# happens rather than when the meeting ends.
+"$PYTHON_BIN" -u "$SCRIPT_DIR/capture.py" "$MEETING_URL" "$DISPLAY_NAME" &
 JOIN_PID=$!
 
 # kill_meeting.sh reads this to escalate past the grace period without having

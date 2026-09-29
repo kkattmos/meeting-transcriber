@@ -835,10 +835,13 @@ launch() {
 
   (
     if [ "$TOTAL" -gt 1 ]; then
-      # Prefix every line so concurrent runs stay readable. awk with an
-      # explicit fflush() rather than `sed -u`, which is a GNU extension.
+      # Prefix every line so concurrent runs stay readable — with a bash
+      # read loop, not awk: mawk (Debian's awk) holds piped lines in its
+      # input buffer. See prefix_lines in lib/run_one.sh.
       bash "$SCRIPT_DIR/lib/run_one.sh" "${args[@]}" 2>&1 \
-        | awk -v r="$run_id" '{print r " | " $0; fflush()}'
+        | while IFS= read -r _line || [ -n "$_line" ]; do
+            printf '%s | %s\n' "$run_id" "$_line"
+          done
       echo "${PIPESTATUS[0]}" > "$RESULT_DIR/$run_id"
     else
       bash "$SCRIPT_DIR/lib/run_one.sh" "${args[@]}"

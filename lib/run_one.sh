@@ -202,8 +202,23 @@ export MEETING_BOT_LANGUAGE="$LANGUAGE"
 # --- Stage helper ------------------------------------------------------------
 # Runs a stage unless it's already done, streaming its output to both the run
 # log and stdout with a [stage] prefix so parallel branches stay readable.
-# awk with an explicit fflush(), not `sed -u`: it flushes per line on every
-# sed/awk implementation rather than relying on a GNU extension.
+# Prefix each line as it arrives. A bash read loop, NOT awk: Debian's default
+# awk is mawk, which reads a pipe in blocks — fflush() flushes its output but
+# a line still waits in mawk's INPUT buffer until more text arrives. A
+# recorder prints the meeting link and then nothing for an hour, so the link
+# never reached the log the web UI polls (found live 2026-09-29; the VM must
+# have had gawk). `sed -u` is a GNU extension; this is plain bash.
+prefix_lines() {
+  local prefix="$1" line
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s%s\n' "$prefix" "$line"
+  done
+}
+
+# Python block-buffers stdout into a pipe, so a stage's progress (capture.py's
+# "Admitted…", "Muting…") would otherwise appear only when it exits.
+export PYTHONUNBUFFERED=1
+
 stage_status() { rs status --run-dir "$RUN_DIR" --stage "$1"; }
 
 run_stage() {
@@ -249,7 +264,7 @@ run_stage() {
   rs start --run-dir "$RUN_DIR" --stage "$stage"
   local log="$LOG_DIR/$stage.log"
   local rc
-  "$@" 2>&1 | tee -a "$log" | awk -v s="$stage" '{print "[" s "] " $0; fflush()}'
+  "$@" 2>&1 | tee -a "$log" | prefix_lines "[$stage] "
   rc=${PIPESTATUS[0]}
   release_slot
 
