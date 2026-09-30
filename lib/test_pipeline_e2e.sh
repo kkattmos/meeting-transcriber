@@ -1409,6 +1409,30 @@ ls -d "$RUNS"/yt_dryrun00001_* >/dev/null 2>&1 \
   && bad "dry-run created a run" || ok "dry-run creates nothing"
 out=$(pipeline "https://youtu.be/dryrun00001" --combine "$TESTROOT/no such dir/x.md" --dry-run 2>&1)
 check "dry-run: a --combine into a missing directory is refused" "$?" "1"
+# Every unusable input is reported (the web UI marks each line), not just the
+# first; the good ones are still planned.
+out=$(pipeline "https://youtu.be/dryrun00002" "https://youtu.be/dryrun00003#t=zz" \
+      "https://not-a-source.example/x" "https://meet.google.com/abc-defg-hij#t=1:00-2:00" \
+      "$TESTROOT/no such file.mp4" --dry-run 2>/dev/null)
+check "dry-run: unusable inputs exit 1" "$?" "1"
+echo "$out" | grep -qP '^ok\tyoutube\t-\tnew\thttps://youtu.be/dryrun00002$' \
+  && ok "dry-run: a good input is still planned beside bad ones" || bad "dry-run: $out"
+echo "$out" | grep -qP '^badarg\tunusable #t= window: .*\thttps://youtu.be/dryrun00003#t=zz$' \
+  && ok "dry-run: a bad #t= window is a badarg line, as typed" || bad "dry-run: $out"
+echo "$out" | grep -qP '^bad\tnot recognised.*\thttps://not-a-source.example/x$' \
+  && ok "dry-run: an unrecognised URL is a bad line" || bad "dry-run: $out"
+echo "$out" | grep -qP '^bad\ta clip window does not apply to a live meeting\thttps://meet.google.com/abc-defg-hij$' \
+  && ok "dry-run: a clipped meeting is a bad line" || bad "dry-run: $out"
+echo "$out" | grep -qP "^extra\t$TESTROOT/no such file.mp4\$" \
+  && ok "dry-run: a missing file is an extra line" || bad "dry-run: $out"
+out=$(pipeline "https://youtu.be/dryrun00002" "$TESTROOT/no such file.mp4" --dry-run 2>/dev/null)
+check "dry-run: one input + a legacy name still passes on the command line" "$?" "0"
+echo "$out" | grep -qP "^extra\t" && ok "dry-run: ... and the name is reported as extra" \
+  || bad "dry-run: $out"
+out=$(pipeline "https://youtu.be/dryrun00003#t=zz" --dry-run 2>&1)
+check "dry-run: only a bad window exits 1" "$?" "1"
+echo "$out" | grep -q "The orchestrator:" && bad "dry-run: printed the usage for a bad window" \
+  || ok "dry-run: a bad window alone is reported, not the usage"
 
 echo "--- Summary language, PDF font and extra instructions, per run"
 out=$(pipeline "https://youtu.be/sumset00001" --summary-language fr --dry-run 2>&1)

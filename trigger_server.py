@@ -245,6 +245,10 @@ def run_summary(run_dir, data):
         "stages": {s: (stages.get(s) or {}).get("status", "pending") for s in STAGES},
         "artifacts": (stages.get("summarize") or {}).get("artifacts") or {},
         "paused": bool((stages.get("summarize") or {}).get("rate_limited")),
+        # What the page needs to leave out stages that never run: frames on a
+        # voice-only run, summarize on a member of a combined set.
+        "summary_source": data.get("summary_source"),
+        "combined_into": data.get("combined_into"),
     }
 
 
@@ -435,12 +439,31 @@ class Handler(BaseHTTPRequestHandler):
             for line in proc.stdout.splitlines():
                 parts = line.split("\t")
                 if parts[0] == "ok" and len(parts) == 5:
-                    plan.append({"kind": parts[1], "clip": None if parts[2] == "-" else parts[2],
+                    plan.append({"status": "ok", "kind": parts[1],
+                                 "clip": None if parts[2] == "-" else parts[2],
                                  "resume": None if parts[3] == "new" else parts[3],
                                  "input": parts[4]})
                 elif parts[0] == "combine" and len(parts) == 2:
-                    plan.append({"kind": "combine", "input": parts[1]})
-            self._json(200, {"ok": proc.returncode == 0, "plan": plan,
+                    plan.append({"status": "ok", "kind": "combine", "input": parts[1]})
+                # The dry run reports every input it can't use, not just the
+                # first, so the page can mark each line. `bad` names the input
+                # as classified (window split off, meet.new canonical), in
+                # input order; `badarg` the argument as typed (a #t= window
+                # that did not parse, refused before classification).
+                elif parts[0] in ("bad", "badarg") and len(parts) == 3:
+                    plan.append({"status": "bad", "reason": parts[1], "input": parts[2],
+                                 "arg": parts[0] == "badarg"})
+                # Not an input at all. On the command line that may be the
+                # legacy form's name; every line of this form is meant as an
+                # input, so here it is a mistake, even though the dry run
+                # itself passed (a mistyped path would become the run's name).
+                elif parts[0] == "extra" and len(parts) == 2:
+                    plan.append({"status": "bad", "extra": True, "arg": True,
+                                 "input": parts[1],
+                                 "reason": "not recognised as an input: check the link, "
+                                           "or that the file exists on this machine"})
+            ok = proc.returncode == 0 and all(p["status"] == "ok" for p in plan)
+            self._json(200, {"ok": ok, "plan": plan,
                              "messages": proc.stderr.strip()[-4000:],
                              "command": ["./pipeline.sh", *args]})
             return

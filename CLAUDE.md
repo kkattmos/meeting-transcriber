@@ -905,7 +905,20 @@ Non-obvious details:
   (`ok kind clip existing-run-or-new input`, plus `combine` / `resume` lines)
   and exits before `rs init`. The web UI's **Check** is exactly this, so the
   form can never disagree with the pipeline about what an input is. Don't
-  reimplement classification in Python for the UI.
+  reimplement classification in Python (or JavaScript) for the UI.
+  **Since 2026-09-30 it reports every unusable input and goes on** rather
+  than stopping at the first, and exits 1 at the end (`DRY_BAD`):
+  `bad<TAB>reason<TAB>input` from the classification loop (unrecognised, a
+  window on a live meeting, audio-only + `both`) — the input as classified,
+  in input order; `badarg<TAB>reason<TAB>arg` for a `#t=` window that did
+  not parse — the argument *as typed*, printed at parse time; and
+  `extra<TAB>arg` for every positional that is not an input at all. An
+  `extra` alone does not fail the dry run: on the command line it may be the
+  legacy form's name. It does fail the web form (`trigger_server.py` sets
+  `ok: false`), because a form line is always meant as an input — before
+  this, a mistyped path beside one good link silently became that run's
+  `--name`. The real (non-dry) path still stops at the first error, as
+  before.
 - **`usage()` prints up to `set -uo pipefail`**, not a fixed line range: the
   range had silently gone stale and cut `--help` off halfway.
 
@@ -2629,6 +2642,10 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **Every value-taking `pipeline.sh` option goes through `need_value`.**
   Without it a trailing option hangs the script silently.
 - **The web UI validates with `pipeline.sh --dry-run`, not its own parser.**
+  Its per-line ✓/✗ come from the dry run's `ok`/`bad`/`badarg`/`extra`
+  lines; the page's own hints check shapes, never what an input is. An
+  `extra` line is a failure in the form (a typo'd path would become the
+  run's name).
 - **A meet.new run is never auto-resumed**, and a hosted call is never ended
   on an unreadable participant count.
 - **Captions are never taken from a YouTube machine translation.** Spoken
@@ -2664,8 +2681,8 @@ without API keys or network, against temp directories
 | `screen/test_extract_frames.py` | frames on change: settle, a transient change, blanks, the motion cap, the safety net, the last sample, the shared distance; the PPM reader; real ffmpeg (black lead-in skipped, audio-only empty, retired settings named) | 19 |
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
-| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, run/log path refusal, summary language/font/instructions, the options, record media / summary source | 11 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine` | 438 |
+| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source | 12 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine` | 448 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, the YouTube caption fallback through a stub yt-dlp (spoken-language auto captions; the other-language track as last resort), `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 131 |
 | `verify_e2e.sh --browser-smoke` | the real browser (Firefox ESR or Chrome) under Xvfb, recorded and measured for black edges | 6 |
 
@@ -2862,6 +2879,49 @@ keeps in `localStorage`.
   `SUMMARY_PROMPT`, so an old name in `.env` still preselects.
 - `/trigger`'s original body contract is unchanged (phone shortcuts keep
   working); `new_meet`, `clip`, `no_combine_pdf` and `playlist` were added.
+
+### The page's design (2026-09-30)
+
+The operator asked for "clearly toggle and input settings, with clear
+warnings and tick symbols", DESIGN.md as the reference, and chose in a round
+of questions:
+
+- **Segmented button groups for 2-3-way choices** (written in, save
+  recording, summarize from, spoken language) with a ✓ on the chosen one and
+  🔒 when locked (audio only locks "Summarize from" at voice); **switches for
+  on/off** (playlists, Markdown only, start over) with an ON/OFF word;
+  dropdowns only for the long lists (style, with a one-line description of
+  each; PDF font).
+- **Live hints plus an automatic check.** Every field has a one-line
+  ✓/⚠/✗/ℹ feedback slot (`fb-<id>`) filled as you type — *format only*
+  (clip shape, jobs, a name with several inputs, a non-.md combine path,
+  start over, playlists). ~900 ms after the last change `/api/check` runs
+  the dry run, and **each input line gets ✓ (kind, new/resume, window) or
+  ✗ (the pipeline's reason)**. A sequence number drops stale answers.
+  Mapping lines to the plan (`mapPlan`): `badarg`/`extra` entries by the
+  exact line, the rest in order; if the counts disagree (playlist
+  expansion) the plan is listed as it came. A refusal before any input was
+  looked at (bad `--clip`, font, jobs) marks the lines "not checked" and
+  shows the pipeline's words. Start reads "Start N runs" and unlocks only
+  for the exact form state that passed; warnings are repeated beside it.
+- **DESIGN.md's palette and callouts**: navy top bar and numbered section
+  banners, the five callout colours as the page's states (ok, info/running,
+  warn, bad with the red frame, note). Dark mode kept (the page follows the
+  system; tokens redefined under `prefers-color-scheme` and
+  `[data-theme=dark]`). Body face Bai Jamjuree → Sarabun → system, code
+  JetBrains Mono, as installed; a phone falls back to its own.
+- **Runs**: cards with a status badge and **labelled stage pills**; a stage
+  that never runs for that input (record on non-meetings, download on a
+  meeting or a voice-only YouTube run, clip without a window, frames on
+  voice only, summarize on a combine member) is hidden while pending
+  (`expected()`; `run_summary` now carries `summary_source` and
+  `combined_into` for it). The detail lists settings, output paths with
+  Copy, and logs whose open/closed state survives the 10 s refresh.
+- **Inline confirmation bars** (`confirmInline`) replace `confirm()` for
+  Stop and End & stop recording; the refresh does not rebuild a detail that
+  is waiting on one.
+- The last tab is remembered in `localStorage` (a convenience; the page
+  works without it).
 
 ## Planned: a Discord voice source (not built)
 

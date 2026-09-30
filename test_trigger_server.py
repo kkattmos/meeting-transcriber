@@ -35,6 +35,12 @@ class TriggerServerTest(unittest.TestCase):
 for a in "$@"; do [ "$a" = "--dry-run" ] && dry=1; done
 if [ -n "$dry" ]; then
   case "$1" in *bad*) echo "ERROR: unrecognized input: $1" >&2; exit 1 ;; esac
+  case "$*" in *extra-case*)
+    printf 'ok\\tyoutube\\t-\\tnew\\t%s\\n' "$1"
+    printf 'bad\\tnot recognised\\thttps://bad.example/x\\n'
+    printf 'badarg\\tunusable #t= window: zz\\thttps://youtu.be/c#t=zz\\n'
+    printf 'extra\\t/no/such/file.mp4\\n'; exit 0 ;;
+  esac
   printf 'ok\\tyoutube\\t-\\tnew\\t%s\\n' "$1"; exit 0
 fi
 echo "argv: $*"
@@ -145,9 +151,27 @@ echo "argv: $*"
         self.assertEqual(status, 200)
         self.assertTrue(r["ok"])
         self.assertEqual(r["plan"][0]["input"], "https://youtu.be/a")
+        self.assertEqual(r["plan"][0]["status"], "ok")
         status, r = self.call("/api/check", {"urls": "https://bad.example"})
         self.assertFalse(r["ok"])
         self.assertIn("unrecognized input", r["messages"])
+
+    def test_check_marks_every_input_the_dry_run_refused(self):
+        # A `bad` line per unusable input, and `extra` for an argument that is
+        # not an input at all — which the dry run itself passes (the legacy
+        # name), but a form line never means.
+        status, r = self.call("/api/check", {"urls": "https://youtu.be/a\nextra-case"})
+        self.assertEqual(status, 200)
+        self.assertFalse(r["ok"])
+        self.assertEqual([p["status"] for p in r["plan"]], ["ok", "bad", "bad", "bad"])
+        self.assertEqual(r["plan"][1]["reason"], "not recognised")
+        self.assertEqual(r["plan"][1]["input"], "https://bad.example/x")
+        self.assertFalse(r["plan"][1]["arg"])
+        # As typed, so the page matches it to its line by the string.
+        self.assertTrue(r["plan"][2]["arg"])
+        self.assertEqual(r["plan"][2]["input"], "https://youtu.be/c#t=zz")
+        self.assertTrue(r["plan"][3]["extra"] and r["plan"][3]["arg"])
+        self.assertEqual(r["plan"][3]["input"], "/no/such/file.mp4")
 
     def test_trigger_logs_the_command(self):
         status, r = self.call("/trigger", {"new_meet": True, "name": "Sync"})

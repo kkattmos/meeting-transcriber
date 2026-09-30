@@ -5,193 +5,462 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Meeting Bot</title>
 <style>
+  /* The palette is DESIGN.md's (the summary PDF's): navy banners, and the
+     callout colours carry the page's states — green ✓ ready/done, amber ⚠
+     a warning, red ✗ refused/failed, blue an example or something running,
+     grey a note. The dark theme keeps the same roles. */
   :root {
-    --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5b6573;
-    --border: #d9dee5; --accent: #1a73e8; --accent-text: #ffffff;
-    --ok: #1e8e3e; --warn: #b06000; --bad: #c5221f; --code: #eef1f5;
+    --bg: #f3f5f8; --panel: #ffffff; --ink: #1b1f27; --heading: #16233a;
+    --muted: #5f6875; --faint: #8a93a0; --hairline: #d3d9e1; --field: #fbfcfd;
+    --navy: #1f3a5f; --navy-ink: #ffffff; --navy-soft: #c9d8ec;
+    --link: #2d5b8f; --thead: #e9eef5; --code: #eef1f5;
+    --ok-fill: #edf5ef; --ok-rule: #2f7d4f; --ok-ink: #1e6a3d;
+    --info-fill: #edf3fa; --info-rule: #2f6aa3; --info-ink: #1f578c;
+    --warn-fill: #fcf4e5; --warn-rule: #c7811f; --warn-ink: #8a5810;
+    --bad-fill: #fcefef; --bad-rule: #b3373b; --bad-ink: #9c2b30; --bad-frame: #deaaac;
+    --note-fill: #f4f6f8; --note-rule: #9aa4b1; --note-ink: #46505d;
+    color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #111418; --panel: #1a1e24; --text: #e6e9ee; --muted: #9aa4b2;
-      --border: #2d333b; --accent: #8ab4f8; --accent-text: #0b1b33;
-      --ok: #81c995; --warn: #fdd663; --bad: #f28b82; --code: #22272e;
+    :root:not([data-theme="light"]) {
+      --bg: #0e131a; --panel: #161c25; --ink: #e3e7ee; --heading: #eef2f8;
+      --muted: #9aa4b2; --faint: #748091; --hairline: #2a3340; --field: #10151d;
+      --navy: #24476f; --navy-ink: #ffffff; --navy-soft: #c9d8ec;
+      --link: #8ab4f8; --thead: #1d2633; --code: #1e2229;
+      --ok-fill: #13261b; --ok-rule: #4caf72; --ok-ink: #86d7a5;
+      --info-fill: #12223a; --info-rule: #4a8ad0; --info-ink: #9cc3f0;
+      --warn-fill: #2c2312; --warn-rule: #d99a3a; --warn-ink: #f0c07a;
+      --bad-fill: #2e1718; --bad-rule: #d0555a; --bad-ink: #f2a0a3; --bad-frame: #5a2a2d;
+      --note-fill: #1b212a; --note-rule: #6b7685; --note-ink: #b8c1cc;
+      color-scheme: dark;
     }
   }
+  :root[data-theme="dark"] {
+    --bg: #0e131a; --panel: #161c25; --ink: #e3e7ee; --heading: #eef2f8;
+    --muted: #9aa4b2; --faint: #748091; --hairline: #2a3340; --field: #10151d;
+    --navy: #24476f; --navy-ink: #ffffff; --navy-soft: #c9d8ec;
+    --link: #8ab4f8; --thead: #1d2633; --code: #1e2229;
+    --ok-fill: #13261b; --ok-rule: #4caf72; --ok-ink: #86d7a5;
+    --info-fill: #12223a; --info-rule: #4a8ad0; --info-ink: #9cc3f0;
+    --warn-fill: #2c2312; --warn-rule: #d99a3a; --warn-ink: #f0c07a;
+    --bad-fill: #2e1718; --bad-rule: #d0555a; --bad-ink: #f2a0a3; --bad-frame: #5a2a2d;
+    --note-fill: #1b212a; --note-rule: #6b7685; --note-ink: #b8c1cc;
+    color-scheme: dark;
+  }
+
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
-         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", "Noto Sans Thai", sans-serif; }
-  main { max-width: 980px; margin: 0 auto; padding: 16px; }
-  h1 { font-size: 20px; margin: 4px 0 16px; display: flex; align-items: center; gap: 10px; }
-  h2 { font-size: 16px; margin: 0 0 12px; }
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  html, body { margin: 0; }
+  body { background: var(--bg); color: var(--ink);
+         font: 15px/1.5 "Bai Jamjuree", "Sarabun", system-ui, -apple-system, "Segoe UI",
+               "Noto Sans Thai", sans-serif; }
+  .mono, code, pre, textarea.mono {
+    font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", ui-monospace, "DejaVu Sans Mono", monospace; }
+  a { color: var(--link); }
+  :focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 0 16px; }
+  .hidden { display: none !important; }
+
+  /* --- Top bar and tabs --------------------------------------------------- */
+  .topbar { background: var(--navy); color: var(--navy-ink); }
+  .topbar .wrap { display: flex; align-items: center; justify-content: space-between;
+                  gap: 12px; min-height: 56px; }
+  .topbar h1 { font-size: 19px; margin: 0; letter-spacing: .2px; }
+  .conn { font-size: 13px; padding: 3px 10px; border-radius: 999px;
+          background: rgba(255,255,255,.12); color: var(--navy-soft); white-space: nowrap; }
+  .conn.on { background: rgba(76,175,114,.22); color: #b9f0cc; }
+  nav.tabs { display: flex; gap: 4px; margin: 16px 0 14px; padding: 4px;
+             background: var(--panel); border: 1px solid var(--hairline); border-radius: 10px;
+             overflow-x: auto; }
+  nav.tabs button { flex: 1 1 0; min-width: 0; border: 0; background: transparent;
+                    color: var(--muted); font: inherit; font-weight: 600; padding: 9px 12px;
+                    border-radius: 7px; cursor: pointer; }
+  nav.tabs button[aria-selected="true"] { background: var(--navy); color: var(--navy-ink); }
+
+  /* --- Panels and numbered banners (the PDF's H2) ---------------------------- */
+  .panel { background: var(--panel); border: 1px solid var(--hairline); border-radius: 10px;
            padding: 16px; margin-bottom: 16px; }
-  label { display: block; font-weight: 600; font-size: 13px; margin: 12px 0 4px; }
-  .hint { color: var(--muted); font-size: 12px; font-weight: 400; }
+  .panel > p.lead { margin: 0 0 6px; color: var(--muted); font-size: 14px; }
+  h2.banner { background: var(--navy); color: var(--navy-ink); font-size: 15px; font-weight: 700;
+              margin: 22px 0 12px; padding: 6px 12px; border-radius: 4px;
+              display: flex; align-items: baseline; gap: 10px; }
+  h2.banner:first-child { margin-top: 0; }
+  h2.banner .n { color: var(--navy-soft); font-weight: 600; }
+  h2.banner small { margin-left: auto; font-weight: 400; color: var(--navy-soft); font-size: 12px; }
+
+  /* --- Fields -------------------------------------------------------------- */
+  .field { margin: 0 0 14px; min-width: 0; }
+  .field > .lbl { display: block; font-weight: 700; font-size: 13.5px; color: var(--heading);
+                  margin: 0 0 5px; }
+  .field > .lbl .opt { font-weight: 400; color: var(--faint); }
+  .help { color: var(--muted); font-size: 12.5px; margin: 4px 0 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0 18px; }
   input[type=text], input[type=password], input[type=number], select, textarea {
-    width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
-    background: var(--bg); color: var(--text); font: inherit; }
-  textarea { min-height: 88px; font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 13px; }
-  textarea.prose { min-height: 64px; font-family: inherit; font-size: 14px; }
-  fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 4px 12px 12px; margin: 14px 0 0; }
-  legend { font-size: 13px; font-weight: 600; color: var(--muted); padding: 0 4px; }
-  .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0 14px; }
-  .checks { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px; }
-  .checks label { display: inline-flex; align-items: center; gap: 6px; font-weight: 400; margin: 0; }
-  button { padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border);
-           background: var(--panel); color: var(--text); font: inherit; cursor: pointer; }
-  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
-  button:disabled { opacity: .5; cursor: default; }
-  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-  .msg { margin-top: 12px; white-space: pre-wrap; font-size: 13px; }
-  .msg.bad { color: var(--bad); } .msg.ok { color: var(--ok); }
-  pre { background: var(--code); padding: 10px; border-radius: 6px; overflow-x: auto;
-        font-size: 12px; max-height: 320px; white-space: pre-wrap; word-break: break-word; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
-  tr.clickable { cursor: pointer; } tr.clickable:hover { background: var(--bg); }
-  .stages { font-family: ui-monospace, Menlo, monospace; letter-spacing: 1px; white-space: nowrap; }
-  .s-done { color: var(--ok); } .s-failed { color: var(--bad); } .s-running { color: var(--warn); }
-  .s-pending { color: var(--muted); }
-  .link { font-family: ui-monospace, Menlo, monospace; font-size: 15px; word-break: break-all; }
-  a.meetlink { color: var(--accent); }
-  button.join { padding: 2px 10px; font-size: 12px; margin-left: 6px; }
-  .meet { display: none; margin-top: 12px; padding: 12px; border: 1px dashed var(--accent); border-radius: 8px; }
-  .badge { font-size: 11px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); }
-  .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
-  .tabs button[aria-selected=true] { border-color: var(--accent); color: var(--accent); }
-  .hidden { display: none; }
-  .table-wrap { overflow-x: auto; }
+    width: 100%; padding: 9px 11px; border: 1px solid var(--hairline); border-radius: 7px;
+    background: var(--field); color: var(--ink); font: inherit; font-size: 14.5px; }
+  textarea { min-height: 96px; resize: vertical; }
+  textarea.mono { font-size: 13px; line-height: 1.55; }
+  input.is-bad, textarea.is-bad { border-color: var(--bad-rule); }
+  input.is-warn { border-color: var(--warn-rule); }
+  input.is-ok { border-color: var(--ok-rule); }
+
+  /* One-line field feedback: ✓ / ⚠ / ✗ / ℹ in the callout colours. */
+  .fb { display: flex; gap: 6px; align-items: flex-start; font-size: 12.5px; margin-top: 5px; }
+  .fb:empty { display: none; }
+  .fb .ic { font-weight: 700; flex: none; width: 1.1em; text-align: center; }
+  .fb.ok { color: var(--ok-ink); } .fb.warn { color: var(--warn-ink); }
+  .fb.bad { color: var(--bad-ink); } .fb.note { color: var(--muted); } .fb.info { color: var(--info-ink); }
+
+  /* Segmented control: every choice visible, the chosen one navy with a ✓. */
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--hairline);
+         border-radius: 8px; overflow: hidden; background: var(--field); max-width: 100%; }
+  .seg label { position: relative; cursor: pointer; }
+  .seg label + label { border-left: 1px solid var(--hairline); }
+  .seg input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .seg span { display: block; padding: 8px 14px; font-size: 14px; color: var(--muted);
+              white-space: nowrap; user-select: none; }
+  .seg span::before { content: ""; display: inline-block; width: 0; transition: width .12s; }
+  .seg input:checked + span { background: var(--navy); color: var(--navy-ink); font-weight: 600; }
+  .seg input:checked + span::before { content: "✓"; width: 1.2em; }
+  .seg input:focus-visible + span { outline: 2px solid var(--link); outline-offset: -3px; }
+  .seg.locked { opacity: .75; }
+  .seg.locked label { cursor: not-allowed; }
+  .seg.locked input:checked + span::before { content: "🔒"; width: 1.5em; }
+
+  /* Switch: a track with a knob; on = green with a ✓ in the knob. */
+  .switches { display: grid; gap: 4px 18px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .switch { display: flex; gap: 12px; align-items: flex-start; cursor: pointer; padding: 6px 0; }
+  .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .switch .track { flex: none; position: relative; width: 42px; height: 24px; border-radius: 999px;
+                   background: var(--hairline); transition: background .15s; margin-top: 1px; }
+  .switch .track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px;
+                          border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25);
+                          transition: left .15s; font-size: 12px; line-height: 18px; text-align: center;
+                          font-weight: 700; color: var(--ok-rule); }
+  .switch input:checked + .track { background: var(--ok-rule); }
+  .switch input:checked + .track::after { left: 21px; content: "✓"; }
+  .switch input:focus-visible + .track { outline: 2px solid var(--link); outline-offset: 2px; }
+  .switch input:disabled + .track { opacity: .45; }
+  .switch.off-limits { cursor: not-allowed; color: var(--faint); }
+  .switch .txt b { display: block; font-size: 14px; }
+  .switch .txt small { display: block; color: var(--muted); font-size: 12.5px; }
+  .switch .state { font-size: 11px; font-weight: 700; letter-spacing: .5px; color: var(--faint);
+                   margin-left: 4px; }
+  .switch input:checked ~ .txt .state { color: var(--ok-ink); }
+
+  /* --- Callouts (DESIGN.md's boxes) ------------------------------------------ */
+  .callout { border-left: 3px solid var(--note-rule); background: var(--note-fill);
+             border-radius: 0 6px 6px 0; padding: 10px 12px; margin: 12px 0; font-size: 14px; }
+  .callout .title { display: flex; gap: 8px; align-items: baseline; font-weight: 700; color: var(--note-ink); }
+  .callout .title .ic { flex: none; width: 1.1em; text-align: center; }
+  .callout .body { margin: 4px 0 0 1.6em; color: var(--ink); }
+  .callout .body ul { margin: 4px 0 0; padding-left: 18px; }
+  .callout.ok   { border-color: var(--ok-rule);   background: var(--ok-fill); }
+  .callout.ok .title   { color: var(--ok-ink); }
+  .callout.info { border-color: var(--info-rule); background: var(--info-fill); }
+  .callout.info .title { color: var(--info-ink); }
+  .callout.warn { border-color: var(--warn-rule); background: var(--warn-fill); }
+  .callout.warn .title { color: var(--warn-ink); }
+  .callout.bad  { border-color: var(--bad-rule);  background: var(--bad-fill);
+                  box-shadow: inset 0 0 0 1px var(--bad-frame); }
+  .callout.bad .title  { color: var(--bad-ink); }
+  .callout .actions { margin-top: 10px; }
+  .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* --- Per-line check of the inputs ---------------------------------------- */
+  ul.lines { list-style: none; margin: 8px 0 0; padding: 0; border: 1px solid var(--hairline);
+             border-radius: 8px; overflow: hidden; }
+  ul.lines:empty { display: none; }
+  ul.lines li { display: grid; grid-template-columns: 1.6em 1fr; gap: 2px 8px; padding: 7px 10px;
+                font-size: 13.5px; border-top: 1px solid var(--hairline); }
+  ul.lines li:first-child { border-top: 0; }
+  ul.lines .ic { font-weight: 700; text-align: center; }
+  ul.lines li.ok .ic { color: var(--ok-rule); }
+  ul.lines li.bad { background: var(--bad-fill); } ul.lines li.bad .ic { color: var(--bad-rule); }
+  ul.lines li.wait .ic, ul.lines li.wait .reason { color: var(--faint); }
+  ul.lines .what { min-width: 0; overflow-wrap: anywhere; }
+  ul.lines .src { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+  ul.lines li.bad .reason { color: var(--bad-ink); font-weight: 600; }
+  .chip { display: inline-block; font-size: 11.5px; font-weight: 600; padding: 1px 7px; margin: 0 4px 2px 0;
+          border-radius: 999px; background: var(--thead); color: var(--heading); white-space: nowrap; }
+  .chip.new { background: var(--ok-fill); color: var(--ok-ink); }
+  .chip.resume { background: var(--info-fill); color: var(--info-ink); }
+
+  /* --- Buttons -------------------------------------------------------------- */
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+  button { padding: 9px 16px; border-radius: 7px; border: 1px solid var(--hairline);
+           background: var(--panel); color: var(--ink); font: inherit; font-size: 14px;
+           font-weight: 600; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--link); }
+  button.primary { background: var(--navy); color: var(--navy-ink); border-color: var(--navy); }
+  button.go { background: var(--ok-rule); color: #fff; border-color: var(--ok-rule); }
+  button.danger { background: var(--bad-rule); color: #fff; border-color: var(--bad-rule); }
+  button.small { padding: 4px 10px; font-size: 12.5px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .btn-note { font-size: 12.5px; color: var(--muted); }
+
+  pre { background: var(--code); padding: 10px 12px; border-radius: 6px; overflow-x: auto;
+        font-size: 12px; max-height: 340px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
+  details > summary { cursor: pointer; font-size: 13px; color: var(--muted); margin-top: 8px; }
+  details[open] > summary { color: var(--ink); }
+
+  /* --- Runs ----------------------------------------------------------------- */
+  .runs-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .runs-head .legend { font-size: 12px; color: var(--muted); margin-left: auto; }
+  .run { border: 1px solid var(--hairline); border-radius: 8px; padding: 10px 12px; margin-top: 8px;
+         cursor: pointer; display: grid; gap: 4px; }
+  .run:hover, .run.sel { border-color: var(--link); }
+  .run.sel { box-shadow: inset 3px 0 0 var(--navy); }
+  .run .top { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .run .id { font-weight: 700; overflow-wrap: anywhere; min-width: 0; }
+  .run .when { margin-left: auto; font-size: 12.5px; color: var(--faint); white-space: nowrap; }
+  .run .src { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+  .badge { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; font-weight: 700;
+           padding: 1px 8px; border-radius: 999px; white-space: nowrap; border: 1px solid transparent; }
+  .badge.ok { background: var(--ok-fill); color: var(--ok-ink); border-color: var(--ok-rule); }
+  .badge.info { background: var(--info-fill); color: var(--info-ink); border-color: var(--info-rule); }
+  .badge.warn { background: var(--warn-fill); color: var(--warn-ink); border-color: var(--warn-rule); }
+  .badge.bad { background: var(--bad-fill); color: var(--bad-ink); border-color: var(--bad-rule); }
+  .badge.note { background: var(--note-fill); color: var(--note-ink); border-color: var(--hairline); }
+  .pills { display: flex; flex-wrap: wrap; gap: 4px; }
+  .pill { font-size: 12px; padding: 1px 8px; border-radius: 4px; border: 1px solid var(--hairline);
+          color: var(--muted); white-space: nowrap; }
+  .pill.done { color: var(--ok-ink); background: var(--ok-fill); border-color: transparent; }
+  .pill.failed { color: var(--bad-ink); background: var(--bad-fill); border-color: var(--bad-rule); font-weight: 700; }
+  .pill.running { color: var(--info-ink); background: var(--info-fill); border-color: var(--info-rule); font-weight: 700; }
+  .pill.pending { border-style: dashed; }
+  .pill.running .dot { animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .25; } }
+  .detail dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 8px 0 0; font-size: 14px; }
+  .detail dt { color: var(--muted); }
+  .detail dd { margin: 0; overflow-wrap: anywhere; min-width: 0; }
+  .detail h3 { font-size: 14px; margin: 16px 0 4px; color: var(--heading); }
+  .outfile { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 4px 0; font-size: 13px; }
+  .outfile code { background: var(--code); padding: 2px 6px; border-radius: 4px; overflow-wrap: anywhere; }
+  .meetlink { font-family: "JetBrains Mono", ui-monospace, monospace; overflow-wrap: anywhere; }
+  .biglink { font-size: 17px; margin: 6px 0 2px; }
+
+  @media (max-width: 560px) {
+    .panel { padding: 12px; }
+    nav.tabs button { padding: 8px 6px; font-size: 13.5px; line-height: 1.25; }
+    .seg span { padding: 8px 11px; }
+    .detail dl { grid-template-columns: 1fr; }
+    .detail dt { margin-top: 6px; }
+  }
 </style>
 </head>
 <body>
-<main>
-  <h1>Meeting Bot <span class="badge" id="conn">not connected</span></h1>
+<header class="topbar">
+  <div class="wrap">
+    <h1>Meeting Bot</h1>
+    <span class="conn" id="conn">○ not connected</span>
+  </div>
+</header>
+<main class="wrap">
 
-  <section class="panel" id="tokenPanel">
-    <h2>Access token</h2>
-    <label for="token">MEETING_BOT_TOKEN <span class="hint">— kept in this browser only</span></label>
-    <input type="password" id="token" autocomplete="off">
+  <section class="panel" id="tokenPanel" style="margin-top:16px">
+    <h2 class="banner">Connect</h2>
+    <div class="field">
+      <label class="lbl" for="token">Access token <span class="opt">— MEETING_BOT_TOKEN, kept in this browser only</span></label>
+      <input type="password" id="token" autocomplete="off" placeholder="Paste the token, or open the link ./webui.sh url prints">
+    </div>
     <div class="actions"><button class="primary" id="saveToken">Connect</button></div>
-    <div class="msg" id="tokenMsg"></div>
+    <div id="tokenMsg"></div>
   </section>
 
   <div id="app" class="hidden">
-    <div class="tabs" role="tablist">
+    <nav class="tabs" role="tablist">
       <button role="tab" aria-selected="true" data-tab="meet">New Google Meet</button>
       <button role="tab" aria-selected="false" data-tab="summarize">Record / summarize</button>
       <button role="tab" aria-selected="false" data-tab="runs">Runs</button>
-    </div>
+    </nav>
 
+    <!-- ===================== New Google Meet ===================== -->
     <section class="panel" data-panel="meet">
-      <h2>Start a new Google Meet</h2>
-      <p class="hint">The bot creates the call in its signed-in Google account, admits everyone who
-        asks to join, records it, and ends the call once everyone has left (or nobody joins within
-        NEW_MEET_WAIT_MINUTES). Transcript and summary follow automatically.</p>
-      <div class="row">
-        <div><label for="meetName">Meeting name</label><input type="text" id="meetName" placeholder="Project sync"></div>
-        <div><label for="meetLang">Spoken language</label><select id="meetLang"></select></div>
-      </div>
-      <fieldset>
-        <legend>Summary</legend>
-        <div class="row">
-          <div><label for="meetPrompt">Style</label><select id="meetPrompt"></select></div>
-          <div><label for="meetOutLang">Written in</label><select id="meetOutLang"></select></div>
-          <div><label for="meetFont">PDF font</label><select id="meetFont"></select></div>
-        </div>
-        <div class="row">
-          <div><label for="meetRecord">Save recording</label><select id="meetRecord"></select></div>
-          <div><label for="meetSource">Summarize from</label><select id="meetSource"></select></div>
-        </div>
-        <p class="hint">Audio only: an .m4a instead of a screen recording, a smaller hidden browser,
-          and no frames — so the summary is from the voice. Voice only with a video recording keeps
-          the video but sends no frames to the summarizer.</p>
-        <label for="meetInstructions">Extra instructions <span class="hint">(optional) — for the
-          summarizer, this run only: what to focus on, what to skip, anything to add</span></label>
-        <textarea id="meetInstructions" class="prose" placeholder="e.g. List every decision with its owner; skip the small talk at the start."></textarea>
-      </fieldset>
-      <div class="actions"><button class="primary" id="startMeet">Create meeting</button></div>
-      <div class="meet" id="meetBox">
-        <div class="hint" id="meetStatus">Creating the meeting…</div>
-        <div class="link" id="meetLink"></div>
-        <div class="actions">
-          <button id="copyMeet" disabled>Copy link</button>
-          <button id="openMeet" disabled>Open</button>
-          <button id="stopMeet" disabled>End &amp; stop recording</button>
-        </div>
-      </div>
-      <div class="msg" id="meetMsg"></div>
-    </section>
+      <p class="lead">The bot creates the call in its signed-in Google account, admits everyone who
+        asks to join, records it, and ends the call once everyone has left (or when nobody joins
+        within NEW_MEET_WAIT_MINUTES). The transcript and summary follow on their own.</p>
 
-    <section class="panel hidden" data-panel="summarize">
-      <h2>Record or summarize</h2>
-      <label for="inputs">Inputs <span class="hint">— one per line: Meet/Zoom link, YouTube link or playlist,
-        Kaltura &lt;iframe&gt; or its src, or a file path on the server. Append
-        <code>#t=00:05:00-01:30:00</code> to summarize only part of one.</span></label>
-      <textarea id="inputs" placeholder="https://www.youtube.com/watch?v=...&#10;/home/you/Videos/lecture.mp4#t=00:05:00-01:30:00"></textarea>
-      <div class="row">
-        <div><label for="language">Spoken language</label><select id="language"></select></div>
-        <div><label for="clip">Clip window for all <span class="hint">(optional)</span></label>
-          <input type="text" id="clip" placeholder="00:05:00-01:30:00"></div>
-        <div><label for="jobs">Parallel jobs</label><input type="number" id="jobs" min="1" max="8"></div>
-      </div>
-      <div class="row">
-        <div><label for="name">Name <span class="hint">(single input only)</span></label><input type="text" id="name"></div>
-        <div><label for="combine">Combine into one document <span class="hint">(optional .md path)</span></label>
-          <input type="text" id="combine" placeholder="/home/you/notes/midterm-review.md"></div>
-      </div>
-      <label for="resources">Reference material <span class="hint">— one per line: a GitHub repo URL or a
-        server path to slides / notes. A Markdown file may carry course/source/citation_label
-        frontmatter; the lecture style then cites it by that label.</span></label>
-      <textarea id="resources" style="min-height:56px"></textarea>
-      <fieldset>
-        <legend>Summary</legend>
-        <div class="row">
-          <div><label for="prompt">Style</label><select id="prompt"></select></div>
-          <div><label for="outLang">Written in</label><select id="outLang"></select></div>
-          <div><label for="font">PDF font</label><select id="font"></select></div>
+      <h2 class="banner"><span class="n">1</span> Meeting</h2>
+      <div class="grid">
+        <div class="field">
+          <label class="lbl" for="meetName">Meeting name <span class="opt">(optional)</span></label>
+          <input type="text" id="meetName" placeholder="Project sync">
+          <div class="help">Names the run and the files.</div>
         </div>
-        <div class="row">
-          <div><label for="source">Summarize from</label><select id="source"></select></div>
-          <div><label for="record">Save recording <span class="hint">(meeting links only)</span></label>
-            <select id="record"></select></div>
+        <div class="field">
+          <span class="lbl" id="lbl-mLang">Spoken language</span>
+          <div class="seg" role="radiogroup" aria-labelledby="lbl-mLang" id="mLang"></div>
         </div>
-        <p class="hint">Voice only skips frames for every input (a YouTube video is then not even
-          downloaded). Audio only records a meeting as an .m4a, and forces voice only.</p>
-        <label for="instructions">Extra instructions <span class="hint">(optional) — for the
-          summarizer, this run only: what to focus on, what to skip, anything to add</span></label>
-        <textarea id="instructions" class="prose" placeholder="e.g. Focus on what will be on the midterm; add a worked example for each formula."></textarea>
-      </fieldset>
-      <div class="checks">
-        <label><input type="checkbox" id="playlist"> Expand YouTube playlists</label>
-        <label><input type="checkbox" id="noCombinePdf"> Combined: markdown only</label>
-        <label><input type="checkbox" id="force"> Start over (ignore earlier progress)</label>
       </div>
+
+      <h2 class="banner"><span class="n">2</span> Recording</h2>
+      <div class="grid">
+        <div class="field">
+          <span class="lbl" id="lbl-mRecord">Save recording</span>
+          <div class="seg" role="radiogroup" aria-labelledby="lbl-mRecord" id="mRecord"></div>
+          <div class="fb" id="fb-mRecord"></div>
+        </div>
+        <div class="field">
+          <span class="lbl" id="lbl-mSource">Summarize from</span>
+          <div class="seg" role="radiogroup" aria-labelledby="lbl-mSource" id="mSource"></div>
+          <div class="fb" id="fb-mSource"></div>
+        </div>
+      </div>
+
+      <h2 class="banner"><span class="n">3</span> Summary</h2>
+      <div class="grid">
+        <div class="field">
+          <label class="lbl" for="meetPrompt">Style</label>
+          <select id="meetPrompt"></select>
+          <div class="fb note" id="fb-meetPrompt"></div>
+        </div>
+        <div class="field">
+          <span class="lbl" id="lbl-mOutLang">Written in</span>
+          <div class="seg" role="radiogroup" aria-labelledby="lbl-mOutLang" id="mOutLang"></div>
+        </div>
+        <div class="field">
+          <label class="lbl" for="meetFont">PDF font</label>
+          <select id="meetFont"></select>
+          <div class="help">The list follows the language the notes are written in.</div>
+        </div>
+      </div>
+      <div class="field">
+        <label class="lbl" for="meetInstructions">Extra instructions <span class="opt">(optional, this run only)</span></label>
+        <textarea id="meetInstructions" placeholder="e.g. List every decision with its owner; skip the small talk at the start."></textarea>
+        <div class="fb" id="fb-meetInstructions"></div>
+      </div>
+
       <div class="actions">
-        <button id="check">Check</button>
-        <button class="primary" id="start" disabled>Start</button>
+        <button class="go" id="startMeet">▶ Create meeting</button>
       </div>
-      <div class="msg" id="checkMsg"></div>
-      <div class="table-wrap"><table id="plan" class="hidden">
-        <thead><tr><th>Type</th><th>Window</th><th>Run</th><th>Input</th></tr></thead><tbody></tbody>
-      </table></div>
-      <pre id="startLog" class="hidden"></pre>
+      <div id="meetBox" class="hidden"></div>
     </section>
 
-    <section class="panel hidden" data-panel="runs">
-      <h2>Runs <span class="hint">— stages: record · fetch · clip · transcribe · frames · summarize</span></h2>
-      <div class="table-wrap"><table id="runs">
-        <thead><tr><th>Run</th><th>Stages</th><th>Updated</th></tr></thead><tbody></tbody>
-      </table></div>
-      <div id="runDetail" class="hidden">
-        <h2 id="rdTitle" style="margin-top:16px"></h2>
-        <div id="rdInfo" class="hint"></div>
-        <div class="actions">
-          <button id="rdJoin" class="primary hidden">Join meeting</button>
-          <button id="rdResume">Resume</button>
-          <button id="rdStop">Stop / leave meeting</button>
-        </div>
-        <div id="rdLogs"></div>
+    <!-- ===================== Record / summarize ===================== -->
+    <section class="panel hidden" data-panel="summarize">
+      <h2 class="banner"><span class="n">1</span> Inputs <small id="inputCount"></small></h2>
+      <div class="field">
+        <label class="lbl" for="inputs">One per line</label>
+        <textarea id="inputs" class="mono" spellcheck="false"
+          placeholder="https://www.youtube.com/watch?v=...&#10;https://meet.google.com/abc-defg-hij&#10;/home/you/Videos/lecture.mp4#t=00:05:00-01:30:00"></textarea>
+        <div class="help">A Meet or Zoom link, a YouTube link or playlist, a Kaltura
+          &lt;iframe&gt; or its src, or a file path on this machine. Add
+          <code>#t=00:05:00-01:30:00</code> to one line to summarize only that part.
+          Each line is checked automatically as you type.</div>
+        <ul class="lines" id="lineChecks" aria-live="polite"></ul>
       </div>
+
+      <h2 class="banner"><span class="n">2</span> Summary</h2>
+      <div class="grid">
+        <div class="field">
+          <label class="lbl" for="prompt">Style</label>
+          <select id="prompt"></select>
+          <div class="fb note" id="fb-prompt"></div>
+        </div>
+        <div class="field">
+          <span class="lbl" id="lbl-sOutLang">Written in</span>
+          <div class="seg" role="radiogroup" aria-labelledby="lbl-sOutLang" id="sOutLang"></div>
+        </div>
+        <div class="field">
+          <label class="lbl" for="font">PDF font</label>
+          <select id="font"></select>
+          <div class="help">The list follows the language the notes are written in.</div>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="field">
+          <span class="lbl" id="lbl-sSource">Summarize from</span>
+          <div class="seg" role="radiogroup" aria-labelledby="lbl-sSource" id="sSource"></div>
+          <div class="fb" id="fb-sSource"></div>
+        </div>
+        <div class="field">
+          <span class="lbl" id="lbl-sRecord">Save recording <span class="opt">(meeting links only)</span></span>
+          <div class="seg" role="radiogroup" aria-labelledby="lbl-sRecord" id="sRecord"></div>
+          <div class="fb" id="fb-sRecord"></div>
+        </div>
+      </div>
+      <div class="field">
+        <label class="lbl" for="instructions">Extra instructions <span class="opt">(optional, this run only)</span></label>
+        <textarea id="instructions" placeholder="e.g. Focus on what will be on the midterm; add a worked example for each formula."></textarea>
+        <div class="fb" id="fb-instructions"></div>
+      </div>
+
+      <h2 class="banner"><span class="n">3</span> Options</h2>
+      <div class="grid">
+        <div class="field">
+          <span class="lbl" id="lbl-sLang">Spoken language</span>
+          <div class="seg" role="radiogroup" aria-labelledby="lbl-sLang" id="sLang"></div>
+        </div>
+        <div class="field">
+          <label class="lbl" for="clip">Clip window for every input <span class="opt">(optional)</span></label>
+          <input type="text" id="clip" class="mono" placeholder="00:05:00-01:30:00" spellcheck="false">
+          <div class="fb" id="fb-clip"></div>
+        </div>
+        <div class="field">
+          <label class="lbl" for="jobs">Parallel jobs</label>
+          <input type="number" id="jobs" min="1" max="8" inputmode="numeric">
+          <div class="fb" id="fb-jobs"></div>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="field">
+          <label class="lbl" for="name">Name <span class="opt">(one input only)</span></label>
+          <input type="text" id="name">
+          <div class="fb" id="fb-name"></div>
+        </div>
+        <div class="field">
+          <label class="lbl" for="combine">Combine into one document <span class="opt">(optional .md path)</span></label>
+          <input type="text" id="combine" class="mono" spellcheck="false" placeholder="/home/you/notes/midterm-review.md">
+          <div class="fb" id="fb-combine"></div>
+        </div>
+      </div>
+      <div class="field">
+        <label class="lbl" for="resources">Reference material <span class="opt">(optional, one per line)</span></label>
+        <textarea id="resources" class="mono" spellcheck="false" style="min-height:60px"
+          placeholder="https://github.com/you/course-slides&#10;/home/you/notes/textbook.md"></textarea>
+        <div class="help">A GitHub repo URL or a path to slides / notes. A Markdown file may carry
+          course / source / citation_label frontmatter; the lecture style then cites it by that label.</div>
+      </div>
+      <div class="switches">
+        <div>
+          <label class="switch"><input type="checkbox" id="playlist" role="switch"><span class="track" aria-hidden="true"></span>
+            <span class="txt"><b>Expand YouTube playlists <span class="state" data-for="playlist"></span></b>
+              <small>A link with <code>&amp;list=</code> becomes one run per video.</small></span></label>
+          <div class="fb" id="fb-playlist"></div>
+        </div>
+        <div>
+          <label class="switch" id="sw-noCombinePdf"><input type="checkbox" id="noCombinePdf" role="switch"><span class="track" aria-hidden="true"></span>
+            <span class="txt"><b>Combined: Markdown only <span class="state" data-for="noCombinePdf"></span></b>
+              <small>Skip the combined PDF.</small></span></label>
+          <div class="fb" id="fb-noCombinePdf"></div>
+        </div>
+        <div>
+          <label class="switch"><input type="checkbox" id="force" role="switch"><span class="track" aria-hidden="true"></span>
+            <span class="txt"><b>Start over <span class="state" data-for="force"></span></b>
+              <small>Ignore earlier progress on these inputs.</small></span></label>
+          <div class="fb" id="fb-force"></div>
+        </div>
+      </div>
+
+      <h2 class="banner"><span class="n">4</span> Check &amp; start</h2>
+      <div id="checkBox"></div>
+      <div class="actions">
+        <button id="check">↻ Check again</button>
+        <button class="go" id="start" disabled>▶ Start</button>
+        <span class="btn-note" id="startNote"></span>
+      </div>
+      <div id="startBox"></div>
+    </section>
+
+    <!-- ===================== Runs ===================== -->
+    <section class="panel hidden" data-panel="runs">
+      <div class="runs-head">
+        <button class="small" id="refreshRuns">↻ Refresh</button>
+        <span class="legend">✓ done · ▶ running · ✗ failed · ○ not yet</span>
+      </div>
+      <div id="runsList"></div>
+      <div id="runDetail" class="detail hidden"></div>
     </section>
   </div>
 </main>
@@ -201,8 +470,7 @@
   const $ = (id) => document.getElementById(id);
   let token = "";
   try { token = localStorage.getItem("mbToken") || ""; } catch (e) {}
-  let lastCheckKey = null;
-  let currentRun = null;
+  let OPT = null;
 
   async function api(path, opts = {}) {
     const res = await fetch(path, {
@@ -218,83 +486,196 @@
     return data;
   }
 
+  // --- Small builders (text only through textContent) ------------------------
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+  const ICON = { ok: "✓", warn: "⚠", bad: "✗", note: "ℹ", info: "▶", wait: "◌" };
+  // A DESIGN.md callout: level ok | info | warn | bad | note. `body` is a
+  // string, a list of strings (a bullet list) or a node.
+  function callout(level, title, body, icon) {
+    const box = el("div", "callout " + level);
+    const t = el("div", "title");
+    const ic = el("span", "ic", icon || ICON[level] || "");
+    if (icon === "spin") { ic.textContent = "◌"; ic.classList.add("spin"); }
+    t.append(ic, el("span", null, title));
+    box.appendChild(t);
+    if (body !== undefined && body !== null && body !== "") {
+      const b = el("div", "body");
+      if (Array.isArray(body)) {
+        const ul = el("ul");
+        body.forEach((x) => ul.appendChild(el("li", null, x)));
+        b.appendChild(ul);
+      } else if (body instanceof Node) b.appendChild(body);
+      else b.textContent = body;
+      box.appendChild(b);
+    }
+    return box;
+  }
+  function show(container, node) { const c = $(container); c.innerHTML = ""; if (node) c.appendChild(node); }
+  // One-line field feedback under a control.
+  function fb(id, level, text) {
+    const f = $("fb-" + id);
+    if (!f) return;
+    f.className = "fb " + (level || "");
+    f.innerHTML = "";
+    if (!text) return;
+    f.append(el("span", "ic", ICON[level] || ""), el("span", null, text));
+  }
+  function mark(input, level) {
+    input.classList.remove("is-ok", "is-warn", "is-bad");
+    if (level) input.classList.add("is-" + level);
+  }
+
+  // Inline confirmation in place of the browser's confirm(): a red bar after
+  // `anchor`, resolving true on the red button.
+  function confirmInline(anchor, text, yesLabel) {
+    document.querySelectorAll(".confirm-bar").forEach((b) => b.remove());
+    return new Promise((resolve) => {
+      const actions = el("div", "actions");
+      const yes = el("button", "danger", yesLabel);
+      const no = el("button", null, "Cancel");
+      actions.append(yes, no);
+      const bar = callout("bad", text, actions, "⚠");
+      bar.classList.add("confirm-bar");
+      anchor.after(bar);
+      yes.onclick = () => { bar.remove(); resolve(true); };
+      no.onclick = () => { bar.remove(); resolve(false); };
+      bar.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      yes.focus();
+    });
+  }
+
   function showToken(msg) {
     $("tokenPanel").classList.remove("hidden");
     $("app").classList.add("hidden");
-    $("conn").textContent = "not connected";
-    $("tokenMsg").textContent = msg || "";
-    $("tokenMsg").className = "msg bad";
+    $("conn").textContent = "○ not connected"; $("conn").classList.remove("on");
+    show("tokenMsg", msg ? callout("bad", msg) : null);
   }
 
   function fillSelect(sel, values, chosen, labels) {
     sel.innerHTML = "";
     values.forEach((v) => {
-      const o = document.createElement("option");
-      o.value = v; o.textContent = (labels && labels[v]) || v || "(default)";
+      const o = el("option", null, (labels && labels[v]) || v || "(default)");
+      o.value = v;
       if (v === chosen) o.selected = true;
       sel.appendChild(o);
     });
   }
 
-  // The PDF font list depends on the language the summary is written in:
-  // Computer Modern has no Thai, so it is only offered for English.
-  let OPT = null;
-  const FONT_LABELS = { "CMU Serif": "Computer Modern (CMU Serif)" };
-  // A language change selects that language's default font (PDF_FONT_TH /
-  // PDF_FONT_EN), not whatever the other language had.
-  function fillFonts(langSel, fontSel) {
-    const lang = langSel.value;
-    const fonts = (OPT.fonts || {})[lang] || [];
-    fillSelect(fontSel, fonts, (OPT.default_fonts || {})[lang], FONT_LABELS);
-  }
-  function setupSummaryFields(langId, fontId) {
-    fillSelect($(langId), OPT.summary_languages, OPT.default_summary_language,
-               OPT.summary_language_names);
-    fillFonts($(langId), $(fontId));
-    $(langId).addEventListener("change", () => {
-      fillFonts($(langId), $(fontId));
-      $(fontId).dispatchEvent(new Event("input"));
+  // Segmented control: radios named after the container, so every choice
+  // shows at once and the chosen one carries a ✓.
+  function buildSeg(id, values, chosen, labels) {
+    const box = $(id); box.innerHTML = "";
+    if (!values.includes(chosen)) chosen = values[0];
+    values.forEach((v) => {
+      const l = el("label");
+      const r = el("input"); r.type = "radio"; r.name = id; r.value = v; r.checked = v === chosen;
+      l.append(r, el("span", null, (labels && labels[v]) || v));
+      box.appendChild(l);
     });
   }
+  const seg = (id) => { const r = document.querySelector('input[name="' + id + '"]:checked'); return r ? r.value : ""; };
+  function setSeg(id, v) {
+    document.querySelectorAll('input[name="' + id + '"]').forEach((r) => { r.checked = r.value === v; });
+  }
+  function lockSeg(id, locked) {
+    $(id).classList.toggle("locked", locked);
+    document.querySelectorAll('input[name="' + id + '"]').forEach((r) => { r.disabled = locked; });
+  }
+  function notify(node) { node.dispatchEvent(new Event("input", { bubbles: true })); }
 
-  // Save recording / Summarize from. Audio only has no picture, so it forces
-  // voice only (pipeline.sh would refuse the pair); video frees the choice
-  // again and restores what was picked before.
-  const SOURCE_LABELS = { both: "Frames and voice", voice: "Voice only" };
-  const RECORD_LABELS = { video: "Video (screen + audio)", audio: "Audio only (.m4a)" };
+  // --- Labels ---------------------------------------------------------------
+  const FONT_LABELS = { "CMU Serif": "Computer Modern (CMU Serif)" };
+  const SPOKEN_LABELS = { th: "Thai", en: "English", auto: "Auto-detect" };
+  const SOURCE_LABELS = { both: "Frames + voice", voice: "Voice only" };
+  const RECORD_LABELS = { video: "Video", audio: "Audio only" };
+  const PROMPT_LABELS = { video: "Video — talks, news, interviews", meeting: "Meeting — decisions and actions",
+    lecture: "Lecture — study sheet", tutorial: "Tutorial — step-by-step guide",
+    reality: "Reality show — episode recap" };
+  const PROMPT_HELP = {
+    video: "Key points of a talk, news piece or interview.",
+    meeting: "Executive summary: decisions, action items with owners, open questions.",
+    lecture: "A study sheet with concepts, examples and exam warnings; cites reference material by its label.",
+    tutorial: "The steps, commands and gotchas, in order.",
+    reality: "Episode recap with [mm:ss] highlights (linked on YouTube), quotes, and the results last.",
+  };
+  function promptHelp(selId, fbId) {
+    const f = () => fb(fbId, "note", PROMPT_HELP[$(selId).value] || "");
+    $(selId).addEventListener("change", f); f();
+  }
+
+  // The font list depends on the language the notes are written in:
+  // Computer Modern has no Thai. A language change selects that language's
+  // default font (PDF_FONT_TH / PDF_FONT_EN).
+  function setupSummaryFields(langId, fontId) {
+    buildSeg(langId, OPT.summary_languages, OPT.default_summary_language, OPT.summary_language_names);
+    const fill = () => fillSelect($(fontId), (OPT.fonts || {})[seg(langId)] || [],
+                                  (OPT.default_fonts || {})[seg(langId)], FONT_LABELS);
+    fill();
+    $(langId).addEventListener("change", () => { fill(); notify($(fontId)); });
+  }
+
+  // Save recording / Summarize from. Audio only has no picture, so it locks
+  // "Summarize from" at voice (pipeline.sh would refuse the pair); video
+  // frees it and restores what was picked before.
   function setupMediaFields(recordId, sourceId) {
-    fillSelect($(recordId), ["video", "audio"], OPT.default_record_media, RECORD_LABELS);
-    fillSelect($(sourceId), ["both", "voice"], OPT.default_summary_source, SOURCE_LABELS);
-    let chosen = $(sourceId).value;
+    buildSeg(recordId, ["video", "audio"], OPT.default_record_media, RECORD_LABELS);
+    buildSeg(sourceId, ["both", "voice"], OPT.default_summary_source, SOURCE_LABELS);
+    let chosen = seg(sourceId);
     const sync = () => {
-      const audio = $(recordId).value === "audio";
-      if (audio) { $(sourceId).value = "voice"; } else { $(sourceId).value = chosen; }
-      $(sourceId).disabled = audio;
+      const audio = seg(recordId) === "audio";
+      setSeg(sourceId, audio ? "voice" : chosen);
+      lockSeg(sourceId, audio);
+      fb(recordId, audio ? "note" : "", audio
+        ? "An .m4a of the meeting audio, with a smaller hidden browser." : "");
+      if (audio) fb(sourceId, "warn", "Locked to voice only: an audio recording has no picture.");
+      else if (seg(sourceId) === "voice") fb(sourceId, "note", "No frames: the summary comes from the transcript alone.");
+      else fb(sourceId, "", "");
     };
-    $(sourceId).addEventListener("change", () => { chosen = $(sourceId).value; });
-    $(recordId).addEventListener("change", () => { sync(); $(sourceId).dispatchEvent(new Event("input")); });
+    $(sourceId).addEventListener("change", () => { chosen = seg(sourceId); sync(); });
+    $(recordId).addEventListener("change", sync);
     sync();
+  }
+  function countHint(textId, fbId) {
+    const f = () => {
+      const n = $(textId).value.trim().length;
+      fb(fbId, n ? "ok" : "", n ? n + " characters — the summarizer follows these for this run only." : "");
+    };
+    $(textId).addEventListener("input", f); f();
+  }
+  // The small ON / OFF word beside each switch.
+  function switchStates() {
+    document.querySelectorAll(".switch .state").forEach((s) => {
+      const c = $(s.dataset.for); s.textContent = c.checked ? "ON" : "OFF";
+    });
   }
 
   async function connect() {
     try {
       const opt = await api("/api/options");
+      OPT = opt;
       $("tokenPanel").classList.add("hidden");
       $("app").classList.remove("hidden");
-      $("conn").textContent = "connected";
-      OPT = opt;
-      const prompts = opt.prompts;
-      fillSelect($("prompt"), prompts, opt.default_prompt || "video");
-      fillSelect($("meetPrompt"), prompts,
-                 opt.prompts.includes("meeting") ? "meeting" : opt.default_prompt);
-      setupSummaryFields("outLang", "font");
-      setupSummaryFields("meetOutLang", "meetFont");
-      setupMediaFields("record", "source");
-      setupMediaFields("meetRecord", "meetSource");
-      fillSelect($("language"), opt.languages, opt.default_language);
-      fillSelect($("meetLang"), opt.languages, opt.default_language);
+      $("conn").textContent = "● connected"; $("conn").classList.add("on");
+      fillSelect($("prompt"), opt.prompts, opt.default_prompt || "video", PROMPT_LABELS);
+      fillSelect($("meetPrompt"), opt.prompts,
+                 opt.prompts.includes("meeting") ? "meeting" : opt.default_prompt, PROMPT_LABELS);
+      promptHelp("prompt", "prompt"); promptHelp("meetPrompt", "meetPrompt");
+      setupSummaryFields("sOutLang", "font");
+      setupSummaryFields("mOutLang", "meetFont");
+      setupMediaFields("sRecord", "sSource");
+      setupMediaFields("mRecord", "mSource");
+      buildSeg("sLang", opt.languages, opt.default_language, SPOKEN_LABELS);
+      buildSeg("mLang", opt.languages, opt.default_language, SPOKEN_LABELS);
+      countHint("instructions", "instructions"); countHint("meetInstructions", "meetInstructions");
       $("jobs").value = opt.default_jobs || 2;
       if (opt.summaries_dir) $("combine").placeholder = opt.summaries_dir.replace(/\/$/, "") + "/combined.md";
+      switchStates();
+      formChanged();
       refreshRuns();
     } catch (e) {
       if (e.message !== "unauthorized") showToken("Could not reach the server: " + e.message);
@@ -306,168 +687,421 @@
     try { localStorage.setItem("mbToken", token); } catch (e) {}
     connect();
   };
+  $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") $("saveToken").click(); });
 
-  document.querySelectorAll("[data-tab]").forEach((b) => {
-    b.onclick = () => {
-      document.querySelectorAll("[data-tab]").forEach((x) => x.setAttribute("aria-selected", x === b));
-      document.querySelectorAll("[data-panel]").forEach((p) =>
-        p.classList.toggle("hidden", p.dataset.panel !== b.dataset.tab));
-      if (b.dataset.tab === "runs") refreshRuns();
-    };
-  });
+  function selectTab(name) {
+    document.querySelectorAll("[data-tab]").forEach((x) => x.setAttribute("aria-selected", x.dataset.tab === name));
+    document.querySelectorAll("[data-panel]").forEach((p) => p.classList.toggle("hidden", p.dataset.panel !== name));
+    try { localStorage.setItem("mbTab", name); } catch (e) {}
+    if (name === "runs") refreshRuns();
+  }
+  document.querySelectorAll("[data-tab]").forEach((b) => { b.onclick = () => selectTab(b.dataset.tab); });
 
-  // --- New Google Meet ------------------------------------------------------
-  let meetRunPoll = null;
+  // --- New Google Meet --------------------------------------------------------
+  const MEET_RE = /^https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
+  let meetRunPoll = null, meetRun = null;
+  function meetAnchor(url, cls) {
+    const a = el("a", "meetlink" + (cls ? " " + cls : ""), url);
+    a.href = url; a.target = "_blank"; a.rel = "noopener";
+    a.onclick = (e) => e.stopPropagation();   // don't also open the run detail
+    return a;
+  }
+  function meetState(level, title, extra, icon) { show("meetBox", callout(level, title, extra, icon)); }
+
   $("startMeet").onclick = async () => {
     $("startMeet").disabled = true;
-    $("meetMsg").textContent = "";
-    $("meetBox").style.display = "block";
-    $("meetStatus").textContent = "Creating the meeting… (the browser is starting; this takes ~20s)";
-    $("meetLink").textContent = "";
-    ["copyMeet", "openMeet", "stopMeet"].forEach((id) => $(id).disabled = true);
+    $("meetBox").classList.remove("hidden");
+    meetRun = null;
+    meetState("info", "Creating the meeting…", "The bot's browser is starting; this takes about 20 seconds.", "spin");
     try {
       const r = await api("/trigger", { method: "POST", body: {
         new_meet: true, name: $("meetName").value.trim() || undefined,
-        prompt: $("meetPrompt").value || undefined, language: $("meetLang").value,
-        summary_language: $("meetOutLang").value, pdf_font: $("meetFont").value,
-        record_media: $("meetRecord").value, summary_source: $("meetSource").value,
+        prompt: $("meetPrompt").value || undefined, language: seg("mLang"),
+        summary_language: seg("mOutLang"), pdf_font: $("meetFont").value,
+        record_media: seg("mRecord"), summary_source: seg("mSource"),
         instructions: $("meetInstructions").value.trim() || undefined } });
       pollMeet(r.log_name, Date.now());
     } catch (e) {
-      $("meetMsg").textContent = e.message; $("meetMsg").className = "msg bad";
+      meetState("bad", "Could not start", e.message);
       $("startMeet").disabled = false;
     }
   };
 
+  function liveMeetBox(url) {
+    const body = el("div");
+    const link = el("div", "biglink"); link.appendChild(meetAnchor(url));
+    const actions = el("div", "actions");
+    const join = el("button", "primary", "Join"); join.onclick = () => window.open(url, "_blank", "noopener");
+    const copy = el("button", null, "Copy link");
+    copy.onclick = async () => {
+      try { await navigator.clipboard.writeText(url); copy.textContent = "✓ Copied"; }
+      catch (e) { copy.textContent = "Copy failed — select the link"; }
+      setTimeout(() => { copy.textContent = "Copy link"; }, 2000);
+    };
+    const stop = el("button", "danger", "■ End & stop recording");
+    stop.disabled = !meetRun;
+    stop.onclick = async () => {
+      if (!meetRun) return;
+      if (!await confirmInline(actions, "End the call for everyone and stop recording?", "Yes, end the call")) return;
+      stop.disabled = true;
+      try {
+        await api("/api/runs/" + encodeURIComponent(meetRun) + "/stop", { method: "POST" });
+        meetState("info", "Leaving the call…", "The recording is finalised, then transcribed and summarized. Follow it under Runs.", "spin");
+      } catch (e) { stop.disabled = false; actions.after(callout("bad", "Could not stop", e.message)); }
+    };
+    actions.append(join, copy, stop);
+    body.append(el("div", null, "Share this link. The bot admits everyone who asks to join."), link, actions);
+    return body;
+  }
+
   function pollMeet(logName, started) {
     clearInterval(meetRunPoll);
+    let shown = null;
     meetRunPoll = setInterval(async () => {
       try {
         const log = await api("/api/log?name=" + encodeURIComponent(logName));
         let m = log.text.match(/New Google Meet: (https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3})/);
         const run = log.text.match(/Run: (\S+)/);
-        if (run) currentRun = run[1];
+        if (run) meetRun = run[1];
         // The link is also stored in the run the moment it exists; use that
         // if the log hasn't carried it (yet).
-        if (!m && currentRun) {
+        if (!m && meetRun) {
           try {
-            const d = await api("/api/runs/" + encodeURIComponent(currentRun));
+            const d = await api("/api/runs/" + encodeURIComponent(meetRun));
             const u = d.summary && d.summary.meet_url;
             if (u) m = [null, u];
           } catch (e) {}
         }
-        if (m) {
-          if (MEET_RE.test(m[1]) && $("meetLink").textContent !== m[1]) {
-            $("meetLink").textContent = "";
-            $("meetLink").appendChild(meetAnchor(m[1]));
-          }
-          $("meetStatus").textContent = "Meeting is live — share this link. The bot admits everyone.";
-          ["copyMeet", "openMeet"].forEach((id) => $(id).disabled = false);
-          $("stopMeet").disabled = !currentRun;
-          $("copyMeet").onclick = () => navigator.clipboard && navigator.clipboard.writeText(m[1]);
-          $("openMeet").onclick = () => window.open(m[1], "_blank", "noopener");
-        } else if (/Cannot create a meeting|meet\.new did not produce|ERROR/.test(log.text)) {
-          $("meetStatus").textContent = "Could not create the meeting:";
-          $("meetMsg").textContent = log.text.split("\n").slice(-12).join("\n");
-          $("meetMsg").className = "msg bad";
-          clearInterval(meetRunPoll); $("startMeet").disabled = false;
-        }
         if (/All runs finished/.test(log.text)) {
-          $("meetStatus").textContent = "The meeting is over; see Runs for the summary.";
-          clearInterval(meetRunPoll); $("startMeet").disabled = false; $("stopMeet").disabled = true;
+          const failed = /^\s+FAIL\s/m.test(log.text);
+          meetState(failed ? "bad" : "ok", failed ? "The meeting ended, but a stage failed"
+                                                  : "The meeting is over",
+                    "See Runs for the transcript and summary.");
+          clearInterval(meetRunPoll); $("startMeet").disabled = false;
+          return;
         }
-        if (Date.now() - started > 3 * 60 * 1000 && !m) {
-          $("meetStatus").textContent = "Still no link after 3 minutes — check Runs for the log.";
+        if (m && MEET_RE.test(m[1])) {
+          const key = m[1] + "|" + meetRun;
+          if (shown !== key) { shown = key; meetState("ok", "The meeting is live", liveMeetBox(m[1])); }
+        } else if (/Cannot create a meeting|meet\.new did not produce|ERROR/.test(log.text)) {
+          const pre = el("pre", "mono", log.text.split("\n").slice(-12).join("\n"));
+          meetState("bad", "Could not create the meeting", pre);
+          clearInterval(meetRunPoll); $("startMeet").disabled = false;
+        } else if (Date.now() - started > 3 * 60 * 1000) {
+          meetState("warn", "Still no link after 3 minutes", "Check the run's log under Runs.");
         }
       } catch (e) { /* keep polling */ }
     }, 3000);
   }
-  $("stopMeet").onclick = async () => {
-    if (!currentRun || !confirm("End the call for everyone and stop recording?")) return;
-    $("stopMeet").disabled = true;
-    try { await api("/api/runs/" + currentRun + "/stop", { method: "POST" });
-          $("meetStatus").textContent = "Leaving… the recording is finalised, then transcribed."; }
-    catch (e) { $("meetMsg").textContent = e.message; $("meetMsg").className = "msg bad"; }
-  };
 
-  // --- Record / summarize ---------------------------------------------------
+  // --- Record / summarize -------------------------------------------------------
+  const inputLines = () => $("inputs").value.split("\n").map((s) => s.trim()).filter(Boolean);
   function formBody() {
     return {
       urls: $("inputs").value, prompt: $("prompt").value || undefined,
-      language: $("language").value, clip: $("clip").value.trim() || undefined,
-      summary_language: $("outLang").value, pdf_font: $("font").value,
-      summary_source: $("source").value, record_media: $("record").value,
+      language: seg("sLang"), clip: $("clip").value.trim() || undefined,
+      summary_language: seg("sOutLang"), pdf_font: $("font").value,
+      summary_source: seg("sSource"), record_media: seg("sRecord"),
       instructions: $("instructions").value.trim() || undefined,
       jobs: $("jobs").value || undefined, name: $("name").value.trim() || undefined,
       combine: $("combine").value.trim() || undefined,
-      no_combine_pdf: $("noCombinePdf").checked, resources: $("resources").value,
+      no_combine_pdf: $("noCombinePdf").checked && !!$("combine").value.trim(),
+      resources: $("resources").value,
       force: $("force").checked, playlist: $("playlist").checked,
     };
   }
-  ["inputs", "prompt", "language", "clip", "jobs", "name", "combine", "resources",
-   "outLang", "font", "instructions", "source", "record",
-   "noCombinePdf", "force", "playlist"].forEach((id) => $(id).addEventListener("input", () => {
-    $("start").disabled = JSON.stringify(formBody()) !== lastCheckKey;
-  }));
 
-  $("check").onclick = async () => {
+  // Format hints, as you type. They never decide what an input IS — that is
+  // the dry run's job (Check) — they only catch shapes and combinations.
+  // Returns the warnings, which are repeated beside the Start button.
+  const CLIP_RE = /^\s*([0-9]+(?::[0-9]{1,2}){0,2}(?:\.[0-9]+)?)\s*-\s*([0-9]+(?::[0-9]{1,2}){0,2}(?:\.[0-9]+)?|end)?\s*$/i;
+  function localHints() {
+    const warns = [];
+    const n = inputLines().length;
+    $("inputCount").textContent = n ? n + (n === 1 ? " input" : " inputs") : "";
+
+    const clip = $("clip").value.trim();
+    if (!clip) { fb("clip", "", ""); mark($("clip")); }
+    else {
+      const m = CLIP_RE.exec(clip);
+      if (m) { fb("clip", "ok", "From " + m[1] + " to " + (m[2] && m[2].toLowerCase() !== "end" ? m[2] : "the end") +
+                    ", for every input without its own #t=."); mark($("clip"), "ok"); }
+      else { fb("clip", "warn", "Expected START-END, e.g. 00:05:00-01:30:00 or 300-5400."); mark($("clip"), "warn");
+             warns.push("The clip window doesn't look like START-END."); }
+    }
+
+    const jobs = $("jobs").value.trim();
+    if (/^[1-9][0-9]*$/.test(jobs)) {
+      fb("jobs", Number(jobs) > 4 ? "warn" : "", Number(jobs) > 4
+         ? "Each job may run a browser, ffmpeg and a summary at once." : "");
+      mark($("jobs"));
+    } else { fb("jobs", "bad", "A whole number, 1 or more."); mark($("jobs"), "bad"); }
+
+    const name = $("name").value.trim();
+    if (name && n > 1) { fb("name", "warn", "Ignored with more than one input: each run is named after its input.");
+                         mark($("name"), "warn"); warns.push("Name is ignored with more than one input."); }
+    else { fb("name", name ? "ok" : "", name ? "Used for the run and its files." : ""); mark($("name")); }
+
+    const combine = $("combine").value.trim();
+    const noPdf = $("noCombinePdf");
+    noPdf.disabled = !combine;
+    $("sw-noCombinePdf").classList.toggle("off-limits", !combine);
+    fb("noCombinePdf", combine ? "" : "note", combine ? "" : "Only with a combine path.");
+    if (!combine) { fb("combine", "", ""); mark($("combine")); }
+    else if (!/\.md$/i.test(combine)) { fb("combine", "warn", "Should be a .md file path."); mark($("combine"), "warn");
+                                        warns.push("The combine path should end in .md."); }
+    else if (!combine.startsWith("/") && !combine.startsWith("~")) {
+      fb("combine", "warn", "Relative path: it is resolved from the project folder."); mark($("combine"), "warn");
+    } else if (n < 2) { fb("combine", "note", "One document from all inputs; this is for two or more."); mark($("combine")); }
+    else { fb("combine", "ok", "One document from all " + n + " inputs, summarized together."); mark($("combine"), "ok"); }
+
+    fb("playlist", $("playlist").checked ? "warn" : "", $("playlist").checked
+       ? "Every video in a playlist becomes its own run; the check lists them all." : "");
+    if ($("playlist").checked) warns.push("Playlists expand into one run per video.");
+    fb("force", $("force").checked ? "warn" : "", $("force").checked
+       ? "Finished stages run again, including paid transcription." : "");
+    if ($("force").checked) warns.push("Start over: finished stages (and paid transcription) run again.");
+    switchStates();
+    return warns;
+  }
+
+  let lastOkKey = null, checkSeq = 0, checkTimer = null, lastCheck = null, localWarns = [];
+  function updateStart() {
+    const ready = lastOkKey !== null && lastOkKey === JSON.stringify(formBody());
+    $("start").disabled = !ready;
+    const runs = ready && lastCheck ? lastCheck.plan.filter((p) => p.status === "ok" && p.kind !== "combine").length : 0;
+    $("start").textContent = ready ? "▶ Start " + runs + (runs === 1 ? " run" : " runs") : "▶ Start";
+    $("startNote").textContent = ready
+      ? (localWarns.length ? "⚠ " + localWarns.length + " warning" + (localWarns.length > 1 ? "s" : "") + " above" : "✓ checked")
+      : "";
+  }
+  function formChanged() {
+    localWarns = localHints();
+    updateStart();
+    clearTimeout(checkTimer);
+    if (!inputLines().length) {
+      checkSeq++;   // drop any answer still on its way
+      lastOkKey = null; lastCheck = null; updateStart();
+      $("lineChecks").innerHTML = "";
+      show("checkBox", callout("note", "Add at least one input", "Each line is checked by the pipeline itself as you type."));
+      return;
+    }
+    if (JSON.stringify(formBody()) === lastOkKey) return;
+    show("checkBox", callout("info", "Checking…", null, "spin"));
+    markLinesWaiting();
+    checkTimer = setTimeout(runCheck, 900);
+  }
+  // The inputs box grows with its lines (up to a limit), so every line and
+  // its mark below stay in view together.
+  function autoGrow(t) { t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight + 2, 360) + "px"; }
+  $("inputs").addEventListener("input", () => autoGrow($("inputs")));
+  const summarizePanel = document.querySelector('[data-panel="summarize"]');
+  summarizePanel.addEventListener("input", (e) => { if (!$("startBox").contains(e.target)) formChanged(); });
+  summarizePanel.addEventListener("change", (e) => { if (e.target.type === "radio" || e.target.type === "checkbox" || e.target.tagName === "SELECT") formChanged(); });
+  $("check").onclick = () => { lastOkKey = null; clearTimeout(checkTimer); runCheck(); };
+
+  function markLinesWaiting() {
+    const ul = $("lineChecks");
+    const lines = inputLines();
+    // Keep the last answer's marks while the next check runs, greyed; only
+    // rebuild when the lines themselves changed.
+    if (ul.dataset.lines === JSON.stringify(lines)) {
+      ul.querySelectorAll("li").forEach((li) => { li.className = "wait"; li.querySelector(".ic").textContent = "◌"; });
+      return;
+    }
+    ul.innerHTML = ""; ul.dataset.lines = JSON.stringify(lines);
+    lines.forEach((line) => {
+      const li = el("li", "wait");
+      const what = el("div", "what"); what.appendChild(el("div", "src mono", line));
+      li.append(el("span", "ic", "◌"), what); ul.appendChild(li);
+    });
+  }
+
+  // The dry run's plan, one entry per line of the form. Entries marked `arg`
+  // (a refused #t= window, or an argument that is not an input) carry the
+  // line as typed and are matched on it; the others come in input order.
+  // Playlist expansion breaks the one-to-one order, so then the plan is
+  // listed as it came.
+  function mapPlan(lines, plan) {
+    const byArg = new Map(), inOrder = [];
+    plan.forEach((p) => {
+      if (p.kind === "combine") return;
+      if (p.arg) byArg.set(p.input, p); else inOrder.push(p);
+    });
+    const rows = []; let i = 0;
+    for (const line of lines) {
+      if (byArg.has(line)) rows.push({ line, p: byArg.get(line) });
+      else rows.push({ line, p: inOrder[i++] });
+    }
+    if (i !== inOrder.length || rows.some((r) => !r.p)) return null;
+    return rows;
+  }
+  function planRow(line, p) {
+    const li = el("li", p.status === "ok" ? "ok" : "bad");
+    const what = el("div", "what");
+    if (p.status === "ok") {
+      const chips = el("div");
+      chips.appendChild(el("span", "chip", p.kind === "local_file" ? "file" : p.kind));
+      if (p.clip) chips.appendChild(el("span", "chip", "clip " + p.clip));
+      chips.appendChild(p.resume ? el("span", "chip resume", "resumes " + p.resume) : el("span", "chip new", "new run"));
+      what.appendChild(chips);
+    } else {
+      what.appendChild(el("div", "reason", p.reason || "can't be used"));
+    }
+    what.appendChild(el("div", "src mono", line || p.input));
+    li.append(el("span", "ic", p.status === "ok" ? "✓" : "✗"), what);
+    return li;
+  }
+
+  async function runCheck() {
     const body = formBody();
-    $("checkMsg").textContent = "Checking…"; $("checkMsg").className = "msg";
-    $("plan").classList.add("hidden"); $("start").disabled = true;
-    try {
-      const r = await api("/api/check", { method: "POST", body });
-      const tb = $("plan").querySelector("tbody"); tb.innerHTML = "";
-      r.plan.forEach((p) => {
-        const tr = document.createElement("tr");
-        [p.kind, p.clip || "—", p.kind === "combine" ? "one document" : (p.resume ? "resume " + p.resume : "new"),
-         p.input].forEach((t) => { const td = document.createElement("td"); td.textContent = t; tr.appendChild(td); });
-        tb.appendChild(tr);
+    const key = JSON.stringify(body);
+    const seq = ++checkSeq;
+    lastOkKey = null; updateStart();
+    let r;
+    try { r = await api("/api/check", { method: "POST", body }); }
+    catch (e) {
+      if (seq === checkSeq) show("checkBox", callout("bad", "Could not check", e.message));
+      return;
+    }
+    if (seq !== checkSeq) return;   // the form has changed since; a newer check follows
+    lastCheck = r;
+    const lines = inputLines();
+    const ul = $("lineChecks"); ul.innerHTML = ""; ul.dataset.lines = "";
+    const entries = r.plan.filter((p) => p.kind !== "combine");
+    const rows = mapPlan(lines, r.plan);
+    if (!entries.length) {
+      // Refused before any input was looked at (a bad --clip, font, jobs…).
+      lines.forEach((line) => {
+        const li = el("li", "wait"), what = el("div", "what");
+        what.append(el("div", "reason", "not checked yet: fix the error below first"), el("div", "src mono", line));
+        li.append(el("span", "ic", "–"), what); ul.appendChild(li);
       });
-      $("plan").classList.toggle("hidden", !r.plan.length);
-      if (r.ok) {
-        lastCheckKey = JSON.stringify(body);
-        $("start").disabled = false;
-        $("checkMsg").textContent = "Looks good." + (r.messages ? "\n" + r.messages : "") +
-          "\nEquivalent command: " + r.command.map((a) => /[\s'"<>#&]/.test(a) ? "'" + a.replace(/'/g, "'\\''") + "'" : a).join(" ");
-        $("checkMsg").className = "msg ok";
-      } else {
-        $("checkMsg").textContent = r.messages || "The pipeline refused these options.";
-        $("checkMsg").className = "msg bad";
-      }
-    } catch (e) { $("checkMsg").textContent = e.message; $("checkMsg").className = "msg bad"; }
-  };
+    } else if (rows) rows.forEach(({ line, p }) => ul.appendChild(planRow(line, p)));
+    else entries.forEach((p) => ul.appendChild(planRow(p.input, p)));
+
+    const bad = r.plan.filter((p) => p.status !== "ok");
+    const good = r.plan.filter((p) => p.status === "ok" && p.kind !== "combine");
+    const combine = r.plan.find((p) => p.kind === "combine");
+    const out = el("div");
+    // The dry run's own summary lines ("Summary: …", "Media: …") are useful
+    // confirmation; the rest (errors) goes in the details.
+    const msgs = (r.messages || "").split("\n");
+    const facts = msgs.filter((m) => /^(Summary|Media): /.test(m));
+    const other = msgs.filter((m) => m.trim() && !/^(Summary|Media): /.test(m)).join("\n");
+
+    if (r.ok) {
+      lastOkKey = key;
+      const resumed = good.filter((p) => p.resume).length;
+      const title = "Ready — " + good.length + (good.length === 1 ? " run" : " runs") +
+        (resumed ? " (" + resumed + " resumed)" : "") + (combine ? ", combined into one document" : "");
+      const list = facts.slice();
+      if (combine) list.push("Combined document: " + combine.input);
+      out.appendChild(callout("ok", title, list.length ? list : null));
+      if (localWarns.length) out.appendChild(callout("warn", "Please check before starting", localWarns));
+    } else if (bad.length) {
+      out.appendChild(callout("bad", bad.length + (bad.length === 1 ? " line needs" : " lines need") + " fixing",
+                              "Marked ✗ above. Nothing starts until every line is ✓."));
+    } else {
+      // Refused for a reason that belongs to no line (a font, the jobs,
+      // the combine directory…): the pipeline's own words.
+      const reason = other.split("\n").filter((l) => /^ERROR|refus|must|needs/i.test(l)).slice(0, 4);
+      out.appendChild(callout("bad", "The pipeline refused these options", reason.length ? reason : other || null));
+    }
+    const det = el("details");
+    det.appendChild(el("summary", null, "Pipeline output and the equivalent command"));
+    if (other) det.appendChild(el("pre", "mono", other));
+    det.appendChild(el("pre", "mono", r.command.map((a) =>
+      /[\s'"<>#&;|$`\\()]/.test(a) ? "'" + a.replace(/'/g, "'\\''") + "'" : a).join(" ")));
+    out.appendChild(det);
+    show("checkBox", out);
+    updateStart();
+  }
 
   let startPoll = null;
   $("start").onclick = async () => {
     $("start").disabled = true;
     try {
       const r = await api("/trigger", { method: "POST", body: formBody() });
-      lastCheckKey = null;
-      $("startLog").classList.remove("hidden");
-      $("startLog").textContent = "Started — " + r.log_name;
+      lastOkKey = null; updateStart();
+      const pre = el("pre", "mono", "");
+      const box = el("div");
+      const status = el("div");
+      status.appendChild(callout("info", "Running", "Log: " + r.log_name + " — progress also shows under Runs.", "spin"));
+      box.append(status, pre);
+      show("startBox", box);
+      show("checkBox", callout("ok", "Started", "Change the form to check a new set of inputs."));
       clearInterval(startPoll);
       startPoll = setInterval(async () => {
         try {
           const log = await api("/api/log?name=" + encodeURIComponent(r.log_name));
-          $("startLog").textContent = log.text;
-          $("startLog").scrollTop = $("startLog").scrollHeight;
-          // The pipeline's final report, or a refusal before anything ran.
-          if (/All runs finished|^ERROR/m.test(log.text)) { clearInterval(startPoll); refreshRuns(); }
+          pre.textContent = log.text;
+          pre.scrollTop = pre.scrollHeight;
+          const refused = /^ERROR/m.test(log.text) && !/All runs finished/.test(log.text);
+          if (/All runs finished/.test(log.text) || refused) {
+            clearInterval(startPoll); refreshRuns();
+            const nOk = (log.text.match(/^\s+OK\s/mg) || []).length;
+            const nFail = (log.text.match(/^\s+FAIL\s/mg) || []).length;
+            const nPause = (log.text.match(/^\s+PAUSED\s/mg) || []).length;
+            status.innerHTML = "";
+            if (refused) status.appendChild(callout("bad", "The pipeline refused to start", "See the log below."));
+            else if (nFail) status.appendChild(callout("bad", nFail + " failed, " + nOk + " finished",
+              "Open the run under Runs for its log, fix the cause, then Resume."));
+            else if (nPause) status.appendChild(callout("warn", nPause + " paused on the Claude usage window, " + nOk + " finished",
+              "They resume on their own after the reset (every 15 minutes while the web UI is on)."));
+            else status.appendChild(callout("ok", "All " + nOk + " finished", "The summaries are listed under Runs."));
+          }
         } catch (e) {}
       }, 4000);
-    } catch (e) { $("checkMsg").textContent = e.message; $("checkMsg").className = "msg bad"; }
+    } catch (e) { show("startBox", callout("bad", "Could not start", e.message)); updateStart(); }
   };
 
-  // --- Runs -------------------------------------------------------------------
-  const MARK = { done: "✓", failed: "✗", running: "▶", pending: "·" };
-  // Only a real Meet link ever becomes a clickable href.
-  const MEET_RE = /^https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
-  function meetAnchor(url) {
-    const link = document.createElement("a");
-    link.href = url; link.target = "_blank"; link.rel = "noopener";
-    link.textContent = url; link.className = "meetlink";
-    link.onclick = (e) => e.stopPropagation();   // don't also open the run detail
-    return link;
+  // --- Runs -----------------------------------------------------------------------
+  const STAGE_NAMES = { record: "record", fetch_video: "download", clip: "clip",
+                        transcribe: "transcribe", frames: "frames", summarize: "summarize" };
+  const STAGE_MARK = { done: "✓", failed: "✗", running: "▶", pending: "○" };
+  // Stages that never run for this kind of run stay pending forever; they are
+  // left out unless something actually happened in them.
+  function expected(stage, run) {
+    const t = run.input_type;
+    if (t === "combine") return stage === "summarize";
+    switch (stage) {
+      case "record": return t === "meeting";
+      // Voice only never downloads a YouTube video; Kaltura still needs the
+      // media for transcription.
+      case "fetch_video": return t === "kaltura" || (t === "youtube" && run.summary_source !== "voice");
+      case "clip": return !!run.clip;
+      case "frames": return run.summary_source !== "voice";
+      case "summarize": return !run.combined_into;
+      default: return true;
+    }
+  }
+  function pills(run) {
+    const box = el("div", "pills");
+    Object.entries(run.stages).forEach(([stage, st]) => {
+      if (st === "pending" && !expected(stage, run)) return;
+      const p = el("span", "pill " + st);
+      const dot = el("span", "dot", (STAGE_MARK[st] || "?") + " ");
+      p.append(dot, document.createTextNode(STAGE_NAMES[stage] || stage));
+      p.title = stage + ": " + st;
+      box.appendChild(p);
+    });
+    return box;
+  }
+  function runStatus(run) {
+    const st = run.stages;
+    if (run.active) return ["info", st.record === "running" ? "● recording" : "▶ running"];
+    if (run.paused) return ["warn", "⏸ paused"];
+    if (Object.values(st).includes("failed")) return ["bad", "✗ failed"];
+    if (run.combined_into) return ["note", "⧉ in a combined set"];
+    if (st.summarize === "done") return ["ok", "✓ done"];
+    return ["note", "○ unfinished"];
+  }
+  function audioBadge(run) {
+    if (!(run.active && run.audio && Date.now() / 1000 - run.audio.at < 60)) return null;
+    if (run.audio.silent_for >= 60) return el("span", "badge warn", "🔇 no audio for " + Math.floor(run.audio.silent_for / 60) + " min");
+    if (run.audio.silent_for > 0) return el("span", "badge note", "🔈 quiet");
+    return el("span", "badge ok", "🔊 hearing audio (" + Math.round(run.audio.peak_db) + " dB)");
   }
   // state.json stamps are UTC; show this browser's local time.
   function fmtTime(iso) {
@@ -477,87 +1111,143 @@
     return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
            " " + p(d.getHours()) + ":" + p(d.getMinutes());
   }
+  let currentRunDetail = null;
   async function refreshRuns() {
     if ($("app").classList.contains("hidden")) return;
     try {
       const r = await api("/api/runs?limit=40");
-      const tb = $("runs").querySelector("tbody"); tb.innerHTML = "";
+      const list = $("runsList"); list.innerHTML = "";
+      if (!r.runs.length) list.appendChild(callout("note", "No runs yet", "Start one from the other two tabs."));
       r.runs.forEach((run) => {
-        const tr = document.createElement("tr"); tr.className = "clickable";
-        const a = document.createElement("td");
-        a.innerHTML = "<div></div><div class='hint'></div>";
-        let audio = "";
-        if (run.active && run.audio && Date.now() / 1000 - run.audio.at < 60) {
-          audio = run.audio.silent_for >= 60
-            ? "  🔇 no meeting audio for " + Math.floor(run.audio.silent_for / 60) + " min"
-            : (run.audio.silent_for > 0 ? "  🔈 quiet" : "  🔊 hearing audio (" + Math.round(run.audio.peak_db) + " dB)");
-        }
-        a.firstChild.textContent = run.run_id + (run.active ? "  ● running" : "") + (run.paused ? "  ⏸ paused" : "") + audio;
+        const card = el("div", "run" + (run.run_id === currentRunDetail ? " sel" : ""));
+        card.tabIndex = 0; card.setAttribute("role", "button");
+        const top = el("div", "top");
+        const [lvl, txt] = runStatus(run);
+        top.append(el("span", "badge " + lvl, txt), el("span", "id", run.run_id));
+        const a = audioBadge(run); if (a) top.appendChild(a);
+        top.appendChild(el("span", "when", fmtTime(run.updated_at)));
+        const src = el("div", "src");
         if (run.meet_url && MEET_RE.test(run.meet_url)) {
-          a.lastChild.appendChild(meetAnchor(run.meet_url));
+          src.appendChild(meetAnchor(run.meet_url));
           if (run.active) {
-            const j = document.createElement("button");
-            j.textContent = "Join"; j.className = "primary join";
+            const j = el("button", "primary small", "Join");
+            j.style.marginLeft = "8px";
             j.onclick = (e) => { e.stopPropagation(); window.open(run.meet_url, "_blank", "noopener"); };
-            a.lastChild.append(" ", j);
+            src.appendChild(j);
           }
-        } else {
-          a.lastChild.textContent = (run.input || "").slice(0, 90);
-        }
-        const s = document.createElement("td"); s.className = "stages";
-        Object.values(run.stages).forEach((st) => {
-          const sp = document.createElement("span"); sp.className = "s-" + st;
-          sp.textContent = MARK[st] || "?"; sp.title = st; s.appendChild(sp);
-        });
-        const u = document.createElement("td"); u.className = "hint";
-        u.textContent = fmtTime(run.updated_at);
-        tr.append(a, s, u);
-        tr.onclick = () => showRun(run.run_id);
-        tb.appendChild(tr);
+        } else src.textContent = (run.input || "").slice(0, 140);
+        card.append(top, src, pills(run));
+        card.onclick = () => showRun(run.run_id);
+        card.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); showRun(run.run_id); } };
+        list.appendChild(card);
       });
       if (currentRunDetail) showRun(currentRunDetail, true);
     } catch (e) {}
   }
-  let currentRunDetail = null;
+  $("refreshRuns").onclick = refreshRuns;
+
+  function outFile(label, path) {
+    const row = el("div", "outfile");
+    row.append(el("span", null, label), el("code", "mono", path));
+    const b = el("button", "small", "Copy path");
+    b.onclick = async () => {
+      try { await navigator.clipboard.writeText(path); b.textContent = "✓ Copied"; }
+      catch (e) { b.textContent = "Copy failed"; }
+      setTimeout(() => { b.textContent = "Copy path"; }, 2000);
+    };
+    row.appendChild(b);
+    return row;
+  }
+  // Remember which log sections were open, so the 10-second refresh does not
+  // fold them back.
+  const openLogs = new Set();
   async function showRun(id, quiet) {
+    const changed = currentRunDetail !== id;
     currentRunDetail = id;
+    if (changed) openLogs.clear();
+    document.querySelectorAll(".run").forEach((c) => c.classList.toggle("sel", c.querySelector(".id").textContent === id));
+    // A confirm bar is waiting for an answer: don't rebuild it away.
+    if (quiet && $("runDetail").querySelector(".confirm-bar")) return;
     try {
       const r = await api("/api/runs/" + encodeURIComponent(id));
-      $("runDetail").classList.remove("hidden");
-      $("rdTitle").textContent = id;
       const s = r.summary, st = r.state;
-      const lines = [
-        "input: " + (s.input || "") + " (" + s.input_type + ")",
-        s.meet_url ? "meeting: " + s.meet_url : "",
-        s.clip ? "clip: " + s.clip : "",
-        "prompt: " + (st.prompt || "(default)") + "   spoken: " + (st.language || ""),
-        "summary in: " + (st.summary_language || "(default)") + "   PDF font: " + (st.pdf_font || "(default)"),
-        st.instructions ? "instructions: " + st.instructions : "",
-        "summary from: " + (st.summary_source === "voice" ? "voice only" : "frames and voice") +
-          (s.input_type === "meeting" ? "   recording: " + (st.record_media || "video") : ""),
-        s.artifacts.md ? "summary: " + s.artifacts.md : "",
-        s.artifacts.pdf ? "pdf: " + s.artifacts.pdf : "",
-      ].filter(Boolean);
-      $("rdInfo").textContent = lines.join("\n"); $("rdInfo").style.whiteSpace = "pre-wrap";
-      const logs = $("rdLogs"); logs.innerHTML = "";
-      Object.entries(r.logs).forEach(([stage, text]) => {
-        const h = document.createElement("label"); h.textContent = stage;
-        const pre = document.createElement("pre"); pre.textContent = text || "(empty)";
-        logs.append(h, pre);
+      const box = $("runDetail"); box.innerHTML = ""; box.classList.remove("hidden");
+      const [lvl, txt] = runStatus(s);
+      const h = el("h2", "banner"); h.append(el("span", null, id));
+      box.append(h, el("span", "badge " + lvl, txt), pills(s));
+
+      const dl = el("dl");
+      const row = (k, v) => { if (v === undefined || v === null || v === "") return;
+        dl.append(el("dt", null, k)); const dd = el("dd"); if (v instanceof Node) dd.appendChild(v); else dd.textContent = v; dl.appendChild(dd); };
+      row("Input", (s.input || "") + (s.input_type ? "  (" + s.input_type + ")" : ""));
+      if (s.meet_url && MEET_RE.test(s.meet_url)) row("Meeting", meetAnchor(s.meet_url));
+      row("Clip", s.clip);
+      row("Style", PROMPT_LABELS[st.prompt] || st.prompt || "(default)");
+      row("Spoken", SPOKEN_LABELS[st.language] || st.language);
+      row("Written in", (OPT && OPT.summary_language_names[st.summary_language]) || st.summary_language || "(default)");
+      row("PDF font", st.pdf_font || "(default)");
+      row("Summary from", st.summary_source === "voice" ? "Voice only" : "Frames + voice");
+      if (s.input_type === "meeting") row("Recording", st.record_media === "audio" ? "Audio only (.m4a)" : "Video");
+      row("Instructions", st.instructions);
+      row("Combined into", s.combined_into);
+      box.appendChild(dl);
+
+      if (s.artifacts.md || s.artifacts.pdf) {
+        box.appendChild(el("h3", null, "Output"));
+        if (s.artifacts.md) box.appendChild(outFile("Summary", s.artifacts.md));
+        if (s.artifacts.pdf) box.appendChild(outFile("PDF", s.artifacts.pdf));
+      }
+
+      const actions = el("div", "actions");
+      if (s.meet_url && MEET_RE.test(s.meet_url) && s.active) {
+        const j = el("button", "primary", "Join meeting");
+        j.onclick = () => window.open(s.meet_url, "_blank", "noopener");
+        actions.appendChild(j);
+      }
+      const resume = el("button", null, "↻ Resume");
+      const finished = lvl === "ok";
+      resume.disabled = s.active || finished;
+      resume.title = s.active ? "It is running" : finished ? "Finished: nothing to resume"
+                                                           : "Run the stages that are not done";
+      resume.onclick = async () => {
+        resume.disabled = true;
+        try {
+          await api("/api/runs/" + encodeURIComponent(id) + "/resume", { method: "POST" });
+          actions.after(callout("info", "Resuming", "The list updates as it goes.", "spin"));
+          setTimeout(refreshRuns, 1500);
+        } catch (e) { actions.after(callout("bad", "Could not resume", e.message)); resume.disabled = false; }
+      };
+      const stop = el("button", "danger", s.input_type === "meeting" ? "■ Stop / leave meeting" : "■ Stop");
+      stop.disabled = !s.active;
+      stop.title = s.active ? "" : "Not running";
+      stop.onclick = async () => {
+        const text = s.input_type === "meeting"
+          ? "Stop this run? The bot leaves the meeting cleanly and keeps the recording."
+          : "Stop this run? It can be resumed later.";
+        if (!await confirmInline(actions, text, "Yes, stop it")) return;
+        stop.disabled = true;
+        try {
+          await api("/api/runs/" + encodeURIComponent(id) + "/stop", { method: "POST" });
+          actions.after(callout("info", "Stopping…", "A recording is finalised before it ends.", "spin"));
+          setTimeout(refreshRuns, 1500);
+        } catch (e) { actions.after(callout("bad", "Could not stop", e.message)); stop.disabled = false; }
+      };
+      actions.append(resume, stop);
+      box.appendChild(actions);
+
+      const logs = Object.entries(r.logs);
+      if (logs.length) box.appendChild(el("h3", null, "Logs"));
+      logs.forEach(([stage, text]) => {
+        const d = el("details");
+        const stStatus = (s.stages || {})[stage];
+        const sum = el("summary", null, (STAGE_MARK[stStatus] ? STAGE_MARK[stStatus] + " " : "") + (STAGE_NAMES[stage] || stage));
+        d.append(sum, el("pre", "mono", text || "(empty)"));
+        d.open = openLogs.has(stage) || (!quiet && (stStatus === "failed" || stStatus === "running"));
+        if (d.open) openLogs.add(stage);
+        d.addEventListener("toggle", () => { if (d.open) openLogs.add(stage); else openLogs.delete(stage); });
+        box.appendChild(d);
       });
-      const joinable = s.meet_url && MEET_RE.test(s.meet_url) && s.active;
-      $("rdJoin").classList.toggle("hidden", !joinable);
-      $("rdJoin").onclick = () => window.open(s.meet_url, "_blank", "noopener");
-      $("rdResume").onclick = async () => {
-        await api("/api/runs/" + encodeURIComponent(id) + "/resume", { method: "POST" });
-        setTimeout(refreshRuns, 1500);
-      };
-      $("rdStop").onclick = async () => {
-        if (!confirm("Stop run " + id + "? A meeting is left cleanly.")) return;
-        await api("/api/runs/" + encodeURIComponent(id) + "/stop", { method: "POST" });
-        setTimeout(refreshRuns, 1500);
-      };
-      if (!quiet) $("runDetail").scrollIntoView({ behavior: "smooth" });
+      if (!quiet) box.scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (e) {}
   }
   setInterval(refreshRuns, 10000);
@@ -571,6 +1261,7 @@
     try { localStorage.setItem("mbToken", token); } catch (e) {}
     history.replaceState(null, "", location.pathname + location.search);
   }
+  try { const t = localStorage.getItem("mbTab"); if (t) selectTab(t); } catch (e) {}
   if (token) { $("token").value = token; connect(); } else { showToken(""); }
 })();
 </script>

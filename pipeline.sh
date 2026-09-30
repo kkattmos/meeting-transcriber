@@ -167,6 +167,10 @@ COMBINE_WANT_PDF=1
 CLIP_SPEC=""
 NEW_MEET=0
 DRY_RUN=0
+# --dry-run reports every input it can't use (a `bad`, `badarg` or `extra` line each)
+# instead of stopping at the first, so the web UI can mark each line; this
+# counts them, and the dry run exits 1 at the end if there were any.
+DRY_BAD=0
 SUMMARY_LANG_OPT=""
 PDF_FONT_OPT=""
 INSTRUCTIONS_OPT=""
@@ -446,6 +450,12 @@ split_clip_suffix() {
 
   local json
   if ! json="$("$PYTHON_BIN" "$SCRIPT_DIR/lib/clip.py" parse "$spec" 2>&1)"; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      # The whole argument, as typed: that is what the web UI matches on.
+      printf 'badarg\tunusable #t= window: %s\t%s\n' "${json#clip: }" "$1"
+      DRY_BAD=$((DRY_BAD + 1))
+      return 1
+    fi
     echo "ERROR: unusable #t= window on this input: #t=$spec" >&2
     echo "  ${json#clip: }" >&2
     echo "  Expected #t=START-END, e.g. #t=00:05:00-01:30:00" >&2
@@ -475,7 +485,7 @@ declare -a INPUTS=()
 declare -a INPUT_CLIP_LABELS=()
 declare -a INPUT_CLIP_TOKENS=()
 add_input() {
-  split_clip_suffix "$1"
+  split_clip_suffix "$1" || return 0   # dry run only: already reported
   INPUTS+=("$SPLIT_INPUT")
   INPUT_CLIP_LABELS+=("$SPLIT_CLIP_LABEL")
   INPUT_CLIP_TOKENS+=("$SPLIT_CLIP_TOKEN")
@@ -497,7 +507,7 @@ if [ "${#POSITIONAL[@]}" -gt 0 ]; then
       # would take the whole string as the URL and the window would vanish
       # without a word. split_clip_suffix is a no-op on an input that has no
       # window, so this is the same decision as before for everything else.
-      split_clip_suffix "$arg"
+      split_clip_suffix "$arg" || continue   # dry run only: already reported
       if looks_like_input "$SPLIT_INPUT"; then
         INPUTS+=("$SPLIT_INPUT")
         INPUT_CLIP_LABELS+=("$SPLIT_CLIP_LABEL")
@@ -541,6 +551,15 @@ fi
 # --new-meet is one more input, after everything else on the line.
 [ "$NEW_MEET" -eq 1 ] && add_input "$NEW_MEET_INPUT"
 
+# A dry run names every argument that is not an input. On the command line
+# one may be the legacy form's name; the web UI, whose every line is meant as
+# an input, marks each of these as not recognised.
+if [ "$DRY_RUN" -eq 1 ]; then
+  for extra in "${LEGACY_EXTRAS[@]:-}"; do
+    [ -n "$extra" ] && printf 'extra\t%s\n' "$extra"
+  done
+fi
+
 # Legacy positional mapping, only when it's unambiguous (exactly one input).
 if [ "${#INPUTS[@]}" -eq 1 ] && [ "${#LEGACY_EXTRAS[@]}" -gt 0 ]; then
   [ -n "${LEGACY_EXTRAS[0]:-}" ] && [ -z "$NAME" ] && NAME="${LEGACY_EXTRAS[0]}"
@@ -558,7 +577,8 @@ elif [ "${#INPUTS[@]}" -gt 1 ]; then
     echo "ERROR: don't mix multiple inputs with the legacy positional form." >&2
     echo "  Unrecognized arguments: ${REAL_EXTRAS[*]}" >&2
     echo "  With several inputs, use the flags: --name, --language, --prompt, ..." >&2
-    exit 1
+    # A dry run has named them (`extra` lines); it checks the rest too.
+    if [ "$DRY_RUN" -eq 1 ]; then DRY_BAD=$((DRY_BAD + ${#REAL_EXTRAS[@]})); else exit 1; fi
   fi
 fi
 
@@ -713,9 +733,16 @@ else
       echo "   check for a typo in the path.)" >&2
       exit 1
     fi
+    # Every input was refused at parse time (a bad #t= window), and said so.
+    [ "$DRY_BAD" -gt 0 ] && exit 1
     usage
     exit 1
   fi
+  # A dry run reports each unusable input and goes on to the next.
+  dry_bad() {  # <reason> <input>
+    printf 'bad\t%s\t%s\n' "$1" "$2"
+    DRY_BAD=$((DRY_BAD + 1))
+  }
   for input_idx in "${!INPUTS[@]}"; do
     input="$(canonical_input "${INPUTS[$input_idx]}")"
     # This input's own window: its #t= suffix if it had one, otherwise the
@@ -730,6 +757,9 @@ else
       echo "  The window is cut out of an existing recording, and this input" >&2
       echo "  has none yet. Record it first, then clip the MP4:" >&2
       echo "    ./pipeline.sh \"\$RECORDINGS_DIR/<run_id>.mp4\" --clip $this_clip_label" >&2
+      if [ "$DRY_RUN" -eq 1 ]; then
+        dry_bad "a clip window does not apply to a live meeting" "$input"; continue
+      fi
       exit 1
     fi
     # An audio recording has no picture to take frames from. Said at second
@@ -740,6 +770,9 @@ else
       echo "ERROR: --summary-source both needs a video recording, but this meeting" >&2
       echo "  records audio only (${RECORD_MEDIA_OPT:+--record-media audio}${RECORD_MEDIA_OPT:-RECORD_MEDIA=audio in .env})." >&2
       echo "  Use --record-media video, or summarize from the voice." >&2
+      if [ "$DRY_RUN" -eq 1 ]; then
+        dry_bad "an audio-only recording can only be summarized from the voice" "$input"; continue
+      fi
       exit 1
     fi
     if [ "$kind" = "unknown" ]; then
@@ -747,6 +780,10 @@ else
       echo "  Expected a Google Meet or Zoom URL (or meet.new to create one)," >&2
       echo "  a YouTube URL, a Kaltura embed (the <iframe> tag or just its src" >&2
       echo "  URL), or a path to a local media file that exists." >&2
+      if [ "$DRY_RUN" -eq 1 ]; then
+        dry_bad "not recognised: expected a Meet/Zoom link, a YouTube link, a Kaltura embed, or a file that exists on this machine" "$input"
+        continue
+      fi
       exit 1
     fi
 
@@ -834,6 +871,10 @@ if [ "$DRY_RUN" -eq 1 ]; then
   [ -n "$INSTRUCTIONS_OPT" ] && _extra=", with extra instructions (${#INSTRUCTIONS_OPT} chars)"
   echo "Summary: prompt ${PROMPT_NAME:-video (default)}, written in $_lang, PDF font $_font$_extra" >&2
   echo "Media: summary from $SUMMARY_SOURCE_EFF$([ "$SUMMARY_SOURCE_EFF" = voice ] && echo ' (transcript only, no frames)'); a meeting records $RECORD_MEDIA_EFF$([ "$RECORD_MEDIA_EFF" = audio ] && echo ' (an .m4a, summarized from the voice)')" >&2
+  if [ "$DRY_BAD" -gt 0 ]; then
+    echo "ERROR: $DRY_BAD input(s) can't be used (the bad/badarg/extra lines above)." >&2
+    exit 1
+  fi
   exit 0
 fi
 

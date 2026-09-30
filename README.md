@@ -326,15 +326,26 @@ The second pm2 process, `meeting-bot-resume`, runs `pipeline.sh --resume-all`
 every 15 minutes — the backstop that finishes a summary paused on the Claude
 usage window once it resets.
 
+The page follows the look of the summary PDF (DESIGN.md: navy section
+banners, green/amber/red boxes) in a light or dark theme, whichever your
+system uses. Two-or-three-way choices are button groups with a ✓ on the chosen
+one, on/off options are switches, and every field says ✓ / ⚠ / ✗ under itself
+as you type.
+
 - **New Google Meet** — one button: the bot creates a meeting, shows you the
-  link to share, admits everyone, records, and summarizes. **End & stop
-  recording** ends it early. See [Hosting a new Google Meet](#hosting-a-new-google-meet).
+  link to share (with **Join** and **Copy link**), admits everyone, records,
+  and summarizes. **End & stop recording** ends it early, after a red
+  confirmation bar. See [Hosting a new Google Meet](#hosting-a-new-google-meet).
 - **Record / summarize** — the pipeline's options as a form: inputs one per
   line (with `#t=` windows), spoken language, clip, combine, reference
-  material. **Check** runs `pipeline.sh --dry-run` with exactly those options
-  — the real parser, so a typo is caught before anything is downloaded or
-  billed — and shows what would run and the equivalent command. **Start** only
-  unlocks once the current form has passed a check.
+  material. About a second after you stop typing the page runs
+  `pipeline.sh --dry-run` with exactly those options — the real parser, so a
+  typo is caught before anything is downloaded or billed — and marks **every
+  input line** ✓ (its kind, new run or which run it resumes, its window) or ✗
+  with the reason. Warnings (a name that will be ignored, **Start over**
+  re-running paid stages, playlists expanding) are listed above the button.
+  **Start N runs** only unlocks once the current form has passed a check;
+  when the runs end the page says how many finished, failed or paused.
 - **Summary**, on both tabs: the style (`video`, `meeting`, `lecture`,
   `tutorial`, `reality`), the language it is written in (Thai or English), the PDF
   font (only the ones that language offers; defaults from `PDF_FONT_TH` /
@@ -343,9 +354,12 @@ usage window once it resets.
   **Save recording** (video, or audio only — meetings) and **Summarize from**
   (frames and voice, or voice only); audio only forces voice only. See
   [Voice only and audio-only recordings](#voice-only-and-audio-only-recordings).
-- **Runs** — every run with its stages (`✓` done, `✗` failed, `▶` running),
-  the created meeting's link, the tail of each stage log, and **Resume** /
-  **Stop**.
+- **Runs** — every run with a status badge (recording, running, paused,
+  failed, done, in a combined set), its stages as labelled pills (`✓ transcribe`,
+  `✗ summarize` … — stages that never run for that kind of input are left
+  out), live meeting audio, the created meeting's link and **Join**. Open one
+  for its settings, the summary and PDF paths (with **Copy path**), the tail of
+  each stage log, and **Resume** / **Stop** (confirmed in the page).
 
 The same server takes scripted requests (a phone shortcut, say):
 
@@ -516,7 +530,7 @@ keeps the frames too).
 | `--no-combine-pdf` | Write only the combined markdown |
 | `--new-meet` | Create a new Google Meet, host it and record it (also: `meet.new` as an input) — see [Hosting a new Google Meet](#hosting-a-new-google-meet) |
 | `--foreground` | Don't detach a meeting into the background (see above) |
-| `--dry-run` | Check every input, window and reference file, print what would run, start nothing |
+| `--dry-run` | Check every input, window and reference file, print what would run, start nothing. Every unusable input is reported (not just the first), and the exit is 1 if there was one |
 | `--force` | Ignore prior state, start clean |
 | `--run-id ID` / `--resume-last` / `--resume-all` | Resume (see below) |
 | `--list` / `--status ID` | Inspect runs |
@@ -1671,8 +1685,8 @@ python3 transcribe/test_yt_autocaptions.py   # the yt-dlp caption fallback: trac
 python3 screen/test_extract_frames.py        # frames on change: settle, motion cap, safety net, blanks, real ffmpeg (19)
 python3 screen/test_capture_host.py          # hosting a created Meet: when it ends, and when it must not (7)
 python3 screen/test_browser.py               # browser choice, fake devices, the bot-account check (16)
-python3 test_trigger_server.py               # the web UI API: argument mapping, auth, dry-run check, paths, summary settings, record/summary source (11)
-bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings, summary settings, voice only / audio only (438)
+python3 test_trigger_server.py               # the web UI API: argument mapping, auth, dry-run check, paths, summary settings, record/summary source, per-line check results (12)
+bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings, summary settings, voice only / audio only, dry-run reports (448)
 bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (131)
 ```
 
