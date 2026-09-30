@@ -227,6 +227,54 @@ def _split_points(text, pieces):
     return [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
 
 
+# The timed transcript (promptnames.TIMED_TRANSCRIPT_PROMPTS): one line per
+# stretch of about this many seconds, each opening with its [mm:ss]. Caption
+# cues are a few seconds long, and a mark on every one of them would cost ~8
+# characters a cue — a third more input on Thai captions — for precision a
+# highlight doesn't need. Long ASR segments are cut to TIMED_SPLIT_SECONDS
+# first, or an AssemblyAI-Thai transcript would get one mark every two
+# minutes (see split_long_segments).
+TIMED_LINE_SECONDS = 10
+TIMED_SPLIT_SECONDS = 30
+
+
+def timestamp_label(seconds):
+    """[mm:ss] under an hour, [h:mm:ss] from the hour on — the spelling the
+    reality prompt asks for, and the one document.link_timestamps reads."""
+    seconds = int(seconds or 0)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"[{h}:{m:02d}:{s:02d}]" if h else f"[{m:02d}:{s:02d}]"
+
+
+def timed_segments(segments, every=None):
+    """Group segments into lines of ~`every` seconds, each text prefixed with
+    its start time. Returned as Segments, so chunk_by_segments can cut and
+    frame-window them like any other — the marks travel inside the text."""
+    every = TIMED_LINE_SECONDS if every is None else every
+    pieces = split_long_segments(segments, max_seconds=TIMED_SPLIT_SECONDS)
+    lines, group = [], []
+
+    def close():
+        if group:
+            text = " ".join(s.text.strip() for s in group if s.text.strip())
+            lines.append(Segment(group[0].start_s, group[-1].end_s,
+                                 f"{timestamp_label(group[0].start_s)} {text}"))
+
+    for seg in pieces:
+        if group and seg.start_s - group[0].start_s >= every:
+            close()
+            group = []
+        group.append(seg)
+    close()
+    return lines
+
+
+def timed_transcript(segments, every=None):
+    """The whole transcript as [mm:ss]-prefixed lines; "" without segments."""
+    return "\n".join(s.text for s in timed_segments(segments, every))
+
+
 def find_srt_for(transcript_path):
     """The .srt sibling of a .txt transcript, if the pipeline produced one."""
     p = Path(transcript_path)
@@ -334,10 +382,14 @@ def chunk_by_text(transcript, frames, limit=None, overlap=None):
     return out
 
 
-def build_chunks(transcript, frames, transcript_path=None):
+def build_chunks(transcript, frames, transcript_path=None, timed=False):
     """Chunk a transcript, preferring the timestamped .srt when available.
 
     Returns [] when the transcript is short enough to summarize in one call.
+    `timed` gives every chunk the [mm:ss]-prefixed lines of timed_segments
+    (pass the timed text as `transcript` too, so the size test counts the
+    marks); without an .srt there are no times to give, and the plain text
+    is chunked as usual.
     """
     if not should_chunk(transcript):
         return []
@@ -347,7 +399,9 @@ def build_chunks(transcript, frames, transcript_path=None):
         if srt:
             segments = parse_srt(srt)
             if segments:
-                return chunk_by_segments(split_long_segments(segments), frames)
+                segments = (timed_segments(segments) if timed
+                            else split_long_segments(segments))
+                return chunk_by_segments(segments, frames)
 
     return chunk_by_text(transcript, frames)
 
@@ -367,26 +421,37 @@ class Part:
     srt_path: Optional[str] = None
 
 
-def part_transcript(parts):
+def _part_text(part, timed):
+    """A video's transcript as the model reads it: [mm:ss] lines when
+    `timed` and the video has an .srt, else its plain text."""
+    if timed and part.srt_path:
+        text = timed_transcript(parse_srt(part.srt_path))
+        if text:
+            return text
+    return part.text.strip()
+
+
+def part_transcript(parts, timed=False):
     """The transcript of several videos as one labelled text.
 
     This is what the model reads when the whole set fits in one call, and
-    what the document embeds. Each video is fenced with its label so the
-    model can keep them apart — the timestamps inside restart from zero at
-    every fence, and nothing else in the text says so.
+    (untimed) what the document embeds. Each video is fenced with its label
+    so the model can keep them apart — the timestamps inside restart from
+    zero at every fence, and nothing else in the text says so.
     """
     blocks = []
     for part in parts:
-        blocks.append(f"=== {part.label} ===\n\n{part.text.strip()}")
+        blocks.append(f"=== {part.label} ===\n\n{_part_text(part, timed)}")
     return "\n\n".join(blocks)
 
 
-def _chunk_one_part(part, limit):
+def _chunk_one_part(part, limit, timed=False):
     """Chunk a single video, always returning at least one chunk."""
     segments = parse_srt(part.srt_path) if part.srt_path else []
     if segments:
-        chunks = chunk_by_segments(split_long_segments(segments), part.frames,
-                                   limit=limit)
+        segments = (timed_segments(segments) if timed
+                    else split_long_segments(segments))
+        chunks = chunk_by_segments(segments, part.frames, limit=limit)
     else:
         chunks = chunk_by_text(part.text, part.frames, limit=limit)
     if not chunks:
@@ -396,7 +461,7 @@ def _chunk_one_part(part, limit):
     return chunks
 
 
-def build_part_chunks(parts, limit=None):
+def build_part_chunks(parts, limit=None, timed=False):
     """Chunk several videos for one map-reduce pass.
 
     Returns [] when everything fits in one call — the caller then sends
@@ -411,12 +476,12 @@ def build_part_chunks(parts, limit=None):
     and one chunk cannot carry two.
     """
     limit = chunk_chars() if limit is None else limit
-    total = sum(len(p.text) for p in parts)
+    total = sum(len(_part_text(p, timed)) for p in parts)
     if not (limit > 0 and total > limit):
         return []
     chunks = []
     for part in parts:
-        chunks.extend(_chunk_one_part(part, limit))
+        chunks.extend(_chunk_one_part(part, limit, timed))
     for index, chunk in enumerate(chunks):
         chunk.index = index
     return chunks

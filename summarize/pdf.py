@@ -835,6 +835,9 @@ li {{ margin: 1.5pt 0; orphans: 2; widows: 2; }}
 li > ul, li > ol {{ margin: 1pt 0 2pt 0; }}
 strong {{ font-weight: 700; color: #111722; }}
 a {{ color: {LINK}; text-decoration: none; }}
+/* A link inside a banner (the reality recap's section timestamps): the body's
+   link blue is unreadable on navy. */
+h2 a {{ color: #c9d8ec; font-weight: 400; }}
 /* The banners separate the sections; a --- between them would be a second
    rule under the first. */
 hr {{ border: none; margin: 4pt 0; }}
@@ -937,6 +940,7 @@ figure.thumb figcaption {{ font-size: 0.85em; color: #666; margin-top: 2pt; }}
 KIND_LABELS = {
     "lecture": "Lecture notes", "tutorial": "Tutorial guide",
     "meeting": "Meeting summary", "video": "Video summary",
+    "reality": "Episode recap",
 }
 
 

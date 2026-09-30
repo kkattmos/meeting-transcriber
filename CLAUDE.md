@@ -1454,6 +1454,64 @@ citations from the lecture prompts only:
   language rule or the no-timestamp rule unless it says so. Braces doubled
   for `.format()`. Never in the static half: it varies per run.
 
+### The reality prompt: the one that cites times (2026-09-30)
+
+`--prompt reality`, for competition reality-show episodes (tuned on The
+Face; generic wording for Drag Race, MasterChef, Survivor …). The operator
+asked for "what happened, highlight timestamps, quotes from the mentors and
+contestants, which team won, who is eliminated" and settled, when asked:
+
+- **Timestamps, accurate and clickable.** The deliberate exception to the
+  no-timestamp rule, for this prompt only (`promptnames.
+  TIMED_TRANSCRIPT_PROMPTS`). Before this the model never saw *when*
+  anything was said — it reads the `.txt`; only frame labels carried times,
+  one per ~30s on a moving picture. Now `summarize.model_transcript` gives a
+  timed prompt `chunking.timed_transcript`: the `.srt` grouped into lines of
+  ~`TIMED_LINE_SECONDS` (10), each opening `[mm:ss]` (`[h:mm:ss]` past the
+  hour), long ASR segments first cut to 30s so AssemblyAI-Thai still gets
+  dense marks. Measured on a 1h54m episode: 73k → 78k chars (+7%), 587
+  lines; a mark on every caption cue would have been ~+30%. The marks ride
+  inside the segment text, so `build_chunks(..., timed=True)` chunks and
+  frame-windows them like any other. The document's `<details>` transcript
+  stays the plain `.txt`. No `.srt` → plain text and a warning; the prompt
+  then writes no timestamps.
+- **The code, not the model, makes the links** (`document.link_timestamps`,
+  run in `main`/`main_parts` for timed prompts, before the wrapper). YouTube
+  only (`youtube_id`), `watch?v=<id>&t=<s>s`; `--clip` start is added to the
+  link, the visible text stays clip-relative (the document's clock). A
+  combined set writes `[Video N, mm:ss]`; a bare mark among several videos
+  stays text. Code spans/fences and marks already followed by `(` are
+  skipped — except a code span holding only a timestamp, which Gemini wrote
+  in the live run's Highlights table and is unwrapped and linked.
+  Kaltura/recordings: plain text.
+- **Live run, 2026-09-30** (Take Hormones Thailand EP.2, 1h54m, Thai auto
+  captions, on the operator's Gemini-only chain): 220 frames, 2 chunks +
+  the reality merge, 8 segments, 78 linked marks, results last ("no one
+  eliminated — a walkout"). Speaker attributions were not checked against
+  the video.
+- **Speakers from the frames.** The transcript has no names (no
+  diarization; YouTube captions never have it). The operator: the names
+  "will be stated there" — on-screen name captions — so the prompt ranks
+  captions, then names said aloud, then context, and says never guess a
+  name. No cast file, no AssemblyAI speaker labels.
+- **Results at the end** (the operator's choice over a results box first):
+  opening paragraph reveals nothing; sections in episode order with a
+  `[mm:ss]` in each heading and an `[!EXAMPLE] Quotes` box per section
+  (`* **Name** (role, team) [mm:ss]: "…"`, original language + translation
+  when it differs from SUMMARY_LANGUAGE); `## Highlights` table; `## Results`
+  last, `[!IMPORTANT]` table (winner, prize, nominees, eliminated, saved,
+  who decided); "not shown" rather than a guessed result.
+- **Its own merge prompt**, `prompts/_merge-reality.md`
+  (`mapreduce.load_merge_template(prompt)` picks `_merge-<stem>.md` when it
+  exists; `summarize_chunked(merge_template=)`). The shared `_merge.md` says
+  "do not add timestamps" and would scatter partial results; this one keeps
+  every mark and quote byte for byte and builds one Highlights and one
+  Results section, last.
+- `inject_instructions` now says "the prompt's rules on timestamps", not
+  "the rule against timestamps". PDF: `KIND_LABELS` "Episode recap"; a link
+  in an H2 banner is pale blue (DESIGN.md) — the body blue was unreadable on
+  navy.
+
 ### The output language is a setting, not a property of the transcript
 
 Settled with the operator 2026-09-15. `SUMMARY_LANGUAGE` (`summarize/language.py`)
@@ -1794,7 +1852,7 @@ Shaped to match the user's course files (`2_Transcripts/chapter1.md`,
 - **The 4-space indent inside `<details>` is deliberate**, reproducing what the
   existing chapter files do (most renderers show it as a code block). Don't
   "fix" it.
-- Applies to the `lecture`, `tutorial` and `video` prompts
+- Applies to the `lecture`, `tutorial`, `video` and `reality` prompts
   (`document.wants_wrapper`, on the resolved name); `meeting` keeps the plain
   executive format. Override with `--format always|never`.
 - `--combine` produces one such document for several videos: one title, one
@@ -2474,9 +2532,16 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   Modern's size.** Setting every face to the same point size is exactly what
   the operator asked not to have.
 - **Computer Modern is never offered for Thai.** No Thai glyphs.
-- **No prompt asks for timestamps or frame citations**, and the four
-  prompts stay four, one file each for every backend. The old names stay as
-  aliases in `promptnames.py` — unfinished runs and `.env` files carry them.
+- **No prompt asks for timestamps or frame citations** — except the
+  timestamps of `reality` (`TIMED_TRANSCRIPT_PROMPTS`), the operator's
+  explicit exception of 2026-09-30; no prompt cites frames. One file per
+  prompt for every backend; don't add a sixth without asking. The old names
+  stay as aliases in `promptnames.py` — unfinished runs and `.env` files
+  carry them.
+- **A timed prompt's timestamps come from the transcript's marks, and the
+  links from `document.link_timestamps`.** Never ask the model for URLs (it
+  cannot know the clip offset, and a wrong link looks right), and never
+  put the marks in the document's embedded transcript.
 - **Per-run instructions go after the static end marker**, never inside the
   static half.
 - **Keep a Thai face in `PDF_FONT_FAMILY`.** Computer Modern has no Thai
@@ -2592,7 +2657,7 @@ without API keys or network, against temp directories
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets, frontmatter, binary files | 36 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
-| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the four prompts (old names resolve, no timestamps, the callout vocabulary), `--instructions` placement, the no-frames note | 200 |
+| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the five prompts (old names resolve, no timestamps outside `reality`, the callout vocabulary), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`) | 221 |
 | `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), real PDF render | 107 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `transcribe/test_yt_autocaptions.py` | the yt-dlp fallback: track choice (never a translation), json3, the CLI against a stub yt-dlp | 11 |
@@ -2744,7 +2809,7 @@ own flags, which is everything about stage 1 except the call itself.
     ├── document.py
     ├── language.py               <- SUMMARY_LANGUAGE: the {language_rule} every prompt carries
     ├── fontchoice.py             <- per-language PDF fonts, defaults, x-height size matching (+ CLI check)
-    ├── promptnames.py            <- the four prompts, the old names' aliases (stdlib only)
+    ├── promptnames.py            <- the five prompts, the old names' aliases, which read timed lines (stdlib only)
     ├── pdf.py                    <- markdown -> PDF (DESIGN.md)
     ├── framecrop.py              <- slide-region detection, blank frames
     ├── mathrender.py             <- LaTeX -> Computer Modern SVG
@@ -2755,7 +2820,9 @@ own flags, which is everything about stage 1 except the call itself.
         ├── meeting.md
         ├── lecture.md            <- study sheet + the course-reference rules
         ├── tutorial.md
-        └── _merge.md             <- internal; leading _ keeps it off the menu
+        ├── reality.md            <- reality-show episode recap: [mm:ss], quotes, results last
+        ├── _merge.md             <- internal; leading _ keeps it off the menu
+        └── _merge-reality.md     <- the reality prompt's own merge
 ```
 
 ## The web UI (`trigger_server.py`, `web/index.html`)

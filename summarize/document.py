@@ -48,10 +48,10 @@ from pathlib import Path
 SECTION_SEPARATOR = "<br><br>"
 
 # Prompts whose output gets the link line and the transcript: the course-note
-# shaped ones, and `video`, whose reader wants the link back to what was
-# summarized. `meeting` keeps the plain executive summary — those don't go
-# into the course files, and a meeting has no link worth printing.
-WRAPPED_PROMPT_PREFIXES = ("lecture", "tutorial", "video")
+# shaped ones, and `video` and `reality`, whose reader wants the link back to
+# what was summarized. `meeting` keeps the plain executive summary — those
+# don't go into the course files, and a meeting has no link worth printing.
+WRAPPED_PROMPT_PREFIXES = ("lecture", "tutorial", "video", "reality")
 
 
 def wants_wrapper(prompt_name, mode="auto"):
@@ -158,6 +158,85 @@ def _clip_line(clip, tag=""):
         return f"Clip{tag}: `{clip}` of that video."
     return (f"Clip: `{clip}` of the source. "
             "Timestamps below are relative to the start of the clip.")
+
+
+YOUTUBE_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:[^#\s]*&)?v=|shorts/|live/|embed/)"
+    r"|youtu\.be/)([A-Za-z0-9_-]{11})")
+
+# A timestamp the reality prompt writes: [12:34], [1:02:03], or, in a
+# combined document, [Video 2, 12:34]. Not one already followed by "(" — that
+# is a link already, from an earlier pass or from the model.
+TIMESTAMP_RE = re.compile(
+    r"\[(?:video\s*(\d+)\s*,\s*)?(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\](?!\()",
+    re.IGNORECASE)
+# A code span holding nothing but a timestamp (`[01:41:22]`) is a timestamp
+# the model dressed as code — seen on the first live run, in a table.
+_CODED_TIMESTAMP_RE = re.compile(
+    r"`(\[(?:video\s*\d+\s*,\s*)?(?:\d{1,2}:)?\d{1,2}:\d{2}\])`", re.IGNORECASE)
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_INLINE_CODE_RE = re.compile(r"(`+)(?:(?!\1).)+\1")
+
+
+def youtube_id(url):
+    """The 11-character video id of a YouTube URL, or None."""
+    m = YOUTUBE_ID_RE.search(str(url or ""))
+    return m.group(1) if m else None
+
+
+def link_timestamps(body, videos):
+    """Turn the model's [mm:ss] marks into links to that moment of the video.
+
+    `videos` is [(source, clip_start_seconds)], video 1 first. A plain
+    [mm:ss] links into the only video — with several it would be ambiguous,
+    so it stays text — and [Video N, mm:ss] into video N. Only YouTube
+    sources get links (a Kaltura embed and a recording have no URL that
+    seeks); the rest stay text. The times the model read are clip-relative
+    (see --clip), so the clip's start is added back for the link, while the
+    visible text keeps the time the document's own transcript uses.
+
+    Code spans and fenced blocks are left alone. The model never writes the
+    URL: it could not know the clip offset, and a link it made up would
+    look exactly as right as one it didn't.
+    """
+    targets = {}
+    for n, (source, offset) in enumerate(videos or [], start=1):
+        vid = youtube_id(source)
+        if vid:
+            targets[n] = (vid, float(offset or 0))
+    if not targets:
+        return body
+
+    def link(m):
+        video, hours, minutes, seconds = m.groups()
+        n = int(video) if video else (1 if len(videos) == 1 else None)
+        if n not in targets:
+            return m.group(0)
+        vid, offset = targets[n]
+        at = int(hours or 0) * 3600 + int(minutes) * 60 + int(seconds)
+        return (f"{m.group(0)}(https://www.youtube.com/watch?v={vid}"
+                f"&t={int(at + offset)}s)")
+
+    out, in_fence = [], False
+    for line in body.split("\n"):
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        # Link only outside inline code: split on the code spans and rewrite
+        # the gaps between them.
+        line = _CODED_TIMESTAMP_RE.sub(r"\1", line)
+        pieces, last = [], 0
+        for code in _INLINE_CODE_RE.finditer(line):
+            pieces.append(TIMESTAMP_RE.sub(link, line[last:code.start()]))
+            pieces.append(code.group(0))
+            last = code.end()
+        pieces.append(TIMESTAMP_RE.sub(link, line[last:]))
+        out.append("".join(pieces))
+    return "\n".join(out)
 
 
 def split_leading_heading(body):

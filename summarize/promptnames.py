@@ -1,12 +1,13 @@
-"""The prompt names: the four that exist, and what the old names became.
+"""The prompt names: the five that exist, and what the old names became.
 
 Stdlib only, so the web UI (trigger_server.py) can show the right default
 without importing the summarizer. summarize.py resolves --prompt through
 canonical_prompt_name() too, so the two cannot disagree.
 
 Four prompts since 2026-09-29 — video, meeting, lecture, tutorial — each one
-file for every backend. `video` is the default when neither --prompt nor
-SUMMARY_PROMPT names one.
+file for every backend, and a fifth since 2026-09-30, `reality`, for episodes
+of competition reality shows. `video` is the default when neither --prompt
+nor SUMMARY_PROMPT names one.
 """
 
 DEFAULT_PROMPT = "video"
@@ -24,6 +25,19 @@ PROMPT_ALIASES = {
     # Both were meeting summarizers.
     "summarize": "meeting", "summarize-v2": "meeting",
 }
+
+
+# Prompts that are shown the transcript with a [mm:ss] mark on every line
+# (chunking.timed_transcript) and may cite those times in the summary. Every
+# other prompt reads the plain text and is told to write no timestamps; the
+# reality prompt's highlights are the one place the operator asked for them,
+# and summarize.py links them back into the video (document.link_timestamps).
+TIMED_TRANSCRIPT_PROMPTS = ("reality",)
+
+
+def wants_timed_transcript(prompt_name):
+    """Does this prompt (any spelling --prompt accepts) read timed lines?"""
+    return canonical_prompt_name(prompt_name) in TIMED_TRANSCRIPT_PROMPTS
 
 
 def canonical_prompt_name(prompt_name):

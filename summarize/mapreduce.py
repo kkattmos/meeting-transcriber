@@ -70,9 +70,20 @@ def _default_merge_template():
     )
 
 
-def load_merge_template():
+def merge_prompt_path(prompt_name=None):
+    """The merge instructions for a prompt: `_merge-<name>.md` when the
+    prompt has its own (reality: keep the timestamps and quotes, results
+    last), else the shared `_merge.md`."""
+    if prompt_name:
+        own = PROMPTS_DIR / f"_merge-{Path(prompt_name).stem}.md"
+        if own.is_file():
+            return own
+    return MERGE_PROMPT_PATH
+
+
+def load_merge_template(prompt_name=None):
     try:
-        text = MERGE_PROMPT_PATH.read_text()
+        text = merge_prompt_path(prompt_name).read_text()
     except OSError:
         text = _default_merge_template()
     if "# Input" in text:
@@ -83,12 +94,14 @@ def load_merge_template():
     return language.apply(text).strip() + "\n\n"
 
 
-def summarize_chunked(chunks, prompt_template, summarize_fn, log=print):
+def summarize_chunked(chunks, prompt_template, summarize_fn, log=print,
+                      merge_template=None):
     """Summarize chunks in parallel, then merge.
 
     `summarize_fn(frames, transcript, template, role=None) -> str` is llm_client.summarize,
     so each chunk and the merge all inherit the configured backend, its retry
-    policy, and the fallback chain.
+    policy, and the fallback chain. `merge_template` defaults to the shared
+    `_merge.md`; summarize.py passes load_merge_template(<prompt>).
     """
     total = len(chunks)
     log(f"==> Long transcript: summarizing {total} chunks "
@@ -158,7 +171,8 @@ def summarize_chunked(chunks, prompt_template, summarize_fn, log=print):
     # role="merge" lets the claude-cli backend put this call on a cheaper
     # model: it folds partials a stronger model already wrote, and its output
     # is about the size of everything it read.
-    merged = summarize_fn([], combined, load_merge_template(), role="merge")
+    merged = summarize_fn([], combined, merge_template or load_merge_template(),
+                          role="merge")
 
     if errors:
         missing = ", ".join(str(i + 1) for i, _ in sorted(errors))

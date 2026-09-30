@@ -336,7 +336,7 @@ usage window once it resets.
   billed — and shows what would run and the equivalent command. **Start** only
   unlocks once the current form has passed a check.
 - **Summary**, on both tabs: the style (`video`, `meeting`, `lecture`,
-  `tutorial`), the language it is written in (Thai or English), the PDF
+  `tutorial`, `reality`), the language it is written in (Thai or English), the PDF
   font (only the ones that language offers; defaults from `PDF_FONT_TH` /
   `PDF_FONT_EN`), and a free-text **Extra instructions** box for this run
   ("focus on the exam hints", "list every decision with its owner"). Also
@@ -499,7 +499,7 @@ keeps the frames too).
 | `--name N` | Meeting name (single input only; otherwise derived) |
 | `--display-name D` | Name the bot shows in the meeting (default `Meeting Bot`) |
 | `--language L` | `th` (default), `en`, `auto`, or any AssemblyAI code |
-| `--prompt P` | The summary style: `video` (default), `meeting`, `lecture` or `tutorial` — see [Summary styles](#summary-styles) |
+| `--prompt P` | The summary style: `video` (default), `meeting`, `lecture`, `tutorial` or `reality` — see [Summary styles](#summary-styles) |
 | `--summary-language L` | The language the summary is **written** in: `th` or `en` (default `SUMMARY_LANGUAGE`) |
 | `--pdf-font F` | The PDF's body font: `"Bai Jamjuree"` or `Sarabun` for Thai; `"CMU Serif"` (Computer Modern), `Sarabun` or `"Bai Jamjuree"` for English (default `PDF_FONT_TH` / `PDF_FONT_EN`) |
 | `--instructions T` | Extra instructions for the summarizer, this run only — e.g. `"Focus on what will be on the midterm"` |
@@ -968,7 +968,7 @@ queue can't wedge permanently and needs no cleanup daemon.
 
 ### Summary styles
 
-There are four prompts, one per kind of recording, shared by the Claude and
+There are five prompts, one per kind of recording, shared by the Claude and
 the Gemini backends (`summarize/prompts/`):
 
 | `--prompt` | For | What it writes |
@@ -977,13 +977,30 @@ the Gemini backends (`summarize/prompts/`):
 | `meeting` | calls | decisions, an action-item table (task, owner, due, priority), the discussion by topic, open questions |
 | `lecture` | classes | a study sheet: what the instructor flagged, then numbered sections with key concepts, worked examples and common mistakes; cites a `--resources` textbook excerpt when it has frontmatter |
 | `tutorial` | walkthroughs, coding videos | prerequisites and takeaways, then the steps with every command and code block verbatim, and a quick-reference table |
+| `reality` | competition reality-show episodes (The Face, Drag Race, MasterChef, …) | an episode recap: the teams, then the episode's segments in order with `[mm:ss]` timestamps and quotes from the mentors, judges and contestants, a highlights table, and last the results — the winner, who was up for elimination, who was eliminated |
 
-None of them writes timestamps or frame citations: the notes stand on their
-own. All four mark their key points with callout boxes that the PDF styles
+None of them but `reality` writes timestamps, and none cites frames: the
+notes stand on their own. All five mark their key points with callout boxes that the PDF styles
 (see [DESIGN.md](DESIGN.md)). The names from before the merge
 (`lecture-claude`, `lecture-gemini`, `lecture-reference`, `meeting-claude`,
 `tutorial-gemini`, `summarize`, …) still work and resolve to the new file, so
 an older `.env` or a resumed run keeps working.
+
+**Reality-show recaps** (`--prompt reality`). The one style that cites
+times: the model reads the transcript with a `[mm:ss]` mark every ~10
+seconds (built from the `.srt`, so it costs ~7% more input; the document's
+own transcript stays plain), and copies the mark where each moment begins.
+On a YouTube source the code then turns every mark into a link to that
+second of the video — with `--clip`, the clip's start is added to the link,
+while the text keeps the clip-relative time. Kaltura and recordings keep the
+marks as plain text. The transcript names no one, so quotes are credited
+from the on-screen name captions in the frames, then names said aloud; an
+unidentified speaker is described by role and team, never guessed. The
+results come last, in a red box: challenge winner, prize, nominees,
+eliminated, saved. A long episode is chunked and merged with its own merge
+prompt (`_merge-reality.md`), which keeps every timestamp and quote and puts
+the results at the end. Without an `.srt` beside the transcript there are
+no timestamps, with a warning in the log.
 
 **Per-run settings.** `--summary-language`, `--pdf-font` and `--instructions`
 (and the matching fields on both tabs of the web UI) are stored with the run,
@@ -1026,7 +1043,7 @@ manifest is summarized from the transcript alone.
 
 ### Markdown
 
-Summaries from the `lecture`, `tutorial` and `video` prompts are wrapped in a
+Summaries from the `lecture`, `tutorial`, `video` and `reality` prompts are wrapped in a
 course-note document, shaped to drop straight into a chapter file:
 
 ```markdown
@@ -1251,15 +1268,15 @@ end the scan.
 | `CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS` | 600 | Retry interval when the CLI reports a hit window without a reset time |
 | `GEMINI_API_KEY_1..3` | — | For the `gemini` fallback |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | A comma-separated list is a fallback chain: every key is tried on the first model, then the next model (`gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash` in `.env.example`). A rate-limited key moves on at once; an unknown model is skipped. Pin real versions, not `-latest` aliases |
-| `SUMMARY_PROMPT` | `video` | `video`, `meeting`, `lecture` or `tutorial` (`lecture` in `.env.example`); `--prompt` overrides. Older names still resolve |
+| `SUMMARY_PROMPT` | `video` | `video`, `meeting`, `lecture`, `tutorial` or `reality` (`lecture` in `.env.example`); `--prompt` overrides. Older names still resolve |
 | `SUMMARY_INSTRUCTIONS` | — | Extra instructions for every summary; `--instructions` (or the web UI's field) overrides it per run |
 | `SUMMARY_MAX_TOKENS` | 16000 | **Gemini only.** The Claude CLI has no output cap, and output is not what spends a subscription window anyway — see below |
-| `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture`/`tutorial`/`video` output; `always`/`never` override |
+| `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture`/`tutorial`/`video`/`reality` output; `always`/`never` override |
 | `SUMMARY_LANGUAGE` | `th` | The language the summary is *written* in: `th` or `en`; `--summary-language` overrides it per run. Independent of `ASSEMBLYAI_LANGUAGE`, which is the language the audio is in — see below |
 
 **Output language.** `SUMMARY_LANGUAGE` decides what every prompt tells the
 model to write in — `th` (the default) or `en`. Every shipped template
-(`video`, `meeting`, `lecture`, `tutorial` and the merge prompt) carries a
+(`video`, `meeting`, `lecture`, `tutorial`, `reality` and the merge prompts) carries a
 `{language_rule}` placeholder that is filled from this setting before the
 prompt is sent, on both the Claude and the Gemini backends. In Thai the
 model is asked for ordinary Thai academic prose with each technical term's

@@ -1469,7 +1469,7 @@ class ShippedMarkedPromptsTest(unittest.TestCase):
     def test_the_expected_files_carry_the_markers(self):
         names = {path.name for path, _ in self._marked()}
         self.assertEqual(names, {"lecture.md", "tutorial.md", "meeting.md",
-                                 "video.md"})
+                                 "video.md", "reality.md"})
 
     def test_each_splits_cleanly(self):
         for path, text in self._marked():
@@ -2008,8 +2008,9 @@ class PromptOrderForCachingTest(unittest.TestCase):
 
 
 class PromptSetTest(unittest.TestCase):
-    """The four prompts (2026-09-29): one file per kind of recording, shared
-    by every backend, none asking for timestamps or frame citations, all
+    """The prompts (four on 2026-09-29, `reality` the fifth on 09-30): one
+    file per kind of recording, shared by every backend, none but the timed
+    ones asking for timestamps, none asking for frame citations, all
     speaking the callout vocabulary the PDF styles (DESIGN.md)."""
 
     PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
@@ -2018,10 +2019,11 @@ class PromptSetTest(unittest.TestCase):
         import summarize as summarize_main
         self.sm = summarize_main
 
-    def test_exactly_four_selectable_prompts(self):
+    def test_exactly_five_selectable_prompts(self):
         names = sorted(p.stem for p in self.PROMPTS_DIR.glob("*.md")
                        if not p.stem.startswith("_"))
-        self.assertEqual(names, ["lecture", "meeting", "tutorial", "video"])
+        self.assertEqual(names, ["lecture", "meeting", "reality", "tutorial",
+                                 "video"])
 
     def test_old_names_resolve_to_their_replacements(self):
         for old, new in (("lecture-claude", "lecture"),
@@ -2035,13 +2037,19 @@ class PromptSetTest(unittest.TestCase):
                 self.assertEqual(self.sm.resolve_prompt_path(old).name,
                                  f"{new}.md")
 
-    def test_an_unknown_prompt_lists_the_four(self):
+    def test_an_unknown_prompt_lists_them(self):
         with self.assertRaises(SystemExit) as cm:
             self.sm.resolve_prompt_path("nope")
-        self.assertIn("lecture, meeting, tutorial, video", str(cm.exception))
+        self.assertIn("lecture, meeting, reality, tutorial, video",
+                      str(cm.exception))
 
     def test_no_prompt_asks_for_timestamps_or_frame_citations(self):
+        from promptnames import TIMED_TRANSCRIPT_PROMPTS
+        timed = {f"{n}.md" for n in TIMED_TRANSCRIPT_PROMPTS} | {
+            f"_merge-{n}.md" for n in TIMED_TRANSCRIPT_PROMPTS}
         for path in sorted(self.PROMPTS_DIR.glob("*.md")):
+            if path.name in timed:
+                continue  # RealityPromptTest holds what those ask for
             text = path.read_text()
             with self.subTest(prompt=path.name):
                 for asks in ("Timestamp Format", "[mm:ss]`", "Visual Index",
@@ -2053,7 +2061,7 @@ class PromptSetTest(unittest.TestCase):
                     self.assertIn("no timestamps", text)
 
     def test_every_prompt_speaks_the_callout_vocabulary(self):
-        for name in ("lecture", "tutorial", "meeting", "video"):
+        for name in ("lecture", "tutorial", "meeting", "video", "reality"):
             text = (self.PROMPTS_DIR / f"{name}.md").read_text()
             with self.subTest(prompt=name):
                 for tag in ("[!CONCEPT]", "[!EXAMPLE]", "[!WARNING]",
@@ -2067,6 +2075,275 @@ class PromptSetTest(unittest.TestCase):
             (self.PROMPTS_DIR / "lecture.md").read_text())
         self.assertIn("Cite only what is in the excerpt", static)
         self.assertIn("If there is none, ignore this section entirely", static)
+
+
+class RealityPromptTest(unittest.TestCase):
+    """The reality-show recap (2026-09-30): the one prompt that reads a timed
+    transcript and cites [mm:ss], which the code — not the model — links
+    into the video; quotes credited from on-screen name captions; the
+    results last."""
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def _srt(self, cues, name="ep.srt"):
+        """cues: [(start_s, end_s, text)] -> the .txt path beside an .srt."""
+        def ts(sec):
+            ms = int(round(sec * 1000))
+            h, rem = divmod(ms, 3600_000)
+            m, rem = divmod(rem, 60_000)
+            s_, ms = divmod(rem, 1000)
+            return f"{h:02d}:{m:02d}:{s_:02d},{ms:03d}"
+        blocks = [f"{i}\n{ts(a)} --> {ts(b)}\n{t}\n"
+                  for i, (a, b, t) in enumerate(cues, start=1)]
+        srt = self.dir / name
+        srt.write_text("\n".join(blocks))
+        txt = srt.with_suffix(".txt")
+        txt.write_text("\n".join(t for _, _, t in cues))
+        return txt
+
+    # --- which prompts read the timed transcript -------------------------
+
+    def test_only_reality_reads_timed_lines(self):
+        from promptnames import wants_timed_transcript
+        self.assertTrue(wants_timed_transcript("reality"))
+        self.assertTrue(wants_timed_transcript("reality.md"))
+        for name in (None, "", "video", "lecture", "meeting", "tutorial",
+                     "lecture-claude", "summarize"):
+            with self.subTest(prompt=name):
+                self.assertFalse(wants_timed_transcript(name))
+
+    def test_it_is_wrapped_with_the_link_and_transcript(self):
+        self.assertTrue(document.wants_wrapper("reality"))
+
+    # --- what the prompt asks for ----------------------------------------
+
+    def test_the_prompt_asks_for_the_recap(self):
+        text = (self.PROMPTS_DIR / "reality.md").read_text()
+        static, dynamic = llm_client.split_static_prompt(text)
+        for asks in ("## Highlights", "## Results", "eliminated",
+                     "[!EXAMPLE]` box titled \"Quotes\"",
+                     "On-screen name captions", "never guess a name",
+                     "The Face", "`[mm:ss]`", "[Video N, mm:ss]",
+                     "If the transcript carries no marks, write no timestamps",
+                     "{language_rule}"):
+            with self.subTest(asks=asks):
+                self.assertIn(asks, static)
+        # Results last, and no spoiler in the opening.
+        self.assertIn("**End with the Results section.**", static)
+        self.assertIn("Do not reveal any result here", static)
+        self.assertLess(static.index("## Highlights"),
+                        static.index("`## Results`"))
+        # Frames are still never cited.
+        self.assertIn("never cite them", static)
+        for placeholder in ("{transcript}", "{frame_manifest}"):
+            self.assertIn(placeholder, dynamic)
+            self.assertNotIn(placeholder, static)
+
+    def test_the_template_formats(self):
+        # Every brace in the file is a placeholder: .format() must not choke.
+        template = self.sm.load_prompt_template(self.PROMPTS_DIR / "reality.md")
+        out = template.format(transcript="T", frame_manifest="F")
+        self.assertIn("[mm:ss]", out)
+
+    # --- the timed transcript --------------------------------------------
+
+    def test_lines_group_cues_and_open_with_their_time(self):
+        segs = [Segment(t, t + 3, f"c{t}") for t in range(0, 30, 3)]
+        lines = chunking.timed_transcript(segs).splitlines()
+        self.assertEqual(lines, ["[00:00] c0 c3 c6 c9",
+                                 "[00:12] c12 c15 c18 c21",
+                                 "[00:24] c24 c27"])
+
+    def test_past_the_hour_the_mark_carries_hours(self):
+        self.assertEqual(chunking.timestamp_label(3599), "[59:59]")
+        self.assertEqual(chunking.timestamp_label(3723.9), "[1:02:03]")
+
+    def test_a_long_asr_segment_is_cut_so_marks_stay_dense(self):
+        # AssemblyAI on Thai: one "sentence" for two minutes.
+        segs = [Segment(0, 120, "ก" * 1200)]
+        lines = chunking.timed_transcript(segs).splitlines()
+        self.assertEqual([ln.split("]")[0] + "]" for ln in lines],
+                         ["[00:00]", "[00:30]", "[01:00]", "[01:30]"])
+
+    def test_chunks_carry_the_marks_and_their_frames(self):
+        txt = self._srt([(t, t + 4, "x" * 50) for t in range(0, 400, 4)])
+        frames = [FrameMeta(timestamp_s=t, kind="motion", path=f"/f{t}.jpg")
+                  for t in (5, 395)]
+        timed = self.sm.model_transcript(txt.read_text(), str(txt), "reality")
+        with mock.patch.dict(os.environ, {"SUMMARY_CHUNK_CHARS": "1500",
+                                          "SUMMARY_CHUNK_OVERLAP": "0"}):
+            chunks = chunking.build_chunks(timed, frames, str(txt), timed=True)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            for line in chunk.text.splitlines():
+                self.assertRegex(line, r"^\[\d\d:\d\d\] ")
+        self.assertEqual([f.timestamp_s for f in chunks[0].frames], [5])
+        self.assertEqual([f.timestamp_s for f in chunks[-1].frames], [395])
+
+    def test_model_transcript_is_timed_only_for_reality(self):
+        txt = self._srt([(0, 4, "hello"), (65, 70, "there")])
+        plain = txt.read_text()
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(self.sm.model_transcript(plain, str(txt), "reality"),
+                             "[00:00] hello\n[01:05] there")
+        self.assertEqual(self.sm.model_transcript(plain, str(txt), "video"),
+                         plain)
+
+    def test_no_srt_means_the_plain_text_and_a_warning(self):
+        txt = self.dir / "bare.txt"
+        txt.write_text("words")
+        err = io.StringIO()
+        with mock.patch("sys.stderr", new=err):
+            self.assertEqual(
+                self.sm.model_transcript("words", str(txt), "reality"), "words")
+        self.assertIn("no timestamps", err.getvalue())
+
+    def test_combined_parts_are_timed_per_video(self):
+        a = self._srt([(0, 3, "one"), (20, 23, "two")], "a.srt")
+        b = self._srt([(5, 8, "three")], "b.srt")
+        parts = [chunking.Part(label="video 1 of 2: A", text="one\ntwo",
+                               srt_path=str(a.with_suffix(".srt"))),
+                 chunking.Part(label="video 2 of 2: B", text="three",
+                               srt_path=str(b.with_suffix(".srt")))]
+        self.assertEqual(chunking.part_transcript(parts, timed=True),
+                         "=== video 1 of 2: A ===\n\n[00:00] one\n[00:20] two"
+                         "\n\n=== video 2 of 2: B ===\n\n[00:05] three")
+        # The document still embeds the plain text.
+        self.assertIn("one\ntwo", chunking.part_transcript(parts))
+
+    # --- the links --------------------------------------------------------
+
+    URL = "https://www.youtube.com/watch?v=abcdefghijk"
+
+    def test_youtube_ids(self):
+        for url in ("https://youtu.be/abcdefghijk",
+                    "https://www.youtube.com/watch?v=abcdefghijk&list=PL1",
+                    "https://www.youtube.com/watch?feature=x&v=abcdefghijk",
+                    "https://youtube.com/shorts/abcdefghijk",
+                    "https://www.youtube.com/live/abcdefghijk?si=1"):
+            with self.subTest(url=url):
+                self.assertEqual(document.youtube_id(url), "abcdefghijk")
+        self.assertIsNone(document.youtube_id("/media/ep.mp4"))
+        self.assertIsNone(document.youtube_id(None))
+
+    def test_marks_become_links_to_that_second(self):
+        body = "## 2. Shoot [08:15]\n* [1:02:03] **Bee**: \"ok\""
+        out = document.link_timestamps(body, [(self.URL, 0)])
+        self.assertIn(f"[08:15]({self.URL}&t=495s)", out)
+        self.assertIn(f"[1:02:03]({self.URL}&t=3723s)", out)
+
+    def test_a_clip_offset_is_added_to_the_link_not_the_text(self):
+        out = document.link_timestamps("[00:10]", [(self.URL, 300)])
+        self.assertEqual(out, f"[00:10]({self.URL}&t=310s)")
+
+    def test_video_n_links_into_that_video(self):
+        other = "https://youtu.be/zyxwvutsrqp"
+        out = document.link_timestamps(
+            "[Video 2, 00:05] and [00:07]", [(self.URL, 0), (other, 0)])
+        self.assertIn("[Video 2, 00:05](https://www.youtube.com/watch?v="
+                      "zyxwvutsrqp&t=5s)", out)
+        # A bare mark is ambiguous among several videos: left as text.
+        self.assertTrue(out.endswith("and [00:07]"))
+
+    def test_a_timestamp_dressed_as_code_is_still_linked(self):
+        # Gemini, live: "| `[01:41:22]` | … |" in the Highlights table.
+        out = document.link_timestamps("| `[01:41:22]` | walkout |",
+                                       [(self.URL, 0)])
+        self.assertEqual(out, f"| [01:41:22]({self.URL}&t=6082s) | walkout |")
+
+    def test_what_is_not_linked(self):
+        body = ("`x [00:01]` and\n```\n[00:02]\n```\n[00:03](https://x) "
+                "[Video 9, 00:04]")
+        self.assertEqual(document.link_timestamps(body, [(self.URL, 0)]), body)
+        # No YouTube source: no links at all.
+        self.assertEqual(document.link_timestamps("[00:05]", [("/ep.mp4", 0)]),
+                         "[00:05]")
+        self.assertEqual(document.link_timestamps(
+            "[00:05]", [("https://cdnapisec.kaltura.com/p/1/embed", 0)]),
+            "[00:05]")
+
+    # --- the merge ---------------------------------------------------------
+
+    def test_the_merge_keeps_timestamps_and_puts_results_last(self):
+        from mapreduce import load_merge_template
+        merge = load_merge_template("reality")
+        self.assertIn("Keep every timestamp exactly as written", merge)
+        self.assertIn("ONE `## Results` section, LAST", merge)
+        self.assertNotIn("{language_rule}", merge)
+        self.assertEqual(merge.format(transcript="P").count("P"), 1 +
+                         merge.count("P"))
+        # Every other prompt keeps the shared merge.
+        self.assertEqual(load_merge_template("video"), load_merge_template())
+        self.assertIn("Do not add timestamps", load_merge_template("lecture"))
+
+    def test_summarize_chunked_uses_the_merge_it_is_given(self):
+        seen = []
+
+        def fake(frames, transcript, template, role=None):
+            seen.append((role, template))
+            return "partial"
+        chunks = [Chunk(index=i, text=f"t{i}") for i in range(2)]
+        summarize_chunked(chunks, "P {transcript}", fake, log=lambda *a: None,
+                          merge_template="MERGE {transcript}")
+        self.assertEqual(seen[-1], ("merge", "MERGE {transcript}"))
+
+    # --- end to end through main() ------------------------------------------
+
+    def test_main_sends_timed_lines_and_writes_links(self):
+        txt = self._srt([(0, 4, "สวัสดี"), (125, 130, "ออกจากการแข่งขัน")])
+        manifest = self.dir / "manifest.json"
+        manifest.write_text('{"frames": []}')
+        out_md = self.dir / "out.md"
+        seen = {}
+
+        def fake(frames, transcript, template, role=None):
+            seen["transcript"] = transcript
+            return "# Ep 1\n\n## Results [02:05]\n\n* **A** eliminated [02:05]"
+        argv = ["summarize.py", "https://youtu.be/abcdefghijk", str(txt),
+                str(out_md), "--prompt", "reality", "--frames-manifest",
+                str(manifest), "--no-pdf", "--title", "Ep 1",
+                "--clip", "00:01:00-00:10:00"]
+        env = {k: v for k, v in os.environ.items() if k != "RESOURCES"}
+        with mock.patch.object(self.sm, "summarize", fake), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("sys.stdout", new=io.StringIO()):
+            self.sm.main()
+        self.assertEqual(seen["transcript"],
+                         "[00:00] สวัสดี\n[02:05] ออกจากการแข่งขัน")
+        doc = out_md.read_text()
+        # The clip started at 1:00, so 02:05 in the clip is 185s in the video.
+        self.assertIn("[02:05](https://www.youtube.com/watch?v=abcdefghijk"
+                      "&t=185s)", doc)
+        # The embedded transcript is the plain one.
+        self.assertIn("    สวัสดี", doc)
+        self.assertNotIn("    [00:00]", doc)
+
+    def test_main_leaves_other_prompts_plain(self):
+        txt = self._srt([(0, 4, "hello")])
+        manifest = self.dir / "manifest.json"
+        manifest.write_text('{"frames": []}')
+        seen = {}
+
+        def fake(frames, transcript, template, role=None):
+            seen["transcript"] = transcript
+            return "# T\n\nbody [00:00]"
+        argv = ["summarize.py", "https://youtu.be/abcdefghijk", str(txt),
+                str(self.dir / "o.md"), "--prompt", "video",
+                "--frames-manifest", str(manifest), "--no-pdf", "--title", "T"]
+        with mock.patch.object(self.sm, "summarize", fake), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch("sys.stdout", new=io.StringIO()):
+            self.sm.main()
+        self.assertEqual(seen["transcript"], "hello")
+        self.assertNotIn("&t=", (self.dir / "o.md").read_text())
 
 
 class InstructionsTest(unittest.TestCase):

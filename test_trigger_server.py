@@ -124,10 +124,11 @@ echo "argv: $*"
         self.assertEqual(self.ts._choice("voice", ("both", "voice")), "voice")
         self.assertEqual(self.ts._choice("tape", ("video", "audio")), "video")
 
-    def test_options_offer_the_four_prompts_and_the_fonts(self):
+    def test_options_offer_the_prompts_and_the_fonts(self):
         status, opt = self.call("/api/options")
         self.assertEqual(status, 200)
-        self.assertEqual(opt["prompts"], ["lecture", "meeting", "tutorial", "video"])
+        self.assertEqual(opt["prompts"],
+                         ["lecture", "meeting", "reality", "tutorial", "video"])
         self.assertEqual(opt["summary_languages"], ["en", "th"])
         self.assertEqual(opt["fonts"]["th"], ["Bai Jamjuree", "Sarabun"])
         self.assertIn("CMU Serif", opt["fonts"]["en"])

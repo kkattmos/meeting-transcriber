@@ -183,11 +183,12 @@ import document  # noqa: E402
 import language  # noqa: E402
 import fontchoice  # noqa: E402
 import pdf as pdf_export  # noqa: E402
-from chunking import build_chunks  # noqa: E402
-from mapreduce import summarize_chunked  # noqa: E402
+from chunking import build_chunks, find_srt_for, parse_srt, timed_transcript  # noqa: E402
+from mapreduce import load_merge_template, summarize_chunked  # noqa: E402
 import paths as botpaths  # noqa: E402
 import resources as botresources  # noqa: E402
 import kaltura  # noqa: E402
+import clip as botclip  # noqa: E402
 import runstate  # noqa: E402
 
 # EX_TEMPFAIL from sysexits.h: the Claude usage window is exhausted and the
@@ -201,6 +202,7 @@ PROMPTS_DIR = SCRIPT_DIR / "prompts"
 # The four prompts and the old names' aliases live in promptnames.py, which
 # the web UI imports too. `video` is the default.
 from promptnames import DEFAULT_PROMPT, PROMPT_ALIASES, canonical_prompt_name  # noqa: E402,F401
+from promptnames import wants_timed_transcript  # noqa: E402
 PROMPT_PATH = PROMPTS_DIR / f"{DEFAULT_PROMPT}.md"
 # YouTube downloads go under MEETING_BOT_ROOT rather than /tmp because a
 # server-side /tmp (often a small tmpfs) can fill up and starve the rest of
@@ -496,6 +498,35 @@ def load_parts(parts_path):
     return parts, videos, frames
 
 
+def _clip_start(label):
+    """Where a clip window starts in its source, in seconds (0 for none)."""
+    if not label:
+        return 0.0
+    try:
+        return botclip.parse_clip(label)[0]
+    except ValueError:
+        return 0.0
+
+
+def model_transcript(transcript, transcript_path, prompt_name):
+    """The transcript the model reads: [mm:ss] lines for a timed prompt
+    (promptnames.TIMED_TRANSCRIPT_PROMPTS) when an .srt sits beside the
+    .txt, else the text itself. The document embeds the plain text either
+    way — the marks are for the model to cite."""
+    if not wants_timed_transcript(prompt_name):
+        return transcript
+    srt = find_srt_for(transcript_path) if transcript_path else None
+    timed = timed_transcript(parse_srt(srt)) if srt else ""
+    if not timed:
+        print("==> WARNING: no timed transcript (.srt) beside "
+              f"{transcript_path} — the summary will have no timestamps",
+              file=sys.stderr)
+        return transcript
+    print(f"==> Timed transcript for the model: {len(timed.splitlines())} "
+          f"[mm:ss] lines from {srt.name}")
+    return timed
+
+
 def _wrap_document(body, *, original_input, source_url, video_path, transcript,
                    title_override, prompt_path, meeting_name, run_id=None,
                    clip=None, videos=None):
@@ -709,7 +740,7 @@ def inject_instructions(prompt_template, instructions):
         "\n\n## Additional instructions for this run\n\n"
         "The person who requested this summary added the instructions below. "
         "Follow them; where they conflict with the default structure above, "
-        "they take precedence. The language rule, and the rule against "
+        "they take precedence. The language rule, and the prompt's rules on "
         "timestamps and frame citations, still apply unless the instructions "
         "explicitly say otherwise.\n\n"
         f"<operator_instructions>\n{safe}\n</operator_instructions>\n"
@@ -858,12 +889,19 @@ def main_parts(argv, options):
                                           run_instructions(options))
 
     _select_backend_banner()
+    timed = wants_timed_transcript(prompt_path.stem)
     transcript = part_transcript(parts)
-    chunks = build_part_chunks(parts)
+    chunks = build_part_chunks(parts, timed=timed)
     if chunks:
-        summary = summarize_chunked(chunks, prompt_template, summarize)
+        summary = summarize_chunked(
+            chunks, prompt_template, summarize,
+            merge_template=load_merge_template(prompt_path.stem))
     else:
-        summary = summarize(frames, transcript, prompt_template)
+        summary = summarize(frames, part_transcript(parts, timed=timed),
+                            prompt_template)
+    if timed:
+        summary = document.link_timestamps(
+            summary, [(v["source"], _clip_start(v.get("clip"))) for v in videos])
 
     # The document's one title: the operator's, else the first video's. It
     # is resolved here so _wrap_document does not look the YouTube title up a
@@ -1041,11 +1079,21 @@ def main():
         #    llm_client/retry.py; here we only decide single-call vs chunked.
         _select_backend_banner()
 
-        chunks = build_chunks(transcript, frames, transcript_path)
+        timed = wants_timed_transcript(prompt_path.stem)
+        for_model = model_transcript(transcript, transcript_path,
+                                     prompt_path.stem)
+        chunks = build_chunks(for_model, frames, transcript_path, timed=timed)
         if chunks:
-            summary = summarize_chunked(chunks, prompt_template, summarize)
+            summary = summarize_chunked(
+                chunks, prompt_template, summarize,
+                merge_template=load_merge_template(prompt_path.stem))
         else:
-            summary = summarize(frames, transcript, prompt_template)
+            summary = summarize(frames, for_model, prompt_template)
+        if timed:
+            # The model wrote [mm:ss]; the code, which knows the clip's
+            # offset, makes them links. A YouTube source only.
+            summary = document.link_timestamps(
+                summary, [(source_url or original_input, _clip_start(clip))])
 
         # 6. Wrap the model's body in the course-note document template, when
         #    the chosen prompt is one of the course-shaped ones. The link,
