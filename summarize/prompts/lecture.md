@@ -89,7 +89,7 @@ The input may contain one or more `<course_reference>` blocks: an excerpt of a t
 
 ## Frames
 
-Each frame is labelled with its number, its position in the recording and why it was captured (a scene change, or a periodic sample on a static slide). The labels are for orientation only — do not cite them.
+Each frame is labelled with its number, its position in the recording and why it was captured. The labels are for orientation only — do not cite them.
 
 {frame_manifest}
 

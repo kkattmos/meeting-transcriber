@@ -26,7 +26,9 @@ POST /trigger          (Authorization: Bearer <token>)
 
   Optional fields: name, language (spoken), prompt (video | meeting | lecture |
   tutorial), summary_language (th | en, what the notes are written in),
-  pdf_font, instructions (extra instructions for the summarizer), jobs,
+  pdf_font, instructions (extra instructions for the summarizer),
+  summary_source (both | voice: frames and transcript, or the transcript
+  alone), record_media (video | audio: what a meeting's recording keeps), jobs,
   display_name, clip, combine, no_combine_pdf, resources (a GitHub repo or
   local path, or a list of them), playlist, and force.
 
@@ -127,6 +129,8 @@ def build_args(body):
                         ("prompt", "--prompt"),
                         ("summary_language", "--summary-language"),
                         ("pdf_font", "--pdf-font"),
+                        ("summary_source", "--summary-source"),
+                        ("record_media", "--record-media"),
                         ("display_name", "--display-name"),
                         ("jobs", "--jobs"),
                         ("clip", "--clip"),
@@ -268,7 +272,18 @@ def options():
         "default_resources": os.environ.get("RESOURCES", ""),
         "summaries_dir": os.environ.get("SUMMARIES_DIR", ""),
         "recordings_dir": os.environ.get("RECORDINGS_DIR", ""),
+        # .env's SUMMARY_SOURCE / RECORD_MEDIA preselect the form; an invalid
+        # value falls back here and is reported by Check (pipeline.sh).
+        "default_summary_source": _choice(os.environ.get("SUMMARY_SOURCE"),
+                                          ("both", "voice")),
+        "default_record_media": _choice(os.environ.get("RECORD_MEDIA"),
+                                        ("video", "audio")),
     }
+
+
+def _choice(value, allowed):
+    value = (value or "").strip()
+    return value if value in allowed else allowed[0]
 
 
 class Handler(BaseHTTPRequestHandler):

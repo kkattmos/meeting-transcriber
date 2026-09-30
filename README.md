@@ -339,7 +339,10 @@ usage window once it resets.
   `tutorial`), the language it is written in (Thai or English), the PDF
   font (only the ones that language offers; defaults from `PDF_FONT_TH` /
   `PDF_FONT_EN`), and a free-text **Extra instructions** box for this run
-  ("focus on the exam hints", "list every decision with its owner").
+  ("focus on the exam hints", "list every decision with its owner"). Also
+  **Save recording** (video, or audio only — meetings) and **Summarize from**
+  (frames and voice, or voice only); audio only forces voice only. See
+  [Voice only and audio-only recordings](#voice-only-and-audio-only-recordings).
 - **Runs** — every run with its stages (`✓` done, `✗` failed, `▶` running),
   the created meeting's link, the tail of each stage log, and **Resume** /
   **Stop**.
@@ -500,6 +503,8 @@ keeps the frames too).
 | `--summary-language L` | The language the summary is **written** in: `th` or `en` (default `SUMMARY_LANGUAGE`) |
 | `--pdf-font F` | The PDF's body font: `"Bai Jamjuree"` or `Sarabun` for Thai; `"CMU Serif"` (Computer Modern), `Sarabun` or `"Bai Jamjuree"` for English (default `PDF_FONT_TH` / `PDF_FONT_EN`) |
 | `--instructions T` | Extra instructions for the summarizer, this run only — e.g. `"Focus on what will be on the midterm"` |
+| `--summary-source S` | `both` (default: transcript + frames) or `voice` (transcript only: no frames stage). `--voice-only` is the short form. Default `SUMMARY_SOURCE` |
+| `--record-media M` | Meetings: `video` (default, an MP4) or `audio` (an `.m4a`, summary from the voice). `--audio-only` is the short form. Default `RECORD_MEDIA` |
 | `--clip W` | Summarize only part of the video, e.g. `--clip 00:05:00-01:30:00` (see below) |
 | `<input>#t=W` | Not a flag: a per-input window, overriding `--clip` for that input |
 | `--resources SPEC` | Slides / notes for this session; repeatable (see below) |
@@ -986,6 +991,38 @@ so a resume summarizes the same way; given again on a resume, they replace
 the stored ones. `--instructions` is free text for the summarizer: it goes in
 after the prompt's cached half, and takes precedence over the default
 structure.
+
+### Voice only and audio-only recordings
+
+When a call is only voices and cameras, the frames cost CPU and summary
+tokens for faces. Two per-run choices, on the command line, in `.env`, and
+on both tabs of the web UI:
+
+- **Summarize from: voice only** (`--voice-only`, `SUMMARY_SOURCE=voice`) —
+  no frames stage at all, nothing on screen offered to the model, no
+  pictures in the PDF. The prompt is told there are no frames.
+- **Save recording: audio only** (`--audio-only`, `RECORD_MEDIA=audio`) — a
+  meeting is recorded as an `.m4a` (AAC 128k, the same audio the MP4
+  carries, ~58 MB/hour) instead of a screen recording, and the bot's hidden
+  browser renders at `RECORD_AUDIO_GEOMETRY` (960x540). No picture means no
+  frames, so it is always voice only; `--audio-only --summary-source both`
+  is refused for a meeting.
+
+What each one does per source:
+
+| Source | Voice only | Audio only |
+|---|---|---|
+| Meet / Zoom link, `--new-meet` | Video still recorded; no frames cut from it | `.m4a`, no x264 encode (measured 1.12 → 0.43 cores with the bot alone in a call), smaller browser; voice only |
+| YouTube | Not even downloaded (the download only ever fed the frames) | — |
+| Kaltura | Still downloaded when AssemblyAI needs the media (no captions); no frames | — |
+| Local file | No frames | — |
+| `--combine` | One transcript-only summary; the members cut no frames | — |
+
+Both are stored with the run. `--summary-source` given again on a resume
+replaces the stored choice (a voice-only run resumed with `--summary-source
+both` extracts its frames then); the recording medium is fixed when the run
+is created. An audio file given as an input needs neither: its empty frame
+manifest is summarized from the transcript alone.
 
 ### Markdown
 
@@ -1570,6 +1607,9 @@ again with `first_time_login.sh`.
 | `TRANSCRIBE_MIN_SOUND_SECONDS` | 30 | Less sound than this in a recording → not sent to AssemblyAI |
 | `KILL_FINALISE_SECONDS` | 120 | `kill_meeting.sh`: how long to wait for the MP4 to be finalised when forcing a stop |
 | `RECORD_GEOMETRY` | `1920x1080` | Xvfb head, browser window and ffmpeg capture size — they must agree or the recording gets black edges |
+| `RECORD_MEDIA` | `video` | `audio` records meetings as an `.m4a`; same as `--record-media` |
+| `RECORD_AUDIO_GEOMETRY` | `960x540` | The browser's display size for an audio-only recording |
+| `SUMMARY_SOURCE` | `both` | `voice` summarizes from the transcript alone; same as `--summary-source` |
 | `RECORD_FRAMERATE` | 15 | |
 | `MEETING_BOT_DISPLAY_NAME` | `Meeting Bot` | Same as `--display-name` |
 | `PIPELINE_JOBS` | 2 | Same as `--jobs` |
@@ -1607,15 +1647,16 @@ python3 lib/test_keyring.py                  # numbered keys + rotation cursor (
 python3 lib/test_resources.py                # resource specs, extraction, GitHub, frontmatter, binary files (36)
 python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions, retries (51)
 python3 lib/test_clip.py                     # --clip parsing, the cut, caption windowing (33)
-python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain, the course reference, the output language, the four prompts, --instructions (198)
-python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, the design (callouts, code, maths symbols), font choice and size matching, PDF render (103)
+python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain, the course reference, the output language, the four prompts, --instructions, no frames (200)
+python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, the design (callouts, code, maths symbols), font choice and size matching, PDF render (107)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
 python3 transcribe/test_yt_autocaptions.py   # the yt-dlp caption fallback: track choice, json3 (11)
+python3 screen/test_extract_frames.py        # frames on change: settle, motion cap, safety net, blanks, real ffmpeg (19)
 python3 screen/test_capture_host.py          # hosting a created Meet: when it ends, and when it must not (7)
 python3 screen/test_browser.py               # browser choice, fake devices, the bot-account check (16)
-python3 test_trigger_server.py               # the web UI API: argument mapping, auth, dry-run check, paths, summary settings (9)
-bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings, summary settings (383)
-bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (125)
+python3 test_trigger_server.py               # the web UI API: argument mapping, auth, dry-run check, paths, summary settings, record/summary source (11)
+bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings, summary settings, voice only / audio only (438)
+bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (131)
 ```
 
 Two of those are worth understanding:

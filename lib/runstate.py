@@ -375,6 +375,12 @@ def main():
     p.add_argument("--summary-language")
     p.add_argument("--pdf-font")
     p.add_argument("--instructions")
+    # What the summary is made from (voice = the transcript alone, no frames
+    # stage) and what a meeting's recording keeps (audio = an .m4a, no
+    # screen). Per run for the same reason: a resume must not start cutting
+    # frames out of a recording that has no picture.
+    p.add_argument("--summary-source", choices=("both", "voice"))
+    p.add_argument("--record-media", choices=("video", "audio"))
 
     p = with_run_dir(sub.add_parser("status"))
     p.add_argument("--stage", required=True)
@@ -498,7 +504,9 @@ def main():
                     members=args.members, output_md=args.output_md,
                     output_pdf=args.output_pdf, meet_url=args.meet_url,
                     summary_language=args.summary_language,
-                    pdf_font=args.pdf_font, instructions=args.instructions)
+                    pdf_font=args.pdf_font, instructions=args.instructions,
+                    summary_source=args.summary_source,
+                    record_media=args.record_media)
         # `init` with no --resources still records an empty list — but only
         # when it creates or refreshes a run (it names the input). Stamping
         # --combined-into on an existing member, --meet-url from inside a
@@ -591,6 +599,10 @@ def main():
                   f"   PDF font: {data.get('pdf_font') or '(default)'}")
         if data.get("instructions"):
             print(f"instructions: {data['instructions']}")
+        if data.get("summary_source") or data.get("record_media"):
+            print(f"media:      summary from {data.get('summary_source') or 'both'}"
+                  + (f"   recording: {data['record_media']}"
+                     if data.get("input_type") == "meeting" else ""))
         print(f"created:    {data.get('created_at')}")
         print(f"updated:    {data.get('updated_at')}")
         print("stages:")

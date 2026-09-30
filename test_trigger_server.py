@@ -104,6 +104,26 @@ echo "argv: $*"
                                       "instructions": "  "})
         self.assertEqual(args, ["https://youtu.be/a"])
 
+    def test_record_and_summary_source(self):
+        args, err = self.ts.build_args({
+            "new_meet": True, "record_media": "audio", "summary_source": "voice"})
+        self.assertIsNone(err)
+        self.assertEqual(args, ["--new-meet", "--summary-source", "voice",
+                                "--record-media", "audio"])
+        # The server passes values through; pipeline.sh is what refuses a bad
+        # one (and Check shows its message).
+        args, _ = self.ts.build_args({"url": "https://youtu.be/a",
+                                      "summary_source": "pictures"})
+        self.assertEqual(args, ["https://youtu.be/a", "--summary-source", "pictures"])
+
+    def test_options_preselect_the_env_media_defaults(self):
+        status, opt = self.call("/api/options")
+        self.assertEqual(status, 200)
+        self.assertEqual(opt["default_summary_source"], "both")
+        self.assertEqual(opt["default_record_media"], "video")
+        self.assertEqual(self.ts._choice("voice", ("both", "voice")), "voice")
+        self.assertEqual(self.ts._choice("tape", ("video", "audio")), "video")
+
     def test_options_offer_the_four_prompts_and_the_fonts(self):
         status, opt = self.call("/api/options")
         self.assertEqual(status, 200)

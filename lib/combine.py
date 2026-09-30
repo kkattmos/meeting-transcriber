@@ -89,7 +89,13 @@ def build_parts(runs_dir, member_ids):
         if srt and not Path(srt).is_file():
             srt = None
         manifest = state.stage("frames").get("artifacts", {}).get("manifest")
-        if state.status("frames") != DONE or not manifest \
+        if state.get("summary_source") == "voice" \
+                or (state.get("input_type") == "meeting"
+                    and state.get("record_media") == "audio"):
+            # Voice only (pipeline.sh --summary-source voice, or an audio
+            # recording): no frames stage ran, and none is owed.
+            manifest = None
+        elif state.status("frames") != DONE or not manifest \
                 or not Path(manifest).is_file():
             problems.append(f"{member}: frames manifest {manifest!r} is "
                             f"missing (frames stage is "

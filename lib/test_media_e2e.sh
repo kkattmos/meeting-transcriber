@@ -787,6 +787,39 @@ fi
 
 echo ""
 echo "=================================================================="
+echo "8. Voice only: the real summarize.py sends the model no pictures"
+echo "=================================================================="
+: > "$CLI_RECORD"
+FRAMES_BEFORE="$(find "$FRAMES_DIR" | sort)"
+"$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" \
+      "$SUMMARIES_DIR/voice.md" --no-frames --no-pdf --prompt lecture \
+      > "$TESTROOT/voice.log" 2>&1
+check "summarize.py --no-frames exits 0" "$?" "0"
+[ -s "$SUMMARIES_DIR/voice.md" ] && ok "voice-only markdown written" || bad "no voice-only markdown"
+VOICE=$("$PY" - "$CLI_RECORD" <<'PYEOF'
+import json, sys
+rec = json.loads(open(sys.argv[1]).readline())
+print(len(rec.get("images") or []), "NOTE" if "No frames: this summary is made from the audio" in rec["prompt"] else "-")
+PYEOF
+)
+check "no image blocks, and the prompt says there are no frames" "$VOICE" "0 NOTE"
+[ "$(find "$FRAMES_DIR" | sort)" = "$FRAMES_BEFORE" ] \
+  && ok "nothing written to FRAMES_DIR" \
+  || bad "--no-frames extracted frames anyway: $(ls "$FRAMES_DIR")"
+
+echo "--- an audio-only file (empty manifest) is summarized, not refused"
+AUDIO="$TESTROOT/talk.m4a"
+ffmpeg -y -loglevel error -i "$LECTURE" -vn -c:a aac -b:a 64k "$AUDIO"
+"$PY" "$REPO/screen/extract_frames.py" "$AUDIO" "$FRAMES_DIR/talk" talk > /dev/null 2>&1
+: > "$CLI_RECORD"
+"$PY" "$REPO/summarize/summarize.py" "$AUDIO" "${OUT_BASE}.txt" "$SUMMARIES_DIR/talk.md" \
+      --frames-manifest "$FRAMES_DIR/talk/manifest.json" --no-pdf > "$TESTROOT/talk.log" 2>&1
+check "summarize.py on an empty manifest exits 0" "$?" "0"
+grep -q "summarizing from the transcript alone" "$TESTROOT/talk.log" \
+  && ok "and says why there are no frames" || bad "no note in $TESTROOT/talk.log"
+
+echo ""
+echo "=================================================================="
 echo "Result: $PASS passed, $FAIL failed"
 echo "=================================================================="
 [ "$FAIL" -eq 0 ] || exit 1

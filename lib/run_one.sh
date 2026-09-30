@@ -139,6 +139,16 @@ PDF_FONT_CFG="$(cfg pdf_font)"
 INSTRUCTIONS="$(cfg instructions)"
 [ -n "$SUMMARY_LANG_CFG" ] && export SUMMARY_LANGUAGE="$SUMMARY_LANG_CFG"
 [ -n "$PDF_FONT_CFG" ] && export PDF_FONT="$PDF_FONT_CFG"
+# pipeline.sh --summary-source / --record-media (or the web UI), fixed in
+# state.json. A run from before they existed has neither: video + frames.
+RECORD_MEDIA_CFG="$(cfg record_media)"
+[ -n "$RECORD_MEDIA_CFG" ] || RECORD_MEDIA_CFG=video
+# Voice only: no frames stage, no frames offered to the model, and on the
+# YouTube path no download at all (it exists only to cut frames from). An
+# audio-only recording is voice only whatever was stored: it has no picture.
+VOICE_ONLY=0
+[ "$(cfg summary_source)" = "voice" ] && VOICE_ONLY=1
+[ "$INPUT_TYPE" = "meeting" ] && [ "$RECORD_MEDIA_CFG" = "audio" ] && VOICE_ONLY=1
 
 # What the summary document cites as its source. For every other input type
 # that is the input itself; a Kaltura input may be a 900-character <iframe>
@@ -192,7 +202,9 @@ fi
 # The five directories are configured independently in .env — none of them is
 # assumed to be a subdirectory of another.
 paths_require || exit 2
+# The name says what is in it: an audio-only recording is an .m4a.
 MP4_FILE="${RECORDINGS_DIR}/${RUN_ID}.mp4"
+[ "$RECORD_MEDIA_CFG" = "audio" ] && MP4_FILE="${RECORDINGS_DIR}/${RUN_ID}.m4a"
 TRANSCRIPT_BASE="${TRANSCRIPTS_DIR}/${RUN_ID}"
 RUN_FRAMES_DIR="${FRAMES_DIR}/${RUN_ID}"
 # Lives in the run dir, beside the YouTube/Kaltura download it is cut from,
@@ -346,6 +358,7 @@ do_summarize_combined() {
   fi
   [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
   [ -n "$INSTRUCTIONS" ] && args+=(--instructions "$INSTRUCTIONS")
+  [ "$VOICE_ONLY" -eq 1 ] && args+=(--no-frames)
   local spec
   for spec in "${RESOURCE_SPECS[@]:-}"; do
     [ -n "$spec" ] && args+=(--resources "$spec")
@@ -453,14 +466,22 @@ run_combine() {
         --error "member run $member is missing"
       return 1
     fi
-    local manifest
-    manifest="$(rs get --run-dir "$member_dir" --key stages.frames.artifacts.manifest 2>/dev/null || true)"
-    if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
-      echo "==> $member: frames were swept or never extracted — extracting them"
-      rs reset --run-dir "$member_dir" --stage frames
+    local manifest need_frames=1
+    # A voice-only combined summary reads no member's frames, and a voice-only
+    # member never extracts any: waiting on them would loop forever.
+    [ "$VOICE_ONLY" -eq 1 ] && need_frames=0
+    [ "$(rs get --run-dir "$member_dir" --key summary_source 2>/dev/null || true)" = "voice" ] \
+      && need_frames=0
+    if [ "$need_frames" -eq 1 ]; then
+      manifest="$(rs get --run-dir "$member_dir" --key stages.frames.artifacts.manifest 2>/dev/null || true)"
+      if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
+        echo "==> $member: frames were swept or never extracted — extracting them"
+        rs reset --run-dir "$member_dir" --stage frames
+      fi
     fi
     if [ "$(rs status --run-dir "$member_dir" --stage transcribe)" != "done" ] \
-       || [ "$(rs status --run-dir "$member_dir" --stage frames)" != "done" ]; then
+       || { [ "$need_frames" -eq 1 ] \
+            && [ "$(rs status --run-dir "$member_dir" --stage frames)" != "done" ]; }; then
       echo ""
       echo "==> $member: finishing transcribe/frames before the combined summary"
       if ! bash "$SCRIPT_DIR/run_one.sh" --run-dir "$member_dir" --skip-summarize; then
@@ -529,7 +550,7 @@ fi
 # --- Stage implementations ---------------------------------------------------
 
 do_record() {
-  bash "$ROOT_DIR/screen/record_screen.sh" \
+  RECORD_MEDIA="$RECORD_MEDIA_CFG" bash "$ROOT_DIR/screen/record_screen.sh" \
     "$INPUT" "$NAME" "$DISPLAY_NAME" "$MP4_FILE"
 }
 
@@ -606,7 +627,6 @@ do_summarize() {
     "$video"
     "${TRANSCRIPT_BASE}.txt"
     "$SUMMARY_FILE"
-    --frames-manifest "$RUN_FRAMES_DIR/manifest.json"
     # PDF_DIR is independent of SUMMARIES_DIR, so the PDF path is passed
     # explicitly rather than derived from the .md path.
     --pdf-out "$SUMMARY_PDF"
@@ -623,6 +643,13 @@ do_summarize() {
   [ -n "$CLIP" ] && args+=(--clip "$CLIP")
   [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
   [ -n "$INSTRUCTIONS" ] && args+=(--instructions "$INSTRUCTIONS")
+  # Voice only: summarize.py must not go and extract (or, for YouTube,
+  # download) frames itself, which is what it does without a manifest.
+  if [ "$VOICE_ONLY" -eq 1 ]; then
+    args+=(--no-frames)
+  else
+    args+=(--frames-manifest "$RUN_FRAMES_DIR/manifest.json")
+  fi
   # Kaltura has no yt-dlp to ask for a title, so the entry's own name (read at
   # fetch time into kaltura.json) is passed explicitly. Best-effort: a run
   # whose fetch predates this file just falls back to the meeting name.
@@ -672,6 +699,9 @@ echo "  input:    $INPUT ($INPUT_TYPE)"
 echo "  language: $LANGUAGE   prompt: ${PROMPT_NAME:-(default)}"
 echo "  summary:  in ${SUMMARY_LANGUAGE:-th}, PDF font ${PDF_FONT:-(default)}${INSTRUCTIONS:+, with extra instructions}"
 [ -n "$CLIP" ] && echo "  clip:     $CLIP  (output timestamps are relative to it)"
+[ "$VOICE_ONLY" -eq 1 ] && echo "  media:    summary from the voice alone (no frames)"
+[ "$INPUT_TYPE" = "meeting" ] && [ "$RECORD_MEDIA_CFG" = "audio" ] \
+  && echo "  record:   audio only -> $MP4_FILE"
 echo "=================================================================="
 
 # --- Stage 1: record (meeting URLs only) -------------------------------------
@@ -784,6 +814,7 @@ branch_transcribe() {
 # refuse the missing manifest and fail a run that has nothing left to do.
 # Only when this run IS about to summarize are the frames needed again.
 frames_settled() {
+  [ "$VOICE_ONLY" -eq 1 ] && return 0
   [ "$(stage_status frames)" = "done" ] || return 1
   [ -f "$RUN_FRAMES_DIR/manifest.json" ] && return 0
   [ "$SKIP_SUMMARIZE" -eq 1 ] && return 0
@@ -800,6 +831,10 @@ media_needed() {
 }
 
 branch_frames() {
+  if [ "$VOICE_ONLY" -eq 1 ]; then
+    echo "[frames] skipped — summary from the voice only"
+    return 0
+  fi
   if [ "$(stage_status frames)" = "done" ]; then
     if frames_settled; then
       echo "[frames] already done — skipping"
@@ -927,7 +962,7 @@ if [ "$SKIP_SUMMARIZE" -eq 1 ]; then
   echo "=================================================================="
   [ "$INPUT_TYPE" = "meeting" ] && echo "Recording:  $MP4_FILE"
   echo "Transcript: ${TRANSCRIPT_BASE}.txt"
-  echo "Frames:     $RUN_FRAMES_DIR/manifest.json"
+  [ "$VOICE_ONLY" -eq 1 ] || echo "Frames:     $RUN_FRAMES_DIR/manifest.json"
   exit 0
 fi
 

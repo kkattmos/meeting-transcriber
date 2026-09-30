@@ -629,6 +629,64 @@ shortcut was tried and rejected: 3-21% of real samples qualified (the Meet
 clock, camera tiles), and a near-identical sample can flip `detect_crop`'s
 box and move the hash by 800+ bits.
 
+### Voice only and audio-only recordings (2026-09-30)
+
+The operator: when a meeting is only voices and cameras, opt out of frames,
+and let the web UI choose "Summarize only from voice / both" and "Save
+recording: audio only / video", for all sources. Settled in two rounds of
+questions:
+
+- **Voice only skips the frames stage entirely** (`--summary-source voice`,
+  `--voice-only`, `SUMMARY_SOURCE=voice`) — not "extract but don't send".
+  `run_one.sh` `VOICE_ONLY`: `branch_frames` returns at once,
+  `frames_settled` is true (so `media_needed` doesn't fetch for frames), and
+  `summarize.py --no-frames` replaces `--frames-manifest` — without it
+  summarize.py would download/extract frames itself. YouTube is therefore
+  never downloaded; Kaltura still is when transcribe needs the media.
+- **Audio only is meetings only** (`--record-media audio`, `--audio-only`,
+  `RECORD_MEDIA=audio`): `record_screen.sh` records `<sink>.monitor` alone as
+  AAC 128k stereo into `<run id>.m4a` (the operator's choice: the MP4's own
+  track, AssemblyAI takes it directly). YouTube/Kaltura downloads stay
+  temporary, as before — "save recording" does not apply to them.
+- **Audio only forces voice only** (no picture). `pipeline.sh` refuses an
+  explicit `--summary-source both` with audio for a meeting input; the web
+  UI disables the select. A meeting run stores `summary_source=voice`.
+- **The browser renders at `RECORD_AUDIO_GEOMETRY` (960x540) for audio** —
+  the operator chose "the smallest Meet tolerates" over 1280x720. Verified
+  live 2026-09-30 on two hosted calls (`zz_*_size_test_*`, archived in
+  `runs-archive/`): at 960x540 the call was created, the device check read
+  "blocked", the "Adjust view" menu was found, and the .m4a (AAC stereo)
+  was valid. NOT verified at that size: admitting a guest, and the
+  self-tile minimise (both need a second participant).
+  Measured with the bot alone in the call (`benchmark.sh --watch-run`):
+  1.12 cores at 1920x1080 video (ffmpeg 0.69, browser 0.37, Xvfb 0.05) →
+  0.43 at 960x540 audio (browser 0.37, ffmpeg 0.04). The browser's own
+  share did not move with nothing to paint; with cameras on it should,
+  but that is unmeasured.
+- **Both are flags, `.env` defaults and state.json fields**
+  (`summary_source`, `record_media`; `runstate init --summary-source
+  --record-media`). A new run stores the effective values. On a resume,
+  `--summary-source` given again replaces the stored one (a voice-only run
+  resumed with `both` extracts its frames then); `record_media` never
+  changes after creation — the file is named for it.
+- **`--combine`**: the combine run passes `--no-frames` when voice-only;
+  `combine.py parts` gives a voice-only member (or an audio meeting) a null
+  manifest instead of refusing it; `run_combine` doesn't wait on frames
+  for those members.
+- **No frames is a note, not an error, in summarize.py** — an empty manifest
+  (an audio file as input) used to `SystemExit("No frames extracted")`
+  after transcription had been paid for, contradicting the Discord plan's
+  "verified" claim below. extract_frames.py fails outright on a decode
+  error, so empty now means "nothing to show". `llm_client._render` puts
+  `NO_FRAMES_NOTE` where the list would be, so the prompts' "look at the
+  frames" does not invite the model to describe pictures it never saw.
+
+Seen in both live calls, at either size, and NOT caused by this change:
+`kill_meeting.sh` on a hosted call logs "Ending the call for everyone",
+clicks "ออกจากการโทร" (Leave call), and still needs the forced stop after
+25s — the end-for-everyone Thai labels remain unverified (see "Hosting a new
+Google Meet").
+
 ### API keys are numbered slots with a persisted cursor
 
 `lib/keyring.py`. `GEMINI_API_KEY_1..3`, `ASSEMBLYAI_API_KEY_1..3` and
@@ -2510,6 +2568,11 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   on an unreadable participant count.
 - **Captions are never taken from a YouTube machine translation.** Spoken
   language first; another language only as the announced last resort.
+- **Voice only means no frames stage, and summarize.py gets `--no-frames`.**
+  Dropping the flag while skipping the stage makes summarize.py extract (or,
+  for YouTube, download) the frames itself.
+- **An audio-only recording is always voice only**, and its medium is fixed
+  at run creation (the recording's file name depends on it).
 - **Course-reference metadata stays in the dynamic half** of the prompt, as
   attributes — never substituted into the static instructions.
 
@@ -2529,16 +2592,16 @@ without API keys or network, against temp directories
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets, frontmatter, binary files | 36 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
-| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the four prompts (old names resolve, no timestamps, the callout vocabulary), `--instructions` placement | 199 |
+| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the four prompts (old names resolve, no timestamps, the callout vocabulary), `--instructions` placement, the no-frames note | 200 |
 | `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), real PDF render | 107 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `transcribe/test_yt_autocaptions.py` | the yt-dlp fallback: track choice (never a translation), json3, the CLI against a stub yt-dlp | 11 |
 | `screen/test_extract_frames.py` | frames on change: settle, a transient change, blanks, the motion cap, the safety net, the last sample, the shared distance; the PPM reader; real ffmpeg (black lead-in skipped, audio-only empty, retired settings named) | 19 |
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
-| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, run/log path refusal, summary language/font/instructions, the options | 9 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources) | 383 |
-| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, the YouTube caption fallback through a stub yt-dlp (spoken-language auto captions; the other-language track as last resort) | 125 |
+| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, run/log path refusal, summary language/font/instructions, the options, record media / summary source | 11 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine` | 438 |
+| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, the YouTube caption fallback through a stub yt-dlp (spoken-language auto captions; the other-language track as last resort), `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 131 |
 | `verify_e2e.sh --browser-smoke` | the real browser (Firefox ESR or Chrome) under Xvfb, recorded and measured for black edges | 6 |
 
 `test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs
@@ -2725,7 +2788,10 @@ keeps in `localStorage`.
   in" (th/en), PDF font (repopulated from `/api/options` `fonts[lang]` when
   the language changes), and **Extra instructions**. `build_args` maps them
   to `--summary-language`, `--pdf-font`, `--instructions` (one argv item,
-  never a shell). The default prompt shown is `canonical_prompt_name` of
+  never a shell). Since 2026-09-30 also **Save recording** / **Summarize
+  from** (`record_media`, `summary_source`; preselected from `.env` via
+  `/api/options` `default_record_media` / `default_summary_source`), with
+  audio disabling the source select at "voice". The default prompt shown is `canonical_prompt_name` of
   `SUMMARY_PROMPT`, so an old name in `.env` still preselects.
 - `/trigger`'s original body contract is unchanged (phone shortcuts keep
   working); `new_meet`, `clip`, `no_combine_pdf` and `playlist` were added.
@@ -2760,8 +2826,9 @@ The shape, when it is built:
   users into one `.ogg`. Needs a live 3-person test.
 - **No new input type is needed in the pipeline.** The bot hands the mixed
   `.ogg` to `pipeline.sh` as a local file with `--prompt meeting-claude`;
-  verified 2026-09-27 that an audio-only file goes through `frames` as an
-  empty manifest and the summary is text-only. A per-user speaker map
+  an audio-only file goes through `frames` as an empty manifest, and (since
+  2026-09-30 — before that summarize.py refused an empty manifest) the
+  summary is text-only; `--voice-only` skips frames outright. A per-user speaker map
   (Discord user per track) is free attribution — a v2, not v1.
 - Delivery is a notify hook after `summarize`: SMTP (the PDF to the email the
   command collected) and a DM to the operator about the recording.

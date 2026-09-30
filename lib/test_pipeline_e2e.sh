@@ -60,6 +60,7 @@ cat > "$STAGING/screen/record_screen.sh" <<'STUB'
 #!/bin/bash
 # stub recorder: writes an "MP4" at the path the orchestrator chose
 [ -f "$STUB_FAIL_RECORD" ] && { echo "stub: record failing on purpose" >&2; exit 1; }
+[ -n "${STUB_RECORD_ENV:-}" ] && echo "RECORD_MEDIA=${RECORD_MEDIA:-}" > "$STUB_RECORD_ENV"
 mkdir -p "$(dirname "$4")"; echo "fake mp4 for $1" > "$4"
 # A meeting the bot created: capture.py stores the real link in state.json the
 # moment meet.new redirects. Do the same, so the orchestration around it runs.
@@ -107,6 +108,8 @@ import json, os, sys
 if os.path.exists(os.environ.get("STUB_FAIL_FRAMES", "/nonexistent")):
     sys.stderr.write("stub: frames failing on purpose\n"); sys.exit(1)
 video, out_dir = sys.argv[1], sys.argv[2]
+if os.environ.get("STUB_FRAMES_CALLS"):
+    open(os.environ["STUB_FRAMES_CALLS"], "a").write(video + "\n")
 os.makedirs(out_dir, exist_ok=True)
 json.dump({"video": video, "frame_count": 2, "frames": [
     {"timestamp_s": 1.0, "kind": "scene_change", "path": f"{out_dir}/a.jpg"},
@@ -157,7 +160,10 @@ if "--parts" in flags:
     parts = json.load(open(flags["--parts"][0]))["parts"]
     for i, part in enumerate(parts, start=1):
         assert os.path.isfile(part["transcript"]), f"part {i}: no transcript"
-        assert os.path.isfile(part["frames_manifest"]), f"part {i}: no manifest"
+        if "--no-frames" in flags:
+            assert not part["frames_manifest"], f"part {i}: voice only, yet a manifest"
+        else:
+            assert os.path.isfile(part["frames_manifest"]), f"part {i}: no manifest"
     out = args[0]
     os.makedirs(os.path.dirname(out), exist_ok=True)
     body = "\n".join(f"video {i}: {p['source']}" for i, p in enumerate(parts, start=1))
@@ -174,7 +180,10 @@ if "--parts" in flags:
 # Assert the orchestrator handed us a pre-extracted manifest rather than making
 # us re-run frame extraction, and told us where the PDF goes (PDF_DIR is not
 # derivable from the .md path — the two directories are configured separately).
-assert "--frames-manifest" in flags, "pipeline must pass --frames-manifest"
+if "--no-frames" in flags:
+    assert "--frames-manifest" not in flags, "voice only, yet a --frames-manifest"
+else:
+    assert "--frames-manifest" in flags, "pipeline must pass --frames-manifest"
 assert "--pdf-out" in flags, "pipeline must pass --pdf-out"
 out = args[2]
 os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -270,6 +279,8 @@ export STUB_TRANSCRIBE_ARGS="$TESTROOT/transcribe_args.txt"
 export STUB_FAIL_KALTURA="$TESTROOT/fail_kaltura"
 export STUB_FAIL_CLIP="$TESTROOT/fail_clip"
 export STUB_FFMPEG_ARGS="$TESTROOT/ffmpeg_args.txt"
+export STUB_RECORD_ENV="$TESTROOT/record_env.txt"
+export STUB_FRAMES_CALLS="$TESTROOT/frames_calls.txt"
 
 RUNS="$MEETING_BOT_ROOT/runs"
 pipeline() { ( cd "$STAGING" && bash ./pipeline.sh "$@" ) ; }
@@ -1520,6 +1531,130 @@ echo "$out" | grep -qP '^ok\tmeeting\t' && ok "--dry-run: never detaches" \
 out=$(MEETING_BOT_FOREGROUND=0 pipeline "https://youtu.be/bgnotmeet01" 2>&1)
 echo "$out" | grep -q "Recording in the background" \
   && bad "background: a YouTube input detached" || ok "background: only meetings detach"
+
+echo ""
+echo "=================================================================="
+echo "Voice only (--summary-source voice) and audio recordings (--record-media audio)"
+echo "=================================================================="
+
+voice_checks() {  # <label> <run dir>: frames never ran, summarize got --no-frames
+  check "$1: summary_source stored" "$(state get --run-dir "$2" --key summary_source)" "voice"
+  check "$1: frames stage never ran" "$(state status --run-dir "$2" --stage frames)" "pending"
+  [ -d "$FRAMES_DIR/$(basename "$2")" ] && bad "$1: a frames dir was made" \
+    || ok "$1: no frames dir"
+  grep -qx -- "--no-frames" "$STUB_SUMMARIZE_ARGS" \
+    && ! grep -qx -- "--frames-manifest" "$STUB_SUMMARIZE_ARGS" \
+    && ok "$1: summarize.py got --no-frames and no manifest" \
+    || bad "$1: summarize args: $(tr '\n' ' ' < "$STUB_SUMMARIZE_ARGS")"
+}
+
+echo "--- YouTube, voice only: no download, no frames"
+: > "$STUB_FRAMES_CALLS"
+out=$(pipeline "https://youtu.be/voiceonly01" --voice-only 2>&1)
+check "voice/youtube: exits 0" "$?" "0"
+run=$(latest_run)
+voice_checks "voice/youtube" "$RUNS/$run"
+check "voice/youtube: the video is never downloaded" \
+  "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "pending"
+check "voice/youtube: summarize done" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+check "voice/youtube: extract_frames.py never called" "$(wc -l < "$STUB_FRAMES_CALLS" | tr -d ' ')" "0"
+
+echo "--- A local file, voice only"
+mkdir -p "$TESTROOT/media"; echo "fake lecture" > "$TESTROOT/media/voice lecture.mp4"
+out=$(pipeline "$TESTROOT/media/voice lecture.mp4" --summary-source voice 2>&1)
+check "voice/local: exits 0" "$?" "0"
+voice_checks "voice/local" "$RUNS/$(latest_run)"
+
+echo "--- Kaltura, voice only: fetched for AssemblyAI, but no frames"
+out=$(pipeline "$KAL_URL" --force --voice-only 2>&1)
+check "voice/kaltura: exits 0" "$?" "0"
+run=$(latest_run)
+voice_checks "voice/kaltura" "$RUNS/$run"
+grep -qx -- "--media" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "voice/kaltura: transcribe still got the media for AssemblyAI" \
+  || bad "voice/kaltura: transcribe args: $(tr '\n' ' ' < "$STUB_TRANSCRIBE_ARGS")"
+
+echo "--- A meeting recorded as audio only"
+out=$(pipeline "https://meet.google.com/aud-ioon-lyy" --name "Audio Call" --audio-only 2>&1)
+check "audio/meet: exits 0" "$?" "0"
+run=$(latest_run)
+grep -qx "RECORD_MEDIA=audio" "$STUB_RECORD_ENV" \
+  && ok "audio/meet: the recorder was asked for audio" \
+  || bad "audio/meet: recorder env: $(cat "$STUB_RECORD_ENV")"
+[ -f "$RECORDINGS_DIR/$run.m4a" ] && ok "audio/meet: the recording is an .m4a" \
+  || bad "audio/meet: no $run.m4a: $(ls "$RECORDINGS_DIR")"
+check "audio/meet: record_media stored" "$(state get --run-dir "$RUNS/$run" --key record_media)" "audio"
+voice_checks "audio/meet" "$RUNS/$run"
+state show --run-dir "$RUNS/$run" | grep -q "summary from voice   recording: audio" \
+  && ok "audio/meet: --status shows both" || bad "audio/meet: --status: $(state show --run-dir "$RUNS/$run")"
+
+echo "--- A meeting by default still records video and uses frames"
+out=$(pipeline "https://meet.google.com/vid-eoon-lyy" --name "Video Call" 2>&1)
+run=$(latest_run)
+grep -qx "RECORD_MEDIA=video" "$STUB_RECORD_ENV" \
+  && ok "default/meet: the recorder was asked for video" || bad "default/meet: $(cat "$STUB_RECORD_ENV")"
+[ -f "$RECORDINGS_DIR/$run.mp4" ] && ok "default/meet: an .mp4" || bad "default/meet: no mp4"
+check "default/meet: frames ran" "$(state status --run-dir "$RUNS/$run" --stage frames)" "done"
+check "default/meet: summary_source both" "$(state get --run-dir "$RUNS/$run" --key summary_source)" "both"
+
+echo "--- Refusals, before anything is created"
+before="$(ls -1 "$RUNS" | wc -l)"
+out=$(pipeline "https://meet.google.com/con-flic-tss" --audio-only --summary-source both 2>&1)
+check "refuse: audio recording + frames for a meeting" "$?" "1"
+echo "$out" | grep -q "needs a video recording" && ok "refuse: says why" || bad "refuse: $out"
+out=$(pipeline "https://youtu.be/voiceonly02" --audio-only --summary-source both --dry-run 2>&1)
+check "refuse: not for a non-meeting input (audio does not apply to it)" "$?" "0"
+out=$(pipeline "https://youtu.be/voiceonly02" --summary-source pictures 2>&1)
+check "refuse: an unknown --summary-source" "$?" "1"
+out=$(RECORD_MEDIA=tape pipeline "https://youtu.be/voiceonly02" 2>&1)
+check "refuse: an unknown RECORD_MEDIA in .env" "$?" "1"
+echo "$out" | grep -q "RECORD_MEDIA must be one of: video audio" \
+  && ok "refuse: names the variable and the choices" || bad "refuse: $out"
+out=$(pipeline "https://youtu.be/voiceonly02" --summary-source 2>&1)
+check "refuse: --summary-source without a value" "$?" "1"
+check "refuse: nothing was created" "$(ls -1 "$RUNS" | wc -l)" "$before"
+
+echo "--- .env defaults, and the flag over them"
+out=$(SUMMARY_SOURCE=voice pipeline "https://youtu.be/voiceonly03" 2>&1)
+check "env: exits 0" "$?" "0"
+check "env: SUMMARY_SOURCE=voice is the default" \
+  "$(state get --run-dir "$RUNS/$(latest_run)" --key summary_source)" "voice"
+out=$(SUMMARY_SOURCE=voice pipeline "https://youtu.be/voiceonly04" --summary-source both 2>&1)
+check "env: the flag wins" "$(state get --run-dir "$RUNS/$(latest_run)" --key summary_source)" "both"
+out=$(RECORD_MEDIA=audio pipeline "https://meet.google.com/env-audi-ooo" 2>&1)
+check "env: RECORD_MEDIA=audio records audio" \
+  "$(state get --run-dir "$RUNS/$(latest_run)" --key record_media)" "audio"
+out=$(pipeline "https://youtu.be/voiceonly05" "https://meet.google.com/dry-medi-aaa" \
+      --audio-only --dry-run 2>&1)
+echo "$out" | grep -q "Media: summary from both; a meeting records audio" \
+  && ok "dry-run: reports the media choice" || bad "dry-run: no Media line: $out"
+
+echo "--- A resume may switch voice only off, and then extracts the frames"
+touch "$STUB_FAIL_SUMMARIZE"
+pipeline "https://youtu.be/voiceonly06" --voice-only >/dev/null 2>&1
+run=$(latest_run)
+rm -f "$STUB_FAIL_SUMMARIZE"
+out=$(pipeline "https://youtu.be/voiceonly06" --summary-source both 2>&1)
+check "resume: exits 0" "$?" "0"
+check "resume: the same run" "$(latest_run)" "$run"
+check "resume: stored both" "$(state get --run-dir "$RUNS/$run" --key summary_source)" "both"
+check "resume: frames now done" "$(state status --run-dir "$RUNS/$run" --stage frames)" "done"
+grep -qx -- "--frames-manifest" "$STUB_SUMMARIZE_ARGS" \
+  && ok "resume: summarize got the manifest" || bad "resume: no manifest passed"
+
+echo "--- A combined summary, voice only"
+out=$(pipeline "https://youtu.be/voicecomb01" "https://youtu.be/voicecomb02" --voice-only \
+      --combine "$TESTROOT/voice-combined.md" 2>&1)
+check "voice/combine: exits 0" "$?" "0"
+[ -f "$TESTROOT/voice-combined.md" ] && ok "voice/combine: the document is written" \
+  || bad "voice/combine: no document: $out"
+grep -qx -- "--no-frames" "$STUB_SUMMARIZE_ARGS" && grep -qx -- "--parts" "$STUB_SUMMARIZE_ARGS" \
+  && ok "voice/combine: summarize --parts got --no-frames" \
+  || bad "voice/combine: args: $(tr '\n' ' ' < "$STUB_SUMMARIZE_ARGS")"
+for m in "$RUNS"/yt_voicecomb0*; do
+  check "voice/combine: $(basename "$m" | cut -c1-15) never cut frames" \
+    "$(state status --run-dir "$m" --stage frames)" "pending"
+done
 
 echo ""
 echo "=================================================================="

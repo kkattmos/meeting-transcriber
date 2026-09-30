@@ -241,6 +241,14 @@ LLM_FRAME_SUBDIR = "llm-{max_dim}{crop}"
 # distinct minutes. Without Pillow nothing is a duplicate.
 FRAME_DEDUPE_MAX_DISTANCE = SAME_SLIDE_MAX_DISTANCE
 
+# Stands in for the frame list when there are no frames — a voice-only run
+# (pipeline.sh --summary-source voice), an audio recording, an audio file.
+# Every prompt says "look at the frames" right under the list; an empty list
+# there invites the model to describe pictures it was never shown.
+NO_FRAMES_NOTE = ("(No frames: this summary is made from the audio transcript "
+                  "alone. There is nothing on screen to use — do not describe "
+                  "or refer to slides, images or anything shown.)")
+
 # Per-call frame cap. 0 = no cap, which is what every run did before the
 # setting existed. The frames are the bulk of a call's input, so this is the
 # first thing to turn down when a lecture doesn't fit the subscription window.
@@ -573,7 +581,7 @@ def _render(frames, transcript, prompt_template, with_paths=False):
         if with_paths:
             line = f"{line} {Path(frame.path).resolve()}"
         lines.append(line)
-    manifest = "\n".join(lines)
+    manifest = "\n".join(lines) or NO_FRAMES_NOTE
     user_text = prompt_template.format(transcript=transcript,
                                        frame_manifest=manifest)
     return sorted_frames, strip_static_markers(user_text)

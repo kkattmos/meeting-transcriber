@@ -1373,6 +1373,13 @@ class FrameNumberingTest(unittest.TestCase):
         _, text = llm_client._render(self.frames(5.0), "t", "{frame_manifest}")
         self.assertIn("[frame 1 @ 5.0s", text)
 
+    def test_no_frames_says_so_instead_of_an_empty_list(self):
+        # Voice only (--no-frames), or an audio file: every prompt says "look
+        # at the frames" under the list, so an empty list must be explained.
+        frames, text = llm_client._render([], "t", "Frames:\n{frame_manifest}")
+        self.assertEqual(frames, [])
+        self.assertIn(llm_client.NO_FRAMES_NOTE, text)
+
 
 # ---------------------------------------------------------------------------
 # The cache-stable prefix

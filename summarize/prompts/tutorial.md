@@ -73,7 +73,7 @@ Use what the frames show — code, terminal output, UI state, diagrams — as co
 
 ## Frames
 
-Each frame is labelled with its number, its position in the recording and why it was captured (a scene change, or a periodic sample on a static screen). The labels are for orientation only — do not cite them.
+Each frame is labelled with its number, its position in the recording and why it was captured. The labels are for orientation only — do not cite them.
 
 {frame_manifest}
 

@@ -43,9 +43,10 @@
 #   --name N            meeting name (single input only; otherwise derived)
 #   --display-name D    name the bot shows in the meeting (default "Meeting Bot")
 #   --language L        th (default), en, auto, or any AssemblyAI language code
-#   --prompt P          the summary style: video, meeting, lecture or tutorial
-#                       (a file in summarize/prompts/; the older names such as
-#                       lecture-claude still work)
+#   --prompt P          the summary style: video, meeting, lecture, tutorial
+#                       or reality (a reality-show episode recap, with
+#                       timestamps; a file in summarize/prompts/; the older
+#                       names such as lecture-claude still work)
 #   --summary-language L  the language the summary is WRITTEN in: th or en
 #                       (default SUMMARY_LANGUAGE). --language is the SPOKEN one.
 #   --pdf-font F        the PDF's body font. Thai: "Bai Jamjuree" or Sarabun;
@@ -55,6 +56,19 @@
 #                       ("focus on the exam hints", "skip the admin part").
 #                       These three are stored with the run, so a resume uses
 #                       them; given again on a resume, they replace the old ones.
+#   --summary-source S  what the summary is made from: both (default: the
+#                       transcript and the frames) or voice (the transcript
+#                       alone — no frames are extracted, and a YouTube video
+#                       is not even downloaded). Default SUMMARY_SOURCE.
+#                       --voice-only is --summary-source voice. Stored with
+#                       the run like the three above.
+#   --record-media M    what a meeting's recording keeps: video (default: an
+#                       MP4 of the screen and the audio) or audio (an .m4a;
+#                       the bot's browser renders at RECORD_AUDIO_GEOMETRY,
+#                       960x540, and no frames are possible, so the summary
+#                       is from the voice). Default RECORD_MEDIA. Meetings
+#                       only; other inputs ignore it. --audio-only is
+#                       --record-media audio. Fixed when the run is created.
 #   --resources SPEC    slides / notes for this session, as a GitHub repo
 #                       (optionally @branch, or a /tree/<branch>/<subdir> URL)
 #                       or a local file or folder. Repeatable. Their text is
@@ -156,6 +170,8 @@ DRY_RUN=0
 SUMMARY_LANG_OPT=""
 PDF_FONT_OPT=""
 INSTRUCTIONS_OPT=""
+SUMMARY_SOURCE_OPT=""
+RECORD_MEDIA_OPT=""
 declare -a POSITIONAL=()
 declare -a RESOURCE_SPECS=()
 # RESOURCES in .env is the default for every run; --resources adds to it.
@@ -191,6 +207,10 @@ while [ "$#" -gt 0 ]; do
     --summary-language) need_value "$1" "$#" "${2:-}"; SUMMARY_LANG_OPT="$2"; shift 2 ;;
     --pdf-font)     need_value "$1" "$#" "${2:-}"; PDF_FONT_OPT="$2"; shift 2 ;;
     --instructions) need_value "$1" "$#" "${2:-}"; INSTRUCTIONS_OPT="$2"; shift 2 ;;
+    --summary-source) need_value "$1" "$#" "${2:-}"; SUMMARY_SOURCE_OPT="$2"; shift 2 ;;
+    --record-media) need_value "$1" "$#" "${2:-}"; RECORD_MEDIA_OPT="$2"; shift 2 ;;
+    --voice-only)   SUMMARY_SOURCE_OPT=voice; shift ;;
+    --audio-only)   RECORD_MEDIA_OPT=audio; shift ;;
     --jobs)         need_value "$1" "$#" "${2:-}"; JOBS="$2"; shift 2 ;;
     --clip)         need_value "$1" "$#" "${2:-}"; CLIP_SPEC="$2"; shift 2 ;;
     --from-file)    need_value "$1" "$#" "${2:-}"; FROM_FILE="$2"; shift 2 ;;
@@ -250,6 +270,27 @@ if [ -n "$PDF_FONT_OPT" ]; then
   SUMMARY_INIT_ARGS+=(--pdf-font "$PDF_FONT_OPT")
 fi
 [ -n "$INSTRUCTIONS_OPT" ] && SUMMARY_INIT_ARGS+=(--instructions "$INSTRUCTIONS_OPT")
+
+# --- What the summary is made from, and what a meeting records -----------------
+# Flag first, then .env (SUMMARY_SOURCE / RECORD_MEDIA), then today's
+# behaviour. A typo in either is refused here, before anything is paid for.
+media_choice() {  # <what> <value> <allowed...>
+  local what="$1" value="$2" ok
+  shift 2
+  for ok in "$@"; do [ "$value" = "$ok" ] && return 0; done
+  echo "ERROR: $what must be one of: $*  (got: $value)" >&2
+  exit 1
+}
+SUMMARY_SOURCE_EFF="${SUMMARY_SOURCE_OPT:-${SUMMARY_SOURCE:-both}}"
+RECORD_MEDIA_EFF="${RECORD_MEDIA_OPT:-${RECORD_MEDIA:-video}}"
+media_choice "${SUMMARY_SOURCE_OPT:+--summary-source}${SUMMARY_SOURCE_OPT:-SUMMARY_SOURCE}" \
+  "$SUMMARY_SOURCE_EFF" both voice
+media_choice "${RECORD_MEDIA_OPT:+--record-media}${RECORD_MEDIA_OPT:-RECORD_MEDIA}" \
+  "$RECORD_MEDIA_EFF" video audio
+# Replaces the stored value on a resume only when asked for explicitly, like
+# the summary settings above. The recording medium never changes on a
+# resume: the file is already named for it (and may already exist).
+[ -n "$SUMMARY_SOURCE_OPT" ] && SUMMARY_INIT_ARGS+=(--summary-source "$SUMMARY_SOURCE_OPT")
 
 # --- Meetings run in the background -------------------------------------------
 # A recording lasts as long as the meeting, and it must not die with the
@@ -691,6 +732,16 @@ else
       echo "    ./pipeline.sh \"\$RECORDINGS_DIR/<run_id>.mp4\" --clip $this_clip_label" >&2
       exit 1
     fi
+    # An audio recording has no picture to take frames from. Said at second
+    # zero rather than discovered as a voice-only summary the operator did
+    # not ask for.
+    if [ "$kind" = "meeting" ] && [ "$RECORD_MEDIA_EFF" = "audio" ] \
+       && [ "$SUMMARY_SOURCE_OPT" = "both" ]; then
+      echo "ERROR: --summary-source both needs a video recording, but this meeting" >&2
+      echo "  records audio only (${RECORD_MEDIA_OPT:+--record-media audio}${RECORD_MEDIA_OPT:-RECORD_MEDIA=audio in .env})." >&2
+      echo "  Use --record-media video, or summarize from the voice." >&2
+      exit 1
+    fi
     if [ "$kind" = "unknown" ]; then
       echo "ERROR: unrecognized input: $input" >&2
       echo "  Expected a Google Meet or Zoom URL (or meet.new to create one)," >&2
@@ -743,7 +794,14 @@ else
         --language "$LANGUAGE" --prompt "$PROMPT_NAME"
         --display-name "$DISPLAY_NAME"
         "${SUMMARY_INIT_ARGS[@]}"
+        --summary-source "$SUMMARY_SOURCE_EFF"
       )
+      if [ "$kind" = "meeting" ]; then
+        init_args+=(--record-media "$RECORD_MEDIA_EFF")
+        # No picture, no frames: stored as voice so --status says what the
+        # summary is made from.
+        [ "$RECORD_MEDIA_EFF" = "audio" ] && init_args+=(--summary-source voice)
+      fi
       [ -n "$this_clip_label" ] && init_args+=(--clip "$this_clip_label")
       [ -n "$this_clip_label" ] \
         && echo "==> $input" && echo "    clip: $this_clip_label"
@@ -775,6 +833,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   _extra=""
   [ -n "$INSTRUCTIONS_OPT" ] && _extra=", with extra instructions (${#INSTRUCTIONS_OPT} chars)"
   echo "Summary: prompt ${PROMPT_NAME:-video (default)}, written in $_lang, PDF font $_font$_extra" >&2
+  echo "Media: summary from $SUMMARY_SOURCE_EFF$([ "$SUMMARY_SOURCE_EFF" = voice ] && echo ' (transcript only, no frames)'); a meeting records $RECORD_MEDIA_EFF$([ "$RECORD_MEDIA_EFF" = audio ] && echo ' (an .m4a, summarized from the voice)')" >&2
   exit 0
 fi
 
@@ -849,6 +908,9 @@ if [ -n "$COMBINE_FILE" ]; then
     --output-md "$COMBINE_FILE"
     "${SUMMARY_INIT_ARGS[@]}"
   )
+  # A new combine run takes the invocation's choice; a resumed one keeps its
+  # own unless --summary-source was given (it is in SUMMARY_INIT_ARGS then).
+  [ -z "$existing" ] && combine_init+=(--summary-source "$SUMMARY_SOURCE_EFF")
   [ -n "$COMBINE_PDF" ] && combine_init+=(--output-pdf "$COMBINE_PDF")
   for member in "${MEMBER_IDS[@]}"; do
     combine_init+=(--members "$member")

@@ -30,6 +30,11 @@ see PROMPT_ALIASES.
 on the exam hints", "skip the admin part") to the prompt, after the
 unchanging half so the cache still holds. SUMMARY_INSTRUCTIONS is the same.
 
+--no-frames summarizes from the transcript alone: no download, no frame
+extraction, nothing on screen offered to the model (pipeline.sh
+--summary-source voice). An empty manifest — an audio-only file — is the
+same thing reached the other way, and is a note rather than an error.
+
 --frames-manifest PATH uses an already-extracted manifest.json instead of
 running extract_frames.py here. pipeline.sh passes it because it extracts
 frames concurrently with transcription; a resumed run also reuses the frames
@@ -551,6 +556,7 @@ BOOLEAN_FLAGS = {
     "--pdf": ("write_pdf", True),
     "--no-markdown": ("write_markdown", False),
     "--markdown": ("write_markdown", True),
+    "--no-frames": ("no_frames", True),
 }
 
 
@@ -832,11 +838,16 @@ def main_parts(argv, options):
               f"{len(part.frames)} frames"
               + (" (no .srt — frames shared out by position)"
                  if not part.srt_path else ""))
-    if not frames:
-        # Same rule as a single run: a document with no pictures at all is
-        # not what anyone asked for, and it usually means the frames stage
-        # was swept or never ran.
-        raise SystemExit("No frames in any of the parts' manifests.")
+    if not frames and not options.get("no_frames"):
+        # Unless the run said voice only, a combined document with no
+        # pictures at all usually means a member's frames stage was swept
+        # or never ran — run_one.sh re-extracts before calling here.
+        raise SystemExit("No frames in any of the parts' manifests "
+                         "(voice-only summaries pass --no-frames).")
+    if options.get("no_frames"):
+        frames = []
+        for part in parts:
+            part.frames = []
 
     prompt_path = resolve_prompt_path(prompt_name)
     print(f"==> Using prompt: {prompt_path}")
@@ -908,6 +919,7 @@ def main():
         return
     prompt_name = options.get("prompt") or os.environ.get("SUMMARY_PROMPT")
     manifest_arg = options.get("frames_manifest")
+    no_frames = bool(options.get("no_frames"))
     source_url = options.get("source_url")
     title_override = options.get("title")
     doc_format = options.get("format") or os.environ.get("SUMMARY_DOC_FORMAT", "auto")
@@ -923,7 +935,7 @@ def main():
         print(
             f"Usage: {argv[0]} <video_or_youtube_url> <transcript_path> "
             f"[<output_md_path>] [--prompt NAME] [--frames-manifest PATH] "
-            f"[--resources SPEC] [--instructions TEXT] [--pdf-out PATH] "
+            f"[--no-frames] [--resources SPEC] [--instructions TEXT] [--pdf-out PATH] "
             f"[--no-pdf] [--no-markdown] "
             f"[--source-url URL] [--title TEXT] [--format auto|always|never] [--run-id ID]"
         f" [--clip WINDOW]"
@@ -948,13 +960,13 @@ def main():
     # nothing left to download. pipeline.sh always passes one — this is what
     # stops a YouTube run from downloading the same video twice.
     yt_tmpdir = None
-    if is_youtube_url(video_arg) and not manifest_arg:
+    if is_youtube_url(video_arg) and not manifest_arg and not no_frames:
         # Always create YT_TMP_ROOT on demand so the script works on a
         # fresh VM where setup.sh hasn't run yet.
         YT_TMP_ROOT.mkdir(parents=True, exist_ok=True)
         yt_tmpdir = tempfile.mkdtemp(prefix="meeting-bot-yt-", dir=str(YT_TMP_ROOT))
         video_arg = str(download_youtube_video(video_arg, yt_tmpdir))
-    elif kaltura.looks_like_kaltura(video_arg) and not manifest_arg:
+    elif kaltura.looks_like_kaltura(video_arg) and not manifest_arg and not no_frames:
         # Same rule as YouTube above: only when nobody has extracted frames
         # yet. The pipeline always passes a manifest, so this is the
         # direct-invocation path only.
@@ -989,7 +1001,10 @@ def main():
         #    one. pipeline.sh always does — it extracts frames concurrently
         #    with transcription, and a resumed run reuses what already
         #    succeeded rather than re-running ffmpeg over the whole video.
-        if manifest_arg:
+        if no_frames:
+            manifest_path = None
+            print("==> Voice only: summarizing from the transcript, no frames")
+        elif manifest_arg:
             manifest_path = Path(manifest_arg)
             if not manifest_path.is_file():
                 raise SystemExit(f"--frames-manifest: no such file: {manifest_path}")
@@ -999,10 +1014,15 @@ def main():
             manifest_path = extract_frames(video_arg, meeting_name, frames_dir)
 
         # 2. Load the frame manifest.
-        frames = load_manifest(manifest_path)
-        if not frames:
-            raise SystemExit("No frames extracted - check extract_frames.py output above.")
-        print(f"==> Loaded {len(frames)} frames from manifest")
+        frames = load_manifest(manifest_path) if manifest_path else []
+        if frames:
+            print(f"==> Loaded {len(frames)} frames from manifest")
+        elif not no_frames:
+            # extract_frames.py fails outright when it cannot decode the
+            # video, so an empty manifest is media with nothing to show: an
+            # audio file, or a picture that was blank throughout.
+            print("==> The manifest has no frames (audio only, or a blank "
+                  "picture) — summarizing from the transcript alone")
 
         # 3. Read the transcript.
         print(f"==> Reading transcript: {transcript_path}")

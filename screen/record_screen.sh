@@ -11,6 +11,12 @@
 # By itself this does NOT transcribe or summarize; it only produces the MP4.
 # pipeline.sh chains it to the later stages.
 #
+# RECORD_MEDIA=audio (pipeline.sh --record-media audio) records the meeting's
+# audio alone, as AAC 128k in an .m4a — the same track the MP4 carries. The
+# browser still has to run to join, admit and leave, but on a smaller
+# display (RECORD_AUDIO_GEOMETRY, 960x540): nobody watches the picture, and
+# painting it is the single biggest CPU cost of a meeting.
+#
 # Usage:
 #   ./screen/record_screen.sh "<meeting_url>" "Meeting Name" [Display Name] [output.mp4]
 #
@@ -42,7 +48,14 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 # shellcheck disable=SC1091
 . "$ROOT_DIR/lib/xsession.sh"
 
-GEOMETRY="${RECORD_GEOMETRY:-1920x1080}"
+RECORD_MEDIA="${RECORD_MEDIA:-video}"
+case "$RECORD_MEDIA" in
+  video) GEOMETRY="${RECORD_GEOMETRY:-1920x1080}"; MEDIA_EXT=mp4 ;;
+  audio) GEOMETRY="${RECORD_AUDIO_GEOMETRY:-960x540}"; MEDIA_EXT=m4a ;;
+  *) echo "RECORD_MEDIA must be video or audio, got: $RECORD_MEDIA" >&2; exit 1 ;;
+esac
+# browser.py sizes the window from RECORD_GEOMETRY; it has to match the head.
+export RECORD_GEOMETRY="$GEOMETRY"
 FRAMERATE="${RECORD_FRAMERATE:-15}"
 ADMIT_WAIT_LIMIT="${ADMIT_WAIT_SECONDS:-620}"
 
@@ -54,9 +67,9 @@ if [ -n "$EXPLICIT_OUTPUT" ]; then
   MP4_FILE="$EXPLICIT_OUTPUT"
 else
   paths_require RECORDINGS_DIR || exit 1
-  MP4_FILE="${RECORDINGS_DIR}/${SAFE_NAME}_${STAMP}.mp4"
+  MP4_FILE="${RECORDINGS_DIR}/${SAFE_NAME}_${STAMP}.${MEDIA_EXT}"
 fi
-FFMPEG_LOG="${MP4_FILE%.mp4}_ffmpeg.log"
+FFMPEG_LOG="${MP4_FILE%.*}_ffmpeg.log"
 mkdir -p "$(dirname "$MP4_FILE")"
 
 # Per-run sentinel directory. pipeline.sh passes one in; a standalone
@@ -251,19 +264,28 @@ if [ ! -f "$ADMITTED_MARKER" ]; then
   exit 1
 fi
 
-echo "==> Admitted. Recording screen + audio -> $MP4_FILE"
-# -preset ultrafast keeps CPU low enough not to drop frames on a 4-vCPU box;
-# -crf 28 is visually fine for slides and talking heads. See CLAUDE.md before
-# changing either.
-ffmpeg -y \
-  -f x11grab -video_size "$GEOMETRY" -framerate "$FRAMERATE" -i ":$DISPLAY_NUM" \
-  -f pulse -i "${SINK_NAME}.monitor" \
-  -c:v libx264 -preset ultrafast -crf 28 \
-  -c:a aac -b:a 128k \
-  -pix_fmt yuv420p \
-  -shortest \
-  "$MP4_FILE" \
-  > "$FFMPEG_LOG" 2>&1 &
+if [ "$RECORD_MEDIA" = "audio" ]; then
+  echo "==> Admitted. Recording audio only -> $MP4_FILE"
+  ffmpeg -y \
+    -f pulse -i "${SINK_NAME}.monitor" \
+    -c:a aac -b:a 128k \
+    "$MP4_FILE" \
+    > "$FFMPEG_LOG" 2>&1 &
+else
+  echo "==> Admitted. Recording screen + audio -> $MP4_FILE"
+  # -preset ultrafast keeps CPU low enough not to drop frames on a 4-vCPU box;
+  # -crf 28 is visually fine for slides and talking heads. See CLAUDE.md before
+  # changing either.
+  ffmpeg -y \
+    -f x11grab -video_size "$GEOMETRY" -framerate "$FRAMERATE" -i ":$DISPLAY_NUM" \
+    -f pulse -i "${SINK_NAME}.monitor" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -c:a aac -b:a 128k \
+    -pix_fmt yuv420p \
+    -shortest \
+    "$MP4_FILE" \
+    > "$FFMPEG_LOG" 2>&1 &
+fi
 FFMPEG_PID=$!
 printf 'record=%s\njoin=%s\nffmpeg=%s\ndisplay=%s\nsink=%s\n' \
   "$$" "$JOIN_PID" "$FFMPEG_PID" "$DISPLAY_NUM" "$SINK_NAME" > "$PID_FILE"
@@ -284,7 +306,7 @@ AUDIO_WATCH_PID=""
 stop_ffmpeg
 
 if [ ! -s "$MP4_FILE" ]; then
-  echo "ERROR: MP4 is empty or missing — the recording failed." >&2
+  echo "ERROR: the recording is empty or missing — it failed." >&2
   echo "  See $FFMPEG_LOG for details." >&2
   exit 1
 fi

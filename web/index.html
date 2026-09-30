@@ -98,6 +98,13 @@
           <div><label for="meetOutLang">Written in</label><select id="meetOutLang"></select></div>
           <div><label for="meetFont">PDF font</label><select id="meetFont"></select></div>
         </div>
+        <div class="row">
+          <div><label for="meetRecord">Save recording</label><select id="meetRecord"></select></div>
+          <div><label for="meetSource">Summarize from</label><select id="meetSource"></select></div>
+        </div>
+        <p class="hint">Audio only: an .m4a instead of a screen recording, a smaller hidden browser,
+          and no frames — so the summary is from the voice. Voice only with a video recording keeps
+          the video but sends no frames to the summarizer.</p>
         <label for="meetInstructions">Extra instructions <span class="hint">(optional) — for the
           summarizer, this run only: what to focus on, what to skip, anything to add</span></label>
         <textarea id="meetInstructions" class="prose" placeholder="e.g. List every decision with its owner; skip the small talk at the start."></textarea>
@@ -143,6 +150,13 @@
           <div><label for="outLang">Written in</label><select id="outLang"></select></div>
           <div><label for="font">PDF font</label><select id="font"></select></div>
         </div>
+        <div class="row">
+          <div><label for="source">Summarize from</label><select id="source"></select></div>
+          <div><label for="record">Save recording <span class="hint">(meeting links only)</span></label>
+            <select id="record"></select></div>
+        </div>
+        <p class="hint">Voice only skips frames for every input (a YouTube video is then not even
+          downloaded). Audio only records a meeting as an .m4a, and forces voice only.</p>
         <label for="instructions">Extra instructions <span class="hint">(optional) — for the
           summarizer, this run only: what to focus on, what to skip, anything to add</span></label>
         <textarea id="instructions" class="prose" placeholder="e.g. Focus on what will be on the midterm; add a worked example for each formula."></textarea>
@@ -243,6 +257,25 @@
     });
   }
 
+  // Save recording / Summarize from. Audio only has no picture, so it forces
+  // voice only (pipeline.sh would refuse the pair); video frees the choice
+  // again and restores what was picked before.
+  const SOURCE_LABELS = { both: "Frames and voice", voice: "Voice only" };
+  const RECORD_LABELS = { video: "Video (screen + audio)", audio: "Audio only (.m4a)" };
+  function setupMediaFields(recordId, sourceId) {
+    fillSelect($(recordId), ["video", "audio"], OPT.default_record_media, RECORD_LABELS);
+    fillSelect($(sourceId), ["both", "voice"], OPT.default_summary_source, SOURCE_LABELS);
+    let chosen = $(sourceId).value;
+    const sync = () => {
+      const audio = $(recordId).value === "audio";
+      if (audio) { $(sourceId).value = "voice"; } else { $(sourceId).value = chosen; }
+      $(sourceId).disabled = audio;
+    };
+    $(sourceId).addEventListener("change", () => { chosen = $(sourceId).value; });
+    $(recordId).addEventListener("change", () => { sync(); $(sourceId).dispatchEvent(new Event("input")); });
+    sync();
+  }
+
   async function connect() {
     try {
       const opt = await api("/api/options");
@@ -256,6 +289,8 @@
                  opt.prompts.includes("meeting") ? "meeting" : opt.default_prompt);
       setupSummaryFields("outLang", "font");
       setupSummaryFields("meetOutLang", "meetFont");
+      setupMediaFields("record", "source");
+      setupMediaFields("meetRecord", "meetSource");
       fillSelect($("language"), opt.languages, opt.default_language);
       fillSelect($("meetLang"), opt.languages, opt.default_language);
       $("jobs").value = opt.default_jobs || 2;
@@ -295,6 +330,7 @@
         new_meet: true, name: $("meetName").value.trim() || undefined,
         prompt: $("meetPrompt").value || undefined, language: $("meetLang").value,
         summary_language: $("meetOutLang").value, pdf_font: $("meetFont").value,
+        record_media: $("meetRecord").value, summary_source: $("meetSource").value,
         instructions: $("meetInstructions").value.trim() || undefined } });
       pollMeet(r.log_name, Date.now());
     } catch (e) {
@@ -360,6 +396,7 @@
       urls: $("inputs").value, prompt: $("prompt").value || undefined,
       language: $("language").value, clip: $("clip").value.trim() || undefined,
       summary_language: $("outLang").value, pdf_font: $("font").value,
+      summary_source: $("source").value, record_media: $("record").value,
       instructions: $("instructions").value.trim() || undefined,
       jobs: $("jobs").value || undefined, name: $("name").value.trim() || undefined,
       combine: $("combine").value.trim() || undefined,
@@ -368,7 +405,7 @@
     };
   }
   ["inputs", "prompt", "language", "clip", "jobs", "name", "combine", "resources",
-   "outLang", "font", "instructions",
+   "outLang", "font", "instructions", "source", "record",
    "noCombinePdf", "force", "playlist"].forEach((id) => $(id).addEventListener("input", () => {
     $("start").disabled = JSON.stringify(formBody()) !== lastCheckKey;
   }));
@@ -496,6 +533,8 @@
         "prompt: " + (st.prompt || "(default)") + "   spoken: " + (st.language || ""),
         "summary in: " + (st.summary_language || "(default)") + "   PDF font: " + (st.pdf_font || "(default)"),
         st.instructions ? "instructions: " + st.instructions : "",
+        "summary from: " + (st.summary_source === "voice" ? "voice only" : "frames and voice") +
+          (s.input_type === "meeting" ? "   recording: " + (st.record_media || "video") : ""),
         s.artifacts.md ? "summary: " + s.artifacts.md : "",
         s.artifacts.pdf ? "pdf: " + s.artifacts.pdf : "",
       ].filter(Boolean);
