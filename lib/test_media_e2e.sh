@@ -99,8 +99,7 @@ export CLAUDE_CLI_BIN="$REPO/lib/fake_claude_cli.py"
 export ANTHROPIC_API_KEY="must-not-reach-the-cli"
 export ASSEMBLYAI_LANGUAGE=th
 export ASSEMBLYAI_POLL_SECONDS=0.2
-export FRAME_PERIOD_SECONDS=5
-export SCENE_THRESHOLD=0.2
+export FRAME_CHECK_SECONDS=1
 
 RECORD_FILE="$TESTROOT/requests.jsonl"
 
@@ -135,15 +134,22 @@ echo "=================================================================="
 echo "1. Build a real lecture-shaped MP4"
 echo "=================================================================="
 LECTURE="$TESTROOT/Week 4 Lecture.mp4"
-# Three "slides": a bright panel on a dark background, changing colour twice —
-# scene-change detection has something real to find, and framecrop has a real
-# slide region to crop to.
+# Three "slides": a bright panel on a dark background, each with its own
+# "lines of text" (dark bars) — extract_frames.py saves a frame when the
+# slide's texture changes, so a colour change alone would be one slide; and
+# framecrop has a real slide region to crop to.
+SLIDE_PANEL="drawbox=x=80:y=50:w=800:h=440:color=0xf5f5f0:t=fill"
+slide_lines() {  # <from> <to> <y1> <y2> <y3>: three bars shown from..to
+  local y out=""
+  for y in "$3" "$4" "$5"; do
+    out+=",drawbox=x=140:y=$y:w=600:h=18:color=0x202020:t=fill:enable='between(t,$1,$2)'"
+  done
+  printf '%s' "$out"
+}
 ffmpeg -y -loglevel error \
   -f lavfi -i "color=c=0x101014:s=960x540:d=30" \
   -f lavfi -i "sine=frequency=440:duration=30" \
-  -filter_complex "[0:v]drawbox=x=80:y=50:w=800:h=440:color=0xf5f5f0:t=fill:enable='between(t,0,9)',\
-drawbox=x=80:y=50:w=800:h=440:color=0xf0e8d8:t=fill:enable='between(t,10,19)',\
-drawbox=x=80:y=50:w=800:h=440:color=0xe8f0f5:t=fill:enable='between(t,20,30)'[v]" \
+  -filter_complex "[0:v]${SLIDE_PANEL}$(slide_lines 0 9.9 90 150 210)$(slide_lines 10 19.9 250 330 410)$(slide_lines 20 30 120 280 440)[v]" \
   -map "[v]" -map 1:a -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p \
   -c:a aac -b:a 64k -t 30 "$LECTURE" 2>"$TESTROOT/ffmpeg.log"
 [ -s "$LECTURE" ] && ok "built a 30s MP4 with slides and audio" \
@@ -200,9 +206,9 @@ CLIP_START=$(probe start_time "$CLIPPED")
 
 echo "--- frames extracted from the clip carry clip-relative timestamps"
 CLIP_FRAMES="$FRAMES_DIR/week4-clip"
-# A short period, so the assertion is about WHERE the frames are rather than
-# about whether a 10s window happened to contain a scene change.
-FRAME_PERIOD_SECONDS=2 "$PY" "$REPO/screen/extract_frames.py" \
+# A frame is taken when the 10s window's slide settles, so the assertion is
+# about WHERE the frames are, not how many.
+"$PY" "$REPO/screen/extract_frames.py" \
   "$CLIPPED" "$CLIP_FRAMES" "week4-clip" > "$TESTROOT/clip-frames.log" 2>&1
 check "extract_frames on the clip exits 0" "$?" "0"
 LAST_TS=$("$PY" -c "

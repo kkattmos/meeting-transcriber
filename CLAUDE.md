@@ -482,7 +482,7 @@ re-download, since 2026-09-13 — see "The download is swept" below), and
 **Don't put `FRAMES_DIR` on `/tmp` here** — though the reason is durability,
 not size. `/tmp` on this host is **tmpfs**: 3.9GB of RAM, no disk behind it.
 Measured against real runs on this box (`$FRAMES_DIR/*/manifest.json`), frames
-are 27-113KB each and `FRAME_PERIOD_SECONDS=30` yields ~120/hour, so a 3-hour
+are 27-113KB each and `FRAME_PERIOD_SECONDS=30` (then) yielded ~120/hour, so a 3-hour
 lecture is only 10-40MB. RAM pressure is therefore **not** the problem for one
 run; it only becomes one if runs accumulate and nothing sweeps them. The real
 costs are:
@@ -522,11 +522,10 @@ The frame count is what drives summarize cost, because
 about 1,844 tokens after Claude's downscale, so **360 frames is ~660k tokens if
 the model reads all of them**. It does not have to — with the CLI it chooses —
 but nothing caps it, and one chunk covering 36 minutes carries ~72 frames
-(~133k tokens) which alone crowds a 200k context. For long lectures raise
-`FRAME_PERIOD_SECONDS` (60-90 is plenty for slides) rather than relying on the
-model to be sparing. `SCENE_THRESHOLD=0.3` contributes very little here — real
-runs show 0-5 scene-change frames per video, so the periodic pass is
-effectively the whole budget.
+(~133k tokens) which alone crowds a 200k context. (Written when frames were
+taken every `FRAME_PERIOD_SECONDS`; since 2026-09-30 they are taken on
+change — see "Frames on change" — so a slide lecture yields about one frame
+per slide, and `FRAME_MOTION_SECONDS` is the lever for video-heavy input.)
 
 **A network mount under an output directory needs the mount checked, not just
 the path.** This box points four of the five at `/mnt/My Libraries/...`, a
@@ -555,17 +554,80 @@ extract_frames.py's ffmpeg arguments change, change the script too.
 Results on the Core 7 150U (12 threads), in CPU-minutes per media hour:
 browser stand-in ≥ 60 (≈1.0-1.4 cores, a floor: no WebRTC, no Meet JS),
 x264 20 (slides) / 56 (full-screen camera), `CLIP_REENCODE=1` 29, frames 13
-(scene 7 + periodic 6 — two full decodes of the same file), silence check
+(scene 7 + periodic 6 — two full decodes of the same file; replaced
+2026-09-30, see "Frames on change"), silence check
 0.5. Per document: PDF ≈ 10 CPU-s, ≈ 4 with `PDF_MATH=0`. Frame prep for the
 model 0.2-0.3 CPU-s per frame. A U-series laptop chip varies ±50% between
 runs (turbo/thermals); rank, don't quote to the second.
 
 The ranking that follows: a live meeting (browser + encoder, for its whole
 length) dwarfs every post-processing stage; frames are the heaviest stage
-after it and have no off switch (`FRAME_PERIOD_SECONDS=0` drops only the
-periodic pass, and the periodic pass must stay — see "MUST NOT change");
-the summary's real cost is the subscription window, not local CPU. The two
-frame passes could share one decode (`split` filter) — not done, not asked.
+after it and have no off switch; the summary's real cost is the
+subscription window, not local CPU. The two frame passes were replaced by one
+decode on 2026-09-30 (next section).
+
+### Frames on change (`screen/extract_frames.py`, 2026-09-30)
+
+The operator: "ONLY cut it when the image changes, not repeatedly … (it
+would be too expensive)" — the cost meant being CPU/time and disk. Settled
+in a round of questions:
+
+- **One ffmpeg decode** samples every `FRAME_CHECK_SECONDS` (2) and pipes
+  full-resolution PPM frames to Python (`image2pipe`, one `read(n)` per
+  frame, `Image.frombuffer` — nothing is written until a frame is kept).
+- **The change test is `framecrop.frame_hash`** (texture hash over the
+  slide region) against the last *saved* frame, at `FRAME_CHANGE_DISTANCE`
+  = `framecrop.SAME_SLIDE_MAX_DISTANCE` = 16 — the one number the model-side
+  duplicate pass (`FRAME_DEDUPE_MAX_DISTANCE`) also uses, so the two agree
+  on what a new slide is. ffmpeg's scene score was rejected: it is
+  whole-frame, and a text-only change on the same white slide scores
+  under 0.3.
+- **Settle, with a cap** (`ChangeDetector`): a changed picture is saved
+  when the NEXT sample matches it (no mid-fade frames) as `scene_change`;
+  a picture that keeps moving gets one `motion` frame per
+  `FRAME_MOTION_SECONDS` (30); a change that goes straight back saves
+  nothing. Kinds downstream: `thin_frames` keeps `scene_change` first.
+- **Safety net, not a periodic pass**: one `periodic` frame after
+  `FRAME_SAFETY_SECONDS` (300) without any. Note it is by definition within
+  16 bits of the frame before it, so llm_client's duplicate pass drops it
+  before the model; it survives for the PDF and with
+  `CLAUDE_CLI_FRAME_DEDUPE=0`.
+- **Blank samples are never saved** and are invisible to the detector.
+- **`FRAME_DECODE_THREADS` = 1** by default: ffmpeg's automatic threading
+  spent ~2x the CPU for the same decode on this PC (86 vs 40 CPU-s on a
+  15-minute recording). `0` = automatic.
+- **JPEG quality 60 + optimize**: same PSNR as ffmpeg's default (36.4 dB on
+  a real Meet frame) at about its size; Pillow's 85 was +50% on disk.
+- `SCENE_THRESHOLD` / `FRAME_PERIOD_SECONDS` are retired; setting one prints
+  a note rather than being silently obeyed. Pillow is required here (it is
+  pinned); without it the stage fails with the install command.
+
+Speed work in `framecrop` the extractor needed, all result-identical
+(`FrameAnalysisPathsTest`): `detect_crop`/`is_blank`/`frame_hash` take a
+decoded image as well as a path (`_opened`); the per-pixel loops have numpy
+twins (exact integer arithmetic — the texture test is
+`Σ(n·v − Σv)² > level²·n³`); and `_downscaled` remembers the last analysis
+resize by image identity, so `is_blank` + `detect_crop` on one sample resize
+once. Resizing is now most of the per-sample cost (~30 ms); it was kept
+bicubic from full resolution so no crop or hash moves.
+
+Measured on three real Meet recordings (Core 7 150U), old two-pass vs new:
+883s — 183 → 77 CPU-s, 18 → 37 frames (a shared YouTube news broadcast:
+genuinely moving, so `motion` every ~32s where the old period was 60s);
+564s — 176 → 72 CPU-s, 24 → 22 frames; 168s — 32 → 15 CPU-s, 6 → 10. Wall
+time with one decoder thread is ~1.5-2x the old (43 vs 28s on the 883s
+file); `FRAME_DECODE_THREADS=0` matched or beat the old wall at ~37% less
+CPU.
+
+Known limit, reported to the operator and not addressed: a small element
+that moves on EVERY sample *inside* the hashed region (a lecturer's camera
+inset on the slide; benchmark.sh's animated corner tile, 19-35 bits per
+sample) keeps the picture from ever settling, and the detector falls back
+to one `motion` frame per 30s. A participant filmstrip beside the slide is
+outside the crop and does not do this. A skipped "pixel-identical sample"
+shortcut was tried and rejected: 3-21% of real samples qualified (the Meet
+clock, camera tiles), and a near-identical sample can flip `detect_crop`'s
+box and move the hash by 800+ bits.
 
 ### API keys are numbered slots with a persisted cursor
 
@@ -1212,8 +1274,9 @@ only, and then the model cites frames it has never seen.
 **Frames are filtered before they are offered** (`drop_uninformative`, same
 pass). Two kinds cost tokens and teach nothing: blank frames — the PDF already
 drops them (`framecrop.is_blank`) but the model was still being shown them,
-and the scene-change pass *prefers* them — and consecutive periodic samples of
-a slide that has not changed. The repeat test is `framecrop.frame_hash`: a
+and the old scene-change pass *preferred* them — and consecutive samples of
+a slide that has not changed. (Since 2026-09-30 extraction saves neither;
+the pass still matters for older manifests and the safety-net frames.) The repeat test is `framecrop.frame_hash`: a
 **texture** hash (per-cell pixel spread, 64x64 cells) over the *slide region*
 found by `detect_crop`, so a participant filmstrip beside the slide never
 enters it. Measured on synthetic 1920x1080 frames: a moved cursor flips 2 of
@@ -1389,8 +1452,8 @@ originals never move, because `pdf.py` crops and embeds them and needs the
 resolution — `_downscale_frames` builds new `FrameMeta` objects with
 `dataclasses.replace` rather than touching the ones `summarize.py` passes on to
 the PDF. Pillow is optional: without it the originals are sent with one
-warning. `SCENE_THRESHOLD` and `FRAME_PERIOD_SECONDS` are untouched — this
-changes resolution, never which frames exist.
+warning. The frame-extraction settings are untouched — this changes
+resolution, never which frames exist.
 
 **The chunk label is appended, not prepended, and the reference material sits
 at the top of the dynamic half.** Both in the same pass. Caching keys on a
@@ -1480,7 +1543,8 @@ summaries. **The recommended Pro-plan values live in `.env.example` instead**
 (settled with the operator 2026-09-12): `CLAUDE_CLI_MAX_FRAMES=20` (raised
 from 12 the same day — with duplicates gone and each frame a third of its old
 cost, 20 distinct slides per chunk is cheaper than 12 samples were),
-`FRAME_PERIOD_SECONDS=60`, `SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`,
+`FRAME_PERIOD_SECONDS=60` (retired 2026-09-30 with the periodic pass),
+`SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`,
 `SUMMARY_CHUNK_CHARS=60000`, `CLAUDE_CLI_MERGE_MODEL=sonnet`,
 `SUMMARY_MERGE_EFFORT=low`. The README's table still lists the code defaults;
 the two differing on purpose is documented there.
@@ -1574,9 +1638,9 @@ Without an `.srt` it falls back to splitting text and dividing frames
 proportionally. A chunk that fails does not discard the others: the merge
 proceeds over what succeeded and the document says which parts are missing.
 
-**Frames.** `screen/extract_frames.py` does a scene-change pass
-(`SCENE_THRESHOLD`, default 0.3) plus a periodic pass (`FRAME_PERIOD_SECONDS`,
-default 30), deduplicated by ±half-period, into `$FRAMES_DIR/<run_id>/manifest.json`.
+**Frames.** `screen/extract_frames.py` saves a frame each time the picture
+changes and settles (see "Frames on change"), into
+`$FRAMES_DIR/<run_id>/manifest.json`.
 The pipeline runs this as its own stage and passes `--frames-manifest` to
 `summarize.py`.
 
@@ -2036,9 +2100,9 @@ design rule here.
 `is_blank()` lives here too, and is the same idea one step blunter: a frame
 whose downscaled grayscale copy is within a few levels of one shade carries no
 picture, so it never reaches the PDF. Recordings are full of solid-black
-frames — a screen share stopping, a slide mid-fade — and the scene-change pass
-collects them preferentially, since black-to-content is the biggest scene
-change in the video.
+frames — a screen share stopping, a slide mid-fade — and the old scene-change
+pass collected them preferentially, since black-to-content is the biggest
+scene change in the video. extract_frames.py now never saves one.
 
 Analysis runs on a 200px-wide grayscale copy, so cost is a few milliseconds per
 frame regardless of source resolution. Pillow is optional: without it frames
@@ -2163,9 +2227,15 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   ffmpeg `SIGINT` so the MP4 stays playable.
 - **H.264 is `libx264 -preset ultrafast -crf 28`.** Keeps CPU low on a 4-vCPU
   VM with no GPU; visually fine for talking heads and slides.
-- **The frame-sampling combo is scene-change + periodic.** Scene-change catches
-  slide transitions and shared-video cuts; periodic guarantees a frame every N
-  seconds on a static slide. Don't drop the periodic pass.
+- **Frames are taken on change, from one decode — not on a clock.** The
+  operator replaced the scene-change + periodic passes on 2026-09-30. Keep:
+  the change test = the model dedupe's hash and distance (one constant,
+  `SAME_SLIDE_MAX_DISTANCE`); save on settle, never mid-transition; the
+  `motion` cap so a played video is not invisible; the 5-minute safety net;
+  blanks never saved. Don't bring back a fixed-period pass without asking.
+- **framecrop's numpy paths must stay result-identical to the Python loops**
+  (`FrameAnalysisPathsTest`). A crop or hash that moves changes the PDF, the
+  dedupe and the frame detector at once.
 - **`--disable-features=ScreenCapture` is intentional** — the bot has no reason
   to share its screen. Layers 2 and 3 in `capture.py` (dialog killer, "Stop
   presenting" monitor) are the catch-nets if Chrome renames the flag.
@@ -2306,7 +2376,7 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **`SUMMARY_MAX_TOKENS` is not a Claude lever, and must not be wired to
   one.** There is no output cap on the CLI, and output is not what spends
   the window. The levers are `SUMMARY_CHUNK_CHARS` (whether there is a merge),
-  `CLAUDE_CLI_MERGE_MODEL`, `CLAUDE_CLI_MAX_FRAMES`, `FRAME_PERIOD_SECONDS`,
+  `CLAUDE_CLI_MERGE_MODEL`, `CLAUDE_CLI_MAX_FRAMES`, `FRAME_MOTION_SECONDS`,
   `FRAME_MAX_DIMENSION`, `SUMMARY_EFFORT` and `CLAUDE_CLI_MODEL`.
 - **`ClaudeCliRateLimited` is `retryable = False` and the chain re-raises
   it.** Retrying it burns the backoff schedule; advancing hands the summary to
@@ -2459,10 +2529,11 @@ without API keys or network, against temp directories
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets, frontmatter, binary files | 36 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
-| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the four prompts (old names resolve, no timestamps, the callout vocabulary), `--instructions` placement | 198 |
-| `summarize/test_pdf_units.py` | crop geometry, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), real PDF render | 103 |
+| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the four prompts (old names resolve, no timestamps, the callout vocabulary), `--instructions` placement | 199 |
+| `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), real PDF render | 107 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `transcribe/test_yt_autocaptions.py` | the yt-dlp fallback: track choice (never a translation), json3, the CLI against a stub yt-dlp | 11 |
+| `screen/test_extract_frames.py` | frames on change: settle, a transient change, blanks, the motion cap, the safety net, the last sample, the shared distance; the PPM reader; real ffmpeg (black lead-in skipped, audio-only empty, retired settings named) | 19 |
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
 | `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, run/log path refusal, summary language/font/instructions, the options | 9 |
@@ -2592,7 +2663,8 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── browser_smoke.py          <- the same browser, without a meeting
 │   ├── test_browser.py
 │   ├── test_capture_host.py
-│   └── extract_frames.py
+│   ├── test_extract_frames.py
+│   └── extract_frames.py         <- one decode; a frame when the picture changes
 ├── transcribe/
 │   ├── transcribe.sh
 │   ├── assemblyai_client.py

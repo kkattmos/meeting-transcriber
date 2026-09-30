@@ -827,6 +827,68 @@ class BlankFrameTest(unittest.TestCase):
         self.assertEqual(list(prepared), [2])
 
 
+def make_textured_frame(size=(960, 540), lines=(), noise_seed=None):
+    """A dark frame with a white slide carrying dark 'text' bars at `lines` y's."""
+    import random
+    img = Image.new("RGB", size, (20, 20, 22))
+    img.paste((245, 245, 240), (100, 60, 860, 480))
+    for y in lines:
+        img.paste((30, 30, 30), (150, y, 700, y + 12))
+    if noise_seed is not None:
+        rng = random.Random(noise_seed)
+        for _ in range(3000):
+            img.putpixel((rng.randrange(size[0]), rng.randrange(size[1])),
+                         (rng.randrange(256),) * 3)
+    return img
+
+
+@unittest.skipIf(Image is None, "Pillow is not installed")
+class FrameAnalysisPathsTest(unittest.TestCase):
+    """extract_frames.py analyses decoded images, fast; the answers must not move."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.images = [
+            make_textured_frame(),
+            make_textured_frame(lines=(100, 200, 300)),
+            make_textured_frame(lines=(150, 400), noise_seed=1),
+            make_textured_frame(size=(1280, 720), lines=(90,), noise_seed=2),
+            Image.new("RGB", (640, 360), (0, 0, 0)),
+        ]
+
+    def _answers(self, image):
+        gray = image.convert("L")
+        return (framecrop.detect_crop(gray), framecrop.detect_crop(gray, mode="border"),
+                framecrop.is_blank(gray), framecrop.frame_hash(gray))
+
+    @unittest.skipIf(framecrop.np is None, "numpy is not installed")
+    def test_numpy_paths_match(self):
+        fast = [self._answers(img) for img in self.images]
+        with mock.patch.object(framecrop, "np", None):
+            slow = [self._answers(img) for img in self.images]
+        self.assertEqual(fast, slow)
+
+    def test_a_decoded_image_gives_the_same_answers_as_its_file(self):
+        for i, img in enumerate(self.images):
+            path = self.dir / f"f{i}.png"  # lossless, so the pixels agree
+            img.save(path)
+            self.assertEqual(self._answers(img),
+                             (framecrop.detect_crop(path),
+                              framecrop.detect_crop(path, mode="border"),
+                              framecrop.is_blank(path), framecrop.frame_hash(path)))
+
+    def test_the_shared_downscale_never_serves_another_image(self):
+        a = self.images[1].convert("L")
+        b = self.images[2].convert("L")
+        size = (200, 112)
+        self.assertIs(framecrop._downscaled(a, size), framecrop._downscaled(a, size))
+        self.assertEqual(list(framecrop._downscaled(b, size).getdata()),
+                         list(b.resize(size).getdata()))
+        self.assertEqual(framecrop._downscaled(b, (100, 56)).size, (100, 56))
+
+
 class BodyFontByLanguageTest(unittest.TestCase):
     """The body face follows the language the summary was written in.
 

@@ -186,8 +186,6 @@ RESULTS="$WORKDIR/results.tsv"
 
 GEOMETRY="${RECORD_GEOMETRY:-1920x1080}"
 FPS="${RECORD_FRAMERATE:-15}"
-PERIOD="${FRAME_PERIOD_SECONDS:-60}"
-THRESH="${SCENE_THRESHOLD:-0.3}"
 
 # measure NAME MEDIA_SECONDS CMD... — wall, children's CPU, peak RSS.
 cat > "$WORKDIR/measure.py" <<'PY'
@@ -209,7 +207,7 @@ echo "==> ffmpeg $(ffmpeg -version | head -1 | cut -d' ' -f3); ${SECONDS_MEDIA}s
 echo ""
 
 # Two sources, because x264's cost follows the picture:
-#   slides — a static slide that changes five times (a change the scene pass
+#   slides — a static slide that changes five times (a change the frames stage
 #            must catch) with a moving 480x270 camera tile in the corner;
 #   camera — a full-screen moving picture with sensor-like noise, the
 #            Spotlight layout on a speaker with their camera on.
@@ -235,14 +233,16 @@ measure source_camera "$SECONDS_MEDIA" ffmpeg -nostdin -y -f lavfi -i "$CAM" -f 
 measure record_encode_camera_raw "$SECONDS_MEDIA" ffmpeg -nostdin -y \
   -f lavfi -i "$CAM" -f lavfi -i "$AUD" -t "$SECONDS_MEDIA" "${ENC[@]}" "$WORKDIR/rec_cam.mp4"
 
-echo "[3/8] frames: scene-change pass (threshold $THRESH) — extract_frames.py"
-mkdir -p "$WORKDIR/frames"
-measure frames_scene "$SECONDS_MEDIA" ffmpeg -nostdin -i "$REC" \
-  -vf "select='gt(scene,$THRESH)',showinfo" -vsync vfr "$WORKDIR/frames/scene_%05d.jpg"
+# The real script, not a copy of its ffmpeg line: since 2026-09-30 half the
+# stage is Python (the change check on every sample), and it runs with the
+# .env's FRAME_* settings as the pipeline would.
+echo "[3/8] frames: change detection, ${FRAME_DECODE_THREADS:-1} decoder thread(s) — extract_frames.py"
+measure frames "$SECONDS_MEDIA" "$VENV_PY" "$SCRIPT_DIR/screen/extract_frames.py" \
+  "$REC" "$WORKDIR/frames" bench
 
-echo "[4/8] frames: periodic pass (every ${PERIOD}s)"
-measure frames_periodic "$SECONDS_MEDIA" ffmpeg -nostdin -i "$REC" \
-  -vf "fps=1/$PERIOD,showinfo" -vsync vfr "$WORKDIR/frames/periodic_%05d.jpg"
+echo "[4/8] frames: the same with automatic decoder threads (FRAME_DECODE_THREADS=0)"
+measure frames_autothreads "$SECONDS_MEDIA" env FRAME_DECODE_THREADS=0 \
+  "$VENV_PY" "$SCRIPT_DIR/screen/extract_frames.py" "$REC" "$WORKDIR/frames_auto" bench
 
 echo "[5/8] --clip: stream copy vs CLIP_REENCODE=1 — lib/clip.py"
 measure clip_copy "$SECONDS_MEDIA" env CLIP_REENCODE=0 \

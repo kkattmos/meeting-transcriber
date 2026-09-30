@@ -60,7 +60,7 @@ flowchart LR
     REC["record<br/>(Firefox ESR + Xvfb + PipeWire/Pulse + ffmpeg)"]
     FETCH["fetch_video<br/>(yt-dlp / Kaltura API)"]
     TR["transcribe<br/>(AssemblyAI / YouTube captions / Kaltura captions)"]
-    FR["frames<br/>(ffmpeg scene-change + periodic)"]
+    FR["frames<br/>(one ffmpeg decode, saved on change)"]
     RES["resources<br/>(GitHub repo / folder)"]
     SUM["summarize<br/>(claude CLI, falling back to Gemini)"]
     OUTMD([summaries/&lt;run_id&gt;.md])
@@ -96,7 +96,7 @@ downloaded file and `fetch_video` runs first, ahead of both branches.
 | `record` | Joins (or creates) the call, records screen + audio to MP4, in the background | Firefox ESR (or Chrome), Xvfb, `pactl`, a profile signed in as `BOT_GOOGLE_ACCOUNT` |
 | `fetch_video` | Downloads a YouTube video (for frames only) or a Kaltura entry (for frames *and* audio) | yt-dlp / nothing (Kaltura needs no key) |
 | `transcribe` | Local file → AssemblyAI; YouTube → youtube-transcript.io captions, else YouTube's own (yt-dlp); Kaltura → its own captions if it has any, else AssemblyAI | `ASSEMBLYAI_API_KEY_1..3` / `YT_TRANSCRIPT_KEY_1..10` (optional for YouTube) |
-| `frames` | Scene-change + periodic keyframes → `manifest.json` | ffmpeg |
+| `frames` | A keyframe each time the slide changes → `manifest.json` | ffmpeg + Pillow |
 | `summarize` | Transcript + frames (+ slides) → Markdown + PDF | the `claude` CLI signed into your Claude subscription / `GEMINI_API_KEY_1..3` |
 
 Where the outputs go is **configured, not assumed** — the five directories are
@@ -904,7 +904,7 @@ Measured on the reference PC (Core 7 150U, 12 threads), 2026-09-29:
 | Recording: browser rendering the call | ≥ 60 CPU-min (≥ 1 core, the whole meeting) | Only by not recording. `MEETING_BROWSER` picks the browser |
 | Recording: x264 encode | 20 (slides) to 56 (full-screen camera) CPU-min | No. `RECORD_FRAMERATE` scales it |
 | `--clip` with `CLIP_REENCODE=1` | ~29 CPU-min | Yes, off by default (stream copy is ~0) |
-| Frame extraction (two full decodes) | ~13 CPU-min | No. `FRAME_PERIOD_SECONDS=0` drops the periodic pass only |
+| Frame extraction (one decode + change check) | ~5-8 CPU-min (three real Meet recordings, 2026-09-30; the old two-pass extractor took 12-19 on the same files) | No. `FRAME_CHECK_SECONDS` scales the check; `FRAME_DECODE_THREADS=0` trades ~50% more CPU for a faster decode |
 | Frame prep for the model | 0.2-0.3 CPU-s per frame | `CLAUDE_CLI_FRAME_VISION=0` skips it |
 | PDF render | ~10 CPU-s per document (half of it maths) | `--no-pdf` / `SUMMARY_WRITE_PDF=0`; `PDF_MATH=0` |
 | Silence check before upload | ~0.5 CPU-min | No, it is what stops paying for silence |
@@ -1295,8 +1295,8 @@ lighter still, but the model then cites frames it has never seen, so the
 pictures in the PDF may not match what the text says about them.
 
 **Before they are sent, frames are filtered, cropped and shrunk.** Blank
-frames (a screen share stopping, a slide mid-fade — the scene-change pass is
-drawn to these) and consecutive frames of an unchanged slide are dropped
+frames (a screen share stopping, a slide mid-fade — extraction already skips
+these, but older runs have them) and consecutive frames of an unchanged slide are dropped
 (`CLAUDE_CLI_FRAME_DEDUPE`; a texture hash of the slide region, so a moved
 cursor or a changed participant tile still counts as the same slide, while a
 changed title does not). What remains is capped by `CLAUDE_CLI_MAX_FRAMES`,
@@ -1337,10 +1337,10 @@ prints it. **That number is how you size a lecture to your plan**: run one,
 read `+N% this stage`, and you know how many fit in a window.
 
 `.env.example` ships Pro-sized values — `CLAUDE_CLI_MAX_FRAMES=20`,
-`FRAME_PERIOD_SECONDS=60`, `SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`,
+`SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`,
 `SUMMARY_CHUNK_CHARS=60000`, `CLAUDE_CLI_MERGE_MODEL=sonnet`,
 `SUMMARY_MERGE_EFFORT=low` — which differ from the code's own defaults (0,
-30, `high`, 3, 24000, and the chunk model/effort) on purpose: an unset
+`high`, 3, 24000, and the chunk model/effort) on purpose: an unset
 variable behaves as it always did, a fresh `.env` fits a lecture into a
 window. Loosen them once the meter says you have room.
 
@@ -1357,10 +1357,11 @@ is not where the window goes. What spends it, in order:
    of noisy ASR happens — stay on `CLAUDE_CLI_MODEL`.
 2. **Frames.** A whole 1920x1080 frame is ~1,844 tokens; cropped to the
    slide and fitted to 768px (`FRAME_MAX_DIMENSION`) it is ~200-450. The
-   blank/duplicate pass usually removes most of a static lecture's periodic
-   samples before any of that; `CLAUDE_CLI_MAX_FRAMES` caps what is left
-   (scene changes first, the rest spread evenly), and `FRAME_PERIOD_SECONDS`
-   sets the count at the source. `CLAUDE_CLI_FRAME_VISION=0` drops them
+   extractor saves a frame only when the slide changes, and the
+   blank/duplicate pass removes what still repeats; `CLAUDE_CLI_MAX_FRAMES`
+   caps what is left (slide changes first, the rest spread evenly), and
+   `FRAME_MOTION_SECONDS` sets how often a moving picture (a played video)
+   is sampled at the source. `CLAUDE_CLI_FRAME_VISION=0` drops them
    entirely, at the cost of citations to pictures the model never saw.
 3. **Effort.** `SUMMARY_EFFORT=high` buys thinking tokens on every chunk;
    `medium` is noticeably cheaper on the window and still fine for notes.
@@ -1492,13 +1493,26 @@ another key would fail identically.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SCENE_THRESHOLD` | 0.3 | ffmpeg scene-change score cutoff |
-| `FRAME_PERIOD_SECONDS` | 30 | Periodic safety-net sample; `0` disables |
+| `FRAME_CHECK_SECONDS` | 2 | How often the picture is looked at; a slide shown for less can be missed |
+| `FRAME_CHANGE_DISTANCE` | 16 | Texture-hash bits (of 4096, over the slide region) that make a new picture; the model-side duplicate pass uses the same number |
+| `FRAME_MOTION_SECONDS` | 30 | A picture that never settles (a played video, a full-screen camera) gets one frame per this |
+| `FRAME_SAFETY_SECONDS` | 300 | A frame anyway after this long without one; `0` disables |
+| `FRAME_DECODE_THREADS` | 1 | ffmpeg decoder threads; `0` = automatic (faster, ~50% more CPU) |
 | `FRAME_MAX_DIMENSION` | 768 | Long edge, in pixels, of the frame *copies* sent to the LLM, after the crop to the slide; `0` skips the downscale |
 | `CLIP_REENCODE` | 0 | `--clip` cuts by stream copy; `1` re-encodes for a frame-accurate start |
 
-Aggressive: `FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2`.
-Slides only: `FRAME_PERIOD_SECONDS=300 SCENE_THRESHOLD=0.6`.
+**A frame is saved when the picture changes, never on a clock.** One ffmpeg
+decode hands a sample every `FRAME_CHECK_SECONDS` to Python, which compares
+it with the last saved frame by a texture hash of the slide region — a moved
+cursor or the participant strip is not a change, a new title or new text is.
+A changed picture is saved once the next sample shows the same thing, so a
+slide mid-fade is never the one kept; a blank (one-colour) sample is never
+saved. A static slide is therefore one frame however long it stays up.
+`SCENE_THRESHOLD` and `FRAME_PERIOD_SECONDS` belonged to the previous
+two-pass extractor and are ignored (the log says so if they are set).
+
+More frames: `FRAME_CHECK_SECONDS=1 FRAME_MOTION_SECONDS=15`.
+Fewer: `FRAME_MOTION_SECONDS=120 FRAME_SAFETY_SECONDS=0`.
 
 **`CLIP_REENCODE` buys exactness with a full transcode.** The default stream
 copy takes seconds and starts at the keyframe at or before the requested time —
@@ -1797,7 +1811,7 @@ had to give up (`PAUSED`, exit 75) is picked up by `./pipeline.sh --resume-all`
 once its recorded reset time has passed — automatically, if you installed
 `setup.sh --with-resume-timer`. To make the next lecture fit, read
 `stages.summarize.usage` in `--status` and turn down `CLAUDE_CLI_MAX_FRAMES`,
-`FRAME_PERIOD_SECONDS` or `SUMMARY_EFFORT` — see
+`FRAME_MOTION_SECONDS` or `SUMMARY_EFFORT` — see
 [the usage window](#the-usage-window). If you would rather have Gemini answer
 than wait, set `SUMMARY_FALLBACK_CHAIN=gemini`.
 
@@ -1811,5 +1825,6 @@ written through deliberately so you can see it in the `.txt`.
 `./pipeline.sh --run-id <run_id>` picks up from there.
 
 **Everything is slow on a long video**
-Frame extraction is CPU-bound. Raise `FRAME_PERIOD_SECONDS`, or lower `--jobs`
-so runs aren't competing for the same cores.
+Frame extraction is CPU-bound. `FRAME_DECODE_THREADS=0` finishes it sooner
+for more CPU; raise `FRAME_CHECK_SECONDS`, or lower `--jobs` so runs aren't
+competing for the same cores.

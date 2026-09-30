@@ -53,8 +53,7 @@ The <video_or_youtube_url> argument can be either:
 
 Configuration (env vars):
   SUMMARIES_DIR / PDF_DIR / FRAMES_DIR   required output directories (lib/paths.py)
-  SCENE_THRESHOLD        default 0.3   (passed to extract_frames.py)
-  FRAME_PERIOD_SECONDS   default 30    (set to 0 to disable periodic pass)
+  FRAME_CHECK_SECONDS etc.             (passed to extract_frames.py; see its docstring)
   SUMMARY_BACKEND        "fallback" (default), "claude-cli", "gemini"
   SUMMARY_FALLBACK_CHAIN default claude-cli,gemini
   CLAUDE_CLI_BIN         path to the claude binary (default: found on PATH)

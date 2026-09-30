@@ -139,8 +139,8 @@ Env vars:
                         after the crop to the slide (default 768; 0 skips
                         the downscale). PDF_FRAME_CROP picks the crop mode.
   CLAUDE_CLI_MAX_FRAMES most frames offered to the model per call (default 0
-                        = every frame of the chunk); scene changes are kept
-                        first, periodic frames are thinned evenly
+                        = every frame of the chunk); slide changes are kept
+                        first, motion/safety-net frames are thinned evenly
   CLAUDE_CLI_MAX_WAIT_SECONDS  how long one call may sleep for the usage
                         window to reset before the stage fails (default 21600)
   CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS  retry interval when the CLI reports a
@@ -171,6 +171,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 from retry import with_retries, _status_of as _http_status  # noqa: E402
+from framecrop import SAME_SLIDE_MAX_DISTANCE  # noqa: E402
 from keyring import KeyRing, missing_keys_message  # noqa: E402
 
 DEFAULT_BACKEND = "fallback"
@@ -233,12 +234,12 @@ DEFAULT_FRAME_MAX_DIMENSION = 768
 LLM_FRAME_SUBDIR = "llm-{max_dim}{crop}"
 
 # Two frames whose texture hashes (framecrop.frame_hash, 4096 bits over the
-# slide region) are within this many bits are the same slide: a moved cursor
-# is ~2 bits, a fade ~5, a changed title ~58, changed body text ~176 (see the
-# measurements on frame_hash). Consecutive duplicates are dropped before the
+# slide region) are within this many bits are the same slide — the number
+# extract_frames.py also saves on, defined once in framecrop with its
+# measurements. Consecutive duplicates are dropped before the
 # frame cap is applied, so the cap covers distinct slides rather than
 # distinct minutes. Without Pillow nothing is a duplicate.
-FRAME_DEDUPE_MAX_DISTANCE = 16
+FRAME_DEDUPE_MAX_DISTANCE = SAME_SLIDE_MAX_DISTANCE
 
 # Per-call frame cap. 0 = no cap, which is what every run did before the
 # setting existed. The frames are the bulk of a call's input, so this is the
@@ -482,7 +483,7 @@ class FrameMeta:
     assign_numbers() — see the warning there.
     """
     timestamp_s: float
-    kind: str  # "scene_change" or "periodic"
+    kind: str  # "scene_change", "motion" or "periodic" (extract_frames.py)
     path: str
     number: int = 0
     # Which video this frame came from when several are summarized as one
@@ -794,11 +795,12 @@ def _rate_limit_poll_seconds():
 def thin_frames(frames, cap):
     """At most `cap` frames, chosen to still cover the whole window.
 
-    Scene changes are kept first — there are rarely more than a handful, and
-    each one is a slide transition the notes should cite — and the periodic
-    frames fill the rest at an even stride, so a 36-minute chunk capped at 20
-    still shows the model something every couple of minutes rather than the
-    first twenty minutes in detail and nothing after.
+    Scene changes (a new slide that settled) are kept first — each one is a
+    slide the notes may cite — and the motion and safety-net frames fill the
+    rest at an even stride; either group over budget is itself strided, so a
+    36-minute chunk capped at 20 still shows the model something every couple
+    of minutes rather than the first twenty minutes in detail and nothing
+    after.
 
     The frames' numbers are untouched: they were assigned over the whole
     manifest by assign_numbers(), and the ones left out keep theirs, so a
