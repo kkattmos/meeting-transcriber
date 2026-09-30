@@ -1682,6 +1682,44 @@ done
 
 echo ""
 echo "=================================================================="
+echo "--source-url: a local recording of a call made elsewhere (the Discord bot)"
+echo "=================================================================="
+DISCORD_LINK="https://discord.com/channels/111111111111111111/222222222222222222"
+mkdir -p "$TESTROOT/media"; echo "fake mix" > "$TESTROOT/media/discord call.m4a"
+out=$(pipeline "$TESTROOT/media/discord call.m4a" --source-url "$DISCORD_LINK" \
+      --voice-only --prompt meeting --name "Discord Standup" 2>&1)
+check "source-url: exits 0" "$?" "0"
+run=$(latest_run)
+check "source-url: classified as a local file" \
+  "$(state get --run-dir "$RUNS/$run" --key input_type)" "local_file"
+check "source-url: stored with the run" \
+  "$(state get --run-dir "$RUNS/$run" --key source_url)" "$DISCORD_LINK"
+grep -A1 -x -- "--source-url" "$STUB_SUMMARIZE_ARGS" | grep -qxF "$DISCORD_LINK" \
+  && ok "source-url: the document cites the channel, not the file" \
+  || bad "source-url: summarize args: $(tr '\n' ' ' < "$STUB_SUMMARIZE_ARGS")"
+check "source-url: the recording is never swept" \
+  "$(ls "$TESTROOT/media/discord call.m4a" 2>/dev/null)" "$TESTROOT/media/discord call.m4a"
+
+echo "--- --source-url refusals, before anything is created"
+before="$(ls -1 "$RUNS" | wc -l)"
+out=$(pipeline "$TESTROOT/media/discord call.m4a" --source-url "http://discord.com/x" --force 2>&1)
+check "source-url: http:// is refused" "$?" "1"
+out=$(pipeline "https://youtu.be/srcurlyt01" --source-url "$DISCORD_LINK" 2>&1)
+check "source-url: refused for a non-file input" "$?" "1"
+echo "$out" | grep -q "cannot go with a youtube input" && ok "source-url: says why" \
+  || bad "source-url: $out"
+out=$(pipeline "$TESTROOT/media/discord call.m4a" "$TESTROOT/media/voice lecture.mp4" \
+      --source-url "$DISCORD_LINK" --force 2>&1)
+check "source-url: refused with two inputs" "$?" "1"
+out=$(pipeline "$TESTROOT/media/discord call.m4a" --source-url 2>&1)
+check "source-url: refused without a value" "$?" "1"
+out=$(pipeline "https://youtu.be/srcurlyt01" --source-url "$DISCORD_LINK" --dry-run 2>&1)
+echo "$out" | grep -qP '^bad\t--source-url applies to a single local file only\t' \
+  && ok "source-url: --dry-run reports it as a bad line" || bad "source-url dry-run: $out"
+check "source-url: nothing was created" "$(ls -1 "$RUNS" | wc -l)" "$before"
+
+echo ""
+echo "=================================================================="
 echo "Result: $PASS passed, $FAIL failed"
 echo "=================================================================="
 [ "$FAIL" -eq 0 ] || exit 1

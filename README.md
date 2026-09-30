@@ -34,6 +34,7 @@ without the others — and `pipeline.sh` chains them.
 - [Web UI](#web-ui)
 - [Commands](#commands)
 - [Hosting a new Google Meet](#hosting-a-new-google-meet)
+- [Discord voice bot](#discord-voice-bot) (in progress)
 - [Summarizing part of a video](#summarizing-part-of-a-video)
 - [Slides and reference material](#slides-and-reference-material)
 - [Resuming a failed run](#resuming-a-failed-run)
@@ -519,6 +520,7 @@ keeps the frames too).
 | `--instructions T` | Extra instructions for the summarizer, this run only — e.g. `"Focus on what will be on the midterm"` |
 | `--summary-source S` | `both` (default: transcript + frames) or `voice` (transcript only: no frames stage). `--voice-only` is the short form. Default `SUMMARY_SOURCE` |
 | `--record-media M` | Meetings: `video` (default, an MP4) or `audio` (an `.m4a`, summary from the voice). `--audio-only` is the short form. Default `RECORD_MEDIA` |
+| `--source-url URL` | One local file only: the `https://` link of the call it was recorded from, cited by the summary in place of the file's path (the Discord bot passes its voice channel's link) |
 | `--clip W` | Summarize only part of the video, e.g. `--clip 00:05:00-01:30:00` (see below) |
 | `<input>#t=W` | Not a flag: a per-input window, overriding `--clip` for that input |
 | `--resources SPEC` | Slides / notes for this session; repeatable (see below) |
@@ -624,6 +626,81 @@ seconds and says so — run `first_time_login.sh`.
 > bot's browser runs in `th-TH`); the Thai admit labels in particular have not
 > yet been checked against a real call. If knockers are left waiting, the
 > labels in `HOST_ADMIT_LABELS` in `screen/capture.py` are the place to look.
+
+---
+
+## Discord voice bot
+
+> **In progress — not usable yet.** What exists: the recording format and
+> mixer (`lib/discord_spool.py`), the pipeline hand-off (`--source-url`), and
+> two spike bots to decide which Discord library the real bot is built on.
+> The bot itself comes after the spike.
+
+What it will do: in a Discord server, anyone in a voice channel types
+`/record-and-summarize` (optional style, language and instructions). The bot
+joins that voice channel, posts "🔴 Recording started by @you" in its chat,
+records until `/stop` (the requester or someone with Manage Server), 30 s
+after the channel empties, or `MAX_MEETING_MINUTES`. Then it transcribes
+and summarizes, and posts the **PDF into the voice channel's chat and into
+the requester's DMs**. The recording (`.m4a`) stays on this PC in
+`RECORDINGS_DIR`, with one speech-only track per speaker beside it
+(`<name>.speakers/`) for a later upgrade to named speakers. The bot runs as a
+third pm2 app, on and off with `./webui.sh on|off`, and its runs appear in
+the web UI.
+
+Why a spike first: since 2 March 2026 every Discord voice call is end-to-end
+encrypted (DAVE), and a recording bot has to *decrypt* what it receives. Two
+libraries do, differently:
+
+| | Python: discord.py fork + `discord-ext-voice-recv` | Node: discord.js + `@discordjs/voice` 0.19 |
+|---|---|---|
+| Who maintains it | a fork of a fork (zacker150), pinned to a commit | the discord.js team |
+| Timing | RTP timestamps, jitter buffer, lost-packet concealment | arrival time only |
+| Needs | `libopus0` (installed here) | Node ≥ 22.12 (Debian 13 has 20) |
+
+### Setting up the Discord application (once)
+
+1. <https://discord.com/developers/applications> → **New Application**, name
+   it (e.g. "Meeting Bot"). Note the **Application ID** on *General
+   Information*.
+2. **Bot** → **Reset Token** → copy it into `.env` as `DISCORD_BOT_TOKEN=`.
+   Leave every *Privileged Gateway Intent* off — slash commands need none.
+3. Invite it to your test server with this URL (put your Application ID in):
+   `https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot+applications.commands&permissions=1084416`.
+   It asks for View Channels, Send Messages, Attach Files and Connect.
+4. In Discord: *User Settings → Advanced → Developer Mode* on, then
+   right-click the server → **Copy Server ID** → `.env`:
+   `DISCORD_SPIKE_GUILD_ID=`. (The spike registers its commands on that one
+   server, where they appear at once.)
+5. Allow DMs from that server's members (*Privacy Settings* on the server),
+   or the DM half of the test fails. The bot says so in the channel when
+   that happens.
+
+### Running the spike
+
+You need a second person (or a second Discord account on another device) in
+the voice channel. Run each candidate in turn:
+
+```bash
+./spike/discord/py/run.sh
+```
+
+```bash
+./spike/discord/node/run.sh --fetch-node
+```
+
+(`--fetch-node` downloads Node 22 into `spike/discord/node/node-v22` the
+first time; nothing is installed system-wide.) In Discord, join a voice
+channel, type `/spike_join`, talk for two minutes — take turns, talk over
+each other once, and leave one long pause — then `/spike_stop`. The bot
+posts `report.json` and `mixed.m4a` into the voice channel's chat and your
+DMs; everything is also in `~/.local/share/meeting-bot/discord/spike/`.
+Listen for: every voice clear (not static or robotic), nobody's words
+shifted against the others', the pause still a pause. Ctrl+C stops the spike
+bot.
+
+Remove the spikes afterwards with `rm -rf spike/discord/py/.venv
+spike/discord/node/node_modules spike/discord/node/node-v22`.
 
 ---
 
@@ -1626,6 +1703,13 @@ again with `first_time_login.sh`.
 | `MEETING_BOT_PORT` | 8765 | |
 | `MEETING_BOT_FOREGROUND` | 0 | `1` = never detach a meeting into the background (same as `--foreground`) |
 
+### Discord voice bot (in progress)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DISCORD_BOT_TOKEN` | — | The bot's token from the Developer Portal (*Bot → Reset Token*). A secret, like the API keys |
+| `DISCORD_SPIKE_GUILD_ID` | — | The spike only: the test server's ID, where `/spike_join` and `/spike_stop` are registered |
+
 ### Meeting behaviour
 
 | Variable | Default | Meaning |
@@ -1678,6 +1762,7 @@ python3 lib/test_keyring.py                  # numbered keys + rotation cursor (
 python3 lib/test_resources.py                # resource specs, extraction, GitHub, frontmatter, binary files (36)
 python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions, retries (51)
 python3 lib/test_clip.py                     # --clip parsing, the cut, caption windowing (33)
+python3 lib/test_discord_spool.py            # Discord recordings: placing each speaker on one timeline, the mix, real ffmpeg (22)
 python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain, the course reference, the output language, the four prompts, --instructions, no frames (200)
 python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, the design (callouts, code, maths symbols), font choice and size matching, PDF render (107)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
@@ -1686,7 +1771,7 @@ python3 screen/test_extract_frames.py        # frames on change: settle, motion 
 python3 screen/test_capture_host.py          # hosting a created Meet: when it ends, and when it must not (7)
 python3 screen/test_browser.py               # browser choice, fake devices, the bot-account check (16)
 python3 test_trigger_server.py               # the web UI API: argument mapping, auth, dry-run check, paths, summary settings, record/summary source, per-line check results (12)
-bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings, summary settings, voice only / audio only, dry-run reports (448)
+bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings, summary settings, voice only / audio only, dry-run reports, --source-url (460)
 bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (131)
 ```
 

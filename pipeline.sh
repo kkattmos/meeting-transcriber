@@ -79,6 +79,11 @@
 #                       citation_label, coverage) — the lecture prompt then
 #                       cites it by that label.
 #                       A binary file named .md/.txt is refused up front.
+#   --source-url URL    the link the summary cites for a LOCAL FILE input, in
+#                       place of the file's path: the call it was recorded
+#                       from (the Discord bot passes the voice channel's
+#                       https://discord.com/channels/... link). One local-file
+#                       input only; stored with the run.
 #   --clip W            summarize only part of the video: --clip 00:05:00-01:30:00
 #                       (also MM:SS, bare seconds, or an open end: 00:05:00-).
 #                       The media is cut to the window before transcription, so
@@ -176,6 +181,7 @@ PDF_FONT_OPT=""
 INSTRUCTIONS_OPT=""
 SUMMARY_SOURCE_OPT=""
 RECORD_MEDIA_OPT=""
+SOURCE_URL_OPT=""
 declare -a POSITIONAL=()
 declare -a RESOURCE_SPECS=()
 # RESOURCES in .env is the default for every run; --resources adds to it.
@@ -213,6 +219,7 @@ while [ "$#" -gt 0 ]; do
     --instructions) need_value "$1" "$#" "${2:-}"; INSTRUCTIONS_OPT="$2"; shift 2 ;;
     --summary-source) need_value "$1" "$#" "${2:-}"; SUMMARY_SOURCE_OPT="$2"; shift 2 ;;
     --record-media) need_value "$1" "$#" "${2:-}"; RECORD_MEDIA_OPT="$2"; shift 2 ;;
+    --source-url)   need_value "$1" "$#" "${2:-}"; SOURCE_URL_OPT="$2"; shift 2 ;;
     --voice-only)   SUMMARY_SOURCE_OPT=voice; shift ;;
     --audio-only)   RECORD_MEDIA_OPT=audio; shift ;;
     --jobs)         need_value "$1" "$#" "${2:-}"; JOBS="$2"; shift 2 ;;
@@ -295,6 +302,22 @@ media_choice "${RECORD_MEDIA_OPT:+--record-media}${RECORD_MEDIA_OPT:-RECORD_MEDI
 # the summary settings above. The recording medium never changes on a
 # resume: the file is already named for it (and may already exist).
 [ -n "$SUMMARY_SOURCE_OPT" ] && SUMMARY_INIT_ARGS+=(--summary-source "$SUMMARY_SOURCE_OPT")
+
+# --- The link a local recording cites ------------------------------------------
+# A file recorded elsewhere (the Discord bot's mix) is a path on this disk; the
+# document should name the call instead. Checked for shape here; that it goes
+# with exactly one local file is checked once the inputs are classified.
+if [ -n "$SOURCE_URL_OPT" ]; then
+  case "$SOURCE_URL_OPT" in
+    https://?*) ;;
+    *) echo "ERROR: --source-url must be an https:// link (got: $SOURCE_URL_OPT)" >&2
+       exit 1 ;;
+  esac
+  case "$SOURCE_URL_OPT" in
+    *[[:space:]]*) echo "ERROR: --source-url must not contain spaces" >&2; exit 1 ;;
+  esac
+  SUMMARY_INIT_ARGS+=(--source-url "$SOURCE_URL_OPT")
+fi
 
 # --- Meetings run in the background -------------------------------------------
 # A recording lasts as long as the meeting, and it must not die with the
@@ -783,6 +806,15 @@ else
       if [ "$DRY_RUN" -eq 1 ]; then
         dry_bad "not recognised: expected a Meet/Zoom link, a YouTube link, a Kaltura embed, or a file that exists on this machine" "$input"
         continue
+      fi
+      exit 1
+    fi
+    if [ -n "$SOURCE_URL_OPT" ] && { [ "$kind" != "local_file" ] \
+         || [ "${#INPUTS[@]}" -ne 1 ] || [ -n "$COMBINE_FILE" ]; }; then
+      echo "ERROR: --source-url names the call ONE local recording came from;" >&2
+      echo "  it cannot go with a $kind input, several inputs, or --combine." >&2
+      if [ "$DRY_RUN" -eq 1 ]; then
+        dry_bad "--source-url applies to a single local file only" "$input"; continue
       fi
       exit 1
     fi

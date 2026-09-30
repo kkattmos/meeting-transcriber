@@ -120,9 +120,12 @@ def provenance_comment(**fields):
 
 # A recorded call's link. Not "Source File": the first live guest recording
 # (2026-09-29) cited its Meet link as a local file, because anything that was
-# neither YouTube nor Kaltura fell through to that label.
+# neither YouTube nor Kaltura fell through to that label. A Discord voice
+# channel's link is one too: the bot's recording is a local file, passed with
+# --source-url so the document cites the channel.
 MEETING_URL_RE = re.compile(
-    r"^https?://(meet\.google\.com|([\w-]+\.)?zoom\.us|teams\.(microsoft|live)\.com|meet\.new)",
+    r"^https?://(meet\.google\.com|([\w-]+\.)?zoom\.us|teams\.(microsoft|live)\.com|meet\.new"
+    r"|(ptb\.|canary\.)?discord(app)?\.com/channels/)",
     re.IGNORECASE)
 
 

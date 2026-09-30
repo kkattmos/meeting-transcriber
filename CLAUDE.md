@@ -2657,6 +2657,12 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   at run creation (the recording's file name depends on it).
 - **Course-reference metadata stays in the dynamic half** of the prompt, as
   attributes — never substituted into the static instructions.
+- **A Discord spool is deleted only after the mix probed correctly**, and
+  each `.pcm` is written before its index line. The call is over; the spool
+  is the recording until the `.m4a` is proven.
+- **The Discord receive stack never enters the project `.venv`** until the
+  spike has chosen it — the Python candidate is a fork that pins its own
+  discord.py. Spikes keep their own venv / node_modules.
 
 ## Tests
 
@@ -2674,6 +2680,7 @@ without API keys or network, against temp directories
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets, frontmatter, binary files | 36 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
+| `lib/test_discord_spool.py` | Discord spool placement from synthetic packet timings (arrival only; RTP: bunching, loss, wraparound, a pause, a resync), crash tolerance, the int32 mix and clipping, real ffmpeg (words where spoken, speaker tracks, the spool kept on failure) | 22 |
 | `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the five prompts (old names resolve, no timestamps outside `reality`, the callout vocabulary), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`) | 221 |
 | `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), real PDF render | 107 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
@@ -2682,7 +2689,7 @@ without API keys or network, against temp directories
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
 | `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source | 12 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine` | 448 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line) | 460 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, the YouTube caption fallback through a stub yt-dlp (spoken-language auto captions; the other-language track as last resort), `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 131 |
 | `verify_e2e.sh --browser-smoke` | the real browser (Firefox ESR or Chrome) under Xvfb, recorded and measured for black edges | 6 |
 
@@ -2790,6 +2797,8 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── kaltura.py                <- Kaltura embeds: parse, media URL, captions
 │   ├── clip.py                   <- --clip: window parsing + the ffmpeg cut
 │   ├── combine.py                <- --combine: parts.json from the member runs, the run key
+│   ├── discord_spool.py          <- Discord recordings: per-speaker spool, timeline placement, the .m4a mix
+│   ├── test_discord_spool.py
 │   ├── run_one.sh                <- the per-run stage DAG
 │   ├── fake_api_server.py        <- stub AssemblyAI/YouTube servers
 │   ├── fake_claude_cli.py        <- stub `claude` binary for the media test
@@ -2801,6 +2810,7 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── test_clip.py
 │   ├── test_pipeline_e2e.sh
 │   └── test_media_e2e.sh
+├── spike/discord/                <- THROWAWAY: py/ and node/ spike bots (run.sh each), until the library is chosen
 ├── screen/
 │   ├── record_screen.sh          <- stage 1, native (no container)
 │   ├── browser.py                <- MEETING_BROWSER, profiles, launch, FirefoxPage adapter, the account check
@@ -2923,47 +2933,84 @@ of questions:
 - The last tab is remembered in `localStorage` (a convenience; the page
   works without it).
 
-## Planned: a Discord voice source (not built)
+## A Discord voice source (in progress, 2026-09-30)
 
-Researched 2026-09-23, confirmed "plan only" 2026-09-27. The operator's
-decisions: **audio only** (bots cannot receive Go Live / camera video at all —
-a user-account "self-bot" in Chrome would violate Discord's ToS, so video is
-a hard wall, not a follow-up; `--resources` is the substitute for slides);
-**one bot instance serving many servers** (not per-organisation installs);
-**email only the summary PDF** (Gmail SMTP with an app password is the first
-version; a recording is 50-500MB, over every provider's attachment limit, so
-it is a DM to the operator when ready — Discord's bot upload limit is 25MiB,
-enough for <~90 min of 32kbps Opus, with a Drive/Seafile link beyond that).
-No second VM and no domain are needed: the gateway is outbound-only, and the
-bot must share this host's `~/.claude` login, key cursor and queue.
+Researched 2026-09-23; the operator asked to build it on 2026-09-30 and
+settled it in three rounds of questions, **replacing** parts of the 09-23
+plan (no email, no `/record`, no nickname change). Done means: in a voice
+meeting, someone types a command in chat; the bot records the audio, makes
+the PDF, posts it **into the voice channel's chat and into the requester's
+DMs**.
 
-The shape, when it is built:
+- **Commands**: `/record-and-summarize` (optional style / summary language /
+  instructions; `.env` defaults otherwise) and `/stop`. `/record` and
+  `/summarize` were dropped. Slash commands, so no privileged intent.
+- **Anywhere, following the requester**: typed in any channel of the server,
+  the bot joins the voice channel the requester is in (refuses if they are
+  not in voice) and delivers into that voice channel's chat.
+- **Who**: anyone in the voice channel starts; only the requester or a member
+  with Manage Server stops. **Any server that invites the bot** may use it
+  (the operator declined an allowlist, knowing it spends their quota).
+- **Stops on** `/stop`, 30 s after the channel empties, `MAX_MEETING_MINUTES`.
+- **Notice**: one "🔴 Recording started by @user" chat message; no rename.
+- **Deliverables**: the PDF only, to the voice chat and the requester's DM.
+  The recording and transcript stay on the PC. Defaults I chose and told the
+  operator: a failure or a pause is reported in both places; closed DMs are
+  reported in the channel.
+- **Audio**: one mixed `.m4a` (AAC 128k, like an audio-only Meet) in
+  `RECORDINGS_DIR`, never swept. **Speakers**: one mixed track now ("option
+  2"), "but be prepared to upgrade" to names — so `<name>.speakers/` keeps one
+  speech-only mono track per speaker plus `speakers.json` mapping it back to
+  the meeting clock. Transcribing those instead of the mix is the upgrade.
+- **Runs**: a third pm2 app, on/off with `./webui.sh on|off`; runs show in
+  the web UI like any other.
+- Audio only is a hard wall (bots receive no Go Live/camera video; a
+  user-account self-bot violates the ToS). `--resources` covers slides.
 
-- `discord_bot.py` (discord.py + `discord-ext-voice-recv`, or Pycord), a third
-  pm2 app beside the web UI, enabled when `DISCORD_BOT_TOKEN` is set.
-  Commands `/record`, `/summarize`, `/record-and-summarize`, `/stop`; an email
-  modal; stops on `/stop` or when the channel empties. Posts "🔴 Recording
-  started by @user" and renames itself while recording (bots can't show the
-  red dot; PDPA and Discord's developer policy both want the notice).
-- **The risky part is the sink.** Discord sends per-user Opus with nothing
-  during silence and no reference clock; both libraries' silence padding is
-  broken (Pycord's `sync_start` is ignored since 2.7; voice-recv's README says
-  its silence generation is "pretty broken"). A custom sink must pad each
-  user's stream by wall-clock arrival in 20ms frames, then ffmpeg `amix` the
-  users into one `.ogg`. Needs a live 3-person test.
-- **No new input type is needed in the pipeline.** The bot hands the mixed
-  `.ogg` to `pipeline.sh` as a local file with `--prompt meeting-claude`;
-  an audio-only file goes through `frames` as an empty manifest, and (since
-  2026-09-30 — before that summarize.py refused an empty manifest) the
-  summary is text-only; `--voice-only` skips frames outright. A per-user speaker map
-  (Discord user per track) is free attribution — a v2, not v1.
-- Delivery is a notify hook after `summarize`: SMTP (the PDF to the email the
-  command collected) and a DM to the operator about the recording.
-- Tests: unit tests for the sink's padding against synthetic packet timings;
-  a `test_pipeline_e2e.sh` case for the hand-off; the live test by hand.
+**DAVE decides the library, and it is not decided yet.** Since 2026-03-02
+every Discord voice call is end-to-end encrypted and a bot must *decrypt*
+received frames. Checked 2026-09-30: py-cord 2.8.0 does DAVE for sending
+only (its docs warn recording may not work); upstream
+`discord-ext-voice-recv` 0.5.2 decodes ciphertext; **zacker150's fork**
+(commit `dcf543a`, pins its own discord.py fork `44287eb`, needs `davey` and
+system `libopus`) decrypts, with RTP timestamps, a jitter buffer and PLC/FEC;
+**`@discordjs/voice` 0.19.2** (official) decrypts in `parsePacket` via
+`@snazzah/davey`, but pushes bare Opus payloads (no RTP timestamp, no jitter
+buffer, no concealment) and needs Node ≥ 22.12 (Debian 13 has 20). The
+operator chose **a live spike of both, then decide**: `spike/discord/py/`
+and `spike/discord/node/` (throwaway deps, gitignored, `run.sh` each;
+steps in README "Discord voice bot"). Both write the same spool and mix
+through `lib/discord_spool.py`, so the only variable is the library. Needs
+the operator's Developer Portal app and a second speaker.
 
-Estimated 4-5 working days. Recurring cost is AssemblyAI only (~$0.15-0.21
-per meeting-hour).
+What is built (library-independent):
+
+- **`lib/discord_spool.py`** — the recording format and the mixer. Per
+  speaker an append-only s16le 48k stereo `.pcm` (silence left out) and a
+  JSONL `.idx` of `{t, off, n}`; `session.json`, `users.json`. Placement: a
+  packet continues its speaker's burst unless they were quiet > `GAP_MS`
+  (200); with an RTP timestamp it is placed by RTP inside the burst (a lost
+  packet leaves a gap of its length, a pause on a running RTP clock starts a
+  new burst instead of storing zeros) and an RTP clock > `RESYNC_MS` (1000)
+  off the wall clock is ignored. `.pcm` is flushed before its index line, so
+  a crash loses ≤ 1 s and never leaves an index past the data. The mix sums
+  in int32 per 10 s block (memory is one block) and clips once; the outputs
+  are probed for length before the `.part.m4a` is renamed, and the spool is
+  deleted only after that (`--remove-spool`). numpy is required here.
+- **`spike/discord/node/spool_writer.mjs`** — the JS twin (arrival-only);
+  its spool was mixed by the Python module in a scratch check (tones where
+  written, −91 dB between).
+- **`pipeline.sh --source-url URL`** — one local-file input only, `https://`
+  only, stored as `source_url` (`rs init --source-url`, replaced on a resume
+  like the summary settings); `run_one.sh` cites it as `SOURCE_URL`, and
+  `document.MEETING_URL_RE` now matches `discord.com/channels/…`, so the
+  document says `Meeting Link:`. The hand-off will be
+  `pipeline.sh <mix>.m4a --source-url https://discord.com/channels/<g>/<c>
+  --voice-only --prompt meeting …`, with `MEETING_BOT_FOREGROUND=1`.
+
+Next, after the spike: the bot itself (library per the spike), the pm2 app,
+delivery (read `stages.summarize.artifacts.pdf` from the run's state), and
+a web-UI label for Discord runs.
 
 ## Things future Claude might want to add
 

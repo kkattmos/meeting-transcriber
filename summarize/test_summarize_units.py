@@ -324,8 +324,11 @@ class DocumentTest(unittest.TestCase):
 
     def test_a_meeting_link_is_labelled_as_one(self):
         # The first live guest recording cited its Meet link as "Source File".
+        # A Discord voice channel: the bot's .m4a is a local file, passed
+        # with --source-url so the document cites the channel.
         for url in ("https://meet.google.com/xbm-ryat-jch",
-                    "https://us02web.zoom.us/j/123456"):
+                    "https://us02web.zoom.us/j/123456",
+                    "https://discord.com/channels/111111111111111111/222222222222222222"):
             with self.subTest(url=url):
                 out = document.build_document(
                     "# T\n\nbody", source=url, source_kind="local_file")
@@ -336,6 +339,7 @@ class DocumentTest(unittest.TestCase):
         self.assertIn("Source File: `/rec/a.mp4`", out)
         self.assertTrue(document.looks_like_meeting("https://meet.google.com/abc-defg-hij"))
         self.assertFalse(document.looks_like_meeting("https://youtu.be/x"))
+        self.assertFalse(document.looks_like_meeting("https://discord.com/invite/abc"))
 
     def test_the_document_records_its_font(self):
         out = document.build_document("# T\n\nbody", source="x.mp4",

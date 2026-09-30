@@ -367,6 +367,9 @@ def main():
     # it while the call is still going, and used as the document's link line
     # in place of "https://meet.new", which points at no meeting in particular.
     p.add_argument("--meet-url")
+    # A local recording made from a call elsewhere (the Discord bot's mix):
+    # the call's link, cited by the document in place of the file's path.
+    p.add_argument("--source-url")
     # The summary's own settings, chosen per run (pipeline.sh / the web UI):
     # the language it is written in, the PDF's body font, and the operator's
     # extra instructions. run_one.sh replays them into summarize.py on every
@@ -503,6 +506,7 @@ def main():
                     combined_into=args.combined_into,
                     members=args.members, output_md=args.output_md,
                     output_pdf=args.output_pdf, meet_url=args.meet_url,
+                    source_url=args.source_url,
                     summary_language=args.summary_language,
                     pdf_font=args.pdf_font, instructions=args.instructions,
                     summary_source=args.summary_source,

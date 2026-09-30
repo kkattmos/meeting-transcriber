@@ -160,6 +160,10 @@ if [ "$INPUT_TYPE" = "kaltura" ]; then
              | sed -nE 's/.*"url": "([^"]*)".*/\1/p')"
   [ -n "$_canon" ] && SOURCE_URL="$_canon"
 fi
+# pipeline.sh --source-url: a local recording of a call made elsewhere (the
+# Discord bot's mix) cites that call, not a path on this disk.
+_source_url_cfg="$(cfg source_url)"
+[ -n "$_source_url_cfg" ] && SOURCE_URL="$_source_url_cfg"
 [ -n "$LANGUAGE" ] || LANGUAGE="${ASSEMBLYAI_LANGUAGE:-th}"
 
 # --- Single-writer lock ------------------------------------------------------

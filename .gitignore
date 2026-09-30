@@ -46,3 +46,9 @@ runs/
 
 # A copy of the Proxmox VM's .env, kept for its keys. Never commit it.
 /t.env
+
+# The Discord spikes' own throwaway dependencies (README "Discord voice bot").
+/spike/discord/py/.venv/
+/spike/discord/node/node_modules/
+/spike/discord/node/node-v22/
+/spike/discord/node/package-lock.json
