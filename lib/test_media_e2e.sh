@@ -705,14 +705,55 @@ grep -q "does not exist" "$TESTROOT/badres.log" \
 
 echo ""
 echo "=================================================================="
-echo "6. YouTube captions (real client -> stub server)"
+echo "6. YouTube captions (yt-dlp first, then the real client -> stub server)"
 echo "=================================================================="
+# yt-dlp is a stub for every call in this section — exported, so no
+# transcribe.sh here can reach YouTube. It logs each call to $FAKE_YTDLP_CALLS;
+# FAKE_YTDLP_FAIL makes it fail outright (a bot check), FAKE_YTDLP_NOTRACK makes
+# it list no captions at all (yt_autocaptions.py then exits 3).
+FAKE_YTDLP="$TESTROOT/fake-yt-dlp"
+FAKE_YTDLP_CALLS="$TESTROOT/fake-yt-dlp.calls"
+export FAKE_YTDLP_CALLS
+cat > "$FAKE_YTDLP" <<'YTDLP'
+#!/bin/sh
+echo "$*" >> "$FAKE_YTDLP_CALLS"
+[ -n "$FAKE_YTDLP_FAIL" ] && { echo "ERROR: stub yt-dlp failing" >&2; exit 1; }
+case " $* " in
+  *" -J "*)
+    if [ -n "$FAKE_YTDLP_NOTRACK" ]; then echo '{"language": "th"}'; exit 0; fi
+    echo '{"language": "th", "automatic_captions": {"th-orig": [{"ext": "json3"}], "en": [{"ext": "json3"}]}}'; exit 0 ;;
+esac
+out=""
+while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
+printf '%s' '{"events": [{"tStartMs": 1000, "dDurationMs": 3000, "segs": [{"utf8": "สวัสดีครับ วันนี้เรียนเรื่องกราฟ"}]}]}' \
+  > "$(dirname "$out")/cap.th-orig.json3"
+YTDLP
+chmod +x "$FAKE_YTDLP"
+export YT_DLP_BIN="$FAKE_YTDLP"
+yt_api_calls() { grep -c '"api": "youtube"' "$RECORD_FILE" 2>/dev/null || true; }
+
+echo "--- yt-dlp is the first choice: the API is never asked"
+: > "$RECORD_FILE"; : > "$FAKE_YTDLP_CALLS"
+YT_TH_BASE="$TRANSCRIPTS_DIR/yt_stub_th"
+bash "$REPO/transcribe/transcribe.sh" \
+     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_th" "th" \
+     --out-base "$YT_TH_BASE" > "$TESTROOT/yt-th.log" 2>&1
+check "YouTube via yt-dlp: exits 0" "$?" "0"
+grep -q "วันนี้เรียนเรื่องกราฟ" "${YT_TH_BASE}.txt" \
+  && ok "used the spoken-language automatic captions" \
+  || bad "did not use yt-dlp's automatic captions: $(tail -5 "$TESTROOT/yt-th.log")"
+grep -q "00:00:01,000" "${YT_TH_BASE}.srt" \
+  && ok "automatic-caption timings preserved" || bad "automatic-caption timings lost"
+check "youtube-transcript.io not called when yt-dlp succeeds" "$(yt_api_calls)" "0"
+
+echo "--- yt-dlp failing: youtube-transcript.io is the fallback"
 : > "$RECORD_FILE"
 YT_BASE="$TRANSCRIPTS_DIR/yt_stub"
-bash "$REPO/transcribe/transcribe.sh" \
+FAKE_YTDLP_FAIL=1 bash "$REPO/transcribe/transcribe.sh" \
      "https://www.youtube.com/watch?v=stubvideo01" "yt_stub" "en" \
      --out-base "$YT_BASE" > "$TESTROOT/yt.log" 2>&1
-check "transcribe.sh (YouTube) exits 0" "$?" "0"
+check "transcribe.sh (YouTube, API fallback) exits 0" "$?" "0"
+check "youtube-transcript.io called once" "$(yt_api_calls)" "1"
 check "two timed segments, not one flat blob" "$(wc -l < "${YT_BASE}.txt")" "2"
 grep -q "Welcome to the lecture" "${YT_BASE}.txt" \
   && ok "caption markup unescaped and stripped" || bad "markup not cleaned"
@@ -727,42 +768,49 @@ check "YouTube key cursor advanced" \
   "$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['YT_TRANSCRIPT_KEY'])" \
      "$CURSOR" 2>/dev/null)" "1"
 
-# The stub video's only uploaded track is English. Asked for Thai, the client
-# says so (--strict, exit 3) and transcribe.sh tries YouTube's own captions
-# through yt-dlp — a stub here, never the network.
-FAKE_YTDLP="$TESTROOT/fake-yt-dlp"
-cat > "$FAKE_YTDLP" <<'YTDLP'
-#!/bin/sh
-[ -n "$FAKE_YTDLP_FAIL" ] && { echo "ERROR: stub yt-dlp failing" >&2; exit 1; }
-case " $* " in
-  *" -J "*) echo '{"language": "th", "automatic_captions": {"th-orig": [{"ext": "json3"}], "en": [{"ext": "json3"}]}}'; exit 0 ;;
-esac
-out=""
-while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
-printf '%s' '{"events": [{"tStartMs": 1000, "dDurationMs": 3000, "segs": [{"utf8": "สวัสดีครับ วันนี้เรียนเรื่องกราฟ"}]}]}' \
-  > "$(dirname "$out")/cap.th-orig.json3"
-YTDLP
-chmod +x "$FAKE_YTDLP"
-YT_TH_BASE="$TRANSCRIPTS_DIR/yt_stub_th"
-YT_DLP_BIN="$FAKE_YTDLP" bash "$REPO/transcribe/transcribe.sh" \
-     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_th" "th" \
-     --out-base "$YT_TH_BASE" > "$TESTROOT/yt-th.log" 2>&1
-check "YouTube, no uploaded Thai track: exits 0" "$?" "0"
-grep -q "วันนี้เรียนเรื่องกราฟ" "${YT_TH_BASE}.txt" \
-  && ok "fell back to the spoken-language automatic captions" \
-  || bad "did not use yt-dlp's automatic captions: $(tail -5 "$TESTROOT/yt-th.log")"
-grep -q "00:00:01,000" "${YT_TH_BASE}.srt" \
-  && ok "automatic-caption timings preserved" || bad "automatic-caption timings lost"
+echo "--- yt-dlp finds no track: the API is asked, and says which"
+: > "$RECORD_FILE"
+YT_NT_BASE="$TRANSCRIPTS_DIR/yt_stub_nt"
+FAKE_YTDLP_NOTRACK=1 bash "$REPO/transcribe/transcribe.sh" \
+     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_nt" "en" \
+     --out-base "$YT_NT_BASE" > "$TESTROOT/yt-nt.log" 2>&1
+check "no yt-dlp track, API has one: exits 0" "$?" "0"
+grep -q "yt-dlp found no 'en' captions" "$TESTROOT/yt-nt.log" \
+  && ok "the log says why the API was asked" || bad "no reason given for the fallback"
+grep -q "Welcome to the lecture" "${YT_NT_BASE}.txt" \
+  && ok "the API's track was used" || bad "the API's track was not used"
 
+echo "--- the API's track labelled in another language is the last resort"
 YT_TH2_BASE="$TRANSCRIPTS_DIR/yt_stub_th2"
-FAKE_YTDLP_FAIL=1 YT_DLP_BIN="$FAKE_YTDLP" bash "$REPO/transcribe/transcribe.sh" \
+FAKE_YTDLP_FAIL=1 bash "$REPO/transcribe/transcribe.sh" \
      "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_th2" "th" \
      --out-base "$YT_TH2_BASE" > "$TESTROOT/yt-th2.log" 2>&1
-check "YouTube, no Thai track and yt-dlp down: still exits 0" "$?" "0"
+check "YouTube, yt-dlp down and no Thai label: still exits 0" "$?" "0"
 grep -q "Welcome to the lecture" "${YT_TH2_BASE}.txt" \
   && ok "the other-language track is the last resort" || bad "last-resort track not used"
 grep -q "NOT in 'th'" "$TESTROOT/yt-th2.log" \
   && ok "and it says so, loudly" || bad "no warning about the wrong-language track"
+
+echo "--- YT_AUTOCAPTIONS=0: the API alone, yt-dlp never run"
+: > "$RECORD_FILE"; : > "$FAKE_YTDLP_CALLS"
+YT_OFF_BASE="$TRANSCRIPTS_DIR/yt_stub_off"
+YT_AUTOCAPTIONS=0 bash "$REPO/transcribe/transcribe.sh" \
+     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_off" "en" \
+     --out-base "$YT_OFF_BASE" > "$TESTROOT/yt-off.log" 2>&1
+check "YT_AUTOCAPTIONS=0: exits 0" "$?" "0"
+check "YT_AUTOCAPTIONS=0: yt-dlp not run" "$(wc -l < "$FAKE_YTDLP_CALLS" | tr -d ' ')" "0"
+check "YT_AUTOCAPTIONS=0: the API answered" "$(yt_api_calls)" "1"
+
+echo "--- both down: a real failure (exit 1), not \"no captions\""
+YT_DOWN_BASE="$TRANSCRIPTS_DIR/yt_stub_down"
+FAKE_YTDLP_FAIL=1 YT_TRANSCRIPT_API_URL="http://127.0.0.1:9/api/transcripts" \
+  bash "$REPO/transcribe/transcribe.sh" \
+     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_down" "en" \
+     --out-base "$YT_DOWN_BASE" > "$TESTROOT/yt-down.log" 2>&1
+check "yt-dlp and the API both failing exits 1" "$?" "1"
+grep -q "deno" "$TESTROOT/yt-down.log" \
+  && ok "the error points at updating yt-dlp / deno" || bad "no hint about yt-dlp"
+unset YT_DLP_BIN
 
 echo ""
 echo "=================================================================="

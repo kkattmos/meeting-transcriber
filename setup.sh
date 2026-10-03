@@ -12,7 +12,7 @@
 #   ./setup.sh [--no-browser]
 #       everything per-user, no sudo: uv, the project venv (.venv, built with
 #       uv — `rm -rf .venv` removes every Python dependency), geckodriver and
-#       yt-dlp in ~/.local/bin, the vendored Thai fonts in ~/.local/share/fonts,
+#       yt-dlp and deno in ~/.local/bin, the vendored Thai fonts in ~/.local/share/fonts,
 #       pm2 (npm, into ~/.local), and a .env with a fresh web UI token if you
 #       don't have one yet. --no-browser skips the recorder's Python drivers.
 #
@@ -206,6 +206,23 @@ chmod a+rx "$LOCAL_BIN/yt-dlp"
 # A firewall that returns an HTML error page instead of the binary fails here
 # rather than three stages into a real run.
 "$LOCAL_BIN/yt-dlp" --version
+
+echo "==> deno (yt-dlp's JavaScript runtime) -> $LOCAL_BIN"
+# yt-dlp solves YouTube's JS challenges with an external runtime, and deno is
+# the one it enables by default. Debian 13's Node 20 is below its Node minimum
+# (22). Without one, some videos are "not available" (seen 2026-10-03 on a
+# Khan Academy lecture; it worked once deno was installed). Unpacked with
+# python3's zipfile so `unzip` isn't another dependency.
+if ! command -v deno >/dev/null 2>&1; then
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/deno.zip" \
+    https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
+  python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract("deno", sys.argv[2])' \
+    "$tmp/deno.zip" "$tmp"
+  install -m 0755 "$tmp/deno" "$LOCAL_BIN/deno"
+  rm -rf "$tmp"
+fi
+deno --version | head -n 1
 
 echo "==> Vendored Thai PDF fonts (Bai Jamjuree, Sarabun) -> ~/.local/share/fonts"
 # Not in Debian's archive; OFL Google Fonts vendored under fonts/. fontconfig

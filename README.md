@@ -96,7 +96,7 @@ downloaded file and `fetch_video` runs first, ahead of both branches.
 |---|---|---|
 | `record` | Joins (or creates) the call, records screen + audio to MP4, in the background | Firefox ESR (or Chrome), Xvfb, `pactl`, a profile signed in as `BOT_GOOGLE_ACCOUNT` |
 | `fetch_video` | Downloads a YouTube video (for frames only) or a Kaltura entry (for frames *and* audio) | yt-dlp / nothing (Kaltura needs no key) |
-| `transcribe` | Local file → AssemblyAI; YouTube → youtube-transcript.io captions, else YouTube's own (yt-dlp); Kaltura → its own captions if it has any, else AssemblyAI | `ASSEMBLYAI_API_KEY_1..3` / `YT_TRANSCRIPT_KEY_1..10` (optional for YouTube) |
+| `transcribe` | Local file → AssemblyAI; YouTube → YouTube's own captions (yt-dlp), else youtube-transcript.io; Kaltura → its own captions if it has any, else AssemblyAI | `ASSEMBLYAI_API_KEY_1..3` / `YT_TRANSCRIPT_KEY_1..10` (optional for YouTube) |
 | `frames` | A keyframe each time the slide changes → `manifest.json` | ffmpeg + Pillow |
 | `summarize` | Transcript + frames (+ slides) → Markdown + PDF | the `claude` CLI signed into your Claude subscription / `GEMINI_API_KEY_1..3` |
 
@@ -178,8 +178,8 @@ directory or the repo:
 - **uv** (from astral.sh, into `~/.local/bin`) and the project venv at
   **`.venv`**, built by uv from the hash-pinned lockfiles. Deleting `.venv`
   removes every Python dependency; `./setup.sh` rebuilds it in seconds.
-- **geckodriver** (Mozilla's release) and **yt-dlp** (latest release) in
-  `~/.local/bin`.
+- **geckodriver** (Mozilla's release), **yt-dlp** (latest release) and
+  **deno** (yt-dlp's JavaScript runtime for YouTube) in `~/.local/bin`.
 - The vendored Bai Jamjuree and Sarabun fonts in `~/.local/share/fonts`.
 - **pm2** (npm, into `~/.local`) — nothing is registered to start at boot.
 - A `.env` from `.env.example` with a fresh `MEETING_BOT_TOKEN`, if you don't
@@ -1598,18 +1598,30 @@ immediately rather than burning the full retry schedule first.
 | `ASSEMBLYAI_API_KEY_1..3` | — | Required for local files |
 | `ASSEMBLYAI_LANGUAGE` | `th` | `en`, `auto`, or any AssemblyAI code |
 | `ASSEMBLYAI_MODEL` | SDK chain `universal-3-5-pro`, `universal-2` | Overrides the leading entry |
-| `YT_TRANSCRIPT_KEY_1..10` | — | YouTube captions, first choice |
-| `YT_AUTOCAPTIONS` | 1 | `0` turns off the yt-dlp caption fallback below |
+| `YT_TRANSCRIPT_KEY_1..10` | — | Optional: youtube-transcript.io, the fallback for YouTube captions |
+| `YT_AUTOCAPTIONS` | 1 | `0` skips yt-dlp for captions (youtube-transcript.io only) |
 | `TRANSCRIBE_BACKEND` | `assemblyai` | YouTube URLs always use captions regardless |
 
-**YouTube captions come from two places.** youtube-transcript.io first; it
-only sees *uploaded* caption tracks. When none of them is in the requested
-language — or the API fails, or no keys are configured — yt-dlp asks YouTube
-itself: an uploaded track in that language if there is one, otherwise
-YouTube's **automatic captions of the language actually spoken**. Never one of
-YouTube's machine translations. A track in some other language is only the
-last resort, and is announced as such (the 2026-09 verify run summarized
-English lectures from their only uploaded track — an Arabic translation).
+**YouTube captions come from two places.** yt-dlp first (free, no key):
+an uploaded track in the requested language if there is one, otherwise
+YouTube's **automatic captions of the language actually spoken**; with
+`--language auto`, an uploaded track in the spoken language before the
+automatic one. Never one of YouTube's machine translations. For a playlist
+that mixes Thai and English lectures, use `--language auto` — with `th`, an
+English lecture that carries an uploaded Thai *translation* is transcribed
+from that translation.
+
+youtube-transcript.io is the fallback, for yt-dlp failing (a bot check, a
+429, a YouTube change) or finding no track. It costs a credit per video and
+returns the same YouTube captions, but its language labels are unreliable — a
+Thai lecture's automatic captions came back labelled `en` — so a track
+labelled in another language is used only as the last resort, with a
+warning. Without keys the fallback is simply skipped.
+
+yt-dlp needs a JavaScript runtime for YouTube; `setup.sh` installs **deno**
+(Debian's Node 20 is below yt-dlp's minimum). Without one, some videos come
+back "This video is not available". When YouTube breaks yt-dlp, `yt-dlp -U`
+(or re-running `./setup.sh`) is the fix.
 
 Kaltura entries need no key at all. When the entry carries a caption track in
 the requested language it is used and AssemblyAI is skipped; most
@@ -1766,7 +1778,7 @@ python3 lib/test_discord_spool.py            # Discord recordings: placing each 
 python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain, the course reference, the output language, the four prompts, --instructions, no frames (200)
 python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, the design (callouts, code, maths symbols), font choice and size matching, PDF render (107)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
-python3 transcribe/test_yt_autocaptions.py   # the yt-dlp caption fallback: track choice, json3 (11)
+python3 transcribe/test_yt_autocaptions.py   # yt-dlp captions: track choice, json3 (13)
 python3 screen/test_extract_frames.py        # frames on change: settle, motion cap, safety net, blanks, real ffmpeg (19)
 python3 screen/test_capture_host.py          # hosting a created Meet: when it ends, and when it must not (7)
 python3 screen/test_browser.py               # browser choice, fake devices, the bot-account check (16)

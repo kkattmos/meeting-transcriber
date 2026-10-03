@@ -53,6 +53,22 @@ class ChooseTrackTest(unittest.TestCase):
     def test_auto_means_spoken(self):
         self.assertEqual(yac.choose_track(INFO, "auto"), ("automatic_captions", "en-orig"))
 
+    def test_auto_prefers_an_uploaded_track_in_the_spoken_language(self):
+        # A Khan Academy lecture, 2026-10-03: English spoken, a human "en"
+        # track and two dozen translations uploaded. Not the ASR, and not
+        # the alphabetically first upload ("ar").
+        info = {"language": "en",
+                "subtitles": {"ar": [{}], "en": [{}], "th": [{}]},
+                "automatic_captions": {"en-orig": [{}], "th": [{}]}}
+        self.assertEqual(yac.choose_track(info, "auto"), ("subtitles", "en"))
+
+    def test_auto_trusts_the_detected_language_over_the_declared_one(self):
+        # A Thai lecture whose uploader left the default "en".
+        info = {"language": "en",
+                "subtitles": {"en": [{}], "th": [{}]},
+                "automatic_captions": {"th-orig": [{}], "en": [{}]}}
+        self.assertEqual(yac.choose_track(info, "auto"), ("subtitles", "th"))
+
     def test_regional_variants_match(self):
         info = {"subtitles": {"en-GB": [{}]}}
         self.assertEqual(yac.choose_track(info, "en"), ("subtitles", "en-GB"))

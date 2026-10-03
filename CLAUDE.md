@@ -52,7 +52,7 @@ persistent browser profile signed in as one bot account (Firefox ESR by
 default, Chrome as the fallback), on a hidden Xvfb display, in the background,
 and records both the screen
 and the meeting audio into an MP4, transcribes the audio with the AssemblyAI
-pre-recorded API (or youtube-transcript.io for YouTube URLs, or the entry's own
+pre-recorded API (or YouTube's own captions via yt-dlp for YouTube URLs, or the entry's own
 captions for a Kaltura embed), and produces a
 Claude summary (through the `claude` CLI, on a subscription — no API key) — Markdown plus a PDF with the cited keyframes cropped to the slide and
 inlined — combining the transcript with keyframes extracted from the recording
@@ -1061,8 +1061,11 @@ first participant, then end the call for everyone when it empties**.
   a silent file, an unsupported language — is raised immediately, because
   another key would fail identically and three uploads of the same video is a
   real cost.
-- YouTube URLs → youtube-transcript.io (`yt_transcript_client.py`). No audio
-  download; captions come back as `{text, offset_ms, duration_ms}` segments.
+- YouTube URLs → YouTube's own captions through yt-dlp
+  (`yt_autocaptions.py`) first, youtube-transcript.io
+  (`yt_transcript_client.py`) as the fallback — swapped 2026-10-03, see
+  "yt-dlp first" below. No audio download; both print
+  `{text, offset_ms, duration_ms}` segments.
 - **The timed segments live in `tracks[].transcript`**, as
   `{start, dur, text}` with seconds-as-strings. The entry's flat `text` field
   is the whole transcript in one string with no timing; parsing that instead
@@ -1076,18 +1079,35 @@ first participant, then end the call for everyone when it empties**.
   translates, and many videos expose just one track (often not English).
   Caption text arrives HTML-escaped (`&lt;i&gt;`, `&amp;`), so
   `_clean_caption_text` unescapes and drops the markup.
-- **youtube-transcript.io only sees uploaded tracks**, so since 2026-09-27 it
-  runs with `--strict`: when a language was asked for and no uploaded track
-  matches, it still prints the track it found but exits **3**. `transcribe.sh`
-  then tries `yt_autocaptions.py` (yt-dlp): an uploaded track in the language,
-  else the **automatic captions of the spoken language** — yt-dlp's
-  `<lang>-orig` key, or the video's `language` on an older yt-dlp — and
-  **never** one of YouTube's machine translations (every other
-  `automatic_captions` key). The other-language track is the last resort, with
-  a loud warning. The same fallback covers the API failing outright (no keys,
-  all exhausted). `YT_AUTOCAPTIONS=0` disables it; `YT_DLP_BIN` is the test
-  seam. Both calls capture their status with `|| RC=$?` — `transcribe.sh` is
+- **yt-dlp first, youtube-transcript.io second** (the operator's choice,
+  2026-10-03, after a comparison for a 100-video playlist). `yt_autocaptions.py`
+  picks: an uploaded track in the requested language, else the **automatic
+  captions of the spoken language** — yt-dlp's `<lang>-orig` key, or the
+  video's `language` on an older yt-dlp — and **never** one of YouTube's
+  machine translations (every other `automatic_captions` key). With `auto`,
+  an uploaded track in the spoken language (the `-orig` language, else the
+  declared one) comes before the ASR track — it used to take the ASR, or
+  with no ASR the alphabetically first upload.
+  Why the swap: the API returns the same YouTube captions for a credit each,
+  and **labels them unreliably** — measured live, a Thai lecture's `th-orig`
+  ASR came back as a track labelled `en` (identical text and offsets), so
+  `--strict` rejected it (exit 3) and every Thai run had paid a credit and
+  then fetched the same text through yt-dlp. The API is now the fallback for
+  yt-dlp failing (exit 1: a bot check, a 429, a breaking YouTube change) or
+  finding no track (exit 3); its `--strict` exit 3 still means "label isn't
+  the language", and that track is the last resort, with a warning that
+  says the label may be wrong. No keys is "not configured", not a failure:
+  both "no track" answers end in exit 2, a real failure of either in exit 1.
+  `YT_AUTOCAPTIONS=0` skips yt-dlp (API only); `YT_DLP_BIN` is the test seam.
+  Both calls capture their status with `|| RC=$?` — `transcribe.sh` is
   `set -e`, and a bare `RC=$?` on the next line never runs.
+- **yt-dlp needs deno** (`setup.sh` installs it into `~/.local/bin`). Since
+  2025.11 yt-dlp solves YouTube's JS challenges with an external runtime;
+  Debian 13's Node 20 is below its minimum (22). Without one, a Khan Academy
+  lecture was "This video is not available" (2026-10-03) and worked once
+  deno 2.9.7 was installed. Rate limits to know for a big playlist (yt-dlp
+  wiki): ~300 videos/hour per IP signed out; the pipeline makes about three
+  YouTube extractions per video (two for captions, one download for frames).
 - Both feed one shared writer producing `.txt` + `.srt`.
 - `--clip-captions WINDOW` trims a *caption-derived* transcript to a window and
   rebases it, immediately before that shared writer. It is a no-op on the
@@ -2379,8 +2399,10 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **Google Meet pre-join uses a Tab-scan, not fixed Tab counts.** The pre-join
   DOM reorders frequently; identifying buttons by accessible name is the only
   durable approach.
-- **YouTube URLs auto-route to youtube-transcript.io**, not AssemblyAI. We
-  already have free captions there and they return in seconds.
+- **YouTube URLs use YouTube's own captions — yt-dlp first,
+  youtube-transcript.io as the fallback** — not AssemblyAI. Don't put the API
+  back in front: it costs a credit per video for the same captions and its
+  language labels are wrong (Thai ASR labelled `en`).
 - **Empty YouTube transcripts fail loudly**, not silently. Every key hits the
   same upstream captions, so retrying won't help. Placeholder-only text (e.g.
   `[เสียงพากย์ไทย]`) is written through so the operator can see it in the
@@ -2684,13 +2706,13 @@ without API keys or network, against temp directories
 | `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the five prompts (old names resolve, no timestamps outside `reality`, the callout vocabulary), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`) | 221 |
 | `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), real PDF render | 107 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
-| `transcribe/test_yt_autocaptions.py` | the yt-dlp fallback: track choice (never a translation), json3, the CLI against a stub yt-dlp | 11 |
+| `transcribe/test_yt_autocaptions.py` | yt-dlp captions: track choice (never a translation; `auto` prefers an upload in the spoken language), json3, the CLI against a stub yt-dlp | 13 |
 | `screen/test_extract_frames.py` | frames on change: settle, a transient change, blanks, the motion cap, the safety net, the last sample, the shared distance; the PPM reader; real ffmpeg (black lead-in skipped, audio-only empty, retired settings named) | 19 |
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
 | `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source | 12 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line) | 460 |
-| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, the YouTube caption fallback through a stub yt-dlp (spoken-language auto captions; the other-language track as last resort), `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 131 |
+| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, YouTube captions through a stub yt-dlp first (the API never asked when it succeeds), youtube-transcript.io when yt-dlp fails or finds no track, the other-language-labelled track as last resort, `YT_AUTOCAPTIONS=0`, both down = exit 1, `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 141 |
 | `verify_e2e.sh --browser-smoke` | the real browser (Firefox ESR or Chrome) under Xvfb, recorded and measured for black edges | 6 |
 
 `test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs
@@ -2824,7 +2846,7 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── transcribe.sh
 │   ├── assemblyai_client.py
 │   ├── yt_transcript_client.py
-│   ├── yt_autocaptions.py        <- yt-dlp fallback: YouTube's own captions
+│   ├── yt_autocaptions.py        <- YouTube's own captions via yt-dlp (first choice)
 │   ├── test_yt_transcript_client.py
 │   └── test_yt_autocaptions.py
 └── summarize/

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""YouTube's own caption tracks, through yt-dlp — the fallback behind
-youtube-transcript.io.
+"""YouTube's own caption tracks, through yt-dlp — the first choice for a
+YouTube transcript since 2026-10-03; youtube-transcript.io is the fallback.
 
-youtube-transcript.io only returns caption tracks someone *uploaded*. Plenty
-of lectures have none in the language they are taught in — two TED-Ed videos
-in the 2026-09 verify run exposed only an Arabic community translation, and
-the English lectures were summarized from Arabic. YouTube's automatic captions
-of the spoken audio are there on almost every video; yt-dlp can read them, and
-needs no key.
+yt-dlp reads the track list itself, so it can tell an uploaded track from
+YouTube's automatic captions and both from a machine translation — which
+youtube-transcript.io's labels do not (a Thai lecture's automatic captions
+came back labelled "en"). YouTube's automatic captions of the spoken audio
+are there on almost every video, it is free, and it needs no key.
 
 Which track, in order:
-  1. an uploaded track in the requested language;
+  1. an uploaded track in the requested language (with "auto": in the
+     spoken language);
   2. the automatic captions of the language actually SPOKEN — yt-dlp names
      that track "<lang>-orig";
   3. nothing (exit 3).
@@ -55,12 +55,17 @@ def choose_track(info, language=None):
     want = None if language in (None, "", "auto") else language
     subs = {k: v for k, v in (info.get("subtitles") or {}).items()
             if k != "live_chat" and v}
-    if want:
-        for key in sorted(subs):
-            if _lang_matches(key, want):
-                return ("subtitles", key)
     auto = info.get("automatic_captions") or {}
     orig = sorted(k for k in auto if k.endswith("-orig") and auto[k])
+    # "auto" asks for the spoken language, and an uploaded (human) track in it
+    # beats YouTube's speech recognition. The "-orig" key is YouTube's own
+    # detection of what was spoken; the video's `language` is what the
+    # uploader declared, so it is only the fallback.
+    target = want or (orig[0][:-len("-orig")] if orig else info.get("language"))
+    if target:
+        for key in sorted(subs):
+            if _lang_matches(key, target):
+                return ("subtitles", key)
     if orig:
         return ("automatic_captions", orig[0])
     # An older yt-dlp without the "-orig" naming: the only automatic track
