@@ -1872,6 +1872,53 @@ class DropUninformativeTest(unittest.TestCase):
         self.assertIn("[frame 1 @ 0.0s", text)
         self.assertIn("[frame 11 @ 300.0s", text)
 
+    def test_gemini_gets_the_same_filtering_as_the_cli(self):
+        # Blank and repeated frames out, then the cap, then cropped and
+        # downscaled copies — on 2026-10-06 Gemini was still sent every
+        # frame at full size, ~90MB for one 910-frame video, which alone
+        # spent the free tier's per-minute token quota.
+        frames = [self._frame(f"f{i}", i * 30, 1) for i in range(10)]
+        frames.append(self._frame("blank", 300, 0, blank=True))
+        frames.append(self._frame("new", 330, 2))
+        frames.append(self._frame("third", 360, 3))
+        frames = llm_client.assign_numbers(frames)
+        sent = []
+
+        class _Resp:
+            text = "BODY"
+
+        class _Models:
+            def generate_content(self, model, contents):
+                sent.append(contents)
+                return _Resp()
+
+        class Client:
+            def __init__(self, api_key, http_options=None):
+                self.models = _Models()
+
+        google = type(sys)("google")
+        genai = type(sys)("google.genai")
+        genai.Client = Client
+        google.genai = genai
+        env = {"MEETING_BOT_ROOT": self.tmp.name, "GEMINI_API_KEY_1": "k1",
+               "GEMINI_MODEL": "m", "CLAUDE_CLI_MAX_FRAMES": "2",
+               "FRAME_MAX_DIMENSION": "320", "PDF_FRAME_CROP": "none"}
+        before = {f.path: Path(f.path).stat().st_size for f in frames}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            llm_client.summarize_gemini(frames, "t", "{transcript}\n{frame_manifest}")
+        parts = sent[0][0]["parts"]
+        images = [p for p in parts if "inline_data" in p]
+        self.assertEqual(len(images), 2)          # 3 distinct slides, cap 2
+        self.assertNotIn("[frame 11 @", parts[0]["text"])   # the blank one
+        from PIL import Image
+        import io
+        for img in images:
+            self.assertLessEqual(max(Image.open(io.BytesIO(
+                img["inline_data"]["data"])).size), 320)
+        self.assertEqual(before, {f.path: Path(f.path).stat().st_size
+                                  for f in frames})   # originals untouched
+
     def test_frame_hash_tells_slides_apart(self):
         import framecrop
         a = framecrop.frame_hash(self._frame("a", 0, 1).path)

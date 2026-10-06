@@ -1755,6 +1755,16 @@ which `retry.is_retryable` takes as transient by its type name — so it gets
 the backoff, then the next key, then the next model. 600s, not less: one
 Thai chunk with ~100 inline frames can legitimately take minutes.
 
+**Gemini gets the same frame passes as the CLI** (2026-10-06):
+`drop_uninformative` → `thin_frames(CLAUDE_CLI_MAX_FRAMES)` →
+`_downscale_frames`, under the CLI's variable names (the operator's choice:
+one cap for both backends). Before, `summarize_gemini` sent every frame at
+full size — a 910-frame video was one ~90MB request, larger than the free
+tier's 250k input tokens per minute (`GenerateContentInputTokensPerModelPer
+MinuteFreeTier`), so the retries within that minute came back 429 on every
+key and model, and a 9-video combine run crawled for hours.
+`test_gemini_gets_the_same_filtering_as_the_cli`.
+
 **`BackendUnavailable` carries `retryable = False`, and `retry.is_retryable`
 honours that before every other check.** It is raised from *inside*
 `with_retries` (the CLI only reveals "not logged in" once it has run), and
@@ -2555,6 +2565,9 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   same wall every fifteen minutes.
 - **`runstate.start` clears `rate_limited` and `waiting_until`.** Otherwise a
   run that resumed and succeeded still looks paused to the next `--resume-all`.
+- **Both backends filter frames the same way** (blanks/repeats, cap,
+  downscaled copy). A backend that sends the raw manifest hits Gemini's
+  per-minute token quota on any long video.
 - **`CLAUDE_CLI_MAX_FRAMES` thins what is offered, never renumbers.** The
   numbers come from `assign_numbers()` over the whole manifest; a thinned
   list that renumbered would recreate the per-chunk numbering bug above.
@@ -2720,7 +2733,7 @@ without API keys or network, against temp directories
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
 | `lib/test_discord_spool.py` | Discord spool placement from synthetic packet timings (arrival only; RTP: bunching, loss, wraparound, a pause, a resync), crash tolerance, the int32 mix and clipping, real ffmpeg (words where spoken, speaker tracks, the spool kept on failure) | 22 |
-| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the five prompts (old names resolve, no timestamps outside `reality`, the callout vocabulary), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`), the Gemini request timeout | 223 |
+| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the five prompts (old names resolve, no timestamps outside `reality`, the callout vocabulary), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`), the Gemini request timeout, Gemini's frame filtering | 224 |
 | `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), real PDF render | 107 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `transcribe/test_yt_autocaptions.py` | yt-dlp captions: track choice (never a translation; `auto` prefers an upload in the spoken language), json3, the CLI against a stub yt-dlp | 13 |

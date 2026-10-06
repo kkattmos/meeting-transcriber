@@ -52,7 +52,8 @@ each of which only removes or shrinks, none of which renumbers:
 drop_uninformative() discards blank frames and consecutive repeats of an
 unchanged slide (framecrop.frame_hash - a texture hash over the slide region,
 so a moved cursor is the same slide and a changed title is not);
-thin_frames() applies CLAUDE_CLI_MAX_FRAMES to what is left; and
+thin_frames() applies CLAUDE_CLI_MAX_FRAMES to what is left (the Gemini
+backend runs all three passes too, under the same names); and
 _downscale_frames() writes a copy of each survivor cropped to the slide
 (framecrop.detect_crop, the PDF's own PDF_FRAME_CROP mode) and fitted to
 FRAME_MAX_DIMENSION px, under <frame dir>/llm-<px>-<mode>/. The saved frames
@@ -1478,7 +1479,27 @@ def summarize_gemini(frames: List[FrameMeta], transcript: str,
                    "https://aistudio.google.com/apikey."),
         ))
 
-    sorted_frames, user_text = _render(frames, transcript, prompt_template)
+    # The same three passes as the Claude path — blanks and consecutive
+    # repeats out, then the CLAUDE_CLI_MAX_FRAMES cap, then a cropped,
+    # downscaled copy. Before 2026-10-06 Gemini was sent every frame at full
+    # size: a 910-frame video was one ~90MB request, over the free tier's
+    # 250k input tokens per minute on its own, so every retry in that minute
+    # came back 429 on every key. Numbers stay global, as on the Claude path.
+    offered, blanks, dupes = drop_uninformative(frames)
+    offered = thin_frames(offered, _max_frames())
+    thinned = len(frames) - blanks - dupes - len(offered)
+    llm_frames, resized = _downscale_frames(offered)
+
+    sorted_frames, user_text = _render(llm_frames, transcript, prompt_template)
+    detail = []
+    if blanks or dupes:
+        detail.append(f"{blanks} blank + {dupes} repeated frame(s) dropped")
+    if thinned:
+        detail.append(f"{thinned} more left out (CLAUDE_CLI_MAX_FRAMES)")
+    if resized:
+        detail.append(f"{resized} cropped/downscaled to {_frame_max_dimension()}px")
+    print(f"     gemini: {len(sorted_frames)} frame(s) of {len(frames)}"
+          + (", " + ", ".join(detail) if detail else ""), file=sys.stderr)
     parts = [{"text": user_text}]
     for frame in sorted_frames:
         data, mime = _read_image_b64(frame.path)
