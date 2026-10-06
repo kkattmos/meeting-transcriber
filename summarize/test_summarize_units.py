@@ -2413,6 +2413,7 @@ class GeminiModelChainTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.calls = []
+        self.http_options = []
         self.script = {}
         test = self
 
@@ -2432,7 +2433,8 @@ class GeminiModelChainTest(unittest.TestCase):
                 return _Resp(outcome)
 
         class Client:
-            def __init__(self, api_key):
+            def __init__(self, api_key, http_options=None):
+                test.http_options.append(http_options)
                 self.models = _Models(api_key)
 
         google = type(sys)("google")
@@ -2504,6 +2506,25 @@ class GeminiModelChainTest(unittest.TestCase):
         self.assertEqual(self._run(), "ok")
         self.assertEqual(self.calls, [("k1", "gemini-3.8-flash"),
                                       ("k1", "gemini-3.7-flash")])
+
+    def test_every_client_has_a_timeout(self):
+        # Without one, a request Gemini never answers blocks the run forever
+        # (2026-10-06: 65 minutes on silent sockets, no retry, no rotation).
+        self._run()
+        self.assertEqual(self.http_options, [{"timeout": 600_000}])
+        self.http_options.clear()
+        with mock.patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "90"}):
+            self._run()
+        self.assertEqual(self.http_options, [{"timeout": 90_000}])
+
+    def test_a_timed_out_request_is_retried_then_rotates(self):
+        class ReadTimeout(Exception):   # httpx's name; retry classifies on it
+            pass
+        self.script[("k1", "gemini-3.8-flash")] = ReadTimeout("timed out")
+        self.assertEqual(self._run(), "ok")
+        # Both retries on k1 (it is transient), then the next key.
+        self.assertEqual(self.calls, [("k1", "gemini-3.8-flash")] * 2
+                         + [("k2", "gemini-3.8-flash")])
 
     def test_a_busy_server_still_gets_the_retry_backoff(self):
         busy = self._err(503, "503 UNAVAILABLE: overloaded")

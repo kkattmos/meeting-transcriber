@@ -182,6 +182,10 @@ DEFAULT_FALLBACK_CHAIN = "claude-cli,gemini"
 DEFAULT_CLAUDE_CLI_MODEL = "opus"
 DEFAULT_CLAUDE_CLI_TIMEOUT = 1800
 DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+# google-genai's client has no timeout of its own: a request Gemini accepts
+# and never answers blocks forever, and no retry or key rotation ever runs.
+# Seen 2026-10-06 — a combine run sat 65 minutes on silent sockets.
+DEFAULT_GEMINI_TIMEOUT = 600
 
 # The effort levels the CLI's --effort accepts, in order. Anything else is a
 # typo, and a typo that reaches the CLI comes back as an opaque usage error.
@@ -685,6 +689,14 @@ def _cli_timeout():
                                           DEFAULT_CLAUDE_CLI_TIMEOUT)))
     except ValueError:
         return DEFAULT_CLAUDE_CLI_TIMEOUT
+
+
+def _gemini_timeout():
+    try:
+        return max(30, int(os.environ.get("GEMINI_TIMEOUT_SECONDS",
+                                          DEFAULT_GEMINI_TIMEOUT)))
+    except ValueError:
+        return DEFAULT_GEMINI_TIMEOUT
 
 
 def _flag_env(name, default="1"):
@@ -1490,10 +1502,14 @@ def summarize_gemini(frames: List[FrameMeta], transcript: str,
                 raise GeminiModelUnavailable(str(exc)) from exc
             raise
 
+    timeout_ms = _gemini_timeout() * 1000
     last_error = None
     for model_name in models:
         for slot, key in ring.rotate():
-            client = new_genai.Client(api_key=key)
+            # HttpOptions.timeout is in milliseconds. A timeout raises
+            # httpx.ReadTimeout, which retry.is_retryable treats as transient.
+            client = new_genai.Client(
+                api_key=key, http_options={"timeout": timeout_ms})
             try:
                 response = with_retries(
                     _call, client, model_name,

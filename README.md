@@ -1359,6 +1359,7 @@ end the scan.
 | `CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS` | 600 | Retry interval when the CLI reports a hit window without a reset time |
 | `GEMINI_API_KEY_1..3` | — | For the `gemini` fallback |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | A comma-separated list is a fallback chain: every key is tried on the first model, then the next model (`gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash` in `.env.example`). A rate-limited key moves on at once; an unknown model is skipped. Pin real versions, not `-latest` aliases |
+| `GEMINI_TIMEOUT_SECONDS` | 600 | How long one Gemini request may go without an answer before it is retried, then handed to the next key/model. Without it a request Gemini never answers hangs the run |
 | `SUMMARY_PROMPT` | `video` | `video`, `meeting`, `lecture`, `tutorial` or `reality` (`lecture` in `.env.example`); `--prompt` overrides. Older names still resolve |
 | `SUMMARY_INSTRUCTIONS` | — | Extra instructions for every summary; `--instructions` (or the web UI's field) overrides it per run |
 | `SUMMARY_MAX_TOKENS` | 16000 | **Gemini only.** The Claude CLI has no output cap, and output is not what spends a subscription window anyway — see below |
