@@ -323,9 +323,14 @@ PC's Tailscale address for your phone (skipped with a warning if Tailscale is
 down). `./webui.sh status`, `./webui.sh url` and `./webui.sh logs` do what
 they say.
 
-The second pm2 process, `meeting-bot-resume`, runs `pipeline.sh --resume-all`
+The second pm2 process, `meeting-bot-resume`, starts `pipeline.sh --resume-all`
 every 15 minutes — the backstop that finishes a summary paused on the Claude
-usage window once it resets.
+usage window once it resets, or one interrupted by a shutdown. Each resume
+runs detached from pm2 (`web/resume.sh`) and logs to
+`~/.local/share/meeting-bot/logs/resume.log`, so a long summary is not cut off
+at the next tick, and `./webui.sh off` does not stop one already under way.
+To stop one, signal its process group (it is resumable afterwards):
+`kill -TERM -- -$(ps -o pgid= -p $(cat ~/.local/share/meeting-bot/runs/<id>/run.lock/pid))`.
 
 The page follows the look of the summary PDF (DESIGN.md: navy section
 banners, green/amber/red boxes) in a light or dark theme, whichever your

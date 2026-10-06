@@ -27,14 +27,14 @@ module.exports = {
       // `pipeline.sh --resume-all` every 15 minutes (it skips a run whose
       // window has not reset yet, and one whose lock owner is alive). One
       // shot per tick, so no autorestart — cron_restart is the schedule.
+      // web/resume.sh detaches the resume and exits: cron_restart kills a
+      // still-running app, which killed every resume longer than 15 minutes.
       name: "meeting-bot-resume",
-      script: path.join(root, "pipeline.sh"),
-      args: ["--resume-all"],
+      script: path.join(root, "web", "resume.sh"),
       interpreter: "bash",
       cwd: root,
       autorestart: false,
       cron_restart: "*/15 * * * *",
-      env: { MEETING_BOT_FOREGROUND: "1" },
     },
   ],
 };

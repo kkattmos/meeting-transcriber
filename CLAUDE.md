@@ -141,7 +141,11 @@ desktop. The decisions, each asked and answered:
 - **pm2, off at boot.** `ecosystem.config.js` defines `meeting-bot-web`
   (`web/serve.sh` → `trigger_server.py`, loading `.env`) and
   `meeting-bot-resume` (`pipeline.sh --resume-all`, `cron_restart */15`,
-  replacing the systemd timer). `./webui.sh on|off|restart|status|url|logs`.
+  replacing the systemd timer; since 2026-10-06 through `web/resume.sh`,
+  which starts the resume under `setsid` and exits — **pm2's cron_restart
+  kills a still-running app**, so a resume run directly by pm2 died at every
+  tick and a chunked summary restarted from chunk 1 for ever; log in
+  `logs/resume.log`). `./webui.sh on|off|restart|status|url|logs`.
   Nothing calls `pm2 startup` or `pm2 save`; don't add either. The three
   systemd unit files are gone from this branch (they are on
   `debian13-in-proxmox`). **`webui.sh` starts pm2 with the `.env` keys
@@ -2340,6 +2344,8 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **A meeting input detaches before any state is written**, and the web UI /
   pm2 resume job run with `MEETING_BOT_FOREGROUND=1`. Detaching after
   `rs init`, or twice, makes duplicate runs (two calls, for meet.new).
+- **pm2 never runs `pipeline.sh` itself for the resume job** —
+  `web/resume.sh` detaches it. cron_restart kills whatever is still running.
 - **pm2 never starts anything at boot.** No `pm2 startup`, no `pm2 save` in
   any script. The operator asked for the web UI to be off by default.
 - **The bot's mic and camera stay blocked at the browser**, and mute_av
@@ -2819,7 +2825,8 @@ own flags, which is everything about stage 1 except the call itself.
 ├── test_trigger_server.py
 ├── web/
 │   ├── index.html                <- the UI page (no external scripts)
-│   └── serve.sh                  <- pm2 entry: loads .env, runs trigger_server.py
+│   ├── serve.sh                  <- pm2 entry: loads .env, runs trigger_server.py
+│   └── resume.sh                 <- pm2 entry: starts --resume-all detached, exits
 ├── lib/
 │   ├── runstate.py               <- run state + locking + CLI
 │   ├── slotqueue.py              <- machine-wide component queue
