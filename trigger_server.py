@@ -245,6 +245,7 @@ def run_summary(run_dir, data):
         "stages": {s: (stages.get(s) or {}).get("status", "pending") for s in STAGES},
         "artifacts": (stages.get("summarize") or {}).get("artifacts") or {},
         "paused": bool((stages.get("summarize") or {}).get("rate_limited")),
+        "stopped": (data.get("stopped") or {}).get("at"),
         # What the page needs to leave out stages that never run: frames on a
         # voice-only run, summarize on a member of a combined set.
         "summary_source": data.get("summary_source"),

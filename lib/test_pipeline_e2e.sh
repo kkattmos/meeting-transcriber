@@ -51,7 +51,7 @@ check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2
 
 # --- Build a staging copy of the repo with the four stages stubbed -----------
 mkdir -p "$STAGING" "$FAKE_BIN"
-cp -r "$REPO"/{pipeline.sh,source_env.sh,lib,summarize,transcribe,screen} "$STAGING/"
+cp -r "$REPO"/{pipeline.sh,kill_meeting.sh,source_env.sh,lib,summarize,transcribe,screen} "$STAGING/"
 # No .env in the test tree: source_env.sh must not pick up the developer's real
 # keys and start making live API calls from a test run.
 : > "$STAGING/.env"
@@ -123,6 +123,12 @@ cat > "$STAGING/summarize/summarize.py" <<'STUB'
 import os, sys
 if os.path.exists(os.environ.get("STUB_FAIL_SUMMARIZE", "/nonexistent")):
     sys.stderr.write("stub: summarize failing on purpose\n"); sys.exit(1)
+if os.path.exists(os.environ.get("STUB_HANG_SUMMARIZE", "/nonexistent")):
+    # A summary that never finishes (a backend looping on errors), for Stop.
+    import time
+    open(os.environ["STUB_HANG_SUMMARIZE"] + ".pid", "w").write(str(os.getpid()))
+    while os.path.exists(os.environ["STUB_HANG_SUMMARIZE"]):
+        time.sleep(0.2)
 if os.path.exists(os.environ.get("STUB_PAUSE_SUMMARIZE", "/nonexistent")):
     # What the real summarize.py does when the Claude usage window is
     # exhausted and the wait gave up: record the reset time on the stage
@@ -272,6 +278,7 @@ export STUB_LIE_TRANSCRIBE="$TESTROOT/lie_transcribe"
 export STUB_FAIL_FRAMES="$TESTROOT/fail_frames"
 export STUB_FAIL_SUMMARIZE="$TESTROOT/fail_summarize"
 export STUB_PAUSE_SUMMARIZE="$TESTROOT/pause_summarize"
+export STUB_HANG_SUMMARIZE="$TESTROOT/hang_summarize"
 export STUB_RUNSTATE="$STAGING/lib/runstate.py"
 export STUB_FAIL_FETCH="$TESTROOT/fail_fetch"
 export STUB_SUMMARIZE_ARGS="$TESTROOT/summarize_args.txt"
@@ -805,6 +812,45 @@ out=$(pipeline "https://www.youtube.com/watch?v=paused00002" 2>&1); rc=$?
 check "pause: explicit re-run exits 0" "$rc" "0"
 check "pause: same run id" "$(latest_run)" "$prun2"
 check "pause: done" "$(state status --run-dir "$RUNS/$prun2" --stage summarize)" "done"
+
+echo "--- Stop on a run that is not recording terminates it (kill_meeting.sh --run-id)"
+# Found 2026-10-12: the web UI's Stop only touched the kill sentinel, which
+# nothing past the recording reads, and a local file's summary ran on.
+touch "$STUB_HANG_SUMMARIZE"; rm -f "$STUB_HANG_SUMMARIZE.pid"
+STOP_OUT="$TESTROOT/stop_pipeline.out"
+pipeline "https://www.youtube.com/watch?v=stopme00001" >"$STOP_OUT" 2>&1 &
+stop_pipe=$!
+for _ in $(seq 1 100); do [ -s "$STUB_HANG_SUMMARIZE.pid" ] && break; sleep 0.1; done
+srun=$(latest_run)
+check "stop: summarize is running" "$(state status --run-dir "$RUNS/$srun" --stage summarize)" "running"
+hang_pid=$(cat "$STUB_HANG_SUMMARIZE.pid")
+out=$( cd "$STAGING" && bash ./kill_meeting.sh --run-id "$srun" 2>&1 ); rc=$?
+check "stop: kill_meeting.sh exits 0" "$rc" "0"
+wait "$stop_pipe"; rc=$?
+check "stop: pipeline exits 1" "$rc" "1"
+kill -0 "$hang_pid" 2>/dev/null && bad "stop: summarize still alive" || ok "stop: summarize terminated"
+rm -f "$STUB_HANG_SUMMARIZE"
+check "stop: summarize marked failed" "$(state status --run-dir "$RUNS/$srun" --stage summarize)" "failed"
+check "stop: transcribe kept" "$(state status --run-dir "$RUNS/$srun" --stage transcribe)" "done"
+[ -n "$(state get --run-dir "$RUNS/$srun" --key stopped.at 2>/dev/null)" ] \
+  && ok "stop: run marked stopped" || bad "stop: no stopped mark"
+[ -d "$RUNS/$srun/run.lock" ] && bad "stop: run.lock left behind" || ok "stop: run.lock released"
+grep -q "STOPPED $srun" "$STOP_OUT" && ok "stop: reported as STOPPED" || bad "stop: not reported as STOPPED"
+out=$(pipeline --resume-all 2>&1)
+echo "$out" | grep -q "$srun: stopped by hand" && ok "stop: --resume-all leaves it alone" \
+  || bad "stop: --resume-all did not skip it"
+check "stop: summarize not attempted again" \
+  "$(state get --run-dir "$RUNS/$srun" --key stages.summarize.attempts)" "1"
+out=$(pipeline --run-id "$srun" 2>&1); rc=$?
+check "stop: --run-id resumes it" "$rc" "0"
+check "stop: summarize done" "$(state status --run-dir "$RUNS/$srun" --stage summarize)" "done"
+[ -z "$(state get --run-dir "$RUNS/$srun" --key stopped 2>/dev/null)" ] \
+  && ok "stop: the stopped mark is cleared" || bad "stop: stopped mark left behind"
+echo "$out" | grep -q "\[transcribe\] already done" && ok "stop: transcribe not re-run" || bad "stop: transcribe re-ran"
+out=$( cd "$STAGING" && bash ./kill_meeting.sh --run-id "$srun" 2>&1 ); rc=$?
+check "stop: stopping a finished run is a no-op" "$rc" "0"
+[ -z "$(state get --run-dir "$RUNS/$srun" --key stopped 2>/dev/null)" ] \
+  && ok "stop: a finished run is not marked stopped" || bad "stop: finished run marked stopped"
 
 echo "--- A failing mid-stage still reports the other branch"
 touch "$STUB_FAIL_TRANSCRIBE"

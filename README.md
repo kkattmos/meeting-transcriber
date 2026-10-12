@@ -585,6 +585,14 @@ python3 screen/extract_frames.py <video> <out_dir> ["name"]
 ./kill_meeting.sh --list           # show what's running, kill nothing
 ```
 
+On a run that is past its recording (transcribing, summarizing — or any
+YouTube/Kaltura/local-file run), `--run-id` — and the web UI's **Stop** —
+terminates that run's processes instead. Finished stages are kept, the run is
+marked stopped, and the 15-minute `--resume-all` leaves it alone; resume it
+with **Resume** or `./pipeline.sh --run-id <id>`. Stopping a meeting while it
+records still lets transcribe and summarize run; press Stop again to stop
+those.
+
 `Ctrl+\` in the recording terminal does the same thing. Either way the bot
 clicks **Leave** in the meeting UI so other participants see it go, rather than
 having the browser killed under it. Only if a recorder is still alive after the

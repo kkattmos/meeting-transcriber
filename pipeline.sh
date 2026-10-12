@@ -698,6 +698,7 @@ elif [ "$RESUME_LAST" -eq 1 ]; then
   RUN_DIRS+=("$RUNS_DIR/$last")
 elif [ "$RESUME_ALL" -eq 1 ]; then
   PAUSED_SKIPPED=0
+  STOPPED_SKIPPED=0
   for run_dir in "$RUNS_DIR"/*/; do
     [ -f "${run_dir}state.json" ] || continue
     status="$(rs status --run-dir "${run_dir%/}" --stage summarize)"
@@ -720,6 +721,14 @@ elif [ "$RESUME_ALL" -eq 1 ]; then
       echo "==> $(basename "${run_dir%/}"): in progress under PID $owner — left alone"
       continue
     fi
+    # Stopped by hand (kill_meeting.sh / the web UI's Stop). The timer must
+    # not restart it; --run-id or the UI's Resume does, and clears the mark.
+    stopped_at="$(rs get --run-dir "${run_dir%/}" --key stopped.at 2>/dev/null || true)"
+    if [ -n "$stopped_at" ]; then
+      echo "==> $(basename "${run_dir%/}"): stopped by hand at $stopped_at — resume it with --run-id"
+      STOPPED_SKIPPED=$((STOPPED_SKIPPED + 1))
+      continue
+    fi
     # A member of a --combine set never summarizes on its own: its combine
     # run does, and that run is picked up by this same loop. Resuming the
     # member here would bill an individual summary nobody asked for.
@@ -733,6 +742,8 @@ elif [ "$RESUME_ALL" -eq 1 ]; then
   if [ "${#RUN_DIRS[@]}" -eq 0 ]; then
     if [ "$PAUSED_SKIPPED" -gt 0 ]; then
       echo "==> Nothing to resume yet: $PAUSED_SKIPPED run(s) are waiting for the Claude usage window."
+    elif [ "$STOPPED_SKIPPED" -gt 0 ]; then
+      echo "==> Nothing to resume: $STOPPED_SKIPPED stopped run(s) wait for --run-id."
     else
       echo "==> Nothing to resume: every run has finished summarizing."
     fi
@@ -1075,6 +1086,10 @@ for run_dir in "${RUN_DIRS[@]}"; do
       [ -n "$summary" ] && echo "        -> $summary"
       [ -n "$pdf" ] && echo "        -> $pdf"
     fi
+  elif [ -n "$(rs get --run-dir "$run_dir" --key stopped.at 2>/dev/null || true)" ]; then
+    FAILED=$((FAILED + 1))
+    echo "  STOPPED $run_id  (stopped by hand; finished stages are kept)"
+    echo "        resume:   ./pipeline.sh --run-id $run_id"
   else
     FAILED=$((FAILED + 1))
     echo "  FAIL  $run_id  (exit $rc)"

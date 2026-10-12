@@ -21,7 +21,8 @@
 # instead of taking down every meeting at once:
 #
 #   ./kill_meeting.sh                  # every active run
-#   ./kill_meeting.sh --run-id <id>    # just that one
+#   ./kill_meeting.sh --run-id <id>    # just that one (a run past its
+#                                      # recording: terminate its processing)
 #   ./kill_meeting.sh --list           # show what's running, kill nothing
 set -euo pipefail
 
@@ -141,6 +142,71 @@ for run_dir in "${ACTIVE_RUNS[@]:-}"; do
   fi
   TARGETS+=("$run_dir")
 done
+
+# --- 2b) A run that is not recording: terminate its processing ---------------
+# The sentinel is read only by capture.py, so on its own it stops nothing once
+# the recording is over — a transcribe, frames or summarize in progress ran on
+# (found 2026-10-12: Stop in the web UI on a local file's summary). With
+# --run-id and no live recorder, terminate that run's own process tree —
+# run_one.sh (the run.lock owner) and everything under it — never its
+# pipeline.sh, which may be running other inputs and reports this one FAILED.
+# The run is marked `stopped` so --resume-all leaves it alone; --run-id (the
+# UI's Resume) clears the mark and carries on from the stages already done.
+# A record stage that is running without a live record.pid (still joining) is
+# left to the sentinel: capture.py checks it while it waits.
+descendants() {
+  local child
+  for child in $(ps -o pid= --ppid "$1" 2>/dev/null); do
+    descendants "$child"
+    echo "$child"
+  done
+}
+
+stop_processing() {
+  local run_dir="$1" run_id owner pids
+  run_id="$(basename "$run_dir")"
+  if [ "$(python3 "$SCRIPT_DIR/lib/runstate.py" status --run-dir "$run_dir" \
+          --stage record --no-verify 2>/dev/null)" = "running" ]; then
+    echo "==> $run_id is still joining its meeting; the sentinel will make it leave."
+    return 0
+  fi
+  # Nothing past the recording reads the sentinel; don't leave it behind.
+  rm -f "$run_dir/kill"
+  owner="$(cat "$run_dir/run.lock/pid" 2>/dev/null || true)"
+  if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
+    echo "==> $run_id is not running; nothing to stop."
+    return 0
+  fi
+  # Mark first, so pipeline.sh already sees `stopped` when run_one.sh dies.
+  python3 "$SCRIPT_DIR/lib/runstate.py" stop --run-dir "$run_dir" || true
+  pids="$(descendants "$owner") $owner"
+  echo "==> Stopping $run_id (PIDs: $(echo $pids))"
+  # shellcheck disable=SC2086
+  kill -TERM $pids 2>/dev/null || true
+  local alive p
+  for _ in $(seq 1 10); do
+    alive=""
+    for p in $pids; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+    [ -z "$alive" ] && break
+    sleep 1
+  done
+  if [ -n "$alive" ]; then
+    echo "==> Still alive after 10s, killing:$alive"
+    # shellcheck disable=SC2086
+    kill -KILL $alive 2>/dev/null || true
+  fi
+  # A run_one.sh killed by a signal skips its EXIT trap; the lock would be
+  # taken over as stale anyway, but leave nothing that looks in progress.
+  kill -0 "$owner" 2>/dev/null || rm -rf "$run_dir/run.lock"
+  # Again: a stage run_one.sh marked running between the two calls ends failed.
+  python3 "$SCRIPT_DIR/lib/runstate.py" stop --run-dir "$run_dir" || true
+  echo "==> Stopped. Finished stages are kept; resume with: ./pipeline.sh --run-id $run_id"
+}
+
+if [ -n "$TARGET_RUN_ID" ] && [ "${#TARGETS[@]}" -eq 0 ]; then
+  stop_processing "$RUNS_DIR/$TARGET_RUN_ID"
+  exit 0
+fi
 
 if [ "${#TARGETS[@]}" -eq 0 ]; then
   echo "==> No recordings are running. Sentinels are set, so anything that"

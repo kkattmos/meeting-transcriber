@@ -1092,6 +1092,7 @@
     const st = run.stages;
     if (run.active) return ["info", st.record === "running" ? "● recording" : "▶ running"];
     if (run.paused) return ["warn", "⏸ paused"];
+    if (run.stopped) return ["warn", "■ stopped"];
     if (Object.values(st).includes("failed")) return ["bad", "✗ failed"];
     if (run.combined_into) return ["note", "⧉ in a combined set"];
     if (st.summarize === "done") return ["ok", "✓ done"];
@@ -1217,18 +1218,21 @@
           setTimeout(refreshRuns, 1500);
         } catch (e) { actions.after(callout("bad", "Could not resume", e.message)); resume.disabled = false; }
       };
-      const stop = el("button", "danger", s.input_type === "meeting" ? "■ Stop / leave meeting" : "■ Stop");
+      const recording = (s.stages || {}).record === "running";
+      const stop = el("button", "danger", recording ? "■ Stop / leave meeting" : "■ Stop");
       stop.disabled = !s.active;
       stop.title = s.active ? "" : "Not running";
       stop.onclick = async () => {
-        const text = s.input_type === "meeting"
+        const text = recording
           ? "Stop this run? The bot leaves the meeting cleanly and keeps the recording."
-          : "Stop this run? It can be resumed later.";
+          : "Stop this run? Finished stages are kept; Resume carries on from there (the 15-minute auto-resume leaves it alone).";
         if (!await confirmInline(actions, text, "Yes, stop it")) return;
         stop.disabled = true;
         try {
           await api("/api/runs/" + encodeURIComponent(id) + "/stop", { method: "POST" });
-          actions.after(callout("info", "Stopping…", "A recording is finalised before it ends.", "spin"));
+          actions.after(callout("info", "Stopping…", recording
+            ? "The bot leaves and the recording is finalised; transcribe and summarize then run. Press Stop again to stop those too."
+            : "The run's processes are being terminated.", "spin"));
           setTimeout(refreshRuns, 1500);
         } catch (e) { actions.after(callout("bad", "Could not stop", e.message)); stop.disabled = false; }
       };

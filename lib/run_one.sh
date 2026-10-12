@@ -194,6 +194,9 @@ trap 'rm -rf "$LOCK_DIR"' EXIT
 # Clear a kill sentinel left behind by a previous run, or capture.py would
 # leave the meeting the moment it joins.
 rm -f "$RUN_DIR/kill"
+# Being run again is the resume a stop waits for (kill_meeting.sh marks a run
+# it terminates `stopped`, and --resume-all leaves such a run alone).
+rs unstop --run-dir "$RUN_DIR" 2>/dev/null || true
 
 if [ "$FORCE" -eq 1 ]; then
   echo "==> --force: discarding previous stage results for $RUN_ID"

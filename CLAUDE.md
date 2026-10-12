@@ -383,6 +383,33 @@ kill_meeting.sh's escalation, one from record_screen.sh. Now:
   filming an empty lobby, cause unknown. Its leave() skips clicking when
   there is no call, which used to outlast kill_meeting.sh's grace period.
 
+### Stop on a run past its recording (2026-10-12)
+
+Found when the operator pressed Stop in the web UI on a local file's summary
+(Gemini looping over 403s) and nothing happened: `kill_meeting.sh --run-id`
+only touched the `kill` sentinel, which nothing but capture.py reads, and
+escalated only through `record.pid`. Settled with the operator:
+
+- **Not recording → terminate, resumable.** With `--run-id` and no live
+  recorder, `stop_processing` SIGTERMs the run's own process tree — the
+  `run.lock` owner (run_one.sh) and every descendant, KILL after 10s — never
+  its pipeline.sh (it may be running other inputs; it reports the run
+  `STOPPED`). Finished stages are kept; the sentinel is removed (nothing would
+  read it); the stale `run.lock` is removed.
+- **`rs stop`** sets top-level `stopped = {at, stages}` and marks running
+  stages failed ("stopped by the operator"); it is called before the kill (so
+  pipeline.sh sees it) and after (a stage started in between). **`--resume-all`
+  skips a stopped run** — pm2's 15-minute timer must not restart it.
+  `run_one.sh` runs `rs unstop` at start, so `--run-id`, the UI's Resume or
+  the same command again resumes and clears it.
+- **Recording → unchanged.** Stop leaves the call and finalises the file,
+  and transcribe + summarize then run; a second Stop terminates those. A
+  record stage running without a live `record.pid` (still joining) is left to
+  the sentinel.
+- The page shows "■ stopped"; the button reads "Stop / leave meeting" only
+  while recording. The global `kill_meeting.sh` (no `--run-id`) is unchanged
+  and does not mark runs stopped.
+
 ### The bot account (`BOT_GOOGLE_ACCOUNT`)
 
 The operator's words: "use the account … only (do not hardcode the email)".
@@ -2363,6 +2390,9 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **Silence is measured by duration, not peak**, before any AssemblyAI upload.
 - **The bot's audio client is never called "Firefox"** (PULSE_PROP_OVERRIDE
   in record_screen.sh), and lib/pinaudio.py keeps it on the recording sink.
+- **Stop on a run that is not recording terminates its process tree and
+  marks it `stopped`; `--resume-all` skips it until it is resumed by hand.**
+  The sentinel alone stops nothing past the recording.
 - **ffmpeg gets exactly one SIGINT, and is never SIGKILLed.** A second one
   while it closes the file leaves an unplayable MP4.
 - **No awk (mawk) in a pipe that must be live.** It holds lines in its
@@ -2726,7 +2756,7 @@ without API keys or network, against temp directories
 
 | File | Covers | Count |
 |---|---|---|
-| `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI, `annotate` and the pause fields | 19 |
+| `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI, `annotate` and the pause fields, `stop`/`unstop` | 20 |
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets, frontmatter, binary files | 36 |
@@ -2741,7 +2771,7 @@ without API keys or network, against temp directories
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
 | `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source | 12 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line) | 460 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line), Stop on a summarizing run (`kill_meeting.sh --run-id` terminates it, `STOPPED`, `--resume-all` skips it, `--run-id` finishes it and clears the mark) | 477 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, YouTube captions through a stub yt-dlp first (the API never asked when it succeeds), youtube-transcript.io when yt-dlp fails or finds no track, the other-language-labelled track as last resort, `YT_AUTOCAPTIONS=0`, both down = exit 1, `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 141 |
 | `verify_e2e.sh --browser-smoke` | the real browser (Firefox ESR or Chrome) under Xvfb, recorded and measured for black edges | 6 |
 

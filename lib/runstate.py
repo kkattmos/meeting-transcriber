@@ -281,6 +281,36 @@ class RunState:
                 st["error"] = error[:2000]
         return self._mutate(_fn)
 
+    def stop(self, reason="stopped by the operator"):
+        """Mark the run stopped by hand, and its running stages failed.
+
+        kill_meeting.sh calls this around terminating a run that is not
+        recording (a transcribe or summarize in progress). The top-level
+        `stopped` field is what `--resume-all` skips on, so the pm2 timer does
+        not restart what the operator just stopped; run_one.sh clears it
+        (`unstop`) when the run is resumed on purpose. Idempotent: called once
+        before the kill and once after, so a stage the dying run_one.sh
+        marked running in between still ends up failed.
+        """
+        def _fn(data):
+            stages = data.setdefault("stages", {})
+            running = [n for n, st in stages.items() if st.get("status") == RUNNING]
+            prev = data.get("stopped") or {}
+            data["stopped"] = {"at": prev.get("at") or _now(),
+                               "stages": sorted(set(prev.get("stages", [])) | set(running))}
+            for n in running:
+                st = stages[n]
+                st["status"] = FAILED
+                st["ended_at"] = _now()
+                st["error"] = reason
+                st.pop("waiting_until", None)
+        return self._mutate(_fn)
+
+    def unstop(self):
+        def _fn(data):
+            data.pop("stopped", None)
+        return self._mutate(_fn)
+
     def reset(self, name=None):
         """Send one stage (or all of them) back to pending.
 
@@ -412,6 +442,9 @@ def main():
     p = with_run_dir(sub.add_parser("get"))
     p.add_argument("--key", required=True)
 
+    p = with_run_dir(sub.add_parser("stop"))
+    p.add_argument("--reason", default="stopped by the operator")
+    with_run_dir(sub.add_parser("unstop"))
     p = with_run_dir(sub.add_parser("reset"))
     p.add_argument("--stage")
 
@@ -571,6 +604,14 @@ def main():
             print(value)
         return 0
 
+    if args.cmd == "stop":
+        state.stop(args.reason)
+        return 0
+
+    if args.cmd == "unstop":
+        state.unstop()
+        return 0
+
     if args.cmd == "reset":
         state.reset(args.stage)
         return 0
@@ -584,6 +625,9 @@ def main():
         print(f"input:      {data.get('input')}  ({data.get('input_type')})")
         if data.get("meet_url"):
             print(f"meeting:    {data['meet_url']}  (created and hosted by the bot)")
+        if data.get("stopped"):
+            print(f"stopped:    {data['stopped'].get('at')}  (by hand; --resume-all skips it,"
+                  " --run-id resumes it)")
         if data.get("clip"):
             print(f"clip:       {data.get('clip')}"
                   "  (output timestamps are relative to it)")
