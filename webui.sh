@@ -3,7 +3,8 @@
 #
 #   ./webui.sh on        start meeting-bot-web + meeting-bot-resume
 #   ./webui.sh off       stop them and remove them from pm2
-#   ./webui.sh restart   off + on — use this after editing .env (see below)
+#   ./webui.sh restart   off + on — after changing the token, port or bind
+#                        address (any other .env edit reaches the next run)
 #   ./webui.sh status    pm2's view of both
 #   ./webui.sh url       the address(es) to open, with the token filled in
 #   ./webui.sh logs      follow the web UI's log
@@ -36,7 +37,9 @@ APPS=(meeting-bot-web meeting-bot-resume)
 # An app pm2 already knows keeps its old snapshot, hence delete-then-start.
 start_clean() {
   local key
-  for app in "${APPS[@]}"; do "$PM2" delete "$app" >/dev/null 2>&1 || true; done
+  # The delete is inside the clean subshell too: when no daemon is running,
+  # the first pm2 call spawns it, and the daemon's own environment is merged
+  # into every app it starts.
   (
     if [ -f "$SCRIPT_DIR/.env" ]; then
       while IFS= read -r key; do
@@ -44,6 +47,7 @@ start_clean() {
       done < <(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' \
                  "$SCRIPT_DIR/.env")
     fi
+    for app in "${APPS[@]}"; do "$PM2" delete "$app" >/dev/null 2>&1 || true; done
     exec "$PM2" start "$SCRIPT_DIR/ecosystem.config.js" >/dev/null
   )
 }

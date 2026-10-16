@@ -78,6 +78,63 @@ import language  # noqa: E402
 from promptnames import canonical_prompt_name  # noqa: E402
 
 REPO = Path(__file__).resolve().parent
+ENV_FILE = Path(os.environ.get("MEETING_BOT_ENV_FILE", str(REPO / ".env")))
+
+
+def read_dotenv(path=None):
+    """.env as it is on disk now: {key: value}, by source_env.sh's rules
+    (blank lines and # comments skipped, one layer of quotes stripped, a
+    leading ~/ is $HOME). Missing or unreadable -> {}."""
+    out = {}
+    try:
+        lines = Path(path or ENV_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = "".join(key.split())
+        if key.startswith("export") and key != "export":
+            key = key[len("export"):]
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        if val.startswith("~/"):
+            val = os.path.expanduser("~") + val[1:]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+            out[key] = val
+    return out
+
+
+# The keys .env named when this server started. serve.sh loaded them into
+# os.environ, so they are a snapshot of .env at that moment — not overrides.
+STARTUP_ENV_KEYS = frozenset(read_dotenv())
+
+
+def current_config():
+    """os.environ with .env re-read: the file's values win, and a key the file
+    named at startup but has since dropped is gone. Without this every run
+    started from the page inherited .env as it was when the UI started, and
+    source_env.sh never overrides a set variable (2026-10-14: a run went to
+    the Gemini chain six minutes after .env had switched it to claude)."""
+    fresh = read_dotenv()
+    env = {k: v for k, v in os.environ.items()
+           if k not in STARTUP_ENV_KEYS or k in fresh}
+    env.update(fresh)
+    return env
+
+
+def child_env():
+    """The environment for a pipeline.sh child: without any .env key, so its
+    own source_env.sh loads .env as it is at launch."""
+    drop = STARTUP_ENV_KEYS | set(read_dotenv())
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    env["MEETING_BOT_FOREGROUND"] = "1"
+    return env
+
+
 TOKEN = os.environ.get("MEETING_BOT_TOKEN")
 SCRIPT = os.environ.get("MEETING_BOT_SCRIPT", str(REPO / "pipeline.sh"))
 KILL_SCRIPT = str(REPO / "kill_meeting.sh")
@@ -182,7 +239,7 @@ def launch(cmd):
     try:
         # Already detached and logged here, so pipeline.sh must not detach a
         # meeting a second time into a log this page doesn't know about.
-        env = dict(os.environ, MEETING_BOT_FOREGROUND="1")
+        env = child_env()
         subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT,
                          start_new_session=True, cwd=str(REPO), env=env)
     finally:
@@ -254,10 +311,11 @@ def run_summary(run_dir, data):
 
 
 def options():
+    cfg = current_config()
     prompts = sorted(p.stem for p in PROMPTS_DIR.glob("*.md") if not p.stem.startswith("_"))
-    default_prompt = canonical_prompt_name(os.environ.get("SUMMARY_PROMPT", ""))
+    default_prompt = canonical_prompt_name(cfg.get("SUMMARY_PROMPT", ""))
     try:
-        default_summary_language = language.output_language()
+        default_summary_language = language.output_language(cfg)
     except language.UnknownLanguage:
         # A typo in SUMMARY_LANGUAGE must not take the page down; the
         # pipeline reports it properly on Check.
@@ -270,18 +328,18 @@ def options():
         "summary_language_names": {c: language.language_name(c) for c in codes},
         "default_summary_language": default_summary_language,
         "fonts": {c: list(fontchoice.CHOICES[c]) for c in codes},
-        "default_fonts": {c: fontchoice.default_font(c) for c in codes},
+        "default_fonts": {c: fontchoice.default_font(c, cfg) for c in codes},
         "languages": ["th", "en", "auto"],
-        "default_language": os.environ.get("ASSEMBLYAI_LANGUAGE", "th"),
-        "default_jobs": os.environ.get("PIPELINE_JOBS", "2"),
-        "default_resources": os.environ.get("RESOURCES", ""),
-        "summaries_dir": os.environ.get("SUMMARIES_DIR", ""),
-        "recordings_dir": os.environ.get("RECORDINGS_DIR", ""),
+        "default_language": cfg.get("ASSEMBLYAI_LANGUAGE", "th"),
+        "default_jobs": cfg.get("PIPELINE_JOBS", "2"),
+        "default_resources": cfg.get("RESOURCES", ""),
+        "summaries_dir": cfg.get("SUMMARIES_DIR", ""),
+        "recordings_dir": cfg.get("RECORDINGS_DIR", ""),
         # .env's SUMMARY_SOURCE / RECORD_MEDIA preselect the form; an invalid
         # value falls back here and is reported by Check (pipeline.sh).
-        "default_summary_source": _choice(os.environ.get("SUMMARY_SOURCE"),
+        "default_summary_source": _choice(cfg.get("SUMMARY_SOURCE"),
                                           ("both", "voice")),
-        "default_record_media": _choice(os.environ.get("RECORD_MEDIA"),
+        "default_record_media": _choice(cfg.get("RECORD_MEDIA"),
                                         ("video", "audio")),
     }
 
@@ -419,7 +477,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 proc = subprocess.run([KILL_SCRIPT, "--run-id", run_dir.name],
                                       capture_output=True, text=True, timeout=120,
-                                      cwd=str(REPO))
+                                      cwd=str(REPO), env=child_env())
                 self._json(200 if proc.returncode == 0 else 500,
                            {"status": "stopping" if proc.returncode == 0 else "error",
                             "output": (proc.stdout + proc.stderr)[-4000:]})
@@ -435,7 +493,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/check":
             proc = subprocess.run([SCRIPT, *args, "--dry-run"], capture_output=True,
-                                  text=True, timeout=120, cwd=str(REPO))
+                                  text=True, timeout=120, cwd=str(REPO),
+                                  env=child_env())
             plan = []
             for line in proc.stdout.splitlines():
                 parts = line.split("\t")

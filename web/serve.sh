@@ -6,8 +6,9 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+# .env wins over whatever pm2 replays (a snapshot from when it started).
 # shellcheck disable=SC1091
-. "$ROOT_DIR/source_env.sh"
+MEETING_BOT_ENV_FRESH=1 . "$ROOT_DIR/source_env.sh"
 PY="${MEETING_BOT_VENV:-$ROOT_DIR/.venv}/bin/python3"
 [ -x "$PY" ] || PY="python3"
 cd "$ROOT_DIR"

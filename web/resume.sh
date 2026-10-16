@@ -14,8 +14,9 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+# .env wins over whatever pm2 replays (a snapshot from when it started).
 # shellcheck disable=SC1091
-. "$ROOT_DIR/source_env.sh"
+MEETING_BOT_ENV_FRESH=1 . "$ROOT_DIR/source_env.sh"
 LOG_DIR="$MEETING_BOT_ROOT/logs"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/resume.log"

@@ -44,6 +44,7 @@ if [ -n "$dry" ]; then
   printf 'ok\\tyoutube\\t-\\tnew\\t%s\\n' "$1"; exit 0
 fi
 echo "argv: $*"
+echo "inherited chain: ${SUMMARY_FALLBACK_CHAIN:-unset}"
 """)
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
         run = root / "bot" / "runs" / "Project_sync_20260927_140000"
@@ -53,6 +54,14 @@ echo "argv: $*"
             "meet_url": "https://meet.google.com/abc-defg-hij",
             "stages": {"record": {"status": "done"}}}))
         (run / "logs" / "record.log").write_text("New Google Meet: x\n")
+        # .env as the server found it at start; serve.sh exported it, so
+        # os.environ holds the same values — the snapshot under test.
+        cls.env_file = root / ".env"
+        cls.env_file.write_text("SUMMARY_FALLBACK_CHAIN=gemini\nPIPELINE_JOBS=2\n"
+                                "SUMMARY_PROMPT=meeting\n")
+        os.environ.update(SUMMARY_FALLBACK_CHAIN="gemini", PIPELINE_JOBS="2",
+                          SUMMARY_PROMPT="meeting",
+                          MEETING_BOT_ENV_FILE=str(cls.env_file))
         os.environ.update(MEETING_BOT_TOKEN=TOKEN, MEETING_BOT_SCRIPT=str(stub),
                           MEETING_BOT_ROOT=str(root / "bot"), MEETING_BOT_PORT="0")
         sys.path.insert(0, str(HERE))
@@ -182,6 +191,41 @@ echo "argv: $*"
                 break
             time.sleep(0.1)
         self.assertIn("argv: --new-meet --name Sync", log["text"])
+
+    def test_an_env_edit_reaches_the_next_run_without_a_restart(self):
+        original = self.env_file.read_text()
+        try:
+            # The operator edits .env while the UI is up.
+            self.env_file.write_text("SUMMARY_FALLBACK_CHAIN=claude\nPIPELINE_JOBS=3\n")
+            _, opts = self.call("/api/options")
+            self.assertEqual(opts["default_jobs"], "3")
+            # A key .env dropped is no longer the form's default either:
+            # the stale "meeting" is gone, and the built-in default shows.
+            self.assertEqual(opts["default_prompt"], "video")
+            status, r = self.call("/trigger", {"new_meet": True})
+            self.assertEqual(status, 202)
+            for _ in range(50):
+                _, log = self.call("/api/log?name=" + r["log_name"])
+                if "inherited chain" in log.get("text", ""):
+                    break
+                time.sleep(0.1)
+            # The child gets no .env key at all, so its own source_env.sh
+            # loads the file as it is now — not the server's stale "gemini".
+            self.assertIn("inherited chain: unset", log["text"])
+            env = self.ts.child_env()
+            self.assertNotIn("SUMMARY_FALLBACK_CHAIN", env)
+            self.assertNotIn("SUMMARY_PROMPT", env)
+            self.assertEqual(env["MEETING_BOT_FOREGROUND"], "1")
+            self.assertEqual(env["MEETING_BOT_TOKEN"], TOKEN)
+        finally:
+            self.env_file.write_text(original)
+
+    def test_read_dotenv_follows_source_env_rules(self):
+        f = Path(self.tmp.name) / "rules.env"
+        f.write_text("# comment\n\nA=1\nB = \"two words\"\nC='x'\nD=~/p\nE=\nexport F=f\n")
+        d = self.ts.read_dotenv(f)
+        self.assertEqual(d, {"A": "1", "B": "two words", "C": "x",
+                             "D": os.path.expanduser("~") + "/p", "E": "", "F": "f"})
 
     def test_runs_and_detail(self):
         _, r = self.call("/api/runs")

@@ -14,6 +14,11 @@
 #   - Does NOT override a value that's already exported — that lets you
 #     `KEY=val ./pipeline.sh ...` for one-off overrides without editing
 #     the file.
+#   - Except with MEETING_BOT_ENV_FRESH=1 (pm2's entry scripts, web/serve.sh
+#     and web/resume.sh): then .env wins. Under pm2 an already-set .env key
+#     is never an override — it is a copy taken when the daemon or the app
+#     started, and honouring it ran a 2026-10-14 summary on the Gemini chain
+#     .env had dropped six minutes earlier. The flag is unset after loading.
 #   - Exits 0 silently if no .env exists (env vars simply come from the
 #     calling shell instead).
 #
@@ -99,9 +104,10 @@ while IFS= read -r line || [ -n "$line" ]; do
 
   # Already exported? Skip — caller override wins.
   # Use `printenv` so we don't false-positive on a same-name local var.
-  if printenv "$key" >/dev/null 2>&1; then
+  if [ -z "${MEETING_BOT_ENV_FRESH:-}" ] && printenv "$key" >/dev/null 2>&1; then
     continue
   fi
   export "$key=$val"
 done < "$ENV_FILE"
+unset MEETING_BOT_ENV_FRESH
 _meeting_bot_defaults
