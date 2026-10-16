@@ -1624,6 +1624,8 @@ immediately rather than burning the full retry schedule first.
 | `ASSEMBLYAI_MODEL` | SDK chain `universal-3-5-pro`, `universal-2` | Overrides the leading entry |
 | `YT_TRANSCRIPT_KEY_1..10` | — | Optional: youtube-transcript.io, the fallback for YouTube captions |
 | `YT_AUTOCAPTIONS` | 1 | `0` skips yt-dlp for captions (youtube-transcript.io only) |
+| `YT_DOWNLOAD_ATTEMPTS` | 4 | attempts at the YouTube video download (for frames); a 403/429/5xx, timeout or dropped connection re-runs yt-dlp, an unavailable/private video fails at once |
+| `YT_DOWNLOAD_RETRY_SECONDS` | 30 | first wait between those attempts, doubled each time |
 | `TRANSCRIBE_BACKEND` | `assemblyai` | YouTube URLs always use captions regardless |
 
 **YouTube captions come from two places.** yt-dlp first (free, no key):

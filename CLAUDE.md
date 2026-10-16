@@ -1243,6 +1243,29 @@ Stage 3), and the 446MB download used to stay in the run dir after the frames
 were swept. Since 2026-09-13 it is swept with them (next section); a resume
 that needs the frames back re-downloads, ~10s here.
 
+### A refused YouTube download is re-run (`lib/ytdownload.py`, 2026-10-16)
+
+Found on a 15-video `--combine`: 2 downloads failed with `HTTP Error 403:
+Forbidden` on the first request for the media, after extraction had
+succeeded (format 136), and the combined summary was never attempted. The
+pm2 resume 10 minutes later fetched both in seconds. yt-dlp's `--retries`
+does not help: it re-requests the same signed googlevideo URL. So
+`ytdownload.py` re-runs yt-dlp itself — a fresh extraction, a fresh URL —
+settled with the operator:
+
+- **4 attempts, waits 30s/60s/120s** (doubling, +0-25% jitter so a batch
+  refused together doesn't return together). `YT_DOWNLOAD_ATTEMPTS`,
+  `YT_DOWNLOAD_RETRY_SECONDS` (tests set 0). A `.part` from a cut-off
+  attempt is resumed by the next (yt-dlp's `--continue`).
+- **Transient failures only** (`TRANSIENT_RE`: 403, 408, 429, 5xx,
+  timeouts, dropped connections). `PERMANENT_RE` is checked first and wins
+  — unavailable, private, removed, members-only, age/bot check, format not
+  available — and anything unrecognised is not retried either.
+- **Queues unchanged**: `QUEUE_SLOTS_FETCH_VIDEO` stays opt-in.
+- It is the one place the download command and the format string live;
+  `do_fetch_video` runs it, `summarize.download_youtube_video` imports it
+  (`quiet=True`). `YT_DLP_BIN` is its test seam, as for the captions.
+
 ### The download is swept after the summary; the recording never is
 
 Settled with the operator 2026-09-13: the box was filling with
@@ -2579,8 +2602,8 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   YouTube exposes no muxed format at all on many videos and `best[ext=mp4]/best`
   alone fails with "Requested format is not available". Keep any future fix
   runtime-agnostic rather than re-enabling the merge.
-  The same string appears in `lib/run_one.sh` and `summarize/summarize.py` —
-  change both.
+  The string lives once, in `lib/ytdownload.py` (`FORMAT`), which both
+  `lib/run_one.sh` and `summarize/summarize.py` use.
 - **Kaltura is reached through `lib/kaltura.py`, never yt-dlp.** Its extractor
   sends no `Referer` and 404s on exactly the entries this project exists for.
 - **Every Kaltura request carries a `Referer`.** Dropping it turns a working
@@ -2867,6 +2890,7 @@ without API keys or network, against temp directories
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets, frontmatter, binary files | 36 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
+| `lib/test_ytdownload.py` | the YouTube download retry: transient vs permanent errors, a 403 then served, doubling waits, the attempt cap, the command never merges | 9 |
 | `lib/test_discord_spool.py` | Discord spool placement from synthetic packet timings (arrival only; RTP: bunching, loss, wraparound, a pause, a resync), crash tolerance, the int32 mix and clipping, real ffmpeg (words where spoken, speaker tracks, the spool kept on failure) | 22 |
 | `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the five prompts (old names resolve, no timestamps outside `reality`, the callout vocabulary), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`), the Gemini request timeout, Gemini's frame filtering, media resolution and own cap, the per-chunk frame cap, the OpenRouter backend (payload, key/model walk, the per-account daily cap, an error inside a 200, a truncated answer retried once then the next model, the chunk cap, the rejected-answer dump, the real model of a router), the chunk flow (the merge's instructions, every model named, finished chunks reused and re-keyed on a model change) | 246 |
 | `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), loose callout markers (`### [!KIND]`, a bare `[!KIND]`), real PDF render | 111 |
@@ -2876,7 +2900,7 @@ without API keys or network, against temp directories
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
 | `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source, an `.env` edit reaching the next run and the form without a restart, the `.env` parser | 14 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line), Stop on a summarizing run (`kill_meeting.sh --run-id` terminates it, `STOPPED`, `--resume-all` skips it, `--run-id` finishes it and clears the mark) | 477 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line), Stop on a summarizing run (`kill_meeting.sh --run-id` terminates it, `STOPPED`, `--resume-all` skips it, `--run-id` finishes it and clears the mark), a YouTube download refused with a 403 and re-run (served, given up, a non-transient failure not retried) | 485 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, YouTube captions through a stub yt-dlp first (the API never asked when it succeeds), youtube-transcript.io when yt-dlp fails or finds no track, the other-language-labelled track as last resort, `YT_AUTOCAPTIONS=0`, both down = exit 1, `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 141 |
 | `verify_e2e.sh --browser-smoke` | the real browser (Firefox ESR or Chrome) under Xvfb, recorded and measured for black edges | 6 |
 
@@ -2984,6 +3008,7 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── resources.py              <- slides/notes from GitHub or a folder
 │   ├── kaltura.py                <- Kaltura embeds: parse, media URL, captions
 │   ├── clip.py                   <- --clip: window parsing + the ffmpeg cut
+│   ├── ytdownload.py             <- the YouTube download (yt-dlp), re-run on a transient 403/429/5xx
 │   ├── combine.py                <- --combine: parts.json from the member runs, the run key
 │   ├── discord_spool.py          <- Discord recordings: per-speaker spool, timeline placement, the .m4a mix
 │   ├── test_discord_spool.py

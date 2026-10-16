@@ -573,14 +573,10 @@ do_fetch_video() {
     echo "yt-dlp is not installed. Run ./setup.sh first." >&2
     return 1
   fi
-  # No merge step on purpose: bestvideo+bestaudio needs a JS runtime for
-  # YouTube extraction and a postprocess merge that fails on this box. The
-  # chain below tries a muxed stream first, then falls back to a *video-only*
-  # stream — which is all this stage is for, since frames need no audio and
-  # YouTube transcripts come from captions, never from this file. See
-  # CLAUDE.md before changing the format string.
-  yt-dlp --no-playlist -f "best[ext=mp4]/best/bv*[ext=mp4][vcodec^=avc1][height<=720]/bv*[ext=mp4][height<=720]/bv*[height<=720]/bv*" \
-    -o "$RUN_DIR/video.%(ext)s" "$INPUT"
+  # The command (a muxed stream, else video-only; never a merge — see
+  # CLAUDE.md before changing the format) lives in lib/ytdownload.py, which
+  # also re-runs yt-dlp after a transient refusal (a 403 on the media URL).
+  "$PYTHON_BIN" "$SCRIPT_DIR/ytdownload.py" "$INPUT" "$RUN_DIR/video.%(ext)s"
 }
 
 # Kaltura: not yt-dlp. Its Kaltura extractor sends no Referer, which a

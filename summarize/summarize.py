@@ -189,6 +189,7 @@ import paths as botpaths  # noqa: E402
 import resources as botresources  # noqa: E402
 import kaltura  # noqa: E402
 import clip as botclip  # noqa: E402
+import ytdownload  # noqa: E402
 import runstate  # noqa: E402
 
 # EX_TEMPFAIL from sysexits.h: the Claude usage window is exhausted and the
@@ -276,21 +277,11 @@ def download_youtube_video(url, out_dir):
 
     print(f"==> Downloading YouTube video via yt-dlp")
     out_template = str(Path(out_dir) / "video.%(ext)s")
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        # Single-file format. No merge step -> no JS-runtime dependency.
-        # Muxed first, then video-only (frames need no audio). On some videos
-        # yt-dlp may fall back to webm when no mp4 stream is exposed; the
-        # caller accepts whatever container lands in out_dir.
-        "-f", "best[ext=mp4]/best/bv*[ext=mp4][vcodec^=avc1][height<=720]/bv*[ext=mp4][height<=720]/bv*[height<=720]/bv*",
-        "-o", out_template,
-        url,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        sys.stderr.write(proc.stderr)
-        raise SystemExit(f"yt-dlp failed with exit code {proc.returncode}")
+    # The command and the retry on a transient refusal: lib/ytdownload.py.
+    rc, err = ytdownload.download(url, out_template, quiet=True)
+    if rc != 0:
+        sys.stderr.write(err)
+        raise SystemExit(f"yt-dlp failed with exit code {rc}")
 
     # yt-dlp picks the extension from the chosen stream: .mp4 when an mp4
     # stream is available, .webm otherwise. Prefer .mp4; fall back to

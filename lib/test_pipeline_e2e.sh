@@ -247,6 +247,12 @@ chmod +x "$STAGING/screen/record_screen.sh" "$STAGING/transcribe/transcribe.sh" 
 cat > "$FAKE_BIN/yt-dlp" <<'STUB'
 #!/bin/bash
 [ -f "$STUB_FAIL_FETCH" ] && { echo "stub: yt-dlp failing on purpose" >&2; exit 1; }
+# A refusal that a fresh attempt gets past, as YouTube's media URLs do.
+if [ -f "$STUB_403_FETCH" ]; then
+  n=$(cat "$STUB_403_FETCH"); echo "$((n - 1))" > "$STUB_403_FETCH"
+  [ "$n" -le 1 ] && rm -f "$STUB_403_FETCH"
+  echo "ERROR: unable to download video data: HTTP Error 403: Forbidden" >&2; exit 1
+fi
 out=""; while [ "$#" -gt 0 ]; do
   case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
 done
@@ -281,6 +287,8 @@ export STUB_PAUSE_SUMMARIZE="$TESTROOT/pause_summarize"
 export STUB_HANG_SUMMARIZE="$TESTROOT/hang_summarize"
 export STUB_RUNSTATE="$STAGING/lib/runstate.py"
 export STUB_FAIL_FETCH="$TESTROOT/fail_fetch"
+export STUB_403_FETCH="$TESTROOT/403_fetch"
+export YT_DOWNLOAD_RETRY_SECONDS=0
 export STUB_SUMMARIZE_ARGS="$TESTROOT/summarize_args.txt"
 export STUB_TRANSCRIBE_ARGS="$TESTROOT/transcribe_args.txt"
 export STUB_FAIL_KALTURA="$TESTROOT/fail_kaltura"
@@ -357,6 +365,32 @@ check "youtube: fetch_video marked cleaned" \
 echo "$out" | grep -q "\[video\] removed the downloaded media" \
   && ok "youtube: the sweep is reported" || bad "youtube: sweep not reported"
 echo "$out" | grep -q -- "--no-playlist" && ok "youtube: &list= did not expand" || ok "youtube: &list= did not expand (single run)"
+
+echo "--- YouTube download refused with a 403, then served (lib/ytdownload.py)"
+echo 2 > "$STUB_403_FETCH"
+out=$(pipeline "https://www.youtube.com/watch?v=403retry0aa" 2>&1); rc=$?
+check "yt 403: exits 0 after two refusals" "$rc" "0"
+run=$(latest_run)
+check "yt 403: video fetched" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
+echo "$out" | grep -q "fresh attempt in 0s (2 of 4)" \
+  && ok "yt 403: the retry is reported" || bad "yt 403: retry not reported"
+echo "$out" | grep -q "downloaded on attempt 3 of 4" \
+  && ok "yt 403: the attempt that worked is named" || bad "yt 403: success attempt not named"
+echo 9 > "$STUB_403_FETCH"
+out=$(YT_DOWNLOAD_ATTEMPTS=2 pipeline "https://www.youtube.com/watch?v=403retry0bb" 2>&1); rc=$?
+rm -f "$STUB_403_FETCH"
+[ "$rc" -ne 0 ] && ok "yt 403: fails once the attempts run out" || bad "yt 403: succeeded with every attempt refused"
+echo "$out" | grep -q "still failing after 2 attempts" \
+  && ok "yt 403: giving up is reported" || bad "yt 403: give-up not reported"
+touch "$STUB_FAIL_FETCH"
+out=$(pipeline "https://www.youtube.com/watch?v=403retry0cc" 2>&1)
+rm -f "$STUB_FAIL_FETCH"
+echo "$out" | grep -q "fresh attempt" \
+  && bad "yt 403: a non-transient failure was retried" || ok "yt 403: a non-transient failure is not retried"
+# Finish both failed runs, so a later --resume-all has nothing of ours to pick up.
+pipeline "https://www.youtube.com/watch?v=403retry0bb" >/dev/null 2>&1
+check "yt 403: the given-up run resumes once YouTube serves it" "$?" "0"
+pipeline "https://www.youtube.com/watch?v=403retry0cc" >/dev/null 2>&1
 
 echo "--- Kaltura embed, pasted as the whole <iframe> tag"
 KAL_IFRAME='<iframe id="kaltura_player" src='"'"'https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/52668182?iframeembed=true&amp;entry_id=1_y9jay9sw&amp;config%5Bplayback%5D=%7B%22startTime%22%3A0%7D'"'"' style="width: 608px;height: 402px;border: 0;" allowfullscreen title="2110322 Online Session"></iframe>'
