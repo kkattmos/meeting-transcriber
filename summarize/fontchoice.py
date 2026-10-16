@@ -96,10 +96,11 @@ def normalize(value, lang):
     return font
 
 
-def default_font(lang):
-    """PDF_FONT_<LANG> when it names a font on the list, else the built-in."""
+def default_font(lang, env=None):
+    """PDF_FONT_<LANG> when it names a font on the list, else the built-in.
+    `env` stands in for os.environ (the web UI passes .env as it is now)."""
     code = _lang(lang)
-    raw = os.environ.get(DEFAULT_ENV[code])
+    raw = (os.environ if env is None else env).get(DEFAULT_ENV[code])
     if raw and raw.strip():
         try:
             return normalize(raw, code)

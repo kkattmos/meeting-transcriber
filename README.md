@@ -312,7 +312,7 @@ nothing registers it to start at boot:
 ```
 
 ```bash
-./webui.sh restart  # after editing .env — a plain `pm2 restart` does not re-read it
+./webui.sh restart  # after changing MEETING_BOT_TOKEN/PORT/BIND; other .env edits apply to the next run
 ```
 
 `./webui.sh on` prints the address(es) to open with the token already in them
@@ -1373,6 +1373,15 @@ end the scan.
 | `GEMINI_API_KEY_1..3` | — | For the `gemini` fallback |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | A comma-separated list is a fallback chain: every key is tried on the first model, then the next model (`gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash` in `.env.example`). A rate-limited key moves on at once; an unknown model is skipped. Pin real versions, not `-latest` aliases |
 | `GEMINI_TIMEOUT_SECONDS` | 600 | How long one Gemini request may go without an answer before it is retried, then handed to the next key/model. Without it a request Gemini never answers hangs the run |
+| `GEMINI_MAX_FRAMES` | (unset) | Gemini's own frame cap, counted after the blank/repeat pass. Unset = `CLAUDE_CLI_MAX_FRAMES`; `0` = every distinct frame (then set `SUMMARY_CHUNK_MAX_FRAMES` so a long video is split across requests) |
+| `GEMINI_MEDIA_RESOLUTION` | (unset) | `low` / `medium` / `high`. The only thing that changes what an image costs Gemini: ~264 / 527 / 1100 tokens per image, whatever its pixel size (measured; unset prices like `high`). The free tier allows 250k input tokens per minute per model |
+| `OPENROUTER_API_KEY_1..3` | — | For the `openrouter` backend (openrouter.ai → Keys; free `:free` models need no card). Free limits are per **account**: 20 requests/min, 50/day, 1,000/day after a one-time $10 top-up — extra keys on one account add nothing |
+| `OPENROUTER_MODEL` | `dots-studio/dots-3-note-preview:free` | A comma-separated chain, walked like `GEMINI_MODEL`. Must accept images. Free variants are withdrawn without notice; a gone one is skipped |
+| `OPENROUTER_TIMEOUT_SECONDS` | 600 | One request's timeout, then retry / next key |
+| `OPENROUTER_MAX_FRAMES` | (unset) | OpenRouter's own frame cap after the blank/repeat pass. Unset = `CLAUDE_CLI_MAX_FRAMES`; `0` = all |
+| `OPENROUTER_MAX_TOKENS` | 32768 | Output cap for one chunk, so a runaway answer stops sooner. The merge is never capped. `0` = no cap |
+| `OPENROUTER_TRUNCATION_RETRIES` | 1 | A cut-off answer is retried this many times on the same model before the next model / backend. Rejected answers are kept in `$MEETING_BOT_ROOT/tmp/rejected-answers/` |
+| `SUMMARY_CHUNK_CACHE` | 1 | Keep each finished chunk summary in `runs/<id>/chunks/` and reuse it on a resume. `0` = always summarize every chunk again |
 | `SUMMARY_PROMPT` | `video` | `video`, `meeting`, `lecture`, `tutorial` or `reality` (`lecture` in `.env.example`); `--prompt` overrides. Older names still resolve |
 | `SUMMARY_INSTRUCTIONS` | — | Extra instructions for every summary; `--instructions` (or the web UI's field) overrides it per run |
 | `SUMMARY_MAX_TOKENS` | 16000 | **Gemini only.** The Claude CLI has no output cap, and output is not what spends a subscription window anyway — see below |
@@ -1600,6 +1609,7 @@ immediately rather than burning the full retry schedule first.
 | Variable | Default | Meaning |
 |---|---|---|
 | `SUMMARY_CHUNK_CHARS` | 24000 | Above this, chunk + merge. `0` disables. `.env.example` ships 60000: fewer seams, and no merge call at all for most lectures |
+| `SUMMARY_CHUNK_MAX_FRAMES` | 0 | Most frames one chunk may carry; a chunk with more is cut in time (at every Nth frame), and the cap alone starts chunking. `0` = no limit. Size it so frames × per-image tokens + the transcript stays well under 250k for the Gemini free tier — e.g. 350 at `low`, 180 at `medium` |
 | `SUMMARY_CHUNK_OVERLAP` | 800 | Context repeated across a boundary |
 | `SUMMARY_SEGMENT_MAX_SECONDS` | 120 | Transcript segments longer than this are split before chunking. `0` disables |
 | `SUMMARY_SEGMENT_MAX_CHARS` | 2000 | Same, by length |

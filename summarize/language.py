@@ -73,9 +73,10 @@ def normalize(value):
     return code
 
 
-def output_language():
-    """The configured code ('th' by default). Raises UnknownLanguage."""
-    return normalize(os.environ.get(ENV_VAR))
+def output_language(env=None):
+    """The configured code ('th' by default). Raises UnknownLanguage.
+    `env` stands in for os.environ (the web UI passes .env as it is now)."""
+    return normalize((os.environ if env is None else env).get(ENV_VAR))
 
 
 def language_name(code=None):

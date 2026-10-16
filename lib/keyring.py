@@ -235,6 +235,7 @@ def _main(argv):
     # `./verify_e2e.sh --preflight` checks `claude auth status` instead.
     rings = [
         ("GEMINI_API_KEY", ("GOOGLE_API_KEY",), 3),
+        ("OPENROUTER_API_KEY", (), 3),
         ("ASSEMBLYAI_API_KEY", (), 3),
         ("YT_TRANSCRIPT_KEY", (), 10),
     ]

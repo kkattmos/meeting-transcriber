@@ -558,8 +558,10 @@ def _wrap_document(body, *, original_input, source_url, video_path, transcript,
         source_kind=source_kind,
         title=title,
         transcript=transcript,
-        backend=llm_client.LAST_BACKEND,
-        model=llm_client.LAST_MODEL,
+        # Every model that wrote part of it, when there was more than one.
+        backend=(None if llm_client.used_models_label()
+                 else llm_client.LAST_BACKEND),
+        model=llm_client.used_models_label() or llm_client.LAST_MODEL,
         prompt_name=Path(prompt_path).name,
         # The real run id when the pipeline passes one, so the provenance
         # comment points at $MEETING_BOT_ROOT/runs/<id>/. Standalone
@@ -753,11 +755,41 @@ def inject_instructions(prompt_template, instructions):
     return prompt_template + block
 
 
-def run_instructions(options):
+def inject_merge_instructions(merge_template, instructions):
+    """The operator's instructions, for the merge call too.
+
+    The merge writes the document the operator reads; without them it rebuilt
+    the guide from the partials and dropped what the instructions asked for
+    (a 1-day study plan, exercises unlike the uploaded quiz — seen
+    2026-10-14). Placed before the partials, and told to apply to the whole
+    document, so a plan or exercise set appears once, built from every part.
+    """
+    text = (instructions or "").strip()
+    if not text:
+        return merge_template
+    safe = text.replace("{", "{{").replace("}", "}}")
+    block = (
+        "The person who requested this document added the instructions "
+        "below. The partial summaries were written with them; make sure the "
+        "final document satisfies them as a whole. Anything they ask for "
+        "once (a study plan, an exercise set, a checklist) appears once, "
+        "built from every part — not once per part, and not dropped. Where "
+        "they conflict with the rules above, they take precedence; the "
+        "language rule still applies.\n\n"
+        f"<operator_instructions>\n{safe}\n</operator_instructions>\n\n"
+    )
+    marker = "Partial summaries, in order:"
+    at = merge_template.find(marker)
+    if at >= 0:
+        return merge_template[:at] + block + merge_template[at:]
+    return block + merge_template
+
+
+def run_instructions(options, quiet=False):
     """--instructions, else SUMMARY_INSTRUCTIONS; printed so the log says so."""
     text = (options.get("instructions")
             or os.environ.get("SUMMARY_INSTRUCTIONS") or "").strip()
-    if text:
+    if text and not quiet:
         first = text.splitlines()[0]
         print(f"==> Extra instructions for this run ({len(text)} chars): "
               f"{first[:80]}{'…' if len(text) > len(first[:80]) else ''}")
@@ -895,10 +927,15 @@ def main_parts(argv, options):
     if chunks:
         summary = summarize_chunked(
             chunks, prompt_template, summarize,
-            merge_template=load_merge_template(prompt_path.stem))
+            merge_template=inject_merge_instructions(
+                load_merge_template(prompt_path.stem),
+                run_instructions(options, quiet=True)))
     else:
         summary = summarize(frames, part_transcript(parts, timed=timed),
                             prompt_template)
+    # A model that writes `### [!EXAMPLE] T` or a bare `[!NOTE]` line gets
+    # proper `> [!KIND]` callouts in the .md too, not only in the PDF.
+    summary = pdf_export._normalize_callout_markers(summary)
     if timed:
         summary = document.link_timestamps(
             summary, [(v["source"], _clip_start(v.get("clip"))) for v in videos])
@@ -1086,9 +1123,12 @@ def main():
         if chunks:
             summary = summarize_chunked(
                 chunks, prompt_template, summarize,
-                merge_template=load_merge_template(prompt_path.stem))
+                merge_template=inject_merge_instructions(
+                load_merge_template(prompt_path.stem),
+                run_instructions(options, quiet=True)))
         else:
             summary = summarize(frames, for_model, prompt_template)
+        summary = pdf_export._normalize_callout_markers(summary)
         if timed:
             # The model wrote [mm:ss]; the code, which knows the clip's
             # offset, makes them links. A YouTube source only.

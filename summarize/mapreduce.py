@@ -14,6 +14,9 @@ Concurrency is bounded by SUMMARY_MAX_PARALLEL (default 3). It's deliberately
 small: every chunk carries images, and firing a dozen multi-megabyte requests
 at a provider is a good way to earn the 429s that retry.py then has to sit out.
 """
+import hashlib
+import json
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -94,6 +97,57 @@ def load_merge_template(prompt_name=None):
     return language.apply(text).strip() + "\n\n"
 
 
+# Finished chunk summaries are kept in the run directory, so a resume (a
+# failed merge, a chunk that failed, a re-merge after the merge prompt
+# changed) does not pay for the chunks that already succeeded. Keyed on
+# everything that shapes the answer: the full chunk prompt, the transcript
+# slice, the frames offered and the configured backends/models. Change any
+# of them and the chunk is summarized again. Only inside a pipeline run
+# (MEETING_BOT_RUN_DIR); a standalone summarize.py keeps nothing.
+_CACHE_ENV = ("SUMMARY_BACKEND", "SUMMARY_FALLBACK_CHAIN", "OPENROUTER_MODEL",
+              "CLAUDE_CLI_MODEL", "GEMINI_MODEL", "SUMMARY_LANGUAGE",
+              "SUMMARY_EFFORT")
+
+
+def _chunk_cache_dir():
+    if os.environ.get("SUMMARY_CHUNK_CACHE", "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return None
+    run_dir = os.environ.get("MEETING_BOT_RUN_DIR")
+    if not run_dir or not Path(run_dir).is_dir():
+        return None
+    return Path(run_dir) / "chunks"
+
+
+def _chunk_key(template, chunk):
+    h = hashlib.sha256()
+    for piece in (template, chunk.text,
+                  *(f"{getattr(f, 'number', '')}:{f.path}" for f in chunk.frames),
+                  *(f"{k}={os.environ.get(k, '')}" for k in _CACHE_ENV)):
+        h.update(piece.encode("utf-8", "replace"))
+        h.update(b"\0")
+    return h.hexdigest()[:24]
+
+
+def _cache_read(cache_dir, key):
+    try:
+        data = json.loads((cache_dir / f"{key}.json").read_text())
+        return data["text"], data.get("models") or []
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, []
+
+
+def _cache_write(cache_dir, key, text, models):
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp = cache_dir / f".{key}.tmp"
+        tmp.write_text(json.dumps({"text": text, "models": models},
+                                  ensure_ascii=False))
+        tmp.replace(cache_dir / f"{key}.json")
+    except OSError:
+        pass   # a lost cache costs one call, never a run
+
+
 def summarize_chunked(chunks, prompt_template, summarize_fn, log=print,
                       merge_template=None):
     """Summarize chunks in parallel, then merge.
@@ -114,10 +168,27 @@ def summarize_chunked(chunks, prompt_template, summarize_fn, log=print,
     results = [None] * total
     errors = []
 
+    cache_dir = _chunk_cache_dir()
+    import llm_client   # the used-models record; imported late (no cycle)
+
     def _one(chunk):
         template = chunk_template.replace("PART_LABEL_PLACEHOLDER",
                                           chunk.header(total))
-        return summarize_fn(chunk.frames, chunk.text, template)
+        key = _chunk_key(template, chunk) if cache_dir else None
+        if key:
+            text, models = _cache_read(cache_dir, key)
+            if text:
+                log(f"    chunk {chunk.index + 1}/{total}: reusing the summary "
+                    f"from an earlier attempt ({', '.join(models) or '?'})")
+                for label in models:
+                    backend, _, model = label.partition("/")
+                    llm_client._record_used(backend, model)
+                return text
+        text = summarize_fn(chunk.frames, chunk.text, template)
+        if key and text:
+            last = llm_client.thread_last_used()
+            _cache_write(cache_dir, key, text, [last] if last else [])
+        return text
 
     with ThreadPoolExecutor(max_workers=max_parallel()) as pool:
         futures = {pool.submit(_one, c): c for c in chunks}

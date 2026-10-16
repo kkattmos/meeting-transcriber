@@ -1223,5 +1223,32 @@ class DesignTest(unittest.TestCase):
         self.assertNotIn("<p>Youtube Link", html_out)
 
 
+
+class LooseCalloutMarkersTest(unittest.TestCase):
+    """`### [!KIND] Title` and a bare `[!KIND]` line become callouts."""
+
+    def test_heading_marker(self):
+        md = "## 1. A\n\n### [!EXAMPLE] Smart TV\n* a\n\n  b\n\n## 2. B\n"
+        out = pdf_export._normalize_callout_markers(md)
+        self.assertIn("> [!EXAMPLE] Smart TV\n> * a\n>\n>   b\n\n## 2. B", out)
+        html = pdf_export._extract_callouts(out)
+        self.assertIn('class="callout callout-example"', html)
+        self.assertNotIn("[!EXAMPLE]", html)
+
+    def test_bare_marker_takes_the_next_heading_as_title(self):
+        md = "[!IMPORTANT]\n### Exam scope\n* x\n\n---\n\nafter\n"
+        out = pdf_export._normalize_callout_markers(md)
+        self.assertTrue(out.startswith("> [!IMPORTANT] Exam scope\n> * x\n"))
+        self.assertIn("\n---\n\nafter", out)
+
+    def test_code_and_proper_callouts_untouched(self):
+        md = "```\n### [!NOTE] in code\n```\n> [!NOTE] ok\n> y\n[!foo] prose\n"
+        self.assertEqual(pdf_export._normalize_callout_markers(md), md)
+
+    def test_a_heading_inside_a_fence_does_not_end_the_box(self):
+        md = "### [!EXAMPLE] Code\n```python\n# comment\n```\n## Next\n"
+        out = pdf_export._normalize_callout_markers(md)
+        self.assertIn("> ```python\n> # comment\n> ```\n\n## Next", out)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

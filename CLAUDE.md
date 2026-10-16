@@ -154,7 +154,20 @@ desktop. The decisions, each asked and answered:
   variables, so a snapshot taken after sourcing `.env` froze it — found
   2026-09-29 when the UI kept `PDF_FONT_SIZE=8` after `.env` said 9.5, and
   every run it started inherited that. It also keeps the API keys out of
-  pm2's process list. An `.env` edit now takes effect on any restart.
+  pm2's process list. **Since 2026-10-14 an `.env` edit reaches the next
+  run with no restart at all.** Found when a run started from the UI used
+  the Gemini chain six minutes after `.env` had switched it to `claude`:
+  the UI had loaded `.env` at its start, every child inherited that copy,
+  and `source_env.sh` never overrides a set variable. (`start_clean` alone
+  could not prevent it either: its first `pm2 delete` spawned the daemon
+  *before* the unset, and the daemon's environment is merged into every
+  app.) Now `trigger_server.child_env()` hands `pipeline.sh` (runs, Check,
+  Stop) an environment with every `.env` key removed, so the child loads
+  the file as it is at launch; `/api/options` reads the form defaults from
+  the file (`current_config`); `web/serve.sh` and `web/resume.sh` source
+  with `MEETING_BOT_ENV_FRESH=1` (`.env` wins over whatever pm2 replays);
+  and the delete runs inside the clean subshell. Only the UI's own token,
+  port and bind address still need `./webui.sh restart`.
 - **The web UI listens on localhost + Tailscale**: `MEETING_BOT_BIND` is a
   comma list and the word `tailscale` resolves to `tailscale ip -4` at start
   (skipped with a warning when Tailscale is down); one `ThreadingHTTPServer`
@@ -1295,8 +1308,8 @@ Split across eight modules:
 - `pdf.py` + `framecrop.py` + `mathrender.py` — the PDF export, its frame
   cropping and its LaTeX typesetting.
 
-Backends: `claude-cli` (default, aliases `claude`/`anthropic`/`cli`/`fcc`) and
-`gemini`. `SUMMARY_BACKEND=fallback` is the default mode and walks
+Backends: `claude-cli` (default, aliases `claude`/`anthropic`/`cli`/`fcc`),
+`gemini` and `openrouter` (2026-10-14; see below). `SUMMARY_BACKEND=fallback` is the default mode and walks
 `SUMMARY_FALLBACK_CHAIN` (default `claude-cli,gemini`). **NVIDIA NIM and Ollama
 were removed** in the Debian 13 port — neither had been on a configured path,
 and both carried env surface and untested code. **The API-key `anthropic`
@@ -1792,6 +1805,74 @@ MinuteFreeTier`), so the retries within that minute came back 429 on every
 key and model, and a 9-video combine run crawled for hours.
 `test_gemini_gets_the_same_filtering_as_the_cli`.
 
+**Every distinct frame to Gemini, priced by `media_resolution`** (same
+day, the operator: "all non-repeat frames are sent", request small enough).
+Measured with `count_tokens` on gemini-3.5/3.6-flash: **an image costs a
+fixed number of tokens whatever its pixels** — 1280x720 and 384x216 both
+1,100 by default, 527 at MEDIUM, 264 at LOW (`GEMINI_IMAGE_TOKENS`). So
+shrinking or recompressing frames saves bytes, never quota; only
+`GEMINI_MEDIA_RESOLUTION` (set per image part) does. Even at LOW the
+lectures of that run had 685-877 distinct frames a video (218-251k tokens),
+at or over the free tier's 250k a minute in one request — so
+`SUMMARY_CHUNK_MAX_FRAMES` cuts a chunk at every Nth frame
+(`chunking._split_by_frames`, segments never split; the cap alone also
+starts chunking, and with `SUMMARY_CHUNK_CHARS=0` only it cuts). Keep a
+request near half the per-minute quota: a 503'd attempt seems to count, and
+the retry lands in the same minute. `GEMINI_MAX_FRAMES` is Gemini's own cap
+(unset = `CLAUDE_CLI_MAX_FRAMES`, `0` = all distinct frames), so the CLI
+keeps its 20.
+
+**OpenRouter is a third backend, and the operator's primary** (2026-10-14;
+the operator's `.env` chain is `openrouter,claude`, on a key without the
+$10 top-up, so 50 free requests a day). Mistral was built first
+and removed the same day: its Free plan no longer activates API keys (the
+console offers only paid plans). `summarize_openrouter`: plain `requests`
+POSTs to `/api/v1/chat/completions` (no SDK — `requests` was already
+pinned), content = the text, then per frame its manifest label and an
+OpenAI-shaped `image_url: {url: data:…}`. `OPENROUTER_MODEL` is a chain
+(default `dots-studio/dots-3-note-preview:free`, the one free image model
+that answered in the operator's live trial) walked keys-first
+like Gemini's. Non-obvious:
+
+- **The free limits are per account**, not per model or key. A 429 whose
+  `X-RateLimit-Reset` is > 5 min away (or that says "per-day") is
+  `OpenRouterDailyLimit`: that key is dropped for *every* model — walking
+  the chain would only spend more calls on the same wall. A per-minute 429
+  is an ordinary retryable error (`Retry-After` honoured by retry.py).
+- **An error can arrive inside a 200** (top-level `error`, or
+  `choices[0].error` / `finish_reason: "error"`); `_openrouter_error`
+  checks the body before taking the content.
+- **`finish_reason: "length"` is `OpenRouterTruncated`** → next model. The
+  free Gemma caps output at 32k tokens; a 9-video combine merge is larger,
+  and a cut-off guide would otherwise be marked done.
+- **Runaway answers (2026-10-14, the first full run on
+  `dots-3-note-preview:free`):** 2 of 10 calls ran to the provider's
+  65,536-token cap (successful chunks were 10-22k) — chunk 4, the shortest
+  video, and chunk 8. Re-sending chunk 4 alone came back at 9.4k tokens, so
+  it is intermittent, not the content. Now: a chunk is capped at
+  `OPENROUTER_MAX_TOKENS` (32768; the merge is not capped — it wrote 38k),
+  a cut-off answer is retried `OPENROUTER_TRUNCATION_RETRIES` (1) time on
+  the same model before the chain moves on, and every rejected answer is
+  kept in `$MEETING_BOT_ROOT/tmp/rejected-answers/` — the text of the two
+  failures was not kept, so "a repetition loop" is still a guess.
+- The response's `model` field is recorded, so a router
+  (`openrouter/free`) is named as `<real model> (via openrouter/free)`.
+- dots-3-note sometimes writes `### [!EXAMPLE] T` or a bare `[!NOTE]`
+  line instead of `> [!EXAMPLE] T`; `pdf._normalize_callout_markers`
+  rewrites both (summarize.py runs it on the body too, so the `.md` gets
+  real callouts).
+- Free models tried 2026-10-14 and rejected: `gemma-4-31b-it:free` /
+  `gemma-4-26b-a4b-it:free` (upstream 429 all day), `inkling:free` (403,
+  "only available on agentic harnesses"), `nemotron-3-nano-omni…:free`
+  (at most 12 images per prompt).
+- 404 / a 400 naming the model = `OpenRouterModelUnavailable` (next model);
+  free variants are withdrawn without notice.
+- Same three frame passes as the others; cap `OPENROUTER_MAX_FRAMES`
+  (unset = `CLAUDE_CLI_MAX_FRAMES`). `role="merge"` is accepted and ignored.
+  Usage goes to the stage log, not the Claude usage ledger.
+  `OpenRouterBackendTest` drives it through a fake `requests`;
+  `OPENROUTER_API_URL` is the test seam. Not yet verified live.
+
 **`BackendUnavailable` carries `retryable = False`, and `retry.is_retryable`
 honours that before every other check.** It is raised from *inside*
 `with_retries` (the CLI only reveals "not logged in" once it has run), and
@@ -1827,6 +1908,23 @@ had an equal claim on every sentence in it. After the split: 3 segments become
 79, the longest drops from 5184s to 127s, chunks land at 39.6k/39.3k/8.7k, and
 the windows are sequential. Interpolating on character offset assumes an even
 speaking rate — wrong in detail, and enormously closer than one 29-minute atom.
+
+**Chunked runs, three fixes of 2026-10-14** (found on a 9-video combine
+run that mixed dots-3-note and Claude Haiku):
+- **The merge gets the operator's instructions** (`inject_merge_instructions`,
+  before "Partial summaries, in order:"), told to satisfy them for the whole
+  document. Before, only the chunk calls saw `--instructions`; the merge
+  rebuilt the guide from the partials and dropped the 1-day study plan they
+  asked for.
+- **Every model that wrote part of a document is named** —
+  `llm_client.USED_MODELS`, provenance `model: a + b` when more than one.
+  It used to name the merge's model only.
+- **Finished chunks are kept** in `runs/<id>/chunks/<key>.json` (text + the
+  model that wrote it; `mapreduce._chunk_key` hashes the chunk prompt, the
+  transcript slice, the frames and the backend/model settings), so a resume
+  or re-merge pays only for what is missing. Pipeline runs only
+  (`MEETING_BOT_RUN_DIR`); `SUMMARY_CHUNK_CACHE=0` turns it off. The model
+  per chunk is `llm_client.thread_last_used()` — chunks run in threads.
 
 **Chunking.** Above `SUMMARY_CHUNK_CHARS` (24000), the transcript is split and
 chunks are summarized concurrently, then merged by one more LLM call using
@@ -2383,6 +2481,10 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   `rs init`, or twice, makes duplicate runs (two calls, for meet.new).
 - **pm2 never runs `pipeline.sh` itself for the resume job** —
   `web/resume.sh` detaches it. cron_restart kills whatever is still running.
+- **The web UI's children get no `.env` key in their environment**
+  (`trigger_server.child_env`), and the pm2 entry scripts source with
+  `MEETING_BOT_ENV_FRESH=1`. Passing `os.environ` through again makes every
+  run use `.env` as it was when the UI started, silently.
 - **pm2 never starts anything at boot.** No `pm2 startup`, no `pm2 save` in
   any script. The operator asked for the web UI to be off by default.
 - **The bot's mic and camera stay blocked at the browser**, and mute_av
@@ -2598,6 +2700,9 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **Both backends filter frames the same way** (blanks/repeats, cap,
   downscaled copy). A backend that sends the raw manifest hits Gemini's
   per-minute token quota on any long video.
+- **Gemini quota is per image, not per pixel.** Don't "optimise" frame
+  size or JPEG quality for Gemini tokens; `GEMINI_MEDIA_RESOLUTION` and
+  `SUMMARY_CHUNK_MAX_FRAMES` are the levers.
 - **`CLAUDE_CLI_MAX_FRAMES` thins what is offered, never renumbers.** The
   numbers come from `assign_numbers()` over the whole manifest; a thinned
   list that renumbered would recreate the per-chunk numbering bug above.
@@ -2763,14 +2868,14 @@ without API keys or network, against temp directories
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
 | `lib/test_discord_spool.py` | Discord spool placement from synthetic packet timings (arrival only; RTP: bunching, loss, wraparound, a pause, a resync), crash tolerance, the int32 mix and clipping, real ffmpeg (words where spoken, speaker tracks, the spool kept on failure) | 22 |
-| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the five prompts (old names resolve, no timestamps outside `reality`, the callout vocabulary), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`), the Gemini request timeout, Gemini's frame filtering | 224 |
-| `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), real PDF render | 107 |
+| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the five prompts (old names resolve, no timestamps outside `reality`, the callout vocabulary), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`), the Gemini request timeout, Gemini's frame filtering, media resolution and own cap, the per-chunk frame cap, the OpenRouter backend (payload, key/model walk, the per-account daily cap, an error inside a 200, a truncated answer retried once then the next model, the chunk cap, the rejected-answer dump, the real model of a router), the chunk flow (the merge's instructions, every model named, finished chunks reused and re-keyed on a model change) | 246 |
+| `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), loose callout markers (`### [!KIND]`, a bare `[!KIND]`), real PDF render | 111 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `transcribe/test_yt_autocaptions.py` | yt-dlp captions: track choice (never a translation; `auto` prefers an upload in the spoken language), json3, the CLI against a stub yt-dlp | 13 |
 | `screen/test_extract_frames.py` | frames on change: settle, a transient change, blanks, the motion cap, the safety net, the last sample, the shared distance; the PPM reader; real ffmpeg (black lead-in skipped, audio-only empty, retired settings named) | 19 |
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
-| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source | 12 |
+| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source, an `.env` edit reaching the next run and the form without a restart, the `.env` parser | 14 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line), Stop on a summarizing run (`kill_meeting.sh --run-id` terminates it, `STOPPED`, `--resume-all` skips it, `--run-id` finishes it and clears the mark) | 477 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, YouTube captions through a stub yt-dlp first (the API never asked when it succeeds), youtube-transcript.io when yt-dlp fails or finds no track, the other-language-labelled track as last resort, `YT_AUTOCAPTIONS=0`, both down = exit 1, `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 141 |
 | `verify_e2e.sh --browser-smoke` | the real browser (Firefox ESR or Chrome) under Xvfb, recorded and measured for black edges | 6 |

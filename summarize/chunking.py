@@ -31,6 +31,13 @@ Env vars:
                                            chunks, so a sentence split across a
                                            boundary isn't lost)
   SUMMARY_MAX_PARALLEL     default 3      (concurrent chunk requests)
+  SUMMARY_CHUNK_MAX_FRAMES default 0      (most frames one chunk may carry;
+                                           a chunk with more is cut in time.
+                                           0 = no limit. The Gemini free tier
+                                           counts every image against 250k
+                                           input tokens a minute, so a video
+                                           with hundreds of distinct frames
+                                           has to go in several requests)
 """
 import os
 import re
@@ -88,6 +95,41 @@ def chunk_chars():
         return int(os.environ.get("SUMMARY_CHUNK_CHARS", 24000))
     except ValueError:
         return 24000
+
+
+def chunk_max_frames():
+    try:
+        return max(0, int(os.environ.get("SUMMARY_CHUNK_MAX_FRAMES", 0)))
+    except ValueError:
+        return 0
+
+
+def _split_by_frames(groups, frames, cap):
+    """Cut every segment group carrying more than `cap` frames into pieces.
+
+    The cuts fall at frame timestamps, every `cap`-th frame of the group's
+    window, so the pieces carry about `cap` frames each however unevenly the
+    slides are spread through the talk; the segments go to the piece their
+    start falls in. A segment is never split, so a piece can still run over
+    when one segment spans many frames — split_long_segments has already
+    capped segments at two minutes, which keeps that small.
+    """
+    if cap <= 0:
+        return groups
+    ordered = sorted(frames, key=lambda f: f.timestamp_s)
+    out = []
+    for group in groups:
+        start, end = group[0].start_s, group[-1].end_s
+        inside = [f for f in ordered if start <= f.timestamp_s < end]
+        if len(inside) <= cap:
+            out.append(group)
+            continue
+        cuts = [inside[i].timestamp_s for i in range(cap, len(inside), cap)]
+        pieces = [[] for _ in range(len(cuts) + 1)]
+        for seg in group:
+            pieces[sum(1 for c in cuts if seg.start_s >= c)].append(seg)
+        out.extend(piece for piece in pieces if piece)
+    return out
 
 
 def chunk_overlap():
@@ -282,9 +324,12 @@ def find_srt_for(transcript_path):
     return candidate if candidate.is_file() else None
 
 
-def should_chunk(transcript, limit=None):
+def should_chunk(transcript, limit=None, frames=None):
     limit = chunk_chars() if limit is None else limit
-    return limit > 0 and len(transcript) > limit
+    if limit > 0 and len(transcript) > limit:
+        return True
+    cap = chunk_max_frames()
+    return bool(frames) and cap > 0 and len(frames) > cap
 
 
 def chunk_by_segments(segments, frames, limit=None, overlap=None):
@@ -294,6 +339,8 @@ def chunk_by_segments(segments, frames, limit=None, overlap=None):
     sees the slide that was actually on screen for the words it's reading.
     """
     limit = chunk_chars() if limit is None else limit
+    if limit <= 0:
+        limit = float("inf")   # size chunking off; only the frame cap cuts
     overlap = chunk_overlap() if overlap is None else overlap
 
     chunks = []
@@ -316,6 +363,7 @@ def chunk_by_segments(segments, frames, limit=None, overlap=None):
         current_len += len(seg.text)
     if current:
         chunks.append(current)
+    chunks = _split_by_frames(chunks, frames, chunk_max_frames())
 
     out = []
     for i, group in enumerate(chunks):
@@ -391,7 +439,7 @@ def build_chunks(transcript, frames, transcript_path=None, timed=False):
     marks); without an .srt there are no times to give, and the plain text
     is chunked as usual.
     """
-    if not should_chunk(transcript):
+    if not should_chunk(transcript, frames=frames):
         return []
 
     if transcript_path:
@@ -477,7 +525,9 @@ def build_part_chunks(parts, limit=None, timed=False):
     """
     limit = chunk_chars() if limit is None else limit
     total = sum(len(_part_text(p, timed)) for p in parts)
-    if not (limit > 0 and total > limit):
+    cap = chunk_max_frames()
+    too_many_frames = cap > 0 and sum(len(p.frames) for p in parts) > cap
+    if not (limit > 0 and total > limit) and not too_many_frames:
         return []
     chunks = []
     for part in parts:

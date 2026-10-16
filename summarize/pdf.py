@@ -307,6 +307,70 @@ CALLOUT_DEFAULT_TITLES = {
 }
 
 
+# Two spellings models write instead of `> [!KIND] Title` (dots-3-note,
+# 2026-10-14): a heading `### [!EXAMPLE] Title`, and a bare `[!IMPORTANT]`
+# line, often followed by a heading that is its title. Neither is a quote,
+# so both printed as source. Only the known kinds count, so a stray
+# `[!foo]` in prose is left alone.
+LOOSE_CALLOUT_RE = re.compile(
+    r"^(?:#{1,6}[ \t]+)?\[!([A-Za-z]+)\][+-]?[ \t]*(.*?)[ \t#]*$")
+HEADING_RE = re.compile(r"^#{1,6}[ \t]+(.*?)[ \t#]*$")
+RULE_RE = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+
+
+def _normalize_callout_markers(text):
+    """Rewrite the loose spellings above into blockquote callouts.
+
+    The box runs from the marker to the next heading, horizontal rule,
+    marker or the end, with trailing blank lines left outside; a heading
+    inside fenced code does not end it."""
+    lines = text.splitlines()
+    out, i, fence = [], 0, None
+    while i < len(lines):
+        line = lines[i]
+        f = FENCE_RE.match(line)
+        if f and not line.startswith("    "):
+            fence = None if fence == f.group(1) else (fence or f.group(1))
+            out.append(line)
+            i += 1
+            continue
+        m = None if fence else LOOSE_CALLOUT_RE.match(line)
+        if not m or m.group(1).lower() not in CALLOUT_KINDS:
+            out.append(line)
+            i += 1
+            continue
+        kind, title = m.group(1).upper(), m.group(2).strip()
+        i += 1
+        if not title:
+            j = i
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            h = HEADING_RE.match(lines[j]) if j < len(lines) else None
+            if h and not LOOSE_CALLOUT_RE.match(lines[j]):
+                title, i = h.group(1).strip(), j + 1
+        body, inner_fence = [], None
+        while i < len(lines):
+            nxt = lines[i]
+            g = FENCE_RE.match(nxt)
+            if g and not nxt.startswith("    "):
+                inner_fence = (None if inner_fence == g.group(1)
+                               else (inner_fence or g.group(1)))
+            elif inner_fence is None and (
+                    HEADING_RE.match(nxt) or RULE_RE.match(nxt)
+                    or LOOSE_CALLOUT_RE.match(nxt)):
+                break
+            body.append(nxt)
+            i += 1
+        trailing = 0
+        while body and not body[-1].strip():
+            body.pop()
+            trailing += 1
+        out.append(f"> [!{kind}] {title}".rstrip())
+        out.extend(f"> {b}" if b.strip() else ">" for b in body)
+        out.extend([""] * max(trailing, 1))
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
 def _extract_callouts(text):
     """Turn top-level blockquotes into callout <div>s. See above."""
     lines = text.splitlines()
@@ -1163,7 +1227,7 @@ def render(markdown_text, output_path, *, frames=(), work_dir=None,
 
         # Callouts first: a formula inside a quote carries "> " on every line
         # until the quote markers are gone. See _extract_callouts.
-        body_md = _extract_callouts(body_md)
+        body_md = _extract_callouts(_normalize_callout_markers(body_md))
         # Maths comes out of the markdown *before* the HTML conversion: python-
         # markdown would eat the underscores and backslashes otherwise. It goes
         # back in after the citation passes, so those never have to step over a
