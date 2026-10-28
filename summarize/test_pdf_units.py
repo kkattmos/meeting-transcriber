@@ -698,6 +698,31 @@ class MathExtractionTest(unittest.TestCase):
         self.assertIn("\u00d7", out)
         self.assertNotIn("\\times", out)
 
+    def test_thai_words_in_a_formula_are_set_as_text(self):
+        # `\text{ หรือ }` used to reach mathtext, which has no Thai glyph and
+        # drew a dummy box per letter ("Font 'rm' does not have a glyph").
+        seen = []
+
+        def engine(tex, size, color):
+            seen.append(tex)
+            return b"<svg/>", 10.0, 8.0, 2.0
+
+        out = mathrender._one(r"r = 0.08 \text{ หรือ } 8\%", True, engine,
+                              8.0, "#000")
+        self.assertIn('<span class="math-words"> หรือ </span>', out)
+        self.assertEqual(out.count("<img"), 2)
+        self.assertFalse(any("ห" in t for t in seen), seen)
+
+    def test_thai_that_cannot_be_cut_out_falls_back_to_text(self):
+        def engine(tex, size, color):
+            raise AssertionError("mathtext must not see Thai")
+
+        for tex in (r"\frac{\text{กำไร}}{\text{หุ้น}}", r"x_\text{ไทย}",
+                    r"P = กำไร / หุ้น"):
+            out = mathrender._one(tex, False, engine, 8.0, "#000")
+            self.assertIn("math-fallback", out)
+            self.assertIn("กำไร" if "กำไร" in tex else "ไทย", out)
+
     def test_rendering_is_deduplicated(self):
         calls = []
 
@@ -960,8 +985,9 @@ class BodyFontByLanguageTest(unittest.TestCase):
 
     def test_css_uses_the_language_stack_for_body_and_footer(self):
         css = pdf_export._css("th")
-        # The body and both footer boxes.
-        self.assertEqual(css.count('"Bai Jamjuree", Sarabun'), 3)
+        # The body, both footer boxes, and the maths fallback (for Thai
+        # letters inside a formula that could not be typeset).
+        self.assertEqual(css.count('"Bai Jamjuree", Sarabun'), 4)
         self.assertNotIn('"Bai Jamjuree"', pdf_export._css("en"))
         # The maths fallback face stays Computer Modern in both.
         for lang in ("th", "en"):

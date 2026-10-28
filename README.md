@@ -1079,7 +1079,7 @@ the Gemini backends (`summarize/prompts/`):
 |---|---|---|
 | `video` (default) | talks, news, interviews, documentaries | key points, then the video's topics in order, speakers attributed |
 | `meeting` | calls | decisions, an action-item table (task, owner, due, priority), the discussion by topic, open questions |
-| `lecture` | classes | a study sheet: what the instructor flagged, then numbered sections with key concepts, worked examples and common mistakes; cites a `--resources` textbook excerpt when it has frontmatter |
+| `lecture` | classes | a cheat sheet (about 300 words per hour, at most 1,200 per call): what the instructor flagged, then terse numbered sections — key formulas, decision rules, pitfalls, an example only where needed; cites a `--resources` textbook excerpt when it has frontmatter |
 | `tutorial` | walkthroughs, coding videos | prerequisites and takeaways, then the steps with every command and code block verbatim, and a quick-reference table |
 | `reality` | competition reality-show episodes (The Face, Drag Race, MasterChef, …) | an episode recap: the teams, then the episode's segments in order with `[mm:ss]` timestamps and quotes from the mentors, judges and contestants, a highlights table, and last the results — the winner, who was up for elimination, who was eliminated |
 
@@ -1380,7 +1380,8 @@ end the scan.
 | `OPENROUTER_TIMEOUT_SECONDS` | 600 | One request's timeout, then retry / next key |
 | `OPENROUTER_MAX_FRAMES` | (unset) | OpenRouter's own frame cap after the blank/repeat pass. Unset = `CLAUDE_CLI_MAX_FRAMES`; `0` = all |
 | `OPENROUTER_MAX_TOKENS` | 32768 | Output cap for one chunk, so a runaway answer stops sooner. The merge is never capped. `0` = no cap |
-| `OPENROUTER_TRUNCATION_RETRIES` | 1 | A cut-off answer is retried this many times on the same model before the next model / backend. Rejected answers are kept in `$MEETING_BOT_ROOT/tmp/rejected-answers/` |
+| `OPENROUTER_TRUNCATION_RETRIES` | 1 | A cut-off or off-script answer is retried this many times on the same model before the next model / backend. Rejected answers are kept in `$MEETING_BOT_ROOT/tmp/rejected-answers/` |
+| `OPENROUTER_MAX_FOREIGN_RUNS` | 2 | An answer with more runs than this of a script that is neither the summary language's nor the transcript's (Chinese or Arabic inside Thai words, say) is rejected like a cut-off one. `0` = reject any |
 | `SUMMARY_CHUNK_CACHE` | 1 | Keep each finished chunk summary in `runs/<id>/chunks/` and reuse it on a resume. `0` = always summarize every chunk again |
 | `SUMMARY_PROMPT` | `video` | `video`, `meeting`, `lecture`, `tutorial` or `reality` (`lecture` in `.env.example`); `--prompt` overrides. Older names still resolve |
 | `SUMMARY_INSTRUCTIONS` | — | Extra instructions for every summary; `--instructions` (or the web UI's field) overrides it per run |

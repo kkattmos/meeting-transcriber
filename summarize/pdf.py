@@ -846,6 +846,9 @@ def _css(lang=None, provenance=None):
     mono_em = fontchoice.mono_factor() / factor
     mono = fontchoice.css_stack(fontchoice.MONO_STACK)
     maths = fontchoice.css_stack(fontchoice.MATH_STACK)
+    # Formulas that fall back to text may hold Thai (or another script CM
+    # lacks): the body face takes those letters before the generic serif.
+    maths_text = fontchoice.css_stack(fontchoice.MATH_STACK[:-1]) + ", " + stack
     callouts = "\n".join(
         f".callout-{kind} {{ background: {fill}; border-left-color: {rule}; }}\n"
         f".callout-{kind} .callout-title {{ color: {title}; }}"
@@ -958,9 +961,11 @@ img.math {{ margin: 0; }}
 .math-block {{ display: block; text-align: center; margin: 7pt 0;
                break-inside: avoid; }}
 .math-line {{ display: block; margin: 2pt 0; }}
-.math-fallback {{ font-family: {maths}; font-style: italic;
+.math-fallback {{ font-family: {maths_text}; font-style: italic;
                   font-size: {math_em:.3f}em; }}
 .msym {{ font-family: {maths}; font-size: {math_em:.3f}em; }}
+/* Words in another script inside a formula (`\\text{{ หรือ }}`): body text. */
+.math-words {{ font-style: normal; }}
 
 /* Small print */
 .colophon {{ margin-top: 16pt; padding-top: 4pt;

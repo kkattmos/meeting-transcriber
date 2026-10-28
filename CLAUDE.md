@@ -1266,6 +1266,67 @@ settled with the operator:
   `do_fetch_video` runs it, `summarize.download_youtube_video` imports it
   (`quiet=True`). `YT_DLP_BIN` is its test seam, as for the captions.
 
+### The KGI combine: script drift, a dub's captions, cheat sheets (2026-10-16)
+
+The operator read `pre-video-summary.pdf` (15 KGI videos, ~10 h, Thai,
+`openrouter,claude` chain) and reported it too long, mixing English in, and
+with text that did not render. Found and settled with the operator:
+
+- **Script drift.** 14 of 15 chunks and the merge came from the free
+  `dots-3-note-preview`, which wrote 168 runs of Chinese, Arabic, Japanese
+  and Cyrillic inside Thai words (`ต้นทุนการซื้อ卖出`, `การ预测แนวโน้ม`) and
+  half-sentences of English. The PDF's fonts have none of those glyphs:
+  blank boxes. The operator kept OpenRouter first; now
+  `language.foreign_runs(answer, input)` counts runs of letters whose
+  script is neither the summary language's nor present (≥ 20 letters) in
+  the model's input, and more than `OPENROUTER_MAX_FOREIGN_RUNS` (2) makes
+  the answer `OpenRouterOffScript` — an `OpenRouterRejected` like
+  `OpenRouterTruncated`: kept in `rejected-answers/`, retried once on the
+  same model, then the next model / backend. Only OpenRouter is checked.
+  Thai left in an *English* summary of a Thai transcript is not caught (it
+  is the input's script); the language rule now forbids it in words. Both
+  rules also say "never switch into English mid-sentence" / "never another
+  script".
+- **A dub's captions.** Video 15 (*KGI ALGO Trading 2026*) is spoken Thai
+  and YouTube auto-dubbed it into English, so it has `en-orig` (speech
+  recognition of the machine dub) and `th-orig`; `choose_track` took
+  `sorted(orig)[0]`. Now `_orig_keys` puts first the `-orig` of the audio
+  format marked "original" (yt-dlp's `format_note`, e.g. "Thai original
+  (default)"), else of the declared `language`. Not the requested language:
+  transcribe.sh always passes one (`th`), which would pick a Thai dub over
+  an English original.
+- **Thai inside maths** (`$0.08 \text{ หรือ } 8\%$`) reached mathtext,
+  which has no Thai glyph ("Font 'rm' does not have a glyph", one dummy box
+  per letter). `mathrender._row_html` now cuts such `\text`-type groups out
+  as `<span class="math-words">` in the body face and typesets the rest;
+  when they can't be cut cleanly (an argument of `\frac`, a subscript, bare
+  Thai) the whole formula is the text fallback, whose stack now has the
+  body face before generic serif. The lecture prompt asks for no words in
+  `$…$` at all.
+- **Length.** 38 pages: each video was one chunk and `_merge.md` said
+  "do not compress". The operator chose "cheat sheet" as the only
+  behaviour: `lecture.md` budgets ~300 words per hour, ≤ 1,200 per call,
+  terse bullets/tables, one example at most per section; `_merge.md`
+  (shared by every prompt but `reality`) now consolidates — at most two
+  thirds of the partials' length, overlapping topics folded, no fact that
+  appears once dropped.
+
+### pm2's Node IPC variables must not reach deno (2026-10-16)
+
+A 193-video `--combine` lost 37 downloads: the web UI runs under pm2, which
+sets `NODE_CHANNEL_FD=3` (+ `NODE_CHANNEL_SERIALIZATION_MODE`,
+`NODE_APP_INSTANCE`) on its apps; they flowed pipeline.sh → yt-dlp → deno,
+which reads the fd as its own IPC channel and dies ("Failed to open IPC
+channel"). yt-dlp then lacks the solved n-challenge, YouTube hides the
+formats and the error reads "This video is not available" — which
+`PERMANENT_RE` called final, so no retry. Now: `web/serve.sh` and
+`web/resume.sh` unset the three variables, `trigger_server.child_env()` and
+`ytdownload` strip them from the child's environment, and
+`ytdownload.CHALLENGE_RE` ("n challenge solving failed", "Failed to open IPC
+channel") is checked *before* `PERMANENT_RE` and means transient. Captions
+(yt-dlp `--skip-download`) never needed the solver, which is why the 37 had
+transcripts. Don't pass `os.environ` unfiltered to a yt-dlp child.
+
 ### The download is swept after the summary; the recording never is
 
 Settled with the operator 2026-09-13: the box was filling with
@@ -1520,7 +1581,8 @@ without them, check what `load_prompt_template` actually returns.
 Settled with the operator 2026-09-29, after the 09-13 pass had removed frame
 citations from the lecture prompts only:
 
-- **Four prompts, one file each, shared by every backend**: `video`
+- **Four prompts, one file each, shared by every backend** (`lecture` is a
+  cheat sheet since 2026-10-16, see "The KGI combine"): `video`
   (the in-code default — talks, news, interviews), `meeting`, `lecture`,
   `tutorial`. The claude/gemini pairs, the `-old` archives, `summarize.md`,
   `summarize-v2.md` and `lecture-reference.md` are gone; the course-reference
@@ -2556,6 +2618,14 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   ffmpeg `SIGINT` so the MP4 stays playable.
 - **H.264 is `libx264 -preset ultrafast -crf 28`.** Keeps CPU low on a 4-vCPU
   VM with no GPU; visually fine for talking heads and slides.
+- **An OpenRouter answer in scripts nobody asked for is rejected**
+  (`language.foreign_runs`), never printed: the PDF has no glyphs for them.
+  The input's own scripts are allowed, so a Chinese lecture can quote Chinese.
+- **The lecture prompt is a cheat sheet and the merge consolidates.** The
+  operator chose it 2026-10-16 after a 38-page combined sheet; don't bring
+  back "preserve the level of detail" in `_merge.md`.
+- **No word in a non-Latin script reaches mathtext.** `mathrender` sets it
+  as text; mathtext draws a dummy box per letter.
 - **Frames are taken on change, from one decode — not on a clock.** The
   operator replaced the scene-change + periodic passes on 2026-09-30. Keep:
   the change test = the model dedupe's hash and distance (one constant,
@@ -2860,6 +2930,9 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   on an unreadable participant count.
 - **Captions are never taken from a YouTube machine translation.** Spoken
   language first; another language only as the announced last resort.
+- **Of several `-orig` tracks, the original audio's wins** — never the
+  alphabetically first, and never the requested language's (transcribe.sh
+  always requests one). An auto-dubbed video has one per dub.
 - **Voice only means no frames stage, and summarize.py gets `--no-frames`.**
   Dropping the flag while skipping the stage makes summarize.py extract (or,
   for YouTube, download) the frames itself.
@@ -2890,16 +2963,16 @@ without API keys or network, against temp directories
 | `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets, frontmatter, binary files | 36 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
-| `lib/test_ytdownload.py` | the YouTube download retry: transient vs permanent errors, a 403 then served, doubling waits, the attempt cap, the command never merges | 9 |
+| `lib/test_ytdownload.py` | the YouTube download retry: transient vs permanent errors (a failed challenge solver beats "not available"), a 403 then served, doubling waits, the attempt cap, the command never merges, no pm2 Node IPC variables passed on | 11 |
 | `lib/test_discord_spool.py` | Discord spool placement from synthetic packet timings (arrival only; RTP: bunching, loss, wraparound, a pause, a resync), crash tolerance, the int32 mix and clipping, real ffmpeg (words where spoken, speaker tracks, the spool kept on failure) | 22 |
-| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the five prompts (old names resolve, no timestamps outside `reality`, the callout vocabulary), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`), the Gemini request timeout, Gemini's frame filtering, media resolution and own cap, the per-chunk frame cap, the OpenRouter backend (payload, key/model walk, the per-account daily cap, an error inside a 200, a truncated answer retried once then the next model, the chunk cap, the rejected-answer dump, the real model of a router), the chunk flow (the merge's instructions, every model named, finished chunks reused and re-keyed on a model change) | 246 |
-| `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), loose callout markers (`### [!KIND]`, a bare `[!KIND]`), real PDF render | 111 |
+| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the five prompts (old names resolve, no timestamps outside `reality`, the callout vocabulary), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`), the Gemini request timeout, Gemini's frame filtering, media resolution and own cap, the per-chunk frame cap, the OpenRouter backend (payload, key/model walk, the per-account daily cap, an error inside a 200, a truncated answer retried once then the next model, the chunk cap, the rejected-answer dump, the real model of a router), the chunk flow (the merge's instructions, every model named, finished chunks reused and re-keyed on a model change), an off-script answer rejected (and a few foreign words or the input's own script let through) | 248 |
+| `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), loose callout markers (`### [!KIND]`, a bare `[!KIND]`), real PDF render, Thai words inside a formula set as text (or the whole formula as text when they can't be cut out) | 113 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
-| `transcribe/test_yt_autocaptions.py` | yt-dlp captions: track choice (never a translation; `auto` prefers an upload in the spoken language), json3, the CLI against a stub yt-dlp | 13 |
+| `transcribe/test_yt_autocaptions.py` | yt-dlp captions: track choice (never a translation; `auto` prefers an upload in the spoken language), json3, the CLI against a stub yt-dlp, an auto-dubbed video's original audio over the dub | 15 |
 | `screen/test_extract_frames.py` | frames on change: settle, a transient change, blanks, the motion cap, the safety net, the last sample, the shared distance; the PPM reader; real ffmpeg (black lead-in skipped, audio-only empty, retired settings named) | 19 |
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
-| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source, an `.env` edit reaching the next run and the form without a restart, the `.env` parser | 14 |
+| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source, an `.env` edit reaching the next run and the form without a restart, the `.env` parser, no pm2 Node IPC variables in a child | 15 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line), Stop on a summarizing run (`kill_meeting.sh --run-id` terminates it, `STOPPED`, `--resume-all` skips it, `--run-id` finishes it and clears the mark), a YouTube download refused with a 403 and re-run (served, given up, a non-transient failure not retried) | 485 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, YouTube captions through a stub yt-dlp first (the API never asked when it succeeds), youtube-transcript.io when yt-dlp fails or finds no track, the other-language-labelled track as last resort, `YT_AUTOCAPTIONS=0`, both down = exit 1, `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 141 |
 | `verify_e2e.sh --browser-smoke` | the real browser (Firefox ESR or Chrome) under Xvfb, recorded and measured for black edges | 6 |

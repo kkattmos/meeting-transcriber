@@ -9,6 +9,8 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 # .env wins over whatever pm2 replays (a snapshot from when it started).
 # shellcheck disable=SC1091
 MEETING_BOT_ENV_FRESH=1 . "$ROOT_DIR/source_env.sh"
+# pm2's Node IPC variables would reach deno (yt-dlp's JS solver) and kill it.
+unset NODE_CHANNEL_FD NODE_CHANNEL_SERIALIZATION_MODE NODE_APP_INSTANCE
 PY="${MEETING_BOT_VENV:-$ROOT_DIR/.venv}/bin/python3"
 [ -x "$PY" ] || PY="python3"
 cd "$ROOT_DIR"

@@ -41,6 +41,7 @@ pages) is not copied: a summary is a study sheet, not an exercise set.
 | Body | The run's font: **Bai Jamjuree** or **Sarabun** (Thai); **CMU Serif**, Sarabun or Bai Jamjuree (English) | `PDF_FONT_SIZE`, default **9.5 pt**, as Computer Modern |
 | Maths: typeset formulas | Computer Modern (matplotlib mathtext, `fontset=cm`), as SVG | nominal × `PDF_MATH_SCALE` (1.0) |
 | Maths: symbols typed into prose (ω, ≤, ⇒, ∑, ², ℝ) | CMU Serif → Latin Modern Math → STIX Two Math → DejaVu Serif | nominal |
+| Maths: words in a script CM lacks (Thai in `\text{…}`) | the body face, upright, between the typeset pieces; a formula that can't be cut falls back to text with the body face before generic serif | body |
 | Code: blocks and inline | JetBrains Mono → JetBrainsMono Nerd Font → DejaVu Sans Mono | the text's x-height |
 | Title (H1) | body face, bold | 2.0 em |
 | Section banner (H2) | body face, bold, white | 1.2 em |

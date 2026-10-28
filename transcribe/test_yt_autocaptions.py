@@ -77,6 +77,33 @@ class ChooseTrackTest(unittest.TestCase):
         info = {"language": "th", "automatic_captions": {"en": [{}], "th": [{}]}}
         self.assertEqual(yac.choose_track(info, "en"), ("automatic_captions", "th"))
 
+    def test_an_auto_dubbed_video_uses_the_original_audio(self):
+        # A Thai talk YouTube dubbed into English: one "-orig" track per
+        # audio track. Alphabetical order took the dub's "en-orig".
+        info = {"language": "th",
+                "automatic_captions": {"en-orig": [{}], "th-orig": [{}],
+                                       "en": [{}], "th": [{}]},
+                "formats": [
+                    {"language": "en-US", "format_note": "English (US), low"},
+                    {"language": "th",
+                     "format_note": "Thai original (default), low"}]}
+        for want in ("th", "en", "auto"):
+            self.assertEqual(yac.choose_track(info, want),
+                             ("automatic_captions", "th-orig"))
+        # No format says "original": the declared language decides.
+        info["formats"] = []
+        self.assertEqual(yac.choose_track(info, "en"),
+                         ("automatic_captions", "th-orig"))
+
+    def test_an_english_talk_dubbed_into_thai_keeps_its_english(self):
+        info = {"language": "en",
+                "automatic_captions": {"en-orig": [{}], "th-orig": [{}]},
+                "formats": [{"language": "en", "format": "251 - audio only "
+                             "(English original (default))"},
+                            {"language": "th", "format_note": "Thai"}]}
+        self.assertEqual(yac.choose_track(info, "th"),
+                         ("automatic_captions", "en-orig"))
+
     def test_nothing_usable(self):
         self.assertIsNone(yac.choose_track({"subtitles": {"live_chat": [{}]}}, "en"))
         self.assertIsNone(yac.choose_track({}, "auto"))

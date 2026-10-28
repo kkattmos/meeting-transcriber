@@ -192,6 +192,21 @@ echo "inherited chain: ${SUMMARY_FALLBACK_CHAIN:-unset}"
             time.sleep(0.1)
         self.assertIn("argv: --new-meet --name Sync", log["text"])
 
+    def test_pm2_node_ipc_variables_do_not_reach_the_children(self):
+        keys = ("NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "NODE_APP_INSTANCE")
+        old = {k: os.environ.get(k) for k in keys}
+        try:
+            for k in keys:
+                os.environ[k] = "3"
+            env = self.ts.child_env()
+            for k in keys:
+                self.assertNotIn(k, env)
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
     def test_an_env_edit_reaches_the_next_run_without_a_restart(self):
         original = self.env_file.read_text()
         try:

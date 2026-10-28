@@ -2716,6 +2716,36 @@ class OpenRouterBackendTest(unittest.TestCase):
         self.assertEqual(self._run(), "fine")
         self.assertEqual(len(self.calls), 2)
 
+    def test_an_answer_drifting_into_other_scripts_is_rejected(self):
+        # The 2026-10-16 run: Chinese and Arabic inside Thai words.
+        drifted = ("ต้นทุนการซื้อ卖出 การ预测แนวโน้ม ด้าน系统 "
+                   "ไม่ใช่สิ่งที่ضمانว่า")
+        self.script[("k1", "m-a")] = drifted
+        with mock.patch.dict(os.environ, {"SUMMARY_LANGUAGE": "th"}):
+            self.assertEqual(self._run(), "ok")
+        self.assertEqual([c[:2] for c in self.calls],
+                         [("k1", "m-a"), ("k1", "m-a"), ("k1", "m-b")])
+        kept = list((Path(self._tmp.name) / "tmp" / "rejected-answers").glob("*.md"))
+        self.assertEqual(len(kept), 2)
+
+    def test_a_few_foreign_words_or_the_inputs_own_script_pass(self):
+        with mock.patch.dict(os.environ, {"SUMMARY_LANGUAGE": "en"}):
+            self.script[("k1", "m-a")] = "Risk, 危机 in Chinese, is danger (危) and opportunity."
+            self.assertIn("危机", self._run())
+            # Thai quoted from a Thai transcript is the input's own script.
+            for key in ("k1", "k2"):
+                self.script[(key, "m-a")] = "ความเสี่ยง (risk), ผลตอบแทน, หุ้น, ปันผล"
+            self.assertIn("หุ้น", llm_client.summarize_openrouter(
+                [], "ไทย" * 20, "{transcript}"))
+            # Unless asked for none.
+            self.calls.clear()
+            with mock.patch.dict(os.environ, {"OPENROUTER_MAX_FOREIGN_RUNS": "0",
+                                              "OPENROUTER_MODEL": "m-a"}):
+                self.script[("k1", "m-a")] = "Risk (危机)."
+                self.script[("k2", "m-a")] = "Risk (危机)."
+                with self.assertRaises(RuntimeError):
+                    self._run()
+
     def test_chunks_are_capped_and_the_merge_is_not(self):
         self._run()
         self.assertEqual(self.calls[-1][2]["max_tokens"], 32768)

@@ -129,7 +129,9 @@ def current_config():
 def child_env():
     """The environment for a pipeline.sh child: without any .env key, so its
     own source_env.sh loads .env as it is at launch."""
-    drop = STARTUP_ENV_KEYS | set(read_dotenv())
+    # pm2's Node IPC variables make deno (yt-dlp's JS solver) fail in children.
+    drop = (STARTUP_ENV_KEYS | set(read_dotenv())
+            | {"NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "NODE_APP_INSTANCE"})
     env = {k: v for k, v in os.environ.items() if k not in drop}
     env["MEETING_BOT_FOREGROUND"] = "1"
     return env

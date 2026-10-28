@@ -56,12 +56,27 @@ TRANSIENT_RE = re.compile(
     r"|giving up after \d+ (fragment )?retries",
     re.IGNORECASE)
 
+# yt-dlp could not run its JS challenge solver (deno). Without the solved
+# challenge YouTube hides the formats and the very same run ends in "This video
+# is not available" -- so this wins over PERMANENT_RE. Found 2026-10-16: pm2's
+# NODE_CHANNEL_FD leaked into deno and 37 of 193 downloads were given up on.
+CHALLENGE_RE = re.compile(
+    r"n challenge solving failed|Error solving n challenge"
+    r"|Failed to open IPC channel", re.IGNORECASE)
+
+# pm2 sets these on the apps it forks; deno reads NODE_CHANNEL_FD as an IPC
+# channel that is not its own and dies.
+NODE_IPC_VARS = ("NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE",
+                 "NODE_APP_INSTANCE")
+
 # Seam for the tests.
 _sleep = time.sleep
 
 
 def is_transient(output):
     """True when yt-dlp's stderr names a failure another attempt may not hit."""
+    if CHALLENGE_RE.search(output):
+        return True
     if PERMANENT_RE.search(output):
         return False
     return bool(TRANSIENT_RE.search(output))
@@ -91,7 +106,8 @@ def _run_once(cmd, quiet):
     stderr is echoed line by line and kept for classification."""
     proc = subprocess.Popen(
         cmd, stdout=subprocess.DEVNULL if quiet else None,
-        stderr=subprocess.PIPE, text=True, errors="replace")
+        stderr=subprocess.PIPE, text=True, errors="replace",
+        env={k: v for k, v in os.environ.items() if k not in NODE_IPC_VARS})
     lines = []
     for line in proc.stderr:
         lines.append(line)

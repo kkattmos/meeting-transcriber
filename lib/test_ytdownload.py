@@ -19,6 +19,7 @@ import ytdownload  # noqa: E402
 # call), then writes the -o file. Every call's argv is appended to $STUB_LOG.
 STUB = r"""#!/bin/bash
 echo "$*" >> "$STUB_LOG"
+env | grep -q "^NODE_CHANNEL_FD=" && echo "NODE_CHANNEL_FD leaked" >> "$STUB_LOG"
 n=$(cat "$STUB_COUNT" 2>/dev/null || echo 0)
 if [ "$n" -gt 0 ]; then
   echo "$((n - 1))" > "$STUB_COUNT"
@@ -49,6 +50,12 @@ class Classification(unittest.TestCase):
                     # A permanent marker wins over a transient-looking one.
                     "HTTP Error 403: Forbidden\nERROR: Video unavailable"):
             self.assertFalse(ytdownload.is_transient(err), err)
+
+    def test_a_failed_challenge_solver_is_transient_despite_not_available(self):
+        err = ('WARNING: [youtube] [jsc] Error solving n challenge request using "deno" provider:'
+               ' Failed to open IPC channel from NODE_CHANNEL_FD (3)\n'
+               'ERROR: [youtube] abc: This video is not available')
+        self.assertTrue(ytdownload.is_transient(err))
 
     def test_an_unknown_failure_is_not_retried(self):
         self.assertFalse(ytdownload.is_transient("ERROR: something new"))
@@ -91,6 +98,11 @@ class Download(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual(self.sleeps, [])
+
+    def test_pm2_node_ipc_variables_are_not_passed_to_yt_dlp(self):
+        rc, _ = self.run_download(NODE_CHANNEL_FD="3")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("NODE_CHANNEL_FD leaked", self.calls())
 
     def test_403_twice_then_served(self):
         self.count.write_text("2")

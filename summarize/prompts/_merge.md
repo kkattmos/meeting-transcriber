@@ -28,9 +28,15 @@ Rules:
   due dates wherever they were given.
 - Keep LaTeX (`$...$`, `$$...$$`) and fenced code blocks byte for byte.
 - Do not add timestamps, time ranges or frame references; the partials have none.
-- Keep the section structure the partial summaries use.
-- Preserve the level of detail. This is a merge, not a further summarization —
-  do not compress the partials into something shorter than they collectively are.
+- Keep the section structure the partial summaries use, but where two parts
+  cover the same topic (the same concept taught in two videos, a recap of an
+  earlier part), fold them into one section.
+- Consolidate, don't concatenate. The final document must be shorter than the
+  partials together — aim for at most two thirds of their combined length —
+  by cutting repetition, restatements, overlapping examples and filler, and by
+  folding parallel material into tables. Never drop a fact that appears only
+  once: a definition, a formula, a number, a decision, an action item.
+- Keep the partials' style: terse bullets and tables, not paragraphs.
 - {language_rule}
 
 Partial summaries, in order:

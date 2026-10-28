@@ -46,6 +46,39 @@ def _lang_matches(key, want):
     return key == want or key.startswith(want + "-") or want.startswith(key + "-")
 
 
+def _original_audio_language(info):
+    """The language of the audio track YouTube marks as the original, or
+    None. A video YouTube has auto-dubbed carries one audio track per
+    language; the original's format note reads "original"."""
+    for fmt in info.get("formats") or []:
+        note = f"{fmt.get('format_note') or ''} {fmt.get('format') or ''}"
+        if fmt.get("language") and "original" in note.lower():
+            return fmt["language"]
+    return None
+
+
+def _orig_keys(info, auto):
+    """The "-orig" automatic-caption keys, the original audio's first.
+
+    A video YouTube has auto-dubbed has one "-orig" track per audio track
+    — a Thai lecture dubbed into English has "en-orig" (speech recognition
+    of the machine dub) beside "th-orig" (of what was said). Alphabetical
+    order picked the dub (2026-10-16, KGI ALGO Trading 2026). The original
+    is the audio track marked original, else the video's declared language
+    — never the requested language: transcribe.sh always requests one (th
+    by default), and an English talk dubbed into Thai must not get the
+    dub's captions for it.
+    """
+    orig = sorted(k for k in auto if k.endswith("-orig") and auto[k])
+    for lang in (_original_audio_language(info), info.get("language")):
+        if not lang:
+            continue
+        hits = [k for k in orig if _lang_matches(k[:-len("-orig")], lang)]
+        if hits:
+            return hits + [k for k in orig if k not in hits]
+    return orig
+
+
 def choose_track(info, language=None):
     """Return (kind, key) — kind "subtitles" or "automatic_captions" — or None.
 
@@ -56,7 +89,7 @@ def choose_track(info, language=None):
     subs = {k: v for k, v in (info.get("subtitles") or {}).items()
             if k != "live_chat" and v}
     auto = info.get("automatic_captions") or {}
-    orig = sorted(k for k in auto if k.endswith("-orig") and auto[k])
+    orig = _orig_keys(info, auto)
     # "auto" asks for the spoken language, and an uploaded (human) track in it
     # beats YouTube's speech recognition. The "-orig" key is YouTube's own
     # detection of what was spoken; the video's `language` is what the

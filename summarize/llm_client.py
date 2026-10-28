@@ -174,6 +174,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from retry import with_retries, _status_of as _http_status  # noqa: E402
 from framecrop import SAME_SLIDE_MAX_DISTANCE  # noqa: E402
 from keyring import KeyRing, missing_keys_message  # noqa: E402
+import language  # noqa: E402
 
 DEFAULT_BACKEND = "fallback"
 DEFAULT_FALLBACK_CHAIN = "claude-cli,gemini"
@@ -211,6 +212,12 @@ DEFAULT_OPENROUTER_MAX_TOKENS = 32768
 # chain moves on: the runaway was intermittent (the same chunk, re-sent,
 # came back at 9k tokens), so a free retry usually beats a paid fallback.
 DEFAULT_OPENROUTER_TRUNCATION_RETRIES = 1
+# More runs than this of a script that is neither the summary language's nor
+# the input's (language.foreign_runs) and the answer is rejected like a
+# cut-off one: retried on the same model, then the next. 2026-10-16: the
+# free dots-3-note wrote ~10 such runs per Thai chunk (การ预测, ซื้อ卖出);
+# a lecture that really quotes one Chinese word stays under the bar.
+DEFAULT_OPENROUTER_MAX_FOREIGN_RUNS = 2
 
 # Env vars that would flip the CLI from subscription auth to API-key billing.
 # Scrubbed from the subprocess environment, never from our own.
@@ -1654,11 +1661,22 @@ class OpenRouterModelUnavailable(Exception):
     retryable = False
 
 
-class OpenRouterTruncated(Exception):
+class OpenRouterRejected(Exception):
+    """An answer that came back but must not be used. Retried on the same
+    model OPENROUTER_TRUNCATION_RETRIES times, then the next model."""
+    retryable = False
+
+
+class OpenRouterTruncated(OpenRouterRejected):
     """finish_reason "length": the model hit its output cap (32k on the
     free Gemma) mid-answer. A cut-off summary looks finished, so it is never
     returned; the loop moves to the next model, whose cap may be larger."""
-    retryable = False
+
+
+class OpenRouterOffScript(OpenRouterRejected):
+    """The answer drifts into a script nobody asked for (Chinese, Arabic …
+    inside Thai or English words): the PDF prints those letters as empty
+    boxes and the sentence stops making sense. See language.foreign_runs."""
 
 
 class OpenRouterHTTPError(Exception):
@@ -1814,6 +1832,8 @@ def summarize_openrouter(frames: List[FrameMeta], transcript: str,
     max_tokens = _openrouter_max_tokens(role)
     retries_left = max(0, _int_env("OPENROUTER_TRUNCATION_RETRIES",
                                    DEFAULT_OPENROUTER_TRUNCATION_RETRIES))
+    max_foreign = max(0, _int_env("OPENROUTER_MAX_FOREIGN_RUNS",
+                                  DEFAULT_OPENROUTER_MAX_FOREIGN_RUNS))
     url = os.environ.get("OPENROUTER_API_URL") or OPENROUTER_API_URL  # test seam
 
     def _call(key, model_name):
@@ -1843,11 +1863,19 @@ def summarize_openrouter(frames: List[FrameMeta], transcript: str,
                     raise OpenRouterTruncated(
                         f"answer cut off at the model's output limit "
                         f"({usage.get('completion_tokens', '?')} tokens)")
+                text = _openrouter_text(
+                    data["choices"][0]["message"].get("content"))
+                runs = language.foreign_runs(text, user_text)
+                if len(runs) > max_foreign:
+                    _save_rejected_answer(model_name, text)
+                    shown = ", ".join(dict.fromkeys(runs))
+                    raise OpenRouterOffScript(
+                        f"answer drifts into other scripts ({len(runs)} "
+                        f"runs: {shown[:120]})")
                 # The model that actually answered: a router such as
                 # openrouter/free picks one per request and names it here.
                 answered[0] = data.get("model") or model_name
-                return _openrouter_text(
-                    data["choices"][0]["message"].get("content"))
+                return text
             status = err.get("code") if isinstance(err.get("code"), int) else 502
             message = str(err.get("message", err))
         else:
@@ -1884,13 +1912,13 @@ def summarize_openrouter(frames: List[FrameMeta], transcript: str,
                             label=f"openrouter/{model_name} "
                                   f"({ring.label(slot)})")
                         break
-                    except OpenRouterTruncated as exc:
+                    except OpenRouterRejected as exc:
                         if retries_left <= 0:
                             raise
                         retries_left -= 1
                         print(f"  !! openrouter/{model_name}: {exc} — "
                               f"trying the same model again", file=sys.stderr)
-            except (OpenRouterModelUnavailable, OpenRouterTruncated) as exc:
+            except (OpenRouterModelUnavailable, OpenRouterRejected) as exc:
                 print(f"  !! openrouter/{model_name} unavailable: {exc}",
                       file=sys.stderr)
                 last_error = exc
