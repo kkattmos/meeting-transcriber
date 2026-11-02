@@ -29,20 +29,29 @@ that request surface moved twice in 2025-2026 and memorized patterns are wrong.
 
 ## Branches
 
+**Features are developed here, on `debian13`, and merged into the deployment
+branches**, each of which keeps only its own layer (setup, services,
+container, docs) and describes it in a "This branch" section of its own
+CLAUDE.md. Synced on 2026-11-02 (see "Shared code runs on every branch").
+
 - **`debian13`** — Debian 13 on the operator's own **desktop PC**,
   as the operator's user (not root), Firefox ESR by default, pm2 for the web
   UI. Ported from the VM layout on 2026-09-29; see "Running on a PC" below.
-- **`debian13-in-proxmox`** — the same system as it ran on the Proxmox VM
-  until 2026-09-29: root, `/opt/meeting-bot`, google-chrome-stable, systemd
-  trigger unit + resume timer. Consult it before reintroducing anything
-  root- or VM-shaped.
-- **`docker`** — the one-container build (branched 2026-09-27). Its non-Docker
-  work (web UI, `--new-meet`, `--dry-run`/`need_value`, the yt-dlp caption
-  fallback, course-reference frontmatter) was ported here on 2026-09-29;
-  the Dockerfile, compose file and entrypoint were not.
-- **`alpinelinux`** — the Alpine host plus a Debian container for the browser
-  stages. Where `docker/recorder_lib.sh` and `audio-setup.sh` still live.
-- `main` — the Alpine tree as it was when the Debian port started.
+- **`debian13-in-proxmox`** — the server deployment: Debian 13 VM, root,
+  `/opt/meeting-bot`, google-chrome-stable, systemd web UI unit + resume
+  timer. Consult it before reintroducing anything root- or VM-shaped here.
+- **`deprecated_proxmox_ubuntu`** — the same server deployment on Ubuntu
+  (uv-managed Python 3.13, Firefox ESR from the Mozilla PPA). The name is
+  historical; it is kept in sync.
+- **`docker`** — the one-container build (Dockerfile, compose,
+  `docker/install.sh`, the entrypoint's resume loop).
+- **`main`** — the Alpine host + a Debian recorder container (Chrome has no
+  musl build): `MEETING_BOT_RECORDER=screen/record_in_container.sh`,
+  OpenRC + crond, `requirements-alpine.txt`.
+- **`windows`** (this one) — native Windows 10/11: the bash scripts under Git Bash,
+  meetings recorded as a visible window + VB-CABLE
+  (`screen/record_windows.py`), Firefox ESR in its own folder, pm2,
+  `setup.ps1`, `requirements-windows.txt`. Not yet run on Windows.
 
 ## What this project is, in one paragraph
 
