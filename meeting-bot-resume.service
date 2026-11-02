@@ -1,0 +1,26 @@
+# Installed by `sudo ./setup.sh --with-resume-timer`, alongside
+# meeting-bot-resume.timer, with @REPO_ROOT@ substituted. The timer runs this
+# every 15 minutes; it resumes every run whose summarize stage did not finish
+# — most usefully one that paused because the Claude subscription's usage
+# window was exhausted. pipeline.sh --resume-all skips a paused run until the
+# reset time recorded in its state.json has passed, a run another pipeline
+# process is working on, a run stopped by hand, and members of a combined set.
+# A oneshot service is not killed by its timer (unlike pm2's cron_restart on
+# the desktop branch), so a long summary runs to the end.
+[Unit]
+Description=Meeting bot: resume unfinished runs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_ROOT@
+# pipeline.sh sources the repo's .env itself; the unit only needs a HOME so
+# the claude CLI finds the login in ~/.claude of the user it runs as, and
+# MEETING_BOT_FOREGROUND so a resumed meeting run does not detach again.
+Environment=HOME=/root
+Environment=MEETING_BOT_FOREGROUND=1
+ExecStart=/bin/bash @REPO_ROOT@/pipeline.sh --resume-all
+# 75 is "paused again — window still exhausted", which is not a failure.
+SuccessExitStatus=75
+User=root

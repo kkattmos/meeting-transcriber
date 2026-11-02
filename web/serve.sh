@@ -1,0 +1,17 @@
+#!/bin/bash
+# The web UI's entry point (meeting-bot-trigger.service; pm2 on the desktop branch). trigger_server.py
+# reads its token, port and bind addresses from the environment, and .env is
+# where the operator keeps them — so load it the same way every other entry
+# script does, then hand over to the venv's Python.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+# .env wins over whatever pm2 replays (a snapshot from when it started).
+# shellcheck disable=SC1091
+MEETING_BOT_ENV_FRESH=1 . "$ROOT_DIR/source_env.sh"
+# pm2's Node IPC variables would reach deno (yt-dlp's JS solver) and kill it.
+unset NODE_CHANNEL_FD NODE_CHANNEL_SERIALIZATION_MODE NODE_APP_INSTANCE
+PY="${MEETING_BOT_VENV:-$ROOT_DIR/.venv}/bin/python3"
+[ -x "$PY" ] || PY="python3"
+cd "$ROOT_DIR"
+exec "$PY" "$ROOT_DIR/trigger_server.py"

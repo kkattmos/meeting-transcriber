@@ -1,15 +1,23 @@
+# The web UI / trigger server. Installed by `sudo ./setup.sh --with-trigger`
+# (or `./webui.sh on`), which substitutes @REPO_ROOT@ and writes the result to
+# /etc/systemd/system/. web/serve.sh loads .env afresh on every start, so the
+# unit itself carries no keys.
 [Unit]
-Description=Meeting bot remote trigger server
+Description=Meeting bot web UI and trigger server
 After=network-online.target tailscaled.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/meeting-bot.env
-ExecStart=/usr/bin/python3 /opt/meeting-bot/trigger_server.py
+WorkingDirectory=@REPO_ROOT@
+Environment=HOME=/root
+ExecStart=/bin/bash @REPO_ROOT@/web/serve.sh
 Restart=on-failure
 RestartSec=5
 User=root
+# A run the web UI started keeps going when the UI restarts: the pipeline
+# runs in its own session, so only the server's own process is stopped.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target

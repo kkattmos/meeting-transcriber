@@ -1,111 +1,278 @@
 #!/bin/bash
 # Standalone "leave now" for the meeting recording bot.
 #
-# Use this when a recording was launched in the background
-# (e.g. via trigger_server.py -> pipeline.sh) and you can't reach its
-# terminal to press Ctrl+\. From the recording terminal itself, Ctrl+\
-# also works.
+# Use this when a recording was launched in the background (e.g. via
+# trigger_server.py -> pipeline.sh) and you can't reach its terminal to press
+# Ctrl+\. From the recording terminal itself, Ctrl+\ also works.
 #
-# What it does:
-#   1. Touches /tmp/meeting_bot_kill so screen/capture.py's polling loop
-#      notices on its next iteration and clicks "Leave" in the meeting UI
-#      (so participants see the bot go, rather than it vanishing).
-#   2. Sends SIGTERM to the running orchestrator + join driver + (if
-#      active) the transcribe/summarize stages. The script names matched
-#      here are the ones introduced by the 3-option split:
-#        - pipeline.sh               (chain orchestrator)
-#        - screen/record_screen.sh   (Option 1 standalone recorder)
-#        - screen/capture.py         (the Playwright join driver)
-#        - transcribe/transcribe.sh  (Option 2 standalone)
-#        - summarize/summarize.py    (Option 3 standalone)
-#   3. Waits up to 10s for processes to exit cleanly. Escalates to SIGKILL
-#      on the Python join driver only if it's still alive (the recording
-#      shell may still be finalizing the MP4 or finishing whisper.cpp, which
-#      is fine to let finish).
+# How it stops a recording, in order:
+#   1. Touches the kill sentinel in every active run directory. capture.py
+#      polls for it and clicks "Leave" in the meeting UI, so other participants
+#      see the bot go rather than it vanishing mid-call. This is the whole
+#      point — do not "optimize" it into a SIGKILL.
+#   2. SIGTERMs the host-side orchestrator + stage scripts.
+#   3. Only if a recorder is still alive after the grace period, stops that
+#      run's browser driver (from $RUN_DIR/record.pid) and waits up to
+#      KILL_FINALISE_SECONDS (120) for record_screen.sh to finalise the MP4.
+#      ffmpeg is never SIGKILLed, and never gets a second SIGINT — see the
+#      comment at the escalation below.
 #
-# Usage:
-#   sudo ./kill_meeting.sh
-#   (sudo needed if the recording was started with sudo -H, which it should be)
+# Each recording writes its own pid file, so this can target a single run
+# instead of taking down every meeting at once:
+#
+#   ./kill_meeting.sh                  # every active run
+#   ./kill_meeting.sh --run-id <id>    # just that one (a run past its
+#                                      # recording: terminate its processing)
+#   ./kill_meeting.sh --list           # show what's running, kill nothing
+set -euo pipefail
 
-set -e
-
-KILL_SENTINEL="/tmp/meeting_bot_kill"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/source_env.sh"
 
-# 1) Touch the sentinel so the Python loop picks it up on its next poll
-#    (POLL_SECONDS = 15s in screen/capture.py, plus 5s for wait_for_admission).
-echo "==> Setting kill sentinel: $KILL_SENTINEL"
-touch "$KILL_SENTINEL"
+MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-$HOME/.local/share/meeting-bot}"
+RUNS_DIR="$MEETING_BOT_ROOT/runs"
+LEGACY_SENTINEL="/tmp/meeting_bot_kill"
+GRACE_SECONDS="${KILL_GRACE_SECONDS:-25}"
+FINALISE_SECONDS="${KILL_FINALISE_SECONDS:-120}"
 
-# 2) Find the relevant processes. -f matches the full command line so we
-#    only hit our own scripts and not, say, the user's other bash sessions.
-#    Patterns match the NEW script layout, not the legacy audio-only one.
-ORCH_PIDS=$(pgrep -f "pipeline\.sh|screen/record_screen\.sh" || true)
-JOIN_PIDS=$(pgrep -f "screen/capture\.py" || true)
-TRANSCRIBE_PIDS=$(pgrep -f "transcribe/transcribe\.sh" || true)
-SUMMARIZE_PIDS=$(pgrep -f "summarize/summarize\.py" || true)
-ALL_OTHER_PIDS="$TRANSCRIBE_PIDS $SUMMARIZE_PIDS"
+TARGET_RUN_ID=""
+LIST_ONLY=0
 
-if [ -z "$ORCH_PIDS$JOIN_PIDS$ALL_OTHER_PIDS" ]; then
-  echo "==> No meeting-bot processes found. Sentinel set anyway - any"
-  echo "    capture.py that starts within the next ~15s will exit"
-  echo "    immediately, so this is also useful to prevent a future run."
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --run-id) TARGET_RUN_ID="${2:-}"; shift 2 ;;
+    --list)   LIST_ONLY=1; shift ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    *) echo "Unknown argument: $1 (try --help)" >&2; exit 1 ;;
+  esac
+done
+
+# --- What's actually running? -----------------------------------------------
+# A run is "recording" if its record.pid names a live process. The pid file is
+# written by screen/record_screen.sh and removed by its EXIT trap, so a stale
+# one only survives a SIGKILL — and the liveness check covers that.
+read_pid_field() {
+  local file="$1" field="$2"
+  [ -f "$file" ] || return 1
+  awk -F= -v k="$field" '$1==k {print $2; exit}' "$file"
+}
+
+declare -a ACTIVE_RUNS=()
+if [ -d "$RUNS_DIR" ]; then
+  for run_dir in "$RUNS_DIR"/*/; do
+    [ -d "$run_dir" ] || continue
+    pid_file="${run_dir}record.pid"
+    [ -f "$pid_file" ] || continue
+    rec_pid="$(read_pid_field "$pid_file" record || true)"
+    if [ -n "$rec_pid" ] && kill -0 "$rec_pid" 2>/dev/null; then
+      ACTIVE_RUNS+=("${run_dir%/}")
+    fi
+  done
+fi
+
+if [ "$LIST_ONLY" -eq 1 ]; then
+  echo "Active recordings:"
+  if [ "${#ACTIVE_RUNS[@]}" -eq 0 ]; then
+    echo "  (none)"
+  else
+    for run_dir in "${ACTIVE_RUNS[@]}"; do
+      pid_file="$run_dir/record.pid"
+      echo "  $(basename "$run_dir")  (pid $(read_pid_field "$pid_file" record), \
+display :$(read_pid_field "$pid_file" display || echo '?'))"
+    done
+  fi
+  echo ""
+  echo "Recent runs:"
+  python3 "$SCRIPT_DIR/lib/runstate.py" list --root "$RUNS_DIR" --limit 10 || true
   exit 0
 fi
 
-if [ -n "$ORCH_PIDS" ]; then
-  echo "==> Sending SIGTERM to orchestrator (pipeline.sh / record_screen.sh) - PIDs: $ORCH_PIDS"
-  kill -TERM $ORCH_PIDS 2>/dev/null || true
-fi
-
-# capture.py doesn't install a signal handler - SIGTERM is delivered to it
-# via the parent process group's TERM from the shell trap. But for the
-# kill_meeting.sh case (parent is unrelated), send it directly so the Python
-# interpreter exits without waiting for the next poll.
-if [ -n "$JOIN_PIDS" ]; then
-  echo "==> Sending SIGTERM to screen/capture.py (PIDs: $JOIN_PIDS)"
-  kill -TERM $JOIN_PIDS 2>/dev/null || true
-fi
-
-# Transcribe/summarize stages don't have any special clean-up; SIGTERM is fine
-# to interrupt whisper-cli or the LLM API call.
-if [ -n "$ALL_OTHER_PIDS" ]; then
-  echo "==> Sending SIGTERM to transcribe/summarize - PIDs: $ALL_OTHER_PIDS"
-  kill -TERM $ALL_OTHER_PIDS 2>/dev/null || true
-fi
-
-# 3) Wait for the orchestrator shell to exit cleanly. We only escalate on
-#    the Python join driver - the shell may legitimately be in whisper-cli
-#    (transcription) or finalizing the MP4, and we want those to finish on
-#    their own.
-echo "==> Waiting up to 10s for processes to exit..."
-for i in $(seq 1 20); do
-  REMAINING_JOIN=$(pgrep -f "screen/capture\.py" || true)
-  REMAINING_ORCH=""
-  for pid in $ORCH_PIDS; do
-    if kill -0 "$pid" 2>/dev/null; then
-      REMAINING_ORCH="$REMAINING_ORCH $pid"
-    fi
-  done
-  if [ -z "$REMAINING_JOIN" ] && [ -z "$REMAINING_ORCH" ]; then
-    echo "==> All meeting-bot processes exited cleanly."
-    exit 0
+# --- 1) Set the kill sentinels ----------------------------------------------
+# A sentinel in a run dir that has no live recording is harmless: run_one.sh
+# clears it at the start of every run.
+if [ -n "$TARGET_RUN_ID" ]; then
+  if [ ! -d "$RUNS_DIR/$TARGET_RUN_ID" ]; then
+    echo "ERROR: no such run: $RUNS_DIR/$TARGET_RUN_ID" >&2
+    echo "  List them with: ./kill_meeting.sh --list" >&2
+    exit 1
   fi
-  sleep 0.5
+  echo "==> Setting kill sentinel for run: $TARGET_RUN_ID"
+  touch "$RUNS_DIR/$TARGET_RUN_ID/kill"
+else
+  SENTINELS_SET=0
+  if [ -d "$RUNS_DIR" ]; then
+    for run_dir in "$RUNS_DIR"/*/; do
+      [ -d "$run_dir" ] || continue
+      touch "${run_dir}kill"
+      SENTINELS_SET=$((SENTINELS_SET + 1))
+    done
+  fi
+  # The /tmp path is still used by a bare `screen/capture.py <url>` run that
+  # never went through the pipeline.
+  touch "$LEGACY_SENTINEL"
+  echo "==> Set kill sentinel in $SENTINELS_SET run dir(s) (+ the legacy /tmp path)"
+fi
+
+# --- 2) SIGTERM the host-side processes --------------------------------------
+# Only when killing everything: with --run-id we let the sentinel do the work
+# and escalate through that run's own pid file below.
+if [ -z "$TARGET_RUN_ID" ]; then
+  ORCH_PIDS=$(pgrep -f "pipeline\.sh|screen/record_screen\.sh" || true)
+  STAGE_PIDS=$(pgrep -f "transcribe/transcribe\.sh|summarize/summarize\.py" || true)
+
+  if [ -n "$ORCH_PIDS" ]; then
+    echo "==> SIGTERM to orchestrator (PIDs: $ORCH_PIDS)"
+    # shellcheck disable=SC2086
+    kill -TERM $ORCH_PIDS 2>/dev/null || true
+  fi
+  if [ -n "$STAGE_PIDS" ]; then
+    echo "==> SIGTERM to transcribe/summarize (PIDs: $STAGE_PIDS)"
+    # shellcheck disable=SC2086
+    kill -TERM $STAGE_PIDS 2>/dev/null || true
+  fi
+fi
+
+# --- 3) Give the bot time to click Leave, then escalate ----------------------
+declare -a TARGETS=()
+for run_dir in "${ACTIVE_RUNS[@]:-}"; do
+  [ -n "$run_dir" ] || continue
+  if [ -n "$TARGET_RUN_ID" ] && [ "$(basename "$run_dir")" != "$TARGET_RUN_ID" ]; then
+    continue
+  fi
+  TARGETS+=("$run_dir")
 done
 
-# Escalate on the Python join driver only. The recording shell is allowed to
-# linger if it's still finishing the MP4 or transcription.
-if [ -n "$REMAINING_JOIN" ]; then
-  echo "==> screen/capture.py didn't exit in time - sending SIGKILL (PIDs: $REMAINING_JOIN)"
-  kill -KILL $REMAINING_JOIN 2>/dev/null || true
-fi
-if [ -n "$REMAINING_ORCH" ]; then
-  echo "==> Orchestrator still running (PIDs:$REMAINING_ORCH) - probably"
-  echo "    finishing MP4 mux / transcription. Leaving it alone; Ctrl+C in its"
-  echo "    terminal (or sudo kill $REMAINING_ORCH) will stop it if needed."
+# --- 2b) A run that is not recording: terminate its processing ---------------
+# The sentinel is read only by capture.py, so on its own it stops nothing once
+# the recording is over — a transcribe, frames or summarize in progress ran on
+# (found 2026-10-12: Stop in the web UI on a local file's summary). With
+# --run-id and no live recorder, terminate that run's own process tree —
+# run_one.sh (the run.lock owner) and everything under it — never its
+# pipeline.sh, which may be running other inputs and reports this one FAILED.
+# The run is marked `stopped` so --resume-all leaves it alone; --run-id (the
+# UI's Resume) clears the mark and carries on from the stages already done.
+# A record stage that is running without a live record.pid (still joining) is
+# left to the sentinel: capture.py checks it while it waits.
+descendants() {
+  local child
+  for child in $(ps -o pid= --ppid "$1" 2>/dev/null); do
+    descendants "$child"
+    echo "$child"
+  done
+}
+
+stop_processing() {
+  local run_dir="$1" run_id owner pids
+  run_id="$(basename "$run_dir")"
+  if [ "$(python3 "$SCRIPT_DIR/lib/runstate.py" status --run-dir "$run_dir" \
+          --stage record --no-verify 2>/dev/null)" = "running" ]; then
+    echo "==> $run_id is still joining its meeting; the sentinel will make it leave."
+    return 0
+  fi
+  # Nothing past the recording reads the sentinel; don't leave it behind.
+  rm -f "$run_dir/kill"
+  owner="$(cat "$run_dir/run.lock/pid" 2>/dev/null || true)"
+  if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
+    echo "==> $run_id is not running; nothing to stop."
+    return 0
+  fi
+  # Mark first, so pipeline.sh already sees `stopped` when run_one.sh dies.
+  python3 "$SCRIPT_DIR/lib/runstate.py" stop --run-dir "$run_dir" || true
+  pids="$(descendants "$owner") $owner"
+  echo "==> Stopping $run_id (PIDs: $(echo $pids))"
+  # shellcheck disable=SC2086
+  kill -TERM $pids 2>/dev/null || true
+  local alive p
+  for _ in $(seq 1 10); do
+    alive=""
+    for p in $pids; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+    [ -z "$alive" ] && break
+    sleep 1
+  done
+  if [ -n "$alive" ]; then
+    echo "==> Still alive after 10s, killing:$alive"
+    # shellcheck disable=SC2086
+    kill -KILL $alive 2>/dev/null || true
+  fi
+  # A run_one.sh killed by a signal skips its EXIT trap; the lock would be
+  # taken over as stale anyway, but leave nothing that looks in progress.
+  kill -0 "$owner" 2>/dev/null || rm -rf "$run_dir/run.lock"
+  # Again: a stage run_one.sh marked running between the two calls ends failed.
+  python3 "$SCRIPT_DIR/lib/runstate.py" stop --run-dir "$run_dir" || true
+  echo "==> Stopped. Finished stages are kept; resume with: ./pipeline.sh --run-id $run_id"
+}
+
+if [ -n "$TARGET_RUN_ID" ] && [ "${#TARGETS[@]}" -eq 0 ]; then
+  stop_processing "$RUNS_DIR/$TARGET_RUN_ID"
+  exit 0
 fi
 
-# Clean up the sentinel so a future run doesn't immediately exit.
-rm -f "$KILL_SENTINEL"
+if [ "${#TARGETS[@]}" -eq 0 ]; then
+  echo "==> No recordings are running. Sentinels are set, so anything that"
+  echo "    starts in the next few seconds will leave immediately too."
+  exit 0
+fi
+
+echo "==> Waiting up to ${GRACE_SECONDS}s for the bot to leave the meeting cleanly..."
+for _ in $(seq 1 "$GRACE_SECONDS"); do
+  still_up=0
+  for run_dir in "${TARGETS[@]}"; do
+    rec_pid="$(read_pid_field "$run_dir/record.pid" record || true)"
+    if [ -n "$rec_pid" ] && kill -0 "$rec_pid" 2>/dev/null; then
+      still_up=1
+    fi
+  done
+  if [ "$still_up" -eq 0 ]; then
+    echo "==> All recordings exited cleanly."
+    exit 0
+  fi
+  sleep 1
+done
+
+# capture.py polls every POLL_SECONDS (15s), so anything still alive after the
+# grace period is genuinely stuck rather than just slow to notice.
+for run_dir in "${TARGETS[@]}"; do
+  pid_file="$run_dir/record.pid"
+  run_id="$(basename "$run_dir")"
+  rec_pid="$(read_pid_field "$pid_file" record || true)"
+  [ -n "$rec_pid" ] && kill -0 "$rec_pid" 2>/dev/null || continue
+  echo "==> $run_id didn't exit in time — forcing it down."
+  # The browser driver only. record_screen.sh notices it has gone, stops
+  # ffmpeg itself with exactly ONE SIGINT and waits for the file to be
+  # finalised. This script used to SIGINT ffmpeg as well: two signals while
+  # ffmpeg closed the file made it abandon the final write ("Error closing
+  # file: Immediate exit requested") and two recordings were unplayable on
+  # 2026-09-29. ffmpeg is signalled from here only if its parent is gone.
+  join_pid="$(read_pid_field "$pid_file" join || true)"
+  ff_pid="$(read_pid_field "$pid_file" ffmpeg || true)"
+  # TERM lets capture.py quit its browser (geckodriver + Firefox); a KILL
+  # straight away orphaned both, still holding the profile.
+  [ -n "$join_pid" ] && kill -TERM "$join_pid" 2>/dev/null || true
+  for _ in $(seq 1 15); do
+    [ -n "$join_pid" ] && kill -0 "$join_pid" 2>/dev/null || break
+    sleep 1
+  done
+  [ -n "$join_pid" ] && kill -0 "$join_pid" 2>/dev/null && kill -KILL "$join_pid" 2>/dev/null || true
+  # Finalising writes the index at the end of the file; on a network drive
+  # that takes a while. Never SIGKILL ffmpeg.
+  echo "==> Waiting up to ${FINALISE_SECONDS}s for the recording to be finalised..."
+  for _ in $(seq 1 "$FINALISE_SECONDS"); do
+    rec_alive=0; ff_alive=0
+    kill -0 "$rec_pid" 2>/dev/null && rec_alive=1
+    [ -n "$ff_pid" ] && kill -0 "$ff_pid" 2>/dev/null && ff_alive=1
+    if [ "$rec_alive" -eq 0 ] && [ "$ff_alive" -eq 1 ] && [ -z "${ff_signalled:-}" ]; then
+      kill -INT "$ff_pid" 2>/dev/null || true       # orphaned: nobody else will
+      ff_signalled=1
+    fi
+    [ "$rec_alive" -eq 0 ] && [ "$ff_alive" -eq 0 ] && break
+    sleep 1
+  done
+  if kill -0 "$rec_pid" 2>/dev/null || { [ -n "$ff_pid" ] && kill -0 "$ff_pid" 2>/dev/null; }; then
+    echo "WARNING: $run_id is still finalising its recording (pids $rec_pid ${ff_pid:-}) —"
+    echo "         left alone; it will finish on its own."
+  fi
+  unset ff_signalled
+done
+
 echo "==> Done."

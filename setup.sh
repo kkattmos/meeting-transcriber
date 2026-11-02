@@ -1,130 +1,254 @@
 #!/bin/bash
-# One-time setup for the meeting recording + transcription bot.
-# Target: Ubuntu 26.04 LTS Server (minimized cloud image recommended),
-# 4 vCPU / 8GB RAM Proxmox VM.
-set -e
+# One-time setup for the meeting recording + transcription bot on a server VM:
+# Ubuntu Server (22.04 / 24.04 LTS) on Proxmox (KVM VM or LXC container), run as root, state under /opt/meeting-bot, real Google
+# Chrome, systemd units.
+#
+# This is the `deprecated_proxmox_ubuntu` branch. The same code runs on a desktop PC as a
+# normal user with Firefox ESR and pm2 on the `debian13` branch; only the
+# deployment (this script, the units, .env.example's paths, webui.sh) differs.
+#
+#   sudo -H ./setup.sh [flags]
+#
+# Idempotent: re-running is safe and cheap. Flags:
+#   --no-chrome          skip Chrome + the browser drivers (stages 2 and 3 only)
+#   --with-firefox       also install Firefox ESR + geckodriver
+#                        (MEETING_BROWSER=firefox-esr; Chrome stays the default)
+#   --with-libreoffice   also install LibreOffice, so .pptx slides passed via
+#                        --resources can be rendered into the PDF (~700MB)
+#   --with-trigger       install and enable the web UI (meeting-bot-trigger.service)
+#   --with-resume-timer  install the 15-minute `pipeline.sh --resume-all` timer,
+#                        so a run paused on the Claude usage window finishes
+#                        without anyone watching
+set -euo pipefail
 
-echo "==> Updating system"
-apt update && apt upgrade -y
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_CHROME=1
+INSTALL_FIREFOX=0
+INSTALL_LIBREOFFICE=0
+INSTALL_TRIGGER=0
+INSTALL_RESUME_TIMER=0
+DISTRO_NAME="Ubuntu"
 
-echo "==> Installing base tools"
-apt install -y \
-  build-essential git wget curl unzip ffmpeg \
+for arg in "$@"; do
+  case "$arg" in
+    --no-chrome)         INSTALL_CHROME=0 ;;
+    --with-firefox)      INSTALL_FIREFOX=1 ;;
+    --with-libreoffice)  INSTALL_LIBREOFFICE=1 ;;
+    --with-trigger)      INSTALL_TRIGGER=1 ;;
+    --with-resume-timer) INSTALL_RESUME_TIMER=1 ;;
+    -h|--help)           sed -n '2,22p' "$0"; exit 0 ;;
+    *) echo "Unknown flag: $arg (try --help)" >&2; exit 1 ;;
+  esac
+done
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "This must be run as root — try: sudo -H $0" >&2
+  exit 1
+fi
+if ! command -v apt-get >/dev/null 2>&1; then
+  echo "ERROR: apt-get not found. This setup script targets $DISTRO_NAME." >&2
+  exit 1
+fi
+. /etc/os-release 2>/dev/null || true
+case "${ID:-} ${ID_LIKE:-}" in
+  *debian*|*ubuntu*) ;;
+  *) echo "WARNING: this looks like ${PRETTY_NAME:-an unknown distro}, not $DISTRO_NAME."
+     echo "  Continuing anyway — the package names below are Debian's." ;;
+esac
+export DEBIAN_FRONTEND=noninteractive
+
+LOCAL_BIN=/usr/local/bin
+VENV="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}"
+
+echo "==> Updating the package index"
+apt-get update -qq
+
+echo "==> Installing packages"
+# ffmpeg            recording (x11grab + pulse), frames, audio demux, clips
+# xvfb              the hidden display the recorder's browser renders into
+# x11vnc/novnc      first_time_login.sh --novnc (the VM has no screen)
+# pulseaudio        a server VM has no audio stack: lib/xsession.sh starts the
+#                   daemon on demand and loads one null sink per run
+# poppler-utils     pdftotext/pdftoppm for --resources PDFs and slide images
+# libpango*         WeasyPrint's text shaping — without it the PDF export dies
+# fonts-*           Thai in the browser (locale th-TH) and in the PDF
+apt-get install -y --no-install-recommends \
+  ca-certificates curl wget gnupg git unzip \
+  ffmpeg \
+  python3 python3-venv \
+  procps psmisc util-linux \
+  tzdata locales \
   xvfb x11vnc novnc websockify \
   pulseaudio pulseaudio-utils \
-  python3 python3-venv python3-pip \
-  cmake wmctrl xdotool \
-  locales fonts-thai-tlwg
+  poppler-utils \
+  libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b \
+  fonts-thai-tlwg fonts-liberation fonts-noto-core fonts-cmu \
+  fontconfig
+# JetBrains Mono (the code face, DESIGN.md) is packaged on Debian 13; where it
+# is not, the PDF falls back to the next monospace face.
+apt-get install -y --no-install-recommends fonts-jetbrains-mono 2>/dev/null \
+  || echo "  fonts-jetbrains-mono not available here — code blocks use the fallback face."
 
-echo "==> Enabling Thai locale (for correct rendering/sorting of Thai text)"
-locale-gen th_TH.UTF-8 en_US.UTF-8
-update-locale LANG=en_US.UTF-8
+echo "==> Generating locales (en_US.UTF-8, th_TH.UTF-8)"
+sed -i 's/^# *\(en_US.UTF-8\|th_TH.UTF-8\)/\1/' /etc/locale.gen 2>/dev/null || true
+locale-gen >/dev/null 2>&1 || locale-gen en_US.UTF-8 th_TH.UTF-8 >/dev/null 2>&1 || true
 
-echo "==> Setting up Python venv + Playwright"
-python3 -m venv /opt/meeting-bot-venv
-source /opt/meeting-bot-venv/bin/activate
-pip install --upgrade pip
-# anthropic: SDK for the Anthropic API (also used against the FCC proxy).
-# openai: SDK for NVIDIA NIM (and any other OpenAI-compatible chat-completions
-#         endpoint). Both NIM's hosted service and self-hosted NIM speak the
-#         OpenAI protocol, so this one dependency covers both.
-# google-genai: SDK for Google Gemini summaries (transitive dep
-#         google-generativeai provides the legacy API used inside llm_client).
-# requests: HTTP client for transcribe/yt_transcript_client.py
-#         (youtube-transcript.io API). urllib was being rate-limited where
-#         curl worked; requests sends a different User-Agent and TLS stack.
-# assemblyai: SDK for the AssemblyAI pre-recorded transcription API
-#         (transcribe/assemblyai_client.py). Replaces the whisper.cpp
-#         local-file path; the API accepts mp3/mp4/m4a/wav/webm/ogg and
-#         handles the upload internally.
-pip install playwright anthropic openai google-genai requests assemblyai
-playwright install --with-deps chromium
-deactivate
-
-echo "==> Installing real Google Chrome"
-# Google blocks sign-in ("This browser or app may not be secure") from
-# unbranded open-source Chromium builds, like the one Playwright bundles above.
-# Real Chrome is needed for the one-time manual login (first_time_login.sh)
-# and is what join_meeting.py drives afterward via Playwright's channel="chrome".
-wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
-  > /etc/apt/sources.list.d/google-chrome.list
-apt update
-apt install -y google-chrome-stable
-
-echo "==> Building whisper.cpp"
-cd /opt
-if [ -d whisper.cpp ]; then
-  echo "    /opt/whisper.cpp already exists - pulling latest instead of re-cloning."
-  cd whisper.cpp
-  git pull
-else
-  git clone https://github.com/ggerganov/whisper.cpp.git
-  cd whisper.cpp
+if [ "$INSTALL_LIBREOFFICE" -eq 1 ]; then
+  echo "==> Installing LibreOffice Impress (for .pptx -> PDF -> slide images)"
+  apt-get install -y --no-install-recommends libreoffice-impress
 fi
-# Build is cheap on incremental changes, so always run it - guarantees the
-# whisper-cli binary is in sync with the source tree.
-cmake -B build
-cmake --build build -j"$(nproc)" --config Release
 
-echo "==> Downloading multilingual model (small - supports Thai)"
-# NOTE: use the multilingual model, NOT the '.en' English-only variant.
-# 'small' is a good CPU-only balance for Thai. For noticeably better Thai
-# accuracy at ~3x the time/RAM cost, switch to 'medium' here and in
-# record_and_transcribe.sh's WHISPER_MODEL variable.
-bash ./models/download-ggml-model.sh small
+if [ "$INSTALL_CHROME" -eq 1 ]; then
+  echo "==> Installing real Google Chrome (the default MEETING_BROWSER here)"
+  # NOT chromium. Google's sign-in flow blocks unbranded Chromium builds with
+  # "This browser or app may not be secure". See CLAUDE.md.
+  if [ ! -f /usr/share/keyrings/google-chrome.gpg ]; then
+    wget -q -O /tmp/google-signing-key.pub https://dl.google.com/linux/linux_signing_key.pub
+    gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg /tmp/google-signing-key.pub
+    rm -f /tmp/google-signing-key.pub
+  fi
+  echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+    > /etc/apt/sources.list.d/google-chrome.list
+  apt-get update -qq
+  apt-get install -y --no-install-recommends google-chrome-stable
+  google-chrome-stable --version
+fi
 
-echo "==> Installing latest yt-dlp"
-# Used by transcribe/transcribe.sh and summarize/summarize.py to download
-# audio + video from YouTube URLs. Installing from GitHub releases (not the
-# apt package) so we always get the freshest build - YouTube breaks yt-dlp
-# regularly and a stale binary is the #1 cause of silent failures.
-curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-  -o /usr/local/bin/yt-dlp
-chmod a+rx /usr/local/bin/yt-dlp
-# Sanity check: a broken download (e.g. firewall block on GitHub) returns
-# an HTML page instead of a binary, which fails immediately on --version.
-/usr/local/bin/yt-dlp --version
+if [ "$INSTALL_FIREFOX" -eq 1 ]; then
+  echo "==> Installing Firefox ESR (MEETING_BROWSER=firefox-esr)"
+  # Ubuntu ships Firefox as a snap, which cannot be driven with its own
+  # profile here; the Mozilla team PPA carries a real firefox-esr .deb.
+  apt-get install -y --no-install-recommends software-properties-common
+  add-apt-repository -y ppa:mozillateam/ppa
+  apt-get update -qq
+  apt-get install -y --no-install-recommends firefox-esr
+fi
 
-echo "==> Installing deno (JS runtime for yt-dlp's YouTube extraction)"
-# yt-dlp now requires a JavaScript runtime to compute YouTube's signed
-# player JS. Without one, newer formats are unavailable and the
-# "bestvideo+bestaudio + merge" path silently fails. Deno is the runtime
-# yt-dlp's error message recommends; it's a single self-contained binary
-# with no apt dependency. Idempotent: skip if already installed.
+echo "==> uv -> $LOCAL_BIN"
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$LOCAL_BIN" UV_NO_MODIFY_PATH=1 sh
+fi
+uv --version
+
+echo "==> Python venv at $VENV (uv)"
+# --seed keeps a pip inside for README's troubleshooting steps. The lockfiles
+# are compiled for Python 3.13: the system one where it is 3.13, otherwise a
+# uv-managed 3.13 is downloaded.
+if [ ! -x "$VENV/bin/python3" ]; then
+  uv venv --seed --python 3.13 "$VENV"
+fi
+REQS=(-r "$SCRIPT_DIR/requirements.txt")
+if [ "$INSTALL_CHROME" -eq 1 ] || [ "$INSTALL_FIREFOX" -eq 1 ]; then
+  REQS+=(-r "$SCRIPT_DIR/requirements-browser.txt")
+fi
+uv pip install --quiet --python "$VENV/bin/python3" "${REQS[@]}"
+if [ "$INSTALL_CHROME" -eq 1 ]; then
+  # The shared libraries Chrome needs. NOT `playwright install chromium`:
+  # capture.py drives the package above with channel="chrome".
+  "$VENV/bin/playwright" install-deps chromium >/dev/null 2>&1 || true
+fi
+
+if [ "$INSTALL_FIREFOX" -eq 1 ] && ! command -v geckodriver >/dev/null 2>&1; then
+  echo "==> geckodriver -> $LOCAL_BIN"
+  tag="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+         https://github.com/mozilla/geckodriver/releases/latest | sed 's#.*/tag/##')"
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/gd.tgz" \
+    "https://github.com/mozilla/geckodriver/releases/download/$tag/geckodriver-$tag-linux64.tar.gz"
+  tar -xzf "$tmp/gd.tgz" -C "$tmp"
+  install -m 0755 "$tmp/geckodriver" "$LOCAL_BIN/geckodriver"
+  rm -rf "$tmp"
+fi
+
+echo "==> yt-dlp -> $LOCAL_BIN"
+# From GitHub releases, not apt: YouTube breaks yt-dlp regularly and a stale
+# binary is the #1 cause of silent failures. Refreshed on every run of this.
+curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "$LOCAL_BIN/yt-dlp"
+chmod a+rx "$LOCAL_BIN/yt-dlp"
+"$LOCAL_BIN/yt-dlp" --version
+
+echo "==> deno (yt-dlp's JavaScript runtime) -> $LOCAL_BIN"
+# yt-dlp solves YouTube's JS challenges with an external runtime; without one
+# some videos are "not available". See CLAUDE.md, "yt-dlp needs deno".
 if ! command -v deno >/dev/null 2>&1; then
-  curl -fsSL -o /tmp/deno.zip \
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/deno.zip" \
     https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
-  unzip -o /tmp/deno.zip -d /usr/local/bin/ >/dev/null
-  chmod a+rx /usr/local/bin/deno
-  rm -f /tmp/deno.zip
+  python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract("deno", sys.argv[2])' \
+    "$tmp/deno.zip" "$tmp"
+  install -m 0755 "$tmp/deno" "$LOCAL_BIN/deno"
+  rm -rf "$tmp"
 fi
-# Sanity check, mirroring the yt-dlp block above.
-deno --version
+deno --version | head -n 1
 
-echo "==> Creating working directories"
-mkdir -p /opt/meeting-bot/{recordings,transcripts,summaries,frames}
-mkdir -p /opt/meeting-bot/secrets
-mkdir -p ~/.meeting-bot/chrome-profile
+echo "==> Vendored Thai PDF fonts (Bai Jamjuree, Sarabun) -> /usr/local/share/fonts/meeting-bot"
+install -d /usr/local/share/fonts/meeting-bot
+install -m 0644 "$SCRIPT_DIR"/fonts/*/*.ttf /usr/local/share/fonts/meeting-bot/
+fc-cache -f /usr/local/share/fonts/meeting-bot >/dev/null 2>&1 || true
 
-# Bootstrap a starter keys file for the youtube-transcript.io API client.
-# The first run of yt_transcript_client.py will populate it with an empty
-# keys list; the user adds accounts by editing this file. chmod 600 is set
-# by the client on first write; on existing files we just enforce permissions.
-KEYS_FILE="/opt/meeting-bot/secrets/youtube_transcript_keys.json"
-if [ ! -f "$KEYS_FILE" ]; then
-  cat > "$KEYS_FILE" <<'EOF'
-{
-  "keys": [],
-  "next_index": 0,
-  "_comment": "Add your youtube-transcript.io API tokens to the 'keys' list. Each entry is one account. Save and re-run; transcribe.sh rotates through them in order. The cursor (next_index) is updated after each successful call."
+echo "==> .env"
+if [ ! -f "$SCRIPT_DIR/.env" ]; then
+  cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
+  chmod 600 "$SCRIPT_DIR/.env"
+  echo "  created from .env.example — fill in BOT_GOOGLE_ACCOUNT and your keys."
+fi
+if ! grep -qE '^MEETING_BOT_TOKEN=.+' "$SCRIPT_DIR/.env"; then
+  token="$("$VENV/bin/python3" -c 'import secrets; print(secrets.token_urlsafe(24))')"
+  if grep -qE '^MEETING_BOT_TOKEN=' "$SCRIPT_DIR/.env"; then
+    sed -i "s|^MEETING_BOT_TOKEN=.*|MEETING_BOT_TOKEN=$token|" "$SCRIPT_DIR/.env"
+  else
+    printf '\nMEETING_BOT_TOKEN=%s\n' "$token" >> "$SCRIPT_DIR/.env"
+  fi
+  echo "  generated MEETING_BOT_TOKEN for the web UI."
+fi
+
+echo "==> Working directories"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/source_env.sh"
+mkdir -p "$MEETING_BOT_ROOT"/{runs,tmp,state,logs,resources}
+for var in RECORDINGS_DIR TRANSCRIPTS_DIR FRAMES_DIR SUMMARIES_DIR PDF_DIR; do
+  dir="${!var:-}"
+  [ -n "$dir" ] || { echo "  $var is not set in .env"; continue; }
+  mkdir -p "$dir" 2>/dev/null && echo "  $var = $dir" \
+    || echo "  WARNING: cannot create $var ($dir) — is the drive mounted?"
+done
+
+install_unit() {  # <unit file in the repo>
+  local name; name="$(basename "$1")"
+  sed -e "s|@REPO_ROOT@|$SCRIPT_DIR|g" -e "s|@VENV@|$VENV|g" "$1" \
+    > "/etc/systemd/system/$name"
+  echo "  /etc/systemd/system/$name"
 }
-EOF
-  chmod 600 "$KEYS_FILE" || true
+if [ "$INSTALL_TRIGGER" -eq 1 ] || [ "$INSTALL_RESUME_TIMER" -eq 1 ]; then
+  echo "==> systemd units"
+  [ "$INSTALL_TRIGGER" -eq 1 ] && install_unit "$SCRIPT_DIR/meeting-bot-trigger.service"
+  if [ "$INSTALL_RESUME_TIMER" -eq 1 ]; then
+    install_unit "$SCRIPT_DIR/meeting-bot-resume.service"
+    install_unit "$SCRIPT_DIR/meeting-bot-resume.timer"
+  fi
+  systemctl daemon-reload
+  [ "$INSTALL_TRIGGER" -eq 1 ] && systemctl enable --now meeting-bot-trigger.service
+  [ "$INSTALL_RESUME_TIMER" -eq 1 ] && systemctl enable --now meeting-bot-resume.timer
 fi
 
+echo "==> The claude CLI (the summarizer spends your Claude subscription)"
+CLI="${CLAUDE_CLI_BIN:-$(command -v claude || true)}"
+if [ -n "$CLI" ] && [ -x "$CLI" ]; then
+  echo "  $CLI ($("$CLI" --version 2>/dev/null | head -n 1))"
+else
+  echo "  not installed. Install it, sign in, and set CLAUDE_CLI_BIN in .env:"
+  echo "      curl -fsSL https://claude.ai/install.sh | bash"
+  echo "      /root/.local/bin/claude auth login"
+fi
+
+echo ""
 echo "==> Done."
 echo "Next steps:"
-echo "  1. Edit $KEYS_FILE and add at least one youtube-transcript.io API token."
-echo "  2. Run first_time_login.sh once to log into Google/Zoom inside the persistent browser profile."
-echo "  3. Set SUMMARY_BACKEND / SUMMARY_FALLBACK_CHAIN / NIM and Gemini env vars as needed."
+echo "  1. Edit .env: BOT_GOOGLE_ACCOUNT, your API keys, and the five output directories."
+echo "  2. ./first_time_login.sh --novnc   — sign the bot's Chrome profile in, over noVNC."
+echo "  3. ./pipeline.sh <url-or-file>     — a Meet/Zoom link records in the background."
+echo "  4. ./webui.sh on                   — the web UI (systemd; --with-trigger also starts it at boot)."
+echo ""
+echo "Check the configuration with:"
+echo "  $VENV/bin/python3 lib/paths.py show"
+echo "  ./verify_e2e.sh --preflight"

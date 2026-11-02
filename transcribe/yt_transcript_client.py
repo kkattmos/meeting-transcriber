@@ -12,17 +12,17 @@ real transcript (Thai included).
 
 Multiple accounts / API keys
 ----------------------------
-To spread quota across multiple accounts, this client round-robins through
-a list of keys stored at /opt/meeting-bot/secrets/youtube_transcript_keys.json:
+To spread quota across multiple accounts, this client round-robins through the
+numbered keys in the repo-root .env file:
 
-    {
-        "keys":   ["acct1-token", "acct2-token", "acct3-token"],
-        "next_index": 0   # cursor — advances after each successful pick
-    }
+    YT_TRANSCRIPT_KEY_1=acct1-token
+    YT_TRANSCRIPT_KEY_2=acct2-token
+    ...                             (up to YT_TRANSCRIPT_KEY_10)
 
-The cursor is persisted back to disk so a sequence of runs deterministically
-walks the list. Use chmod 600 on the file (the script will enforce this on
-first write).
+The rotation cursor is persisted by lib/keyring.py under
+$MEETING_BOT_ROOT/state/keycursor.json, so consecutive runs start on different
+accounts instead of always hammering the first one. (Before the Debian 13
+port these keys lived in a separate JSON file; they are .env-only now.)
 
 Authentication
 --------------
@@ -38,8 +38,10 @@ Public API
 - extract_video_id(url) -> str
 - fetch_transcript(video_id) -> list[dict]
     Returns [{'text': str, 'offset_ms': int, 'duration_ms': int}, ...]
-- CLI: `python3 -m yt_transcript_client <video_url>` prints segments to stdout
+- CLI: `python3 -m yt_transcript_client <video_url> [<language>]` prints
+  segments to stdout
 """
+import html
 import json
 import os
 import re
@@ -49,20 +51,20 @@ from pathlib import Path
 import requests
 import requests.exceptions
 
-# Canonical path for the keys file. Matches what setup.sh creates and what
-# .gitignore excludes. Override with YT_TRANSCRIPT_KEYS_FILE for tests.
-# Falls back to the YT_TRANSCRIPT_KEYS_FILE env var so users can point it
-# somewhere else via .env without touching code.
-DEFAULT_KEYS_FILE = Path(
-    os.environ.get(
-        "YT_TRANSCRIPT_KEYS_FILE",
-        "/opt/meeting-bot/secrets/youtube_transcript_keys.json",
-    )
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from keyring import KeyRing, missing_keys_message  # noqa: E402
+
+# youtube-transcript.io publishes a 10-account ceiling per operator; the ring
+# reads YT_TRANSCRIPT_KEY_1..10 from .env.
+KEY_NAME = "YT_TRANSCRIPT_KEY"
+MAX_KEYS = 10
 
 # youtube-transcript.io API endpoint. Stable as of 2025; if it changes, only
-# this constant needs to move.
-API_URL = "https://www.youtube-transcript.io/api/transcripts"
+# this constant needs to move. YT_TRANSCRIPT_API_URL points it somewhere else,
+# which is how the end-to-end test exercises this client against a local stub
+# server instead of spending a real caption quota on every test run.
+API_URL = os.environ.get("YT_TRANSCRIPT_API_URL",
+                         "https://www.youtube-transcript.io/api/transcripts")
 
 # Video ID extraction. Matches both youtube.com/watch?v=<id> and youtu.be/<id>.
 # 11-char ID matches what YouTube itself enforces; we accept >=6 to be lenient.
@@ -89,74 +91,30 @@ def extract_video_id(url):
     return m.group(1)
 
 
-def _read_keys_file(path):
-    """Load the keys file. Returns the parsed dict; creates a starter file
-    with an empty keys list if the file doesn't exist yet (so the user can
-    edit it without running a separate init step)."""
-    if not path.exists():
-        # Bootstrap a starter file. Caller is expected to edit it; we just
-        # make the workflow discoverable.
-        path.parent.mkdir(parents=True, exist_ok=True)
-        starter = {"keys": [], "next_index": 0, "_comment": (
-            "Add your youtube-transcript.io API tokens to the 'keys' list. "
-            "Each entry is a separate account. Save the file and re-run."
-        )}
-        path.write_text(json.dumps(starter, indent=2) + "\n")
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            # Non-fatal — log via stderr and continue. The file is still
-            # root-owned in most setups.
-            print(
-                f"warning: could not chmod 600 {path} — please do it manually",
-                file=sys.stderr,
-            )
-        raise SystemExit(
-            f"Created starter keys file at {path}. Add at least one API "
-            f"token to its 'keys' list and re-run."
-        )
+def _keys_message():
+    """The "where do I put my API key?" message.
 
-    try:
-        data = json.loads(path.read_text())
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"Keys file {path} is not valid JSON: {e}")
-
-    keys = data.get("keys") or []
-    if not isinstance(keys, list) or not keys:
-        raise SystemExit(
-            f"Keys file {path} has an empty 'keys' list. Add at least one "
-            f"API token."
-        )
-    cursor = int(data.get("next_index", 0)) % len(keys)
-    return {"keys": keys, "next_index": cursor, "_path": path}
-
-
-def _write_cursor(path, cursor):
-    """Persist the round-robin cursor back to disk.
-
-    Best-effort: we don't want a transient write failure (disk full, perms)
-    to mask a successful transcript fetch. The next run will pick the same
-    key again, which is fine — the worst case is one duplicate request.
+    Worth spelling out: these tokens used to live in a JSON file under
+    /opt/meeting-bot/secrets/, and anyone following an older README will go
+    looking for it.
     """
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        # If we can't read it, we can't update it; bail silently.
-        return
-    data["next_index"] = cursor % max(1, len(data.get("keys") or []))
-    try:
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2) + "\n")
-        tmp.replace(path)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    except OSError as e:
-        print(
-            f"warning: could not persist cursor to {path}: {e}",
-            file=sys.stderr,
-        )
+    return missing_keys_message(
+        KEY_NAME, MAX_KEYS,
+        extra=("\nGet a token from https://www.youtube-transcript.io "
+               "(account -> API).\nOnly YouTube inputs need this; local "
+               "recordings use ASSEMBLYAI_API_KEY_1..3 instead.\n\n"
+               "These tokens no longer live in "
+               "/opt/meeting-bot/secrets/youtube_transcript_keys.json — "
+               "that file is gone; .env is the only source now."),
+    )
+
+
+def _key_ring():
+    """The configured key ring, or SystemExit with instructions if empty."""
+    ring = KeyRing.from_env(KEY_NAME, max_slots=MAX_KEYS)
+    if not ring:
+        raise SystemExit(_keys_message())
+    return ring
 
 
 def _call_api(video_id, api_key):
@@ -210,7 +168,71 @@ def _call_api(video_id, api_key):
     return resp.json()
 
 
-def _normalise_segments(raw):
+def _clean_caption_text(text):
+    """Unescape entities and drop caption markup.
+
+    YouTube caption cues arrive HTML-escaped, so italics reach us as the
+    literal characters "&lt;i&gt;" and an ampersand as "&amp;". Left alone
+    they end up in the .txt, in the .srt, and inside the <details> block of
+    the summary document.
+    """
+    text = html.unescape(str(text))
+    # Caption markup is only ever simple tags like <i> / </i> / <b>.
+    text = re.sub(r"</?[a-zA-Z][^>]*>", "", text)
+    return text.strip()
+
+
+def _pick_track(entry, prefer_language=None, report=None):
+    """Return the transcript segment list from an entry's `tracks`, or None.
+
+    `report`, when given, gets report["matched"] = whether the track used is
+    in `prefer_language` (True when no language was asked for).
+
+    The current API shape (verified 2026-09) is:
+
+        [{"id": ..., "title": ..., "text": "<whole transcript, one string>",
+          "languages": [{"label": "en", "languageCode": "en"}, ...],
+          "tracks": [{"language": "en",
+                      "transcript": [{"start": "6.951", "dur": "2",
+                                      "text": "..."}, ...]}]}]
+
+    `tracks[].transcript` is the only place per-segment timing lives, and
+    timing is what lets chunking hand each chunk the frames that were on
+    screen while those words were spoken. The flat `text` field has none.
+    """
+    tracks = entry.get("tracks")
+    if not isinstance(tracks, list) or not tracks:
+        return None
+    chosen = None
+    if prefer_language:
+        # A track's `language` is a human label ("English - English",
+        # "Japanese"), not a code. The sibling `languages` array carries the
+        # ISO code for the same label, in the same order, so use it to
+        # translate before matching — otherwise every comparison against
+        # "en" fails and we silently fall back to tracks[0].
+        code_by_label = {}
+        for lang in entry.get("languages") or []:
+            if isinstance(lang, dict) and lang.get("label"):
+                code_by_label[str(lang["label"])] = str(lang.get("languageCode") or "")
+        want = str(prefer_language).lower()
+        for t in tracks:
+            label = str(t.get("language") or "")
+            candidates = {label.lower(), code_by_label.get(label, "").lower()}
+            candidates.discard("")
+            # "en" should match "en-US" and vice versa.
+            if any(c == want or c.startswith(want + "-") or want.startswith(c + "-")
+                   for c in candidates):
+                chosen = t
+                break
+    if report is not None:
+        report["matched"] = chosen is not None or not prefer_language
+    if chosen is None:
+        chosen = tracks[0]
+    segments = chosen.get("transcript")
+    return segments if isinstance(segments, list) else None
+
+
+def _normalise_segments(raw, prefer_language=None, report=None):
     """Convert the API's response shape into a flat list of segments.
 
     The API's exact field names are documented to drift between versions, so
@@ -222,21 +244,28 @@ def _normalise_segments(raw):
 
     out = []
     for entry in raw:
-        # Most API versions return one entry per video, with segments under
-        # 'transcripts' or 'segments'. Some return segments directly.
-        segments = entry.get("transcripts") or entry.get("segments") or entry
+        # Current shape first: the timed segments under tracks[].transcript.
+        # Without this the fallbacks below land on the entry dict itself and
+        # its flat `text` field, producing ONE segment holding the entire
+        # transcript with no timing at all — which is exactly what happened
+        # before this branch existed.
+        segments = _pick_track(entry, prefer_language, report)
+        if segments is None:
+            # Older/other shapes: segments under 'transcripts' or 'segments',
+            # or the entry itself.
+            segments = entry.get("transcripts") or entry.get("segments") or entry
         if isinstance(segments, dict):
             segments = [segments]
         if not isinstance(segments, list):
             continue
 
         for seg in segments:
-            text = (
+            text = _clean_caption_text(
                 seg.get("text")
                 or seg.get("transcript")
                 or seg.get("caption")
                 or ""
-            ).strip()
+            )
             # Offset / duration can come back as either seconds (float) or
             # milliseconds (int). Normalise to int milliseconds.
             offset = seg.get("offset") or seg.get("start") or seg.get("startMs") or 0
@@ -258,31 +287,27 @@ def _normalise_segments(raw):
     return out
 
 
-def fetch_transcript(video_id, keys_file=None):
+def fetch_transcript(video_id, prefer_language=None, ring=None, report=None):
     """Fetch a transcript for `video_id`, trying each configured key in
     round-robin order until one succeeds.
+
+    `prefer_language` picks among the caption tracks the video actually has
+    ("en" matches "en-US"); the first track is used when it doesn't match,
+    since a transcript in the wrong language still beats no transcript.
 
     Returns a list of {'text', 'offset_ms', 'duration_ms'} segments.
 
     Raises SystemExit (with the last error) if every key fails.
     Raises ValueError if the API returns no usable segments for the video.
     """
-    path = Path(keys_file) if keys_file else DEFAULT_KEYS_FILE
-    state = _read_keys_file(path)
-    keys = state["keys"]
-    cursor = state["next_index"]
-    keys_path = state["_path"]
+    ring = ring or _key_ring()
 
     last_error = None
-    for i, key in enumerate(keys):
-        pick = (cursor + i) % len(keys)
+    for slot, key in ring.rotate():
         try:
-            raw = _call_api(video_id, keys[pick])
+            raw = _call_api(video_id, key)
         except RuntimeError as e:
-            print(
-                f"  key #{pick + 1}/{len(keys)} failed: {e}",
-                file=sys.stderr,
-            )
+            print(f"  {ring.label(slot)} failed: {e}", file=sys.stderr)
             last_error = e
             continue
         except requests.exceptions.RequestException as e:
@@ -290,19 +315,16 @@ def fetch_transcript(video_id, keys_file=None):
             # (only some subclasses do). Fall back to str(e) for a
             # human-readable label.
             reason = getattr(e, "reason", None) or str(e)
-            print(
-                f"  key #{pick + 1}/{len(keys)} network error: {reason}",
-                file=sys.stderr,
-            )
+            print(f"  {ring.label(slot)} network error: {reason}",
+                  file=sys.stderr)
             last_error = e
             continue
 
-        # Success — persist the cursor for the next call. Advance past the
-        # key we just used so the *next* request lands on a different one.
-        next_cursor = (pick + 1) % len(keys)
-        _write_cursor(keys_path, next_cursor)
+        # Success — advance the persisted cursor so the *next* run starts on a
+        # different account.
+        ring.commit(slot)
 
-        segments = _normalise_segments(raw)
+        segments = _normalise_segments(raw, prefer_language, report)
         if not segments:
             # The API returned 200 but no usable segments. Don't bother
             # retrying on a different key — every key hits the same
@@ -318,7 +340,7 @@ def fetch_transcript(video_id, keys_file=None):
 
     # All keys failed. Surface the most informative error we saw.
     raise SystemExit(
-        f"All {len(keys)} youtube-transcript.io key(s) failed for video "
+        f"All {len(ring)} youtube-transcript.io key(s) failed for video "
         f"{video_id!r}. Last error: {last_error}"
     )
 
@@ -357,14 +379,31 @@ def main():
 
     Prints the segments as JSON to stdout (so the bash wrapper can pipe it
     to the writer). Exits non-zero on failure.
+
+    --strict: when a language was asked for and the video has no uploaded
+    track in it, still print the track that WAS used, but exit 3. That is
+    transcribe.sh's cue to try YouTube's own captions of the spoken audio
+    (yt_autocaptions.py) before settling for a track in another language.
     """
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <youtube_url>", file=sys.stderr)
+    args = [a for a in sys.argv[1:] if a != "--strict"]
+    strict = len(args) != len(sys.argv) - 1
+    if len(args) not in (1, 2):
+        print(f"Usage: {sys.argv[0]} <youtube_url> [<language>] [--strict]",
+              file=sys.stderr)
         sys.exit(1)
-    video_id = extract_video_id(sys.argv[1])
-    segments = fetch_transcript(video_id)
+    video_id = extract_video_id(args[0])
+    # "auto" means "whatever the video has" — same as passing nothing.
+    prefer = args[1] if len(args) == 2 else None
+    if prefer in ("auto", ""):
+        prefer = None
+    report = {}
+    segments = fetch_transcript(video_id, prefer_language=prefer, report=report)
     json.dump(segments, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
+    if strict and report.get("matched") is False:
+        print(f"  no uploaded {prefer!r} track; the one above is another "
+              f"language", file=sys.stderr)
+        sys.exit(3)
 
 
 if __name__ == "__main__":
