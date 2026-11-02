@@ -1,0 +1,4 @@
+# Windows text files the shell scripts read must keep LF line endings.
+*.sh text eol=lf
+.env.example text eol=lf
+*.ps1 text eol=crlf

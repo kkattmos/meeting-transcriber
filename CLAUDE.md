@@ -29,7 +29,7 @@ that request surface moved twice in 2025-2026 and memorized patterns are wrong.
 
 ## Branches
 
-- **`debian13`** (this one) — Debian 13 on the operator's own **desktop PC**,
+- **`debian13`** — Debian 13 on the operator's own **desktop PC**,
   as the operator's user (not root), Firefox ESR by default, pm2 for the web
   UI. Ported from the VM layout on 2026-09-29; see "Running on a PC" below.
 - **`debian13-in-proxmox`** — the same system as it ran on the Proxmox VM
@@ -99,6 +99,59 @@ allocated per run in `lib/xsession.sh`:
 
 If you are tempted to hardcode a display number again, don't — that only worked
 because of the container boundary that no longer exists.
+
+## This branch: `windows` (native Windows, Git Bash)
+
+Created 2026-11-02 from `debian13`, settled with the operator in two rounds
+of questions: **native Windows** (not WSL, not Docker), the bash scripts
+**under Git Bash** (not a Python or PowerShell rewrite), meetings recorded
+as **a visible window + VB-CABLE**, **Firefox ESR** by default, **pm2**.
+**Features are developed on `debian13` and merged here**; this branch keeps
+only its layer:
+
+- `setup.ps1` — winget (Git, ffmpeg, Node, uv, deno, poppler, MSYS2), Pango
+  via MSYS2 pacman (`WEASYPRINT_DLL_DIRECTORIES`), Firefox ESR **in its own
+  folder** (`%LOCALAPPDATA%\meeting-bot\firefox-esr` — Windows routes sound
+  per program PATH, so the bot's Firefox can go to the cable without moving
+  the operator's own Firefox), geckodriver + yt-dlp in
+  `%LOCALAPPDATA%\meeting-bot\bin`, the venv from `requirements-windows.txt`
+  (+ `.venv/bin/python3` shims so the scripts' `$MEETING_BOT_VENV/bin/python3`
+  works), per-user fonts (vendored + CMU from CTAN + JetBrains Mono), pm2,
+  `.env`. VB-CABLE is a driver and is installed by hand.
+- `screen/record_windows.sh` → `record_windows.py` (`MEETING_BOT_RECORDER`):
+  capture.py joins as on Linux; the bot's Firefox is a kiosk window on
+  `MEETING_BOT_KIOSK_MONITOR` (`--kiosk-monitor`); after admission the
+  largest visible window of capture.py's process tree is found
+  (EnumWindows + a Toolhelp snapshot — never another Firefox on the
+  desktop) and ffmpeg records it with `gdigrab title=…` (the HWND is
+  resolved once, so Meet changing its title later is harmless) plus
+  `dshow audio=CABLE Output…`, scaled/padded to `RECORD_GEOMETRY`, with the
+  Linux encoder settings. **Stopped with ffmpeg's own `q` on stdin** —
+  Windows has no SIGINT for another process. One recording at a time
+  (`state/windows-recorder.pid`): one cable. `record.pid` keeps
+  record_screen.sh's format with Windows pids; kill_meeting.sh taskkills
+  capture.py's tree past the grace period and never touches ffmpeg.
+- `screen/windows_sound_setup.py` — plays a tone in the bot's browser so it
+  shows up in the Volume mixer for the one-time routing.
+- `.env.example`: `%LOCALAPPDATA%`-based paths (`~/AppData/Local/…`),
+  `FIREFOX_BIN`, `GECKODRIVER_BIN`, `MEETING_BOT_RECORDER`,
+  `MEETING_BOT_KIOSK_MONITOR`, `WINDOWS_AUDIO_DEVICE`, `MEETING_BOT_BASH`,
+  `WEASYPRINT_DLL_DIRECTORIES`, `CLAUDE_CLI_BIN=…claude.exe`.
+- `requirements-windows.txt`, `requirements-browser-windows.txt`
+  (`--python-platform x86_64-pc-windows-msvc`).
+- `screen/test_record_windows.py` (runs on Linux: device parsing, the
+  ffmpeg command, the process tree, record.pid).
+
+The shared helpers this relies on (debian13, "Shared code runs on every
+branch"): `lib/procutil.py`, `lib/platform.sh`, the loader's `C:/…` path
+conversion, `trigger_server._shell`, the recorder hook, the kiosk monitor.
+
+**Not yet run on Windows** (written and tested on Linux only). Linux-only
+here: the noVNC sign-in, `benchmark.sh`, `verify_e2e.sh --browser-smoke`,
+the live audio badge (`audio_watch`), the Discord spikes. GDI capture on a
+monitor with display scaling ≠ 100% may crop: if it does, set that monitor to
+100%. Everything else in this file describing "the PC" applies, with Git
+Bash in place of a Linux shell.
 
 ## Running on a PC (2026-09-29)
 

@@ -1,34 +1,39 @@
 # meeting-transcriber
 
-A meeting/lecture bot that runs on your own **Debian 13 (trixie) PC**, as your
-own user. It joins a Google Meet or Zoom call — or creates a new Google Meet and
-hosts it — in a signed-in **Firefox ESR** (Chrome is the fallback), on a hidden
-display so it never takes over your screen, records the screen and audio to
-MP4 **in the background**, transcribes it, and writes an AI summary — as
-Markdown **and as a PDF** — combining the transcript with keyframes pulled from
-the recording. It also works on YouTube links, on Kaltura lecture-capture
-embeds (paste the `<iframe>` from your LMS), and on video files you already
-have, and it can read the lecturer's own slides from a GitHub repo or a folder
-and use them as reference material. A small web UI, run by pm2 and off until
-you switch it on, does all of that from a browser.
+A meeting/lecture bot for **native Windows 10/11** (no WSL, no Docker). It
+joins a Google Meet or Zoom call — or creates a new Google Meet and hosts it
+— in a signed-in **Firefox ESR** of its own (Chrome is the fallback), records
+that window and the meeting's sound to MP4, transcribes it, and writes an AI
+summary — as Markdown **and as a PDF** — combining the transcript with
+keyframes pulled from the recording. It also works on YouTube links, on
+Kaltura lecture-capture embeds (paste the `<iframe>` from your LMS), and on
+video files you already have, and it can read the lecturer's own slides from
+a GitHub repo or a folder and use them as reference material. A small web
+UI, run by pm2 and off until you switch it on, does all of that from a
+browser — including the run history, and an optional copy of every PDF in
+Google Drive.
 
 The three stages are independent — each has its own entry script and runs
-without the others — and `pipeline.sh` chains them.
+without the others — and `pipeline.sh` chains them. On Windows they run
+under **Git Bash** (Git for Windows), which `setup.ps1` installs.
 
-- **Everything you run day to day is in [Commands](#commands).**
+- **Everything you run day to day is in [Commands](#commands)** — type them
+  in Git Bash, in the repo folder.
+- **What is different on Windows is in [Running on Windows](#running-on-windows).**
 - Architectural decisions and the reasons behind them live in `CLAUDE.md`.
 
-> **Other versions.** The same system as a root install on a Proxmox VM (with
-> `/opt`, systemd units and Chrome) is on the `debian13-in-proxmox` branch; the
-> one-container Docker build is on `docker`; the Alpine host + Debian container
-> is on `alpinelinux`.
+> **Other versions.** This is the `windows` branch. The same code on a
+> Debian desktop is on `debian13`, where features are developed first; a
+> root install on a Proxmox VM is on `debian13-in-proxmox` (Debian) and
+> `deprecated_proxmox_ubuntu` (Ubuntu); the one-container Docker build is on
+> `docker`; the Alpine host + Debian recorder container is on `main`.
 
 ---
 
 ## Table of contents
 
 - [How it works](#how-it-works)
-- [Running on a PC](#running-on-a-pc)
+- [Running on Windows](#running-on-windows)
 - [Install](#install)
 - [First-time login](#first-time-login)
 - [Web UI](#web-ui)
@@ -127,81 +132,96 @@ $MEETING_BOT_ROOT/                      the pipeline's own bookkeeping (~/.local
 
 ---
 
-## Running on a PC
+## Running on Windows
 
-Settled 2026-09-29. The system used to live on a Proxmox VM, as root, with
-everything under `/opt` (that version is on the `debian13-in-proxmox` branch).
-On a desktop PC it runs as **you**:
+This branch is the code on `debian13` running natively on Windows. Everything
+except the meeting recorder is the same program; what differs:
 
-| | Proxmox VM (`debian13-in-proxmox`) | This PC (`debian13`) |
+| | Windows (`windows`) | Debian desktop (`debian13`) |
 |---|---|---|
-| User | root | your own account; `sudo` only for `setup.sh --system` |
-| Bot state | `/opt/meeting-bot` | `~/.local/share/meeting-bot` |
-| Python | `/opt/meeting-bot-venv` | `.venv` in the repo, built by **uv** — `rm -rf .venv` removes it |
-| Browser | google-chrome-stable via Playwright | **Firefox ESR** via Selenium + geckodriver; Chrome selectable |
-| Sign-in | noVNC | a window on your desktop (noVNC still available) |
-| Bot account | whatever the profile held | **`BOT_GOOGLE_ACCOUNT` only** — anything else is refused |
-| A meeting | ran in your terminal | **runs in the background**; the command returns at once |
-| Services | systemd trigger unit + resume timer | **pm2**: `./webui.sh on` / `off`, nothing at boot |
-| Camera/mic | none on the VM | the PC's real ones are never given to the browser |
+| Shell | **Git Bash** (Git for Windows) runs `pipeline.sh` and the other scripts | bash |
+| Python | `.venv` built by **uv** (Python 3.13), from `requirements-windows.txt` | `.venv` from `requirements.txt` |
+| Bot state | `%LOCALAPPDATA%\meeting-bot` | `~/.local/share/meeting-bot` |
+| Browser | **Firefox ESR in its own folder** (`%LOCALAPPDATA%\meeting-bot\firefox-esr`), Chrome selectable | Firefox ESR, Chrome selectable |
+| The meeting's picture | the bot's **visible full-screen window** on the monitor `MEETING_BOT_KIOSK_MONITOR` names, recorded by window title (ffmpeg gdigrab) | a hidden Xvfb display |
+| The meeting's sound | **VB-Audio Virtual Cable**: the bot's Firefox plays into "CABLE Input", ffmpeg records "CABLE Output" | a PulseAudio sink per run |
+| Recordings at once | **one** (one cable) | several |
+| PDF text engine | Pango from **MSYS2** (`WEASYPRINT_DLL_DIRECTORIES`) | Debian's Pango |
+| Services | pm2 (`./webui.sh on`), off at boot | pm2 |
 
-Per-run isolation is unchanged: `lib/xsession.sh` claims a free display number
-for each recording and loads a PulseAudio null sink named after the run, and
-the browser is pointed at that sink with `PULSE_SINK` — so a recording never
-touches your desktop's screen or speakers, and two recordings never share a
-sink. On the PC it also loads a second, silent sink whose monitor is the
-browser's **microphone**, so a bot that failed to mute can't broadcast your
-room, and the browser's camera is refused outright.
+**What you give up while a meeting records:** the bot's window takes over
+the monitor `MEETING_BOT_KIOSK_MONITOR` names (0 = the main one; the default,
+1, is a second monitor — a cheap HDMI dummy plug also works) and **must not
+be covered or minimised**, because what Windows shows there is what is
+recorded. The bot's microphone and camera stay blocked, as on Linux, so it
+never hears or films your room. One meeting records at a time.
 
 ---
 
 ## Install
 
-Target: Debian 13 (trixie) desktop, as a normal user with `sudo`.
+Target: Windows 10 (21H2+) or 11, x86-64, as your normal user, with
+**winget** (App Installer). In PowerShell, in the repo folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```
+
+It installs, with winget: Git for Windows, ffmpeg, Node.js (for pm2), uv,
+deno (yt-dlp's JavaScript runtime for YouTube), poppler and MSYS2 with
+Pango (the PDF renderer's text engine); then Firefox ESR **into its own
+folder** (not over your own Firefox), geckodriver and yt-dlp, the venv
+(`.venv`, Python 3.13, from the hash-pinned `requirements-windows.txt`), the
+PDF fonts for your user (Bai Jamjuree, Sarabun, CMU Serif, JetBrains Mono),
+pm2, and a `.env` with a fresh `MEETING_BOT_TOKEN`. `-WithChrome` also
+installs Chrome; `-NoBrowser` skips the browser (a PC that only transcribes
+and summarizes).
+
+**Then, once, by hand:**
+
+1. **VB-Audio Virtual Cable** — download it from
+   <https://vb-audio.com/Cable/>, run `VBCABLE_Setup_x64.exe` as
+   administrator, restart Windows. (A driver; setup.ps1 cannot install it.)
+2. **Open Git Bash in the repo folder** (right-click → *Open Git Bash here*)
+   — everything from here on is typed there.
+3. Edit `.env`: `BOT_GOOGLE_ACCOUNT`, your API keys, the five output folders
+   (`~/` is your user folder), and `MEETING_BOT_KIOSK_MONITOR`.
+4. **Point the bot's sound at the cable.** Windows chooses a program's
+   output device per program, and lists one only while it plays:
+
+   ```bash
+   .venv/bin/python3 screen/windows_sound_setup.py
+   ```
+
+   opens the bot's Firefox playing a quiet tone for 90 s. Meanwhile: Settings
+   → System → Sound → Volume mixer → the bot's **firefox.exe** → Output
+   device: **CABLE Input**. Windows remembers it. (Your own Firefox lives in
+   another folder and is not affected.)
+5. `./first_time_login.sh` — signs the bot's Firefox in as
+   `BOT_GOOGLE_ACCOUNT`, in a window on your desktop.
+
+**Python dependencies are pinned** per platform: `requirements-windows.txt` /
+`requirements-browser-windows.txt` here, generated from the same
+`requirements*.in` as the Linux lockfiles:
 
 ```bash
-sudo ./setup.sh --system
+uv pip compile --generate-hashes --python-version 3.13 --python-platform x86_64-pc-windows-msvc requirements.in -o requirements-windows.txt
 ```
 
 ```bash
-./setup.sh
+uv pip compile --generate-hashes --python-version 3.13 --python-platform x86_64-pc-windows-msvc -c requirements-windows.txt requirements-browser.in -o requirements-browser-windows.txt
 ```
 
-The first installs the apt packages — ffmpeg, Xvfb, `pactl`
-(`pulseaudio-utils`; not the PulseAudio daemon, since the desktop runs
-PipeWire), x11vnc/noVNC, **firefox-esr**, poppler, Pango for the PDF renderer,
-Thai fonts, nodejs/npm and the Thai locale. Add `--with-chrome` for
-`google-chrome-stable` (only for `MEETING_BROWSER=chrome`) and
-`--with-libreoffice` so `.pptx` slides can be rendered into the PDF (~700MB).
+Wherever the rest of this README says `sudo ./setup.sh`, use `setup.ps1`;
+`~/.local/bin/claude` is `claude.exe` from `irm https://claude.ai/install.ps1 | iex`
+(in PowerShell); and the noVNC sign-in, `benchmark.sh` and
+`verify_e2e.sh --browser-smoke` (Xvfb) are Linux-only.
 
-The second runs as you, with no sudo, and puts everything else in your home
-directory or the repo:
-
-- **uv** (from astral.sh, into `~/.local/bin`) and the project venv at
-  **`.venv`**, built by uv from the hash-pinned lockfiles. Deleting `.venv`
-  removes every Python dependency; `./setup.sh` rebuilds it in seconds.
-- **geckodriver** (Mozilla's release), **yt-dlp** (latest release) and
-  **deno** (yt-dlp's JavaScript runtime for YouTube) in `~/.local/bin`.
-- The vendored Bai Jamjuree and Sarabun fonts in `~/.local/share/fonts`.
-- **pm2** (npm, into `~/.local`) — nothing is registered to start at boot.
-- A `.env` from `.env.example` with a fresh `MEETING_BOT_TOKEN`, if you don't
-  have one yet.
-
-`--no-browser` skips the recorder's Python drivers (Selenium, Playwright) for a
-box that only transcribes and summarizes.
-
-**Python dependencies are pinned.** `requirements.txt` (and
-`requirements-browser.txt`) hold every package and transitive dependency at an
-exact version with a SHA-256 hash, generated from the `requirements.in` files
-beside them. To change a dependency, edit the `.in` file, then:
-
-```bash
-uv pip compile --generate-hashes --python-version 3.13 --python-platform x86_64-unknown-linux-gnu requirements.in -o requirements.txt
-```
-
-```bash
-uv pip compile --generate-hashes --python-version 3.13 --python-platform x86_64-unknown-linux-gnu -c requirements.txt requirements-browser.in -o requirements-browser.txt
-```
+**Limits of this branch, honestly:** it was written on Linux and has been
+tested there (its unit tests, and every Linux suite with the shared helpers);
+**it has not yet been run on a Windows PC.** Expect the first meeting there
+to need a fix or two; the recorder's log (`runs/<id>/logs/record.log`) and
+`runs/<id>/*_ffmpeg.log` say what happened.
 
 ### Sign the summarizer in
 
@@ -301,6 +321,9 @@ signing in, but it is the first suspect if Meet ever starts refusing the bot;
 ---
 
 ## Web UI
+
+> **On Windows** `./webui.sh` works the same in Git Bash; pm2 runs the
+> scripts with Git for Windows' bash (`MEETING_BOT_BASH`, set by setup.ps1).
 
 Off until you switch it on, and off again after a reboot — pm2 runs it, but
 nothing registers it to start at boot:
