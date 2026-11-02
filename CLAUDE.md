@@ -2548,6 +2548,10 @@ Four requests from the operator, settled in three rounds of questions.
   full `drive` — `drive.file` cannot list folders shared with the bot, which
   the folder browser needs. Login is CLI-only on the PC: Google requires a
   loopback redirect for desktop clients, so it cannot be done from a phone.
+  The redirect always names `127.0.0.1`; what listens is `--bind` /
+  `GDRIVE_LOGIN_BIND` and `--port` / `GDRIVE_LOGIN_PORT` — the Docker build
+  listens on `0.0.0.0:8766` inside and publishes the port to the host's
+  `127.0.0.1`, so the host's browser completes the redirect.
 - **Own stage, replace in place** (the operator's choices): `upload` runs
   after summarize (and after the sweeps) in `run_one.sh` `maybe_upload`,
   for single and combine runs; a failure fails only `upload` (summarize
