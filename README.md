@@ -1939,6 +1939,7 @@ python3 lib/test_slotqueue.py                # cross-session component queue (23
 python3 lib/test_keyring.py                  # numbered keys + rotation cursor (22)
 python3 lib/test_resources.py                # resource specs, extraction, GitHub, frontmatter, binary files (36)
 python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions, retries (51)
+python3 lib/test_procutil.py                 # pid liveness + file locks + lib/platform.sh (Linux; Windows never calls os.kill) (10)
 python3 lib/test_gdrive.py                   # Google Drive: folder links, names, the upload (create vs replace), folders (13)
 python3 lib/test_clip.py                     # --clip parsing, the cut, caption windowing (33)
 python3 lib/test_discord_spool.py            # Discord recordings: placing each speaker on one timeline, the mix, real ffmpeg (22)

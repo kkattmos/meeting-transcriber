@@ -8,6 +8,10 @@
 // either to setup.sh.
 const path = require("path");
 const root = __dirname;
+// Windows (the `windows` branch): the scripts run under Git for Windows' bash.
+const bash = process.platform === "win32"
+  ? (process.env.MEETING_BOT_BASH || "C:\\Program Files\\Git\\bin\\bash.exe")
+  : "bash";
 
 module.exports = {
   apps: [
@@ -16,7 +20,7 @@ module.exports = {
       // which loads .env). Restarted if it crashes.
       name: "meeting-bot-web",
       script: path.join(root, "web", "serve.sh"),
-      interpreter: "bash",
+      interpreter: bash,
       cwd: root,
       autorestart: true,
       max_restarts: 10,
@@ -31,7 +35,7 @@ module.exports = {
       // still-running app, which killed every resume longer than 15 minutes.
       name: "meeting-bot-resume",
       script: path.join(root, "web", "resume.sh"),
-      interpreter: "bash",
+      interpreter: bash,
       cwd: root,
       autorestart: false,
       cron_restart: "*/15 * * * *",

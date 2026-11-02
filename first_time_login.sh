@@ -38,7 +38,10 @@ PY="${MEETING_BOT_VENV:-$LOADER_DIR/.venv}/bin/python3"
 # A desktop session has a display to put the window on; a headless box (or
 # an SSH login) gets the noVNC path.
 MODE="novnc"
-if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/platform.sh"
+# Windows (Git Bash) has a desktop and no DISPLAY variable: always a window.
+if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ] || mb_is_windows; then
   MODE="desktop"
 fi
 BIND_ADDR="127.0.0.1"
@@ -145,7 +148,7 @@ profile_lock_pid() {
   done
   return 1
 }
-if LOCK_PID="$(profile_lock_pid)" && [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
+if LOCK_PID="$(profile_lock_pid)" && [ -n "$LOCK_PID" ] && mb_alive "$LOCK_PID"; then
   echo "ERROR: the profile is in use by pid $LOCK_PID (a recording?)." >&2
   echo "  Let it finish, or stop it with ./kill_meeting.sh, then run this again." >&2
   exit 1

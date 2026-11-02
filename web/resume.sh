@@ -24,11 +24,12 @@ mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/resume.log"
 # One appended log, rotated at 5MB: a tick with nothing to do still writes the
 # member list, 96 times a day.
-if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt 5242880 ]; then
+if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 5242880 ]; then
   mv -f "$LOG" "$LOG.1"
 fi
 printf '\n===== %s resume-all =====\n' "$(date '+%F %T')" >>"$LOG"
 cd "$ROOT_DIR"
-MEETING_BOT_FOREGROUND=1 setsid nohup "$ROOT_DIR/pipeline.sh" --resume-all \
-  >>"$LOG" 2>&1 </dev/null &
-echo "resume-all started (pid $!), log: $LOG"
+# shellcheck disable=SC1091
+. "$ROOT_DIR/lib/platform.sh"
+pid="$(MEETING_BOT_FOREGROUND=1 mb_detach "$LOG" bash "$ROOT_DIR/pipeline.sh" --resume-all)"
+echo "resume-all started (pid $pid), log: $LOG"

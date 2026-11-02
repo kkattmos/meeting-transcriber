@@ -2613,6 +2613,39 @@ placeholder in between). The dry run prints
 `combine<TAB>SUMMARIES_DIR/<combine run id>.md`. `/trigger` still accepts a
 `.md` string in `combine` for old shortcuts; `true` means the switch.
 
+## Shared code runs on every branch, Windows included (2026-11-02)
+
+The operator asked for all deployment branches to be kept in sync and for a
+native Windows branch. The decision: **features are developed here, on
+`debian13`, and merged into the others**, each of which keeps only a
+deployment layer (setup, services, container, docs) — so the shared code
+must be correct on each of them:
+
+- **Process liveness and file locks go through `lib/procutil.py`** (Python)
+  and **`lib/platform.sh`** (bash). On Linux they are exactly the old
+  `os.kill(pid, 0)` / `fcntl.flock` / `kill -0` / `setsid nohup` / `ps
+  --ppid` walk. Under Git Bash on Windows, `$$` is an MSYS pid nobody else
+  knows, so `mb_pid` writes the Windows pid (`/proc/<pid>/winpid`) into
+  `run.lock` and the slot queue, `mb_alive` asks `tasklist`, `mb_kill_tree`
+  is `taskkill /T /F`, and `mb_detach` is `nohup` + `disown` (no setsid);
+  Python's `pid_alive` uses OpenProcess, because **`os.kill(pid, 0)` on
+  Windows sends CTRL_C**, it does not test anything; and `lock_file` uses
+  `msvcrt.locking`.
+- **`MEETING_BOT_RECORDER`** (run_one.sh `do_record`) swaps the recorder for
+  one with record_screen.sh's arguments and contract: the Alpine branch's
+  container wrapper, the Windows branch's `screen/record_windows.sh`. Unset
+  here.
+- `trigger_server._shell` runs a `.sh` through bash on Windows;
+  `first_time_login.sh` always opens a desktop window there;
+  `kill_meeting.sh` escalates with `taskkill` there (no TERM/INT on
+  Windows); `MEETING_BOT_KIOSK_MONITOR` puts Firefox's kiosk on a chosen
+  monitor (`--kiosk-monitor`) — the Windows recorder films a visible window.
+- `gdrive.py login --bind/--port` (the Docker build's published port).
+
+`lib/test_procutil.py` holds the Linux behaviour and that Windows never
+reaches `os.kill`. The branches' own layers are described in each branch's
+"This branch" section of its CLAUDE.md.
+
 ## Cross-session queueing (`lib/slotqueue.py`)
 
 `--jobs` throttles concurrency *within one* `pipeline.sh` invocation. It does
@@ -3061,6 +3094,13 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   run whose `run.lock` owner is alive; never clear a member of a live set.
 - **`--combine`'s path is optional; only an `.md` next argument is one.**
   Don't make it a required value again (the web UI sends it bare).
+- **Never `os.kill(pid, 0)`, `fcntl`, `kill -0` on a lock's pid, or
+  `setsid` directly in shared code** — `lib/procutil.py` / `lib/platform.sh`.
+  On Windows the first sends CTRL_C and the others don't exist or test the
+  wrong pid. Every deployment branch runs this code.
+- **Features go to `debian13` first, then are merged into the deployment
+  branches**, which keep only their layer. Don't develop a feature on a
+  deployment branch.
 - **A meet.new run is never auto-resumed**, and a hosted call is never ended
   on an unreadable participant count.
 - **Captions are never taken from a YouTube machine translation.** Spoken
@@ -3093,6 +3133,7 @@ without API keys or network, against temp directories
 | File | Covers | Count |
 |---|---|---|
 | `lib/test_gdrive.py` | folder ids from links, PDF names, query escaping, gmail comparison, status / token file mode, not-logged-in and a revoked login, the consent URL, upload create vs replace (resumable, no parents on a revision), folder listing (pages, Shared with me), a file is not a folder, CLI errors | 13 |
+| `lib/test_procutil.py` | pid liveness (and that Windows never calls `os.kill`), the cross-process lock, `platform.sh` on Linux: `mb_pid`, `mb_alive`, `mb_tree` / `mb_kill_tree`, `mb_detach` in its own session | 10 |
 | `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI, `annotate` and the pause fields, `stop`/`unstop` | 20 |
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
@@ -3221,6 +3262,9 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── combine.py                <- --combine: parts.json from the member runs, the run key
 │   ├── gdrive.py                 <- Google Drive: the bot account's OAuth login, folders, the PDF upload
 │   ├── runadmin.py               <- run history: clear, cache removal, tags (stdlib; the web UI imports it)
+│   ├── procutil.py               <- pid liveness + file locks, Linux and Windows (stdlib)
+│   ├── platform.sh               <- the same for bash: mb_pid, mb_alive, mb_kill_tree, mb_detach
+│   ├── test_procutil.py
 │   ├── test_gdrive.py
 │   ├── discord_spool.py          <- Discord recordings: per-speaker spool, timeline placement, the .m4a mix
 │   ├── test_discord_spool.py

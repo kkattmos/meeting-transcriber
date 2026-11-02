@@ -251,6 +251,15 @@ def build_args(body):
     return args, None
 
 
+def _shell(cmd):
+    """A pipeline.sh / kill_meeting.sh command line Windows can execute: there
+    a .sh is not executable, so it runs under Git Bash (MEETING_BOT_BASH, or
+    bash on PATH). Unchanged elsewhere."""
+    if os.name == "nt" and cmd and str(cmd[0]).endswith(".sh"):
+        return [os.environ.get("MEETING_BOT_BASH") or "bash", *cmd]
+    return cmd
+
+
 def launch(cmd):
     """Start cmd detached, its output in a fresh trigger log. Returns the log path."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -274,7 +283,7 @@ def launch(cmd):
         # Already detached and logged here, so pipeline.sh must not detach a
         # meeting a second time into a log this page doesn't know about.
         env = child_env()
-        subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT,
+        subprocess.Popen(_shell(cmd), stdout=log_file, stderr=subprocess.STDOUT,
                          start_new_session=True, cwd=str(REPO), env=env)
     finally:
         # The child holds its own descriptor; ours is no longer needed.
@@ -308,13 +317,7 @@ def run_summary(run_dir, data):
         owner = (run_dir / "run.lock" / "pid").read_text().strip()
     except OSError:
         pass
-    active = False
-    if owner.isdigit():
-        try:
-            os.kill(int(owner), 0)
-            active = True
-        except OSError:
-            pass
+    active = owner.isdigit() and runadmin.is_active(run_dir)
     # The recorder's live audio check (record_screen.sh audio_watch):
     # "<epoch> <peak dB> <seconds silent>".
     audio = None
@@ -605,7 +608,7 @@ class Handler(BaseHTTPRequestHandler):
                 log = launch([SCRIPT, "--run-id", run_dir.name, *extra])
                 self._json(202, {"status": "started", "log": log.name})
             else:
-                proc = subprocess.run([KILL_SCRIPT, "--run-id", run_dir.name],
+                proc = subprocess.run(_shell([KILL_SCRIPT, "--run-id", run_dir.name]),
                                       capture_output=True, text=True, timeout=120,
                                       cwd=str(REPO), env=child_env())
                 self._json(200 if proc.returncode == 0 else 500,
@@ -622,7 +625,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/check":
-            proc = subprocess.run([SCRIPT, *args, "--dry-run"], capture_output=True,
+            proc = subprocess.run(_shell([SCRIPT, *args, "--dry-run"]), capture_output=True,
                                   text=True, timeout=120, cwd=str(REPO),
                                   env=child_env())
             plan = []
