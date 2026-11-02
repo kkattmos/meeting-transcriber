@@ -20,7 +20,7 @@ CLI (every command prints one JSON object on stdout; errors exit 1 with the
 reason on stderr):
 
     gdrive.py status                      configured / logged in / which account
-    gdrive.py login [--no-browser] [--port N]
+    gdrive.py login [--no-browser] [--port N] [--bind ADDR]
     gdrive.py logout
     gdrive.py folders [--parent root|shared|drives|<folder id>]
     gdrive.py folder  --id <folder id or URL>        its name, and whether we can write
@@ -382,7 +382,7 @@ def _open_in_bot_browser(url):
     return True
 
 
-def login(open_browser=True, port=0, timeout=600):
+def login(open_browser=True, port=0, timeout=600, bind=None):
     cid, secret = client()
     if not cid or not secret:
         raise DriveError(
@@ -415,7 +415,13 @@ def login(open_browser=True, port=0, timeout=600):
         def log_message(self, *a):
             pass
 
-    server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    # The redirect always names 127.0.0.1 (Google allows only a loopback for
+    # a desktop client); what listens may differ. In a container
+    # (GDRIVE_LOGIN_BIND=0.0.0.0, GDRIVE_LOGIN_PORT published to the host's
+    # 127.0.0.1) the host's browser reaches the container through the port.
+    bind = bind or os.environ.get("GDRIVE_LOGIN_BIND") or "127.0.0.1"
+    port = port or int(os.environ.get("GDRIVE_LOGIN_PORT") or 0)
+    server = http.server.HTTPServer((bind, port), Handler)
     redirect = f"http://127.0.0.1:{server.server_port}"
     url = auth_url(cid, redirect, challenge, state, expected_account())
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -476,6 +482,7 @@ def main(argv=None):
     p = sub.add_parser("login")
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--port", type=int, default=0)
+    p.add_argument("--bind")
     sub.add_parser("logout")
     p = sub.add_parser("folders")
     p.add_argument("--parent", default="root")
@@ -498,7 +505,7 @@ def main(argv=None):
                 raise DriveError(f"not a Drive folder id or link: {args.value}")
             out = {"id": fid}
         elif args.cmd == "login":
-            out = login(open_browser=not args.no_browser, port=args.port)
+            out = login(open_browser=not args.no_browser, port=args.port, bind=args.bind)
         elif args.cmd == "logout":
             try:
                 token_file().unlink()
