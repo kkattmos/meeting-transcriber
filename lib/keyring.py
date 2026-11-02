@@ -149,10 +149,11 @@ class KeyRing:
         except OSError:
             return
         try:
-            import fcntl
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from procutil import lock_file
             lock_path = self.cursor_path.with_suffix(".lock")
             with open(lock_path, "a+") as lock:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                lock_file(lock)
                 try:
                     data = json.loads(self.cursor_path.read_text())
                     if not isinstance(data, dict):

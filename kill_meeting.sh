@@ -29,6 +29,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/source_env.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/platform.sh"
 
 MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-$HOME/.local/share/meeting-bot}"
 RUNS_DIR="$MEETING_BOT_ROOT/runs"
@@ -65,7 +67,7 @@ if [ -d "$RUNS_DIR" ]; then
     pid_file="${run_dir}record.pid"
     [ -f "$pid_file" ] || continue
     rec_pid="$(read_pid_field "$pid_file" record || true)"
-    if [ -n "$rec_pid" ] && kill -0 "$rec_pid" 2>/dev/null; then
+    if [ -n "$rec_pid" ] && mb_alive "$rec_pid"; then
       ACTIVE_RUNS+=("${run_dir%/}")
     fi
   done
@@ -173,12 +175,22 @@ stop_processing() {
   # Nothing past the recording reads the sentinel; don't leave it behind.
   rm -f "$run_dir/kill"
   owner="$(cat "$run_dir/run.lock/pid" 2>/dev/null || true)"
-  if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
+  if [ -z "$owner" ] || ! mb_alive "$owner"; then
     echo "==> $run_id is not running; nothing to stop."
     return 0
   fi
   # Mark first, so pipeline.sh already sees `stopped` when run_one.sh dies.
   python3 "$SCRIPT_DIR/lib/runstate.py" stop --run-dir "$run_dir" || true
+  if mb_is_windows; then
+    # A Windows pid (lib/platform.sh): no TERM to send, so the tree goes at
+    # once with taskkill /T /F. Finished stages are in state.json already.
+    echo "==> Stopping $run_id (PID $owner and its children)"
+    mb_kill_tree TERM "$owner"
+    mb_alive "$owner" || rm -rf "$run_dir/run.lock"
+    python3 "$SCRIPT_DIR/lib/runstate.py" stop --run-dir "$run_dir" || true
+    echo "==> Stopped. Finished stages are kept; resume with: ./pipeline.sh --run-id $run_id"
+    return 0
+  fi
   pids="$(descendants "$owner") $owner"
   echo "==> Stopping $run_id (PIDs: $(echo $pids))"
   # shellcheck disable=SC2086
@@ -186,7 +198,7 @@ stop_processing() {
   local alive p
   for _ in $(seq 1 10); do
     alive=""
-    for p in $pids; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+    for p in $pids; do mb_alive "$p" && alive="$alive $p"; done
     [ -z "$alive" ] && break
     sleep 1
   done
@@ -197,7 +209,7 @@ stop_processing() {
   fi
   # A run_one.sh killed by a signal skips its EXIT trap; the lock would be
   # taken over as stale anyway, but leave nothing that looks in progress.
-  kill -0 "$owner" 2>/dev/null || rm -rf "$run_dir/run.lock"
+  mb_alive "$owner" || rm -rf "$run_dir/run.lock"
   # Again: a stage run_one.sh marked running between the two calls ends failed.
   python3 "$SCRIPT_DIR/lib/runstate.py" stop --run-dir "$run_dir" || true
   echo "==> Stopped. Finished stages are kept; resume with: ./pipeline.sh --run-id $run_id"
@@ -219,7 +231,7 @@ for _ in $(seq 1 "$GRACE_SECONDS"); do
   still_up=0
   for run_dir in "${TARGETS[@]}"; do
     rec_pid="$(read_pid_field "$run_dir/record.pid" record || true)"
-    if [ -n "$rec_pid" ] && kill -0 "$rec_pid" 2>/dev/null; then
+    if [ -n "$rec_pid" ] && mb_alive "$rec_pid"; then
       still_up=1
     fi
   done
@@ -236,7 +248,7 @@ for run_dir in "${TARGETS[@]}"; do
   pid_file="$run_dir/record.pid"
   run_id="$(basename "$run_dir")"
   rec_pid="$(read_pid_field "$pid_file" record || true)"
-  [ -n "$rec_pid" ] && kill -0 "$rec_pid" 2>/dev/null || continue
+  [ -n "$rec_pid" ] && mb_alive "$rec_pid" || continue
   echo "==> $run_id didn't exit in time — forcing it down."
   # The browser driver only. record_screen.sh notices it has gone, stops
   # ffmpeg itself with exactly ONE SIGINT and waits for the file to be
@@ -248,27 +260,36 @@ for run_dir in "${TARGETS[@]}"; do
   ff_pid="$(read_pid_field "$pid_file" ffmpeg || true)"
   # TERM lets capture.py quit its browser (geckodriver + Firefox); a KILL
   # straight away orphaned both, still holding the profile.
-  [ -n "$join_pid" ] && kill -TERM "$join_pid" 2>/dev/null || true
+  if mb_is_windows; then
+    # No TERM on Windows: taskkill the driver and its browser. The recorder
+    # (screen/record_windows.py) sees capture.py gone and stops ffmpeg itself
+    # with its "q" command, which finalises the file.
+    [ -n "$join_pid" ] && mb_kill_tree TERM "$join_pid"
+  else
+    [ -n "$join_pid" ] && kill -TERM "$join_pid" 2>/dev/null || true
+  fi
   for _ in $(seq 1 15); do
-    [ -n "$join_pid" ] && kill -0 "$join_pid" 2>/dev/null || break
+    [ -n "$join_pid" ] && mb_alive "$join_pid" || break
     sleep 1
   done
-  [ -n "$join_pid" ] && kill -0 "$join_pid" 2>/dev/null && kill -KILL "$join_pid" 2>/dev/null || true
+  [ -n "$join_pid" ] && mb_alive "$join_pid" && kill -KILL "$join_pid" 2>/dev/null || true
   # Finalising writes the index at the end of the file; on a network drive
   # that takes a while. Never SIGKILL ffmpeg.
   echo "==> Waiting up to ${FINALISE_SECONDS}s for the recording to be finalised..."
   for _ in $(seq 1 "$FINALISE_SECONDS"); do
     rec_alive=0; ff_alive=0
-    kill -0 "$rec_pid" 2>/dev/null && rec_alive=1
-    [ -n "$ff_pid" ] && kill -0 "$ff_pid" 2>/dev/null && ff_alive=1
+    mb_alive "$rec_pid" && rec_alive=1
+    [ -n "$ff_pid" ] && mb_alive "$ff_pid" && ff_alive=1
     if [ "$rec_alive" -eq 0 ] && [ "$ff_alive" -eq 1 ] && [ -z "${ff_signalled:-}" ]; then
-      kill -INT "$ff_pid" 2>/dev/null || true       # orphaned: nobody else will
+      # orphaned: nobody else will. (Windows has no SIGINT for another
+      # process; an orphaned ffmpeg there is left to finish or be closed.)
+      mb_is_windows || kill -INT "$ff_pid" 2>/dev/null || true
       ff_signalled=1
     fi
     [ "$rec_alive" -eq 0 ] && [ "$ff_alive" -eq 0 ] && break
     sleep 1
   done
-  if kill -0 "$rec_pid" 2>/dev/null || { [ -n "$ff_pid" ] && kill -0 "$ff_pid" 2>/dev/null; }; then
+  if mb_alive "$rec_pid" || { [ -n "$ff_pid" ] && mb_alive "$ff_pid"; }; then
     echo "WARNING: $run_id is still finalising its recording (pids $rec_pid ${ff_pid:-}) —"
     echo "         left alone; it will finish on its own."
   fi
