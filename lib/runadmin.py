@@ -45,6 +45,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from procutil import pid_alive as _proc_alive  # noqa: E402
 from runstate import RunState, normalize_tags  # noqa: E402
 
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -68,11 +69,7 @@ def frames_root(env=None):
 
 
 def _pid_alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError):
-        return False
+    return _proc_alive(pid)
 
 
 def is_active(run_dir):

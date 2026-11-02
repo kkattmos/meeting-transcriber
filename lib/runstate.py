@@ -60,7 +60,6 @@ CLI (all subcommands take --run-dir, except `latest`/`list` which take --root):
     runstate.py sweep   [--root R] [--days N]      -> delete run dirs older than N days
 """
 import argparse
-import fcntl
 import json
 import os
 import shutil
@@ -69,6 +68,9 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from procutil import lock_file, pid_alive, unlock_file  # noqa: E402  (Linux + Windows)
 
 DEFAULT_ROOT = Path(os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot"))) / "runs"
 
@@ -123,11 +125,11 @@ class RunState:
             def __enter__(self):
                 run_dir.mkdir(parents=True, exist_ok=True)
                 self.fh = open(lock_path, "a+")
-                fcntl.flock(self.fh, fcntl.LOCK_EX)
+                lock_file(self.fh)
                 return self
 
             def __exit__(self, *exc):
-                fcntl.flock(self.fh, fcntl.LOCK_UN)
+                unlock_file(self.fh)
                 self.fh.close()
                 return False
 

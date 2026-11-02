@@ -58,6 +58,33 @@ _meeting_bot_defaults() {
   : "${MEETING_BOT_ROOT:=${XDG_DATA_HOME:-$HOME/.local/share}/meeting-bot}"
   : "${MEETING_BOT_VENV:=$LOADER_DIR/.venv}"
   export MEETING_BOT_ROOT MEETING_BOT_VENV
+  _meeting_bot_windows_paths
+}
+
+# Under Git Bash on Windows (the `windows` branch), a path written `~/…` or
+# taken from $HOME is `/c/Users/…`: bash understands it, but the Windows
+# Python and ffmpeg the scripts hand it to through the ENVIRONMENT do not
+# (MSYS converts command-line arguments, never variables). So every
+# path-like setting is rewritten to the mixed form `C:/Users/…`, which both
+# understand. A no-op everywhere else.
+_meeting_bot_windows_paths() {
+  case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) ;; *) return 0 ;; esac
+  command -v cygpath >/dev/null 2>&1 || return 0
+  local name val
+  while IFS= read -r name; do
+    val="${!name}"
+    case "$val" in
+      /*) export "$name=$(cygpath -m "$val")" ;;
+    esac
+  done < <(compgen -e | grep -E '(_DIR|_ROOT|_VENV|_BIN|_FILE|_DIRECTORIES|_RECORDER)$')
+  # A bare `python3` in Git Bash is often the Microsoft Store stub; the
+  # venv's bin/python3 (a shim setup.ps1 writes) is the real one.
+  if [ -n "${MEETING_BOT_VENV:-}" ] && [ -d "$MEETING_BOT_VENV/bin" ]; then
+    case ":$PATH:" in
+      *":$(cygpath -u "$MEETING_BOT_VENV")/bin:"*) ;;
+      *) export PATH="$(cygpath -u "$MEETING_BOT_VENV")/bin:$PATH" ;;
+    esac
+  fi
 }
 
 ENV_FILE="$(_find_env || true)"

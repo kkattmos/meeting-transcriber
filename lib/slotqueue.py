@@ -50,8 +50,6 @@ automatically — nothing can wedge the queue permanently.
     slotqueue.py reset [--component X]   clear a queue (stale-state escape hatch)
 """
 import argparse
-import errno
-import fcntl
 import json
 import os
 import signal
@@ -60,6 +58,9 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from procutil import lock_file, pid_alive, unlock_file  # noqa: E402  (Linux + Windows)
 
 COMPONENTS = ("record", "fetch_video", "transcribe", "frames", "summarize")
 
@@ -96,13 +97,7 @@ def _alive(pid):
     Signal 0 checks for existence without delivering anything. EPERM means the
     process exists but belongs to another user — still alive, so still holding.
     """
-    try:
-        os.kill(int(pid), 0)
-    except OSError as exc:
-        return exc.errno == errno.EPERM
-    except (TypeError, ValueError):
-        return False
-    return True
+    return pid_alive(pid)
 
 
 class Queue:
@@ -123,11 +118,11 @@ class Queue:
             def __enter__(self):
                 directory.mkdir(parents=True, exist_ok=True)
                 self.fh = open(lock_path, "a+")
-                fcntl.flock(self.fh, fcntl.LOCK_EX)
+                lock_file(self.fh)
                 return self
 
             def __exit__(self, *exc):
-                fcntl.flock(self.fh, fcntl.LOCK_UN)
+                unlock_file(self.fh)
                 self.fh.close()
                 return False
 
@@ -344,8 +339,10 @@ def main():
             if proc and proc.poll() is None:
                 proc.send_signal(signum)
 
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGQUIT):
-            signal.signal(sig, _forward)
+        # SIGQUIT does not exist on Windows.
+        for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGQUIT", None)):
+            if sig is not None:
+                signal.signal(sig, _forward)
 
         try:
             proc = subprocess.Popen(command)
