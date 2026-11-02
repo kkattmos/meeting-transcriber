@@ -4,7 +4,7 @@ Per-run state for the pipeline: what stage got how far, and where its output
 landed. This is what makes `pipeline.sh` resumable and safe to run twice at
 once.
 
-State lives at /opt/meeting-bot/runs/<run_id>/state.json. One directory per
+State lives at $MEETING_BOT_ROOT/runs/<run_id>/state.json. One directory per
 run holds everything mutable about it:
 
     runs/<run_id>/
@@ -70,7 +70,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_ROOT = Path(os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot")) / "runs"
+DEFAULT_ROOT = Path(os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot"))) / "runs"
 
 # Declared in dependency order for display purposes only; the actual DAG lives
 # in pipeline.sh. `fetch_video` exists so the YouTube download can run in
@@ -80,7 +80,10 @@ DEFAULT_ROOT = Path(os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot")) / "r
 # a YouTube or Kaltura input is the download. It stays `pending` forever on an
 # unclipped run, which is the same thing `record` does on every non-meeting
 # input — a stage that never applies is not a stage that failed.
-STAGES = ("record", "fetch_video", "clip", "transcribe", "frames", "summarize")
+# `upload` (2026-11-02) is the PDF's copy in Google Drive, after summarize; it
+# stays pending forever on a run that names no Drive folder.
+STAGES = ("record", "fetch_video", "clip", "transcribe", "frames", "summarize",
+          "upload")
 
 PENDING, RUNNING, DONE, FAILED = "pending", "running", "done", "failed"
 
@@ -281,6 +284,36 @@ class RunState:
                 st["error"] = error[:2000]
         return self._mutate(_fn)
 
+    def stop(self, reason="stopped by the operator"):
+        """Mark the run stopped by hand, and its running stages failed.
+
+        kill_meeting.sh calls this around terminating a run that is not
+        recording (a transcribe or summarize in progress). The top-level
+        `stopped` field is what `--resume-all` skips on, so the pm2 timer does
+        not restart what the operator just stopped; run_one.sh clears it
+        (`unstop`) when the run is resumed on purpose. Idempotent: called once
+        before the kill and once after, so a stage the dying run_one.sh
+        marked running in between still ends up failed.
+        """
+        def _fn(data):
+            stages = data.setdefault("stages", {})
+            running = [n for n, st in stages.items() if st.get("status") == RUNNING]
+            prev = data.get("stopped") or {}
+            data["stopped"] = {"at": prev.get("at") or _now(),
+                               "stages": sorted(set(prev.get("stages", [])) | set(running))}
+            for n in running:
+                st = stages[n]
+                st["status"] = FAILED
+                st["ended_at"] = _now()
+                st["error"] = reason
+                st.pop("waiting_until", None)
+        return self._mutate(_fn)
+
+    def unstop(self):
+        def _fn(data):
+            data.pop("stopped", None)
+        return self._mutate(_fn)
+
     def reset(self, name=None):
         """Send one stage (or all of them) back to pending.
 
@@ -305,6 +338,19 @@ class RunState:
 
 
 # --- CLI --------------------------------------------------------------------
+
+
+def normalize_tags(values):
+    """Tags as stored: split on commas, trimmed, de-duplicated (case-
+    insensitively, first spelling wins), at most 20 of at most 40 chars."""
+    out, seen = [], set()
+    for value in values or []:
+        for tag in str(value).split(","):
+            tag = " ".join(tag.split())[:40]
+            if tag and tag.lower() not in seen:
+                seen.add(tag.lower())
+                out.append(tag)
+    return out[:20]
 
 
 def _parse_artifacts(pairs):
@@ -367,6 +413,33 @@ def main():
     # it while the call is still going, and used as the document's link line
     # in place of "https://meet.new", which points at no meeting in particular.
     p.add_argument("--meet-url")
+    # A local recording made from a call elsewhere (the Discord bot's mix):
+    # the call's link, cited by the document in place of the file's path.
+    p.add_argument("--source-url")
+    # The summary's own settings, chosen per run (pipeline.sh / the web UI):
+    # the language it is written in, the PDF's body font, and the operator's
+    # extra instructions. run_one.sh replays them into summarize.py on every
+    # attempt. An `init` carrying only these (a resume that changes them)
+    # must not blank the run's resources — see below.
+    p.add_argument("--summary-language")
+    p.add_argument("--pdf-font")
+    p.add_argument("--instructions")
+    # What the summary is made from (voice = the transcript alone, no frames
+    # stage) and what a meeting's recording keeps (audio = an .m4a, no
+    # screen). Per run for the same reason: a resume must not start cutting
+    # frames out of a recording that has no picture.
+    p.add_argument("--summary-source", choices=("both", "voice"))
+    p.add_argument("--record-media", choices=("video", "audio"))
+    # The PDF's Google Drive destination (lib/gdrive.py): a folder id, the
+    # folder's name as the web UI's browser showed it (for display only), and
+    # the file name in Drive (empty = the summary's title). An empty
+    # --drive-folder turns the upload off. Replaced on a resume when given.
+    p.add_argument("--drive-folder")
+    p.add_argument("--drive-folder-name")
+    p.add_argument("--drive-name")
+    # The operator's own labels for the run history (the web UI's filter
+    # chips). Repeatable; given at all, they replace the stored list.
+    p.add_argument("--tags", action="append", default=None)
 
     p = with_run_dir(sub.add_parser("status"))
     p.add_argument("--stage", required=True)
@@ -395,6 +468,9 @@ def main():
     p = with_run_dir(sub.add_parser("get"))
     p.add_argument("--key", required=True)
 
+    p = with_run_dir(sub.add_parser("stop"))
+    p.add_argument("--reason", default="stopped by the operator")
+    with_run_dir(sub.add_parser("unstop"))
     p = with_run_dir(sub.add_parser("reset"))
     p.add_argument("--stage")
 
@@ -488,12 +564,23 @@ def main():
                     display_name=args.display_name, clip=args.clip,
                     combined_into=args.combined_into,
                     members=args.members, output_md=args.output_md,
-                    output_pdf=args.output_pdf, meet_url=args.meet_url)
-        # `init` with no --resources still records an empty list — except
-        # when it is only stamping --combined-into on an existing member, or
-        # --meet-url from inside a recording, neither of which may blank the
+                    output_pdf=args.output_pdf, meet_url=args.meet_url,
+                    source_url=args.source_url,
+                    summary_language=args.summary_language,
+                    pdf_font=args.pdf_font, instructions=args.instructions,
+                    summary_source=args.summary_source,
+                    record_media=args.record_media,
+                    drive_folder=args.drive_folder,
+                    drive_folder_name=args.drive_folder_name,
+                    drive_name=args.drive_name,
+                    tags=(None if args.tags is None
+                          else normalize_tags(args.tags)))
+        # `init` with no --resources still records an empty list — but only
+        # when it creates or refreshes a run (it names the input). Stamping
+        # --combined-into on an existing member, --meet-url from inside a
+        # recording, or new summary settings on a resume must not blank the
         # resources the run was created with.
-        if args.combined_into is None and args.meet_url is None:
+        if args.input is not None:
             meta["resources"] = args.resources or []
         state.init(**meta)
         return 0
@@ -548,6 +635,14 @@ def main():
             print(value)
         return 0
 
+    if args.cmd == "stop":
+        state.stop(args.reason)
+        return 0
+
+    if args.cmd == "unstop":
+        state.unstop()
+        return 0
+
     if args.cmd == "reset":
         state.reset(args.stage)
         return 0
@@ -561,6 +656,9 @@ def main():
         print(f"input:      {data.get('input')}  ({data.get('input_type')})")
         if data.get("meet_url"):
             print(f"meeting:    {data['meet_url']}  (created and hosted by the bot)")
+        if data.get("stopped"):
+            print(f"stopped:    {data['stopped'].get('at')}  (by hand; --resume-all skips it,"
+                  " --run-id resumes it)")
         if data.get("clip"):
             print(f"clip:       {data.get('clip')}"
                   "  (output timestamps are relative to it)")
@@ -575,6 +673,15 @@ def main():
                   "  (its summarize stage runs there, not here)")
         print(f"name:       {data.get('name')}  (safe: {data.get('safe_name')})")
         print(f"language:   {data.get('language')}   prompt: {data.get('prompt') or '(default)'}")
+        if data.get("summary_language") or data.get("pdf_font"):
+            print(f"summary:    written in {data.get('summary_language') or '(default)'}"
+                  f"   PDF font: {data.get('pdf_font') or '(default)'}")
+        if data.get("instructions"):
+            print(f"instructions: {data['instructions']}")
+        if data.get("summary_source") or data.get("record_media"):
+            print(f"media:      summary from {data.get('summary_source') or 'both'}"
+                  + (f"   recording: {data['record_media']}"
+                     if data.get("input_type") == "meeting" else ""))
         print(f"created:    {data.get('created_at')}")
         print(f"updated:    {data.get('updated_at')}")
         print("stages:")

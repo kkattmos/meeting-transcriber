@@ -3,10 +3,11 @@
 # URL to text.
 #
 # Routing:
-#   * YouTube URL  -> youtube-transcript.io API (fast, multi-account
-#                     round-robin via yt_transcript_client.py). The argument
-#                     is the URL itself; the client extracts the video id.
-#                     No audio is downloaded, no AssemblyAI is run.
+#   * YouTube URL  -> YouTube's own captions through yt-dlp
+#                     (yt_autocaptions.py), then the youtube-transcript.io API
+#                     (multi-account round-robin via yt_transcript_client.py)
+#                     when yt-dlp fails or finds no track. The argument is the
+#                     URL itself. No audio is downloaded, no AssemblyAI is run.
 #   * Kaltura embed-> the entry's own caption track when it has one (free and
 #                     instant, same reasoning as the YouTube path), otherwise
 #                     AssemblyAI on the MP4 given behind --media. The input is
@@ -114,7 +115,7 @@ fi
 # Same venv used by the summarize step. Falls back to system python3 if the
 # venv is missing (e.g. user is running on a system where setup.sh hasn't
 # run).
-PYTHON_BIN="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
+PYTHON_BIN="${MEETING_BOT_VENV:-$LOADER_DIR/.venv}/bin/python3"
 if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="python3"
 fi
@@ -134,64 +135,76 @@ SEGMENTS_FILE=""
 # --clip-captions acts on exactly this case and no other; see the header.
 SEGMENTS_ARE_CAPTIONS=0
 
-# --- YouTube path: youtube-transcript.io, then YouTube's own captions -------
-# youtube-transcript.io first: it is fast and keyed. It only sees UPLOADED
-# tracks, though, and a video whose only uploaded track is some other language
-# used to be summarized from that — English lectures from Arabic community
-# captions, in the 2026-09 verify run. --strict makes the client say so (exit
-# 3, the track it found still printed); then yt_autocaptions.py asks yt-dlp for
-# an uploaded track in $LANGUAGE or the automatic captions of the language
-# actually spoken, and the other-language track is only the last resort. The
-# same fallback covers the API failing outright (no keys, all exhausted), since
-# yt-dlp needs neither. YT_AUTOCAPTIONS=0 turns the fallback off.
+# --- YouTube path: YouTube's own captions (yt-dlp), then youtube-transcript.io
+# yt-dlp first since 2026-10-03: it is free, needs no key, and reads the track
+# list itself — an uploaded track in $LANGUAGE, else the automatic captions of
+# the language actually spoken ("<lang>-orig"), never a machine translation.
+# youtube-transcript.io returns the same YouTube captions for a credit each,
+# and labels them unreliably: a Thai lecture's automatic captions came back as
+# an "en" track, so --strict rejected them and every Thai run paid a credit and
+# then fetched the same text through yt-dlp anyway. It is now the fallback for
+# yt-dlp failing (a bot check, a 429, a YouTube change that needs an update) or
+# finding no track. A track whose label is not $LANGUAGE is still used as the
+# last resort, announced. YT_AUTOCAPTIONS=0 skips yt-dlp (API only).
 if [ "$IS_YOUTUBE" -eq 1 ]; then
-  echo "==> Fetching YouTube transcript via youtube-transcript.io"
   SEGMENTS_FILE="$WORK_DIR/segments.json"
   API_FILE="$WORK_DIR/segments.api.json"
   AUTO_FILE="$WORK_DIR/segments.auto.json"
+  count_segments() { grep -o '"text"' "$1" 2>/dev/null | wc -l | tr -d ' '; }
   # $LANGUAGE only picks among the caption tracks the video already has —
   # nothing is translated or transcribed here.
-  # `|| API_RC=$?`, not a bare `API_RC=$?` on the next line: under errexit
-  # the non-zero exit would end this script before the fallback could run.
-  API_RC=0
-  "$PYTHON_BIN" "$SCRIPT_DIR/yt_transcript_client.py" "$INPUT" "$LANGUAGE" --strict \
-      > "$API_FILE" 2>"$WORK_DIR/yt-client.log" || API_RC=$?
-  count_segments() { grep -o '"text"' "$1" 2>/dev/null | wc -l | tr -d ' '; }
+  # `|| RC=$?`, not a bare `RC=$?` on the next line: under errexit the
+  # non-zero exit would end this script before the fallback could run.
+  # Skipped counts as "no track" (3), so the exit code is the API's alone.
+  AUTO_RC=3
+  AUTO_SKIPPED=0
+  case "$(printf '%s' "${YT_AUTOCAPTIONS:-1}" | tr 'A-Z' 'a-z')" in
+    0|false|no) AUTO_SKIPPED=1
+                echo "==> YT_AUTOCAPTIONS=0: not asking yt-dlp for captions" ;;
+    *)
+      echo "==> Fetching YouTube's own captions (yt-dlp)"
+      AUTO_RC=0
+      "$PYTHON_BIN" "$SCRIPT_DIR/yt_autocaptions.py" "$INPUT" "$LANGUAGE" \
+        > "$AUTO_FILE" 2>"$WORK_DIR/yt-autocaptions.log" || AUTO_RC=$?
+      sed 's/^/    /' "$WORK_DIR/yt-autocaptions.log"
+      ;;
+  esac
 
-  if [ "$API_RC" -eq 0 ] && [ "$(count_segments "$API_FILE")" -ge 1 ]; then
-    mv "$API_FILE" "$SEGMENTS_FILE"
+  if [ "$AUTO_RC" -eq 0 ] && [ "$(count_segments "$AUTO_FILE")" -ge 1 ]; then
+    mv "$AUTO_FILE" "$SEGMENTS_FILE"
   else
-    cat "$WORK_DIR/yt-client.log"
-    if [ "$API_RC" -eq 3 ]; then
-      echo "==> No uploaded '$LANGUAGE' captions on youtube-transcript.io — trying YouTube's own captions (yt-dlp)"
+    if [ "$AUTO_RC" -eq 3 ] && [ "$AUTO_SKIPPED" -eq 0 ]; then
+      echo "==> yt-dlp found no '$LANGUAGE' captions — trying youtube-transcript.io"
     else
-      echo "==> youtube-transcript.io gave no transcript — trying YouTube's own captions (yt-dlp)"
+      echo "==> Fetching YouTube transcript via youtube-transcript.io"
     fi
-    AUTO_RC=1
-    case "$(printf '%s' "${YT_AUTOCAPTIONS:-1}" | tr 'A-Z' 'a-z')" in
-      0|false|no) echo "    (skipped: YT_AUTOCAPTIONS=0)" ;;
-      *)
-        AUTO_RC=0
-        "$PYTHON_BIN" "$SCRIPT_DIR/yt_autocaptions.py" "$INPUT" "$LANGUAGE" \
-          > "$AUTO_FILE" 2>"$WORK_DIR/yt-autocaptions.log" || AUTO_RC=$?
-        sed 's/^/    /' "$WORK_DIR/yt-autocaptions.log"
-        ;;
-    esac
-    if [ "$AUTO_RC" -eq 0 ] && [ "$(count_segments "$AUTO_FILE")" -ge 1 ]; then
-      mv "$AUTO_FILE" "$SEGMENTS_FILE"
-    elif [ "$API_RC" -eq 3 ] && [ "$(count_segments "$API_FILE")" -ge 1 ]; then
-      echo "WARNING: using a caption track that is NOT in '$LANGUAGE' — the"
-      echo "         summary will be written from it. Check the .txt."
+    API_RC=0
+    "$PYTHON_BIN" "$SCRIPT_DIR/yt_transcript_client.py" "$INPUT" "$LANGUAGE" --strict \
+        > "$API_FILE" 2>"$WORK_DIR/yt-client.log" || API_RC=$?
+    sed 's/^/    /' "$WORK_DIR/yt-client.log"
+    # No keys is "not configured", not a failure: the keys are optional now.
+    API_FAILED=0
+    if [ "$API_RC" -ne 0 ] && [ "$API_RC" -ne 3 ] \
+       && ! grep -qE "no usable transcript|No YT_TRANSCRIPT_KEY configured" \
+                 "$WORK_DIR/yt-client.log"; then
+      API_FAILED=1
+    fi
+    if [ "$API_RC" -eq 0 ] && [ "$(count_segments "$API_FILE")" -ge 1 ]; then
       mv "$API_FILE" "$SEGMENTS_FILE"
-    elif [ "$API_RC" -ne 0 ] && [ "$API_RC" -ne 3 ] \
-         && ! grep -q "no usable transcript" "$WORK_DIR/yt-client.log"; then
-      echo "ERROR: youtube-transcript.io fetch failed (see $WORK_DIR/yt-client.log),"
-      echo "       and YouTube's own captions were not available either."
+    elif [ "$API_RC" -eq 3 ] && [ "$(count_segments "$API_FILE")" -ge 1 ]; then
+      echo "WARNING: using a youtube-transcript.io track labelled NOT in '$LANGUAGE'."
+      echo "         Its labels are unreliable (Thai has come back as \"en\"), so"
+      echo "         it may be fine, or it may be another language. Check the .txt."
+      mv "$API_FILE" "$SEGMENTS_FILE"
+    elif { [ "$AUTO_RC" -ne 0 ] && [ "$AUTO_RC" -ne 3 ]; } || [ "$API_FAILED" -eq 1 ]; then
+      echo "ERROR: no YouTube transcript: yt-dlp and youtube-transcript.io"
+      echo "       failed or are not configured (both logs above)."
+      echo "       For yt-dlp: update it (yt-dlp -U) and check deno is on PATH."
       rm -rf "$WORK_DIR"
       exit 1
     else
       echo "ERROR: no usable transcript: the video has no captions, or only"
-      echo "       placeholders, on youtube-transcript.io or on YouTube itself."
+      echo "       placeholders, on YouTube itself or on youtube-transcript.io."
       echo "       Investigate (region, login state, captions availability) and re-run."
       rm -rf "$WORK_DIR"
       exit 2
@@ -280,6 +293,34 @@ else
         ;;
     esac
 
+    # Silence costs money and can never succeed: a presentation shared
+    # without its tab audio records digital zero (found live 2026-09-29),
+    # AssemblyAI bills the upload and answers "no usable transcript", and the
+    # resume job would pay again every 15 minutes. lib/audiocheck.py measures
+    # how much of the file has sound (not the loudest point — Meet's join
+    # chimes peak at -14 dB in an otherwise silent call). Exit 2 = ffmpeg can't
+    # read the file at all — an unfinalised MP4 (no moov) — which AssemblyAI
+    # can't either: it was uploaded anyway once and answered "Transcoding
+    # failed". Every format this branch accepts is one ffmpeg reads.
+    AUDIO_RC=0
+    AUDIO_REPORT="$("$PYTHON_BIN" "$ROOT_DIR/lib/audiocheck.py" "$AUDIO_FILE" \
+                     --min-sound-seconds "${TRANSCRIBE_MIN_SOUND_SECONDS:-30}")" || AUDIO_RC=$?
+    echo "==> Audio check: $AUDIO_REPORT"
+    if [ "$AUDIO_RC" -eq 2 ]; then
+      echo "ERROR: $MEDIA_INPUT can't be read (an unfinished or corrupt file) -"
+      echo "       not sending it to AssemblyAI. Check it with: ffprobe \"$MEDIA_INPUT\""
+      rm -rf "$WORK_DIR"
+      exit 1
+    fi
+    if [ "$AUDIO_RC" -eq 3 ]; then
+      echo "ERROR: the audio is effectively silent - not sending it to AssemblyAI"
+      echo "       (it would bill the upload and return nothing)."
+      echo "       A meeting: when presenting, share a Chrome/Edge TAB with"
+      echo "       'Also share tab audio' ticked, or speak with the microphone on."
+      rm -rf "$WORK_DIR"
+      exit 1
+    fi
+
     echo "==> Transcribing with AssemblyAI (language: $LANGUAGE)"
     SEGMENTS_FILE="$WORK_DIR/segments.json"
     # Run it plainly and capture $? on the next line. Inside `if ! cmd; then`,
@@ -288,9 +329,14 @@ else
     # successful, run_one.sh marked the stage done, and it recorded .txt/.srt
     # artifacts that had never been written. (runstate's on-disk artifact check
     # caught it after the fact, but only on the next resume.)
+    # `|| EXIT_CODE=$?`, not a bare `EXIT_CODE=$?` on the next line: this
+    # script is `set -e`, so a failing client aborted right here and the
+    # lines below that print its error never ran — a failed transcription
+    # left only "==> Transcribing with AssemblyAI" in the stage log (found
+    # live 2026-09-29, twice, before anyone could see why).
+    EXIT_CODE=0
     "$PYTHON_BIN" "$SCRIPT_DIR/assemblyai_client.py" "$AUDIO_FILE" "$LANGUAGE" \
-          > "$SEGMENTS_FILE" 2>"$WORK_DIR/assemblyai-client.log"
-    EXIT_CODE=$?
+          > "$SEGMENTS_FILE" 2>"$WORK_DIR/assemblyai-client.log" || EXIT_CODE=$?
     if [ "$EXIT_CODE" -ne 0 ]; then
       cat "$WORK_DIR/assemblyai-client.log"
       echo "ERROR: AssemblyAI transcription failed (see $WORK_DIR/assemblyai-client.log)"

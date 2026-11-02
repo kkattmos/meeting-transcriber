@@ -41,5 +41,17 @@ runs/
 .bash_history-*.tmp
 .bashrc.bak-*
 
+# The uv-built project venv (setup.sh). Delete it to remove every Python dep.
+/.venv/
+
+# A copy of the Proxmox VM's .env, kept for its keys. Never commit it.
+/t.env
+
+# The Discord spikes' own throwaway dependencies (README "Discord voice bot").
+/spike/discord/py/.venv/
+/spike/discord/node/node_modules/
+/spike/discord/node/node-v22/
+/spike/discord/node/package-lock.json
+
 # docker-compose.yml's default for HOST_FILES_DIR (lecture files to feed in).
 /data/

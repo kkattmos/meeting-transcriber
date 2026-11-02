@@ -33,6 +33,7 @@ Pillow is required for cropping. Without it, crop_frame() copies the source
 through unchanged and says so once — a PDF with uncropped frames still beats
 no PDF.
 """
+import contextlib
 import os
 import shutil
 import sys
@@ -42,6 +43,16 @@ try:
     from PIL import Image
 except ImportError:  # pragma: no cover - exercised on boxes without Pillow
     Image = None
+
+# numpy (matplotlib brings it) runs the per-pixel loops below in C. Every
+# numpy path computes exactly what its pure-Python twin does — integer sums,
+# the same divisions — so a box without it gets the same crops and hashes,
+# only slower. extract_frames.py analyses a sample every few seconds of
+# video, which is where the difference shows (test_numpy_paths_match).
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - exercised on boxes without numpy
+    np = None
 
 ANALYSIS_WIDTH = 200
 
@@ -57,6 +68,38 @@ ASPECT_RANGE = (0.9, 3.2)
 _warned_no_pillow = False
 
 
+def _opened(src):
+    """Image.open(src), or `src` itself when it is already a decoded image.
+
+    detect_crop, is_blank and frame_hash take either, so extract_frames.py
+    can judge a frame straight off ffmpeg's pipe without writing it first.
+    """
+    if isinstance(src, Image.Image):
+        return contextlib.nullcontext(src)
+    return Image.open(src)
+
+
+_last_downscale = (None, None, None)  # (grayscale source, size, the copy)
+
+
+def _downscaled(gray, size):
+    """gray.resize(size), remembering the last one.
+
+    is_blank and detect_crop analyse the same ANALYSIS_WIDTH copy, and
+    extract_frames.py calls both on every sample it decodes: handed the same
+    grayscale image object, the second call reuses the first's resize — the
+    single most expensive step here. Keyed on identity, so an image opened
+    from a path (a new object every call) is simply resized again.
+    """
+    global _last_downscale
+    source, cached_size, copy = _last_downscale
+    if source is gray and cached_size == size:
+        return copy
+    copy = gray.resize(size)
+    _last_downscale = (gray, size, copy)
+    return copy
+
+
 def _warn_once():
     global _warned_no_pillow
     if not _warned_no_pillow:
@@ -67,6 +110,10 @@ def _warn_once():
 
 def _profiles(gray, width, height):
     """Row and column mean/max brightness for a small grayscale image."""
+    if np is not None:
+        a = np.asarray(gray, dtype=np.int64)
+        return ((a.sum(axis=1) / width).tolist(), a.max(axis=1).tolist(),
+                (a.sum(axis=0) / height).tolist(), a.max(axis=0).tolist())
     pixels = gray.load()
     col_mean = [0.0] * width
     col_max = [0] * width
@@ -116,6 +163,11 @@ def _border_box(row_mean, row_max, col_mean, col_max):
 
 def _bright_box(gray, width, height):
     """Bounding box of the bright (slide-like) pixels."""
+    if np is not None:
+        ys, xs = np.nonzero(np.asarray(gray) >= BRIGHT_LEVEL)
+        if not len(xs):
+            return None
+        return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
     pixels = gray.load()
     left, top = width, height
     right = bottom = -1
@@ -148,8 +200,11 @@ def _scale_box(box, factor, size):
 
 
 def _mean_brightness(gray, box):
-    pixels = gray.load()
     left, top, right, bottom = box
+    if np is not None:
+        region = np.asarray(gray, dtype=np.int64)[top:bottom, left:right]
+        return (int(region.sum()) / region.size) if region.size else 0.0
+    pixels = gray.load()
     total = 0
     count = 0
     for y in range(top, bottom):
@@ -168,14 +223,14 @@ def detect_crop(path, mode="slide"):
     if mode in (None, "", "none") or Image is None:
         return None
     try:
-        with Image.open(path) as img:
-            img = img.convert("RGB")
-            full_w, full_h = img.size
+        with _opened(path) as img:
+            gray = img if img.mode == "L" else img.convert("RGB").convert("L")
+            full_w, full_h = gray.size
             if full_w < 8 or full_h < 8:
                 return None
             factor = max(full_w / ANALYSIS_WIDTH, 1.0)
-            small = img.convert("L").resize(
-                (max(1, int(full_w / factor)), max(1, int(full_h / factor)))
+            small = _downscaled(
+                gray, (max(1, int(full_w / factor)), max(1, int(full_h / factor)))
             )
     except OSError:
         return None
@@ -304,11 +359,16 @@ def is_blank(path, threshold=None):
         return False
     limit = BLANK_STDDEV if threshold is None else threshold
     try:
-        with Image.open(path) as img:
-            gray = img.convert("L")
+        with _opened(path) as img:
+            gray = img if img.mode == "L" else img.convert("L")
             width = ANALYSIS_WIDTH
             height = max(1, int(gray.height * (width / gray.width)))
-            gray = gray.resize((width, height))
+            gray = _downscaled(gray, (width, height))
+            if np is not None:
+                a = np.asarray(gray, dtype=np.int64)
+                n, s1, s2 = a.size, int(a.sum()), int((a * a).sum())
+                # The variance as one exact fraction, not a float running sum.
+                return ((n * s2 - s1 * s1) / (n * n)) ** 0.5 <= limit
             values = list(gray.getdata())
     except (OSError, ValueError):
         return False
@@ -318,6 +378,13 @@ def is_blank(path, threshold=None):
     variance = sum((v - mean) ** 2 for v in values) / len(values)
     return variance ** 0.5 <= limit
 
+
+# Two hashes within this many bits are the same slide: a moved cursor is ~2
+# bits, a fade ~5, a changed title ~58, changed body text ~176 (measured,
+# see frame_hash). extract_frames.py saves a frame only past it, and
+# llm_client's duplicate pass drops repeats under it; one number, so the
+# two agree on what a new slide is.
+SAME_SLIDE_MAX_DISTANCE = 16
 
 # The hash grid. 64x64 cells over the slide region: a 60px title on a 720px
 # slide is five rows of cells, so a changed title flips dozens of bits; a
@@ -343,7 +410,7 @@ def frame_hash(path, crop_mode="slide", grid=HASH_GRID):
 
     Measured on synthetic 1920x1080 frames: a moved cursor flips 2 bits, a
     slide that faded to a different shade 5, a changed title 58, changed
-    body text 176. FRAME_DEDUPE_MAX_DISTANCE in llm_client sits between.
+    body text 176. SAME_SLIDE_MAX_DISTANCE sits between.
 
     Not an average hash (cell brighter than the mean): with dark UI around a
     white slide the mean is pulled so low that every slide cell reads as
@@ -356,12 +423,14 @@ def frame_hash(path, crop_mode="slide", grid=HASH_GRID):
         return None
     try:
         box = detect_crop(path, mode=crop_mode)
-        with Image.open(path) as img:
+        with _opened(path) as img:
             gray = img.convert("L")
             if box:
                 gray = gray.crop(box)
             side = grid * HASH_SUBSAMPLE
             gray = gray.resize((side, side), Image.BILINEAR)
+            if np is not None:
+                return _texture_bits_np(np.asarray(gray, dtype=np.int64), grid)
             px = list(gray.getdata())
     except (OSError, ValueError):
         return None
@@ -379,6 +448,21 @@ def frame_hash(path, crop_mode="slide", grid=HASH_GRID):
             var = sum((v - mean) ** 2 for v in vals) / n
             bits = (bits << 1) | (1 if var ** 0.5 > HASH_TEXTURE_LEVEL else 0)
     return bits
+
+
+def _texture_bits_np(a, grid):
+    """frame_hash's cell loop over a (side, side) int array, in C.
+
+    Per cell of n samples: n³·variance = Σ(n·v − Σv)², all integers, so the
+    test against HASH_TEXTURE_LEVEL is exact and matches the Python loop's
+    `variance ** 0.5 > level` bit for bit. Row-major, first cell = high bit.
+    """
+    sub = HASH_SUBSAMPLE
+    n = sub * sub
+    cells = a.reshape(grid, sub, grid, sub).transpose(0, 2, 1, 3).reshape(grid, grid, n)
+    dev = n * cells - cells.sum(axis=2, keepdims=True)
+    textured = (dev * dev).sum(axis=2) > HASH_TEXTURE_LEVEL ** 2 * n ** 3
+    return int("".join("1" if b else "0" for b in textured.ravel().tolist()), 2)
 
 
 def hamming(a, b):

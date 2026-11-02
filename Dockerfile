@@ -1,5 +1,5 @@
 # The meeting bot, as one image: Chrome + Xvfb + PulseAudio for recording,
-# ffmpeg, the Python venv, yt-dlp and the `claude` CLI.
+# ffmpeg, the Python venv, yt-dlp + deno and the `claude` CLI.
 #
 #   docker compose up -d --build        (see docker-compose.yml and README)
 #
@@ -20,7 +20,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MEETING_BOT_IN_DOCKER=1 \
     MEETING_BOT_ROOT=/data/bot \
     MEETING_BOT_VENV=/opt/meeting-bot-venv \
+    MEETING_BROWSER=chrome \
     CHROME_PROFILE_DIR=/data/bot/chrome-profile \
+    FIREFOX_PROFILE_DIR=/data/bot/firefox-profile \
     RESOURCE_CACHE_DIR=/data/bot/resources \
     RECORDINGS_DIR=/data/out/recordings \
     TRANSCRIPTS_DIR=/data/out/transcripts \
@@ -30,26 +32,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CLAUDE_CONFIG_DIR=/root/.claude \
     CLAUDE_CLI_BIN=/root/.local/bin/claude \
     DISABLE_AUTOUPDATER=1 \
+    GDRIVE_LOGIN_BIND=0.0.0.0 \
+    GDRIVE_LOGIN_PORT=8766 \
     PATH=/opt/meeting-bot-venv/bin:/root/.local/bin:$PATH
 
-# The venv first on PATH, so a bare `python3` in `docker compose exec` is the
-# one with the pinned dependencies. (It doesn't exist yet while setup.sh runs,
-# which therefore creates it with the system python3, as it should.)
-#
-# uv makes the pinned install seconds instead of minutes; setup.sh uses it
-# when it is on PATH and verifies the same hashes either way.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-# The installer and the lockfiles only, so editing the code does not throw
-# away the apt/Chrome/venv layer.
-COPY setup.sh source_env.sh requirements.txt requirements-browser.txt ./
+# The installer, the lockfiles and the fonts only, so editing the code does
+# not throw away the apt/Chrome/venv layer.
+COPY docker/install.sh docker/install.sh
+COPY requirements.txt requirements-browser.txt ./
+COPY fonts fonts
 ARG WITH_LIBREOFFICE=0
-RUN apt-get update -qq \
- && apt-get install -y --no-install-recommends ca-certificates wget tini \
- && if [ "$WITH_LIBREOFFICE" = "1" ]; then ./setup.sh --with-libreoffice; else ./setup.sh; fi \
- && rm -rf /var/lib/apt/lists/* /root/.cache
+ARG WITH_FIREFOX=0
+RUN apt-get update -qq && apt-get install -y --no-install-recommends python3 \
+ && WITH_LIBREOFFICE=$WITH_LIBREOFFICE WITH_FIREFOX=$WITH_FIREFOX ./docker/install.sh
 
 # The Claude Code CLI, for the summarizer's subscription billing. Its login
 # lives in the claude-config volume (CLAUDE_CONFIG_DIR), not in the image, so
@@ -62,5 +61,6 @@ COPY . .
 RUN chmod +x docker/entrypoint.sh
 
 # 8765: the web UI / trigger. 6080: noVNC, only while first_time_login.sh runs.
-EXPOSE 8765 6080
+# 8766: the Google Drive sign-in's redirect, only while `gdrive.py login` runs.
+EXPOSE 8765 6080 8766
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker/entrypoint.sh"]

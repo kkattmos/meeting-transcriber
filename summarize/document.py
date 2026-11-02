@@ -47,9 +47,12 @@ from pathlib import Path
 
 SECTION_SEPARATOR = "<br><br>"
 
-# Prompts whose output is course-note shaped. meeting-* keeps the plain
-# executive summary — those don't go into the course files.
-WRAPPED_PROMPT_PREFIXES = ("lecture", "tutorial")
+# Prompts whose output gets the link line and the transcript: the course-note
+# shaped ones, and `video`, `reality` and `drama`, whose reader wants the link back to
+# what was summarized. `meeting` keeps the plain executive summary — those
+# don't go into the course files, and a meeting has no link worth printing.
+WRAPPED_PROMPT_PREFIXES = ("lecture", "tutorial", "video", "reality",
+                           "drama")
 
 
 def wants_wrapper(prompt_name, mode="auto"):
@@ -116,10 +119,27 @@ def provenance_comment(**fields):
     return "\n".join(lines)
 
 
+# A recorded call's link. Not "Source File": the first live guest recording
+# (2026-09-29) cited its Meet link as a local file, because anything that was
+# neither YouTube nor Kaltura fell through to that label. A Discord voice
+# channel's link is one too: the bot's recording is a local file, passed with
+# --source-url so the document cites the channel.
+MEETING_URL_RE = re.compile(
+    r"^https?://(meet\.google\.com|([\w-]+\.)?zoom\.us|teams\.(microsoft|live)\.com|meet\.new"
+    r"|(ptb\.|canary\.)?discord(app)?\.com/channels/)",
+    re.IGNORECASE)
+
+
+def looks_like_meeting(source):
+    return bool(MEETING_URL_RE.match(str(source or "").strip()))
+
+
 def _source_line(source, source_kind, tag=""):
     """The clickable (or at least copyable) line naming where a video came from."""
     if source_kind == "youtube":
         return f"Youtube Link{tag}: `{source}`"
+    if source_kind == "meeting" or looks_like_meeting(source):
+        return f"Meeting Link{tag}: `{source}`"
     if source_kind == "kaltura":
         # Not "Source File" — a Kaltura lecture is a link like the YouTube one,
         # and the reader needs to be able to click it.
@@ -144,6 +164,85 @@ def _clip_line(clip, tag=""):
             "Timestamps below are relative to the start of the clip.")
 
 
+YOUTUBE_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:[^#\s]*&)?v=|shorts/|live/|embed/)"
+    r"|youtu\.be/)([A-Za-z0-9_-]{11})")
+
+# A timestamp the reality prompt writes: [12:34], [1:02:03], or, in a
+# combined document, [Video 2, 12:34]. Not one already followed by "(" — that
+# is a link already, from an earlier pass or from the model.
+TIMESTAMP_RE = re.compile(
+    r"\[(?:video\s*(\d+)\s*,\s*)?(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\](?!\()",
+    re.IGNORECASE)
+# A code span holding nothing but a timestamp (`[01:41:22]`) is a timestamp
+# the model dressed as code — seen on the first live run, in a table.
+_CODED_TIMESTAMP_RE = re.compile(
+    r"`(\[(?:video\s*\d+\s*,\s*)?(?:\d{1,2}:)?\d{1,2}:\d{2}\])`", re.IGNORECASE)
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_INLINE_CODE_RE = re.compile(r"(`+)(?:(?!\1).)+\1")
+
+
+def youtube_id(url):
+    """The 11-character video id of a YouTube URL, or None."""
+    m = YOUTUBE_ID_RE.search(str(url or ""))
+    return m.group(1) if m else None
+
+
+def link_timestamps(body, videos):
+    """Turn the model's [mm:ss] marks into links to that moment of the video.
+
+    `videos` is [(source, clip_start_seconds)], video 1 first. A plain
+    [mm:ss] links into the only video — with several it would be ambiguous,
+    so it stays text — and [Video N, mm:ss] into video N. Only YouTube
+    sources get links (a Kaltura embed and a recording have no URL that
+    seeks); the rest stay text. The times the model read are clip-relative
+    (see --clip), so the clip's start is added back for the link, while the
+    visible text keeps the time the document's own transcript uses.
+
+    Code spans and fenced blocks are left alone. The model never writes the
+    URL: it could not know the clip offset, and a link it made up would
+    look exactly as right as one it didn't.
+    """
+    targets = {}
+    for n, (source, offset) in enumerate(videos or [], start=1):
+        vid = youtube_id(source)
+        if vid:
+            targets[n] = (vid, float(offset or 0))
+    if not targets:
+        return body
+
+    def link(m):
+        video, hours, minutes, seconds = m.groups()
+        n = int(video) if video else (1 if len(videos) == 1 else None)
+        if n not in targets:
+            return m.group(0)
+        vid, offset = targets[n]
+        at = int(hours or 0) * 3600 + int(minutes) * 60 + int(seconds)
+        return (f"{m.group(0)}(https://www.youtube.com/watch?v={vid}"
+                f"&t={int(at + offset)}s)")
+
+    out, in_fence = [], False
+    for line in body.split("\n"):
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        # Link only outside inline code: split on the code spans and rewrite
+        # the gaps between them.
+        line = _CODED_TIMESTAMP_RE.sub(r"\1", line)
+        pieces, last = [], 0
+        for code in _INLINE_CODE_RE.finditer(line):
+            pieces.append(TIMESTAMP_RE.sub(link, line[last:code.start()]))
+            pieces.append(code.group(0))
+            last = code.end()
+        pieces.append(TIMESTAMP_RE.sub(link, line[last:]))
+        out.append("".join(pieces))
+    return "\n".join(out)
+
+
 def split_leading_heading(body):
     """(heading text, rest) when the body opens with an H1; else (None, body)."""
     lines = body.strip().splitlines()
@@ -155,7 +254,7 @@ def split_leading_heading(body):
 def build_document(body, *, source, source_kind, title=None, transcript="",
                    backend=None, model=None, prompt_name=None, run_id=None,
                    generated=None, include_transcript=True, clip=None,
-                   videos=None):
+                   videos=None, language=None, font=None):
     """Wrap a model-written summary body in the course-note template.
 
     `videos`, when given, is the list of sources a --combine summary was made
@@ -168,6 +267,13 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
 
     `title` is the video's, and is used only when the body has no H1 of its
     own — see the module docstring.
+
+    `language` is the SUMMARY_LANGUAGE code the body was written in. It goes
+    into the provenance comment so pdf.py can pick the matching body face
+    when the document is re-rendered later, whatever the box is set to by
+    then. The wrapper's own labels stay in English regardless: the .md has
+    to drop into the operator's existing course files. `font` is the PDF
+    body face the run chose (fontchoice.py), recorded for the same reason.
     """
     generated = generated or date.today().isoformat()
 
@@ -175,9 +281,11 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
         source=source,
         source_type=source_kind,
         model=f"{backend}/{model}" if backend and model else (model or backend),
-        prompt=prompt_name or "summarize.md",
+        prompt=prompt_name or "video.md",
         run_id=run_id,
         clip=clip,
+        language=language,
+        font=font,
         generated=generated,
     )
     if videos:

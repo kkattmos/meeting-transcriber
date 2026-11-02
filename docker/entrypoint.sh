@@ -12,7 +12,7 @@ if [ -z "${MEETING_BOT_TOKEN:-}" ]; then
   exit 1
 fi
 
-mkdir -p "$MEETING_BOT_ROOT"/{runs,state,tmp,logs} "$CHROME_PROFILE_DIR" \
+mkdir -p "$MEETING_BOT_ROOT"/{runs,state,tmp,logs} "$CHROME_PROFILE_DIR" "$FIREFOX_PROFILE_DIR" \
          "$RESOURCE_CACHE_DIR" "$FRAMES_DIR" \
          "$RECORDINGS_DIR" "$TRANSCRIPTS_DIR" "$SUMMARIES_DIR" "$PDF_DIR"
 
@@ -37,7 +37,7 @@ fi
 (
   sleep "${RESUME_FIRST_DELAY_SECONDS:-300}"
   while true; do
-    ./pipeline.sh --resume-all >> "$MEETING_BOT_ROOT/logs/resume.log" 2>&1
+    MEETING_BOT_FOREGROUND=1 ./pipeline.sh --resume-all >> "$MEETING_BOT_ROOT/logs/resume.log" 2>&1
     sleep "${RESUME_INTERVAL_SECONDS:-900}"
   done
 ) &

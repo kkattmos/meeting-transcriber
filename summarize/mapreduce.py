@@ -14,6 +14,9 @@ Concurrency is bounded by SUMMARY_MAX_PARALLEL (default 3). It's deliberately
 small: every chunk carries images, and firing a dozen multi-megabyte requests
 at a provider is a good way to earn the 429s that retry.py then has to sit out.
 """
+import hashlib
+import json
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -21,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from chunking import max_parallel  # noqa: E402
+import language  # noqa: E402
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 MERGE_PROMPT_PATH = PROMPTS_DIR / "_merge.md"
@@ -37,9 +41,9 @@ CHUNK_PREAMBLE = (
     "recordings being summarized together — {part_label}. "
     "Cover this part thoroughly and do not speculate about what happened in the "
     "other parts. Your output will later be merged with the summaries of the "
-    "other parts, so keep timestamps and speaker attributions intact; when the "
-    "part label names a video, say which video a timestamp or frame belongs "
-    "to.\n\n"
+    "other parts, so keep speaker attributions intact, and when the part label "
+    "names a video, say which video the material comes from. The part label "
+    "is for orientation only: do not copy its times into the summary.\n\n"
 )
 
 
@@ -61,29 +65,97 @@ def _default_merge_template():
         "appear more than once.\n"
         "- Collect all action items into a single list with owners and due "
         "dates where stated.\n"
-        "- Preserve timestamp citations exactly as given.\n"
+        "- Keep callout boxes (`> [!TAG] Title`), LaTeX and code blocks "
+        "exactly as written.\n"
         "- Keep the section structure used by the partial summaries.\n"
-        "- Write in the same language as the source material.\n\n"
+        "- {language_rule}\n\n"
         "Partial summaries:\n\n{transcript}\n"
     )
 
 
-def load_merge_template():
+def merge_prompt_path(prompt_name=None):
+    """The merge instructions for a prompt: `_merge-<name>.md` when the
+    prompt has its own (reality: keep the timestamps and quotes, results
+    last), else the shared `_merge.md`."""
+    if prompt_name:
+        own = PROMPTS_DIR / f"_merge-{Path(prompt_name).stem}.md"
+        if own.is_file():
+            return own
+    return MERGE_PROMPT_PATH
+
+
+def load_merge_template(prompt_name=None):
     try:
-        text = MERGE_PROMPT_PATH.read_text()
+        text = merge_prompt_path(prompt_name).read_text()
     except OSError:
-        return _default_merge_template()
+        text = _default_merge_template()
     if "# Input" in text:
         text = text.split("# Input", 1)[1]
-    return text.strip() + "\n\n"
+    # The merge writes the final document, so it is told the output language
+    # outright rather than left to infer it from partials that already obey
+    # the same rule — one setting, one answer, no drift on the last call.
+    return language.apply(text).strip() + "\n\n"
 
 
-def summarize_chunked(chunks, prompt_template, summarize_fn, log=print):
+# Finished chunk summaries are kept in the run directory, so a resume (a
+# failed merge, a chunk that failed, a re-merge after the merge prompt
+# changed) does not pay for the chunks that already succeeded. Keyed on
+# everything that shapes the answer: the full chunk prompt, the transcript
+# slice, the frames offered and the configured backends/models. Change any
+# of them and the chunk is summarized again. Only inside a pipeline run
+# (MEETING_BOT_RUN_DIR); a standalone summarize.py keeps nothing.
+_CACHE_ENV = ("SUMMARY_BACKEND", "SUMMARY_FALLBACK_CHAIN", "OPENROUTER_MODEL",
+              "CLAUDE_CLI_MODEL", "GEMINI_MODEL", "SUMMARY_LANGUAGE",
+              "SUMMARY_EFFORT")
+
+
+def _chunk_cache_dir():
+    if os.environ.get("SUMMARY_CHUNK_CACHE", "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return None
+    run_dir = os.environ.get("MEETING_BOT_RUN_DIR")
+    if not run_dir or not Path(run_dir).is_dir():
+        return None
+    return Path(run_dir) / "chunks"
+
+
+def _chunk_key(template, chunk):
+    h = hashlib.sha256()
+    for piece in (template, chunk.text,
+                  *(f"{getattr(f, 'number', '')}:{f.path}" for f in chunk.frames),
+                  *(f"{k}={os.environ.get(k, '')}" for k in _CACHE_ENV)):
+        h.update(piece.encode("utf-8", "replace"))
+        h.update(b"\0")
+    return h.hexdigest()[:24]
+
+
+def _cache_read(cache_dir, key):
+    try:
+        data = json.loads((cache_dir / f"{key}.json").read_text())
+        return data["text"], data.get("models") or []
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, []
+
+
+def _cache_write(cache_dir, key, text, models):
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp = cache_dir / f".{key}.tmp"
+        tmp.write_text(json.dumps({"text": text, "models": models},
+                                  ensure_ascii=False))
+        tmp.replace(cache_dir / f"{key}.json")
+    except OSError:
+        pass   # a lost cache costs one call, never a run
+
+
+def summarize_chunked(chunks, prompt_template, summarize_fn, log=print,
+                      merge_template=None):
     """Summarize chunks in parallel, then merge.
 
     `summarize_fn(frames, transcript, template, role=None) -> str` is llm_client.summarize,
     so each chunk and the merge all inherit the configured backend, its retry
-    policy, and the fallback chain.
+    policy, and the fallback chain. `merge_template` defaults to the shared
+    `_merge.md`; summarize.py passes load_merge_template(<prompt>).
     """
     total = len(chunks)
     log(f"==> Long transcript: summarizing {total} chunks "
@@ -96,10 +168,27 @@ def summarize_chunked(chunks, prompt_template, summarize_fn, log=print):
     results = [None] * total
     errors = []
 
+    cache_dir = _chunk_cache_dir()
+    import llm_client   # the used-models record; imported late (no cycle)
+
     def _one(chunk):
         template = chunk_template.replace("PART_LABEL_PLACEHOLDER",
                                           chunk.header(total))
-        return summarize_fn(chunk.frames, chunk.text, template)
+        key = _chunk_key(template, chunk) if cache_dir else None
+        if key:
+            text, models = _cache_read(cache_dir, key)
+            if text:
+                log(f"    chunk {chunk.index + 1}/{total}: reusing the summary "
+                    f"from an earlier attempt ({', '.join(models) or '?'})")
+                for label in models:
+                    backend, _, model = label.partition("/")
+                    llm_client._record_used(backend, model)
+                return text
+        text = summarize_fn(chunk.frames, chunk.text, template)
+        if key and text:
+            last = llm_client.thread_last_used()
+            _cache_write(cache_dir, key, text, [last] if last else [])
+        return text
 
     with ThreadPoolExecutor(max_workers=max_parallel()) as pool:
         futures = {pool.submit(_one, c): c for c in chunks}
@@ -153,7 +242,8 @@ def summarize_chunked(chunks, prompt_template, summarize_fn, log=print):
     # role="merge" lets the claude-cli backend put this call on a cheaper
     # model: it folds partials a stronger model already wrote, and its output
     # is about the size of everything it read.
-    merged = summarize_fn([], combined, load_merge_template(), role="merge")
+    merged = summarize_fn([], combined, merge_template or load_merge_template(),
+                          role="merge")
 
     if errors:
         missing = ", ".join(str(i + 1) for i, _ in sorted(errors))

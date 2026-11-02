@@ -7,8 +7,11 @@
 # One-time sign-ins (both are kept in named volumes, so rebuilding the image
 # never signs you out):
 #   docker compose exec -it bot claude auth login      # the Claude subscription
-#   docker compose exec -it bot ./first_time_login.sh  # Google + Zoom, via
-#                                                      # http://localhost:6080/vnc.html
+#   docker compose exec -it bot ./first_time_login.sh --novnc  # Google + Zoom,
+#                                         via http://localhost:6080/vnc.html
+#   docker compose exec -it bot python3 lib/gdrive.py login --no-browser
+#                                         # optional: PDFs to Google Drive; open
+#                                         # the printed link on this machine
 #
 # Everything else works as before, prefixed:
 #   docker compose exec bot ./pipeline.sh --list
@@ -22,6 +25,7 @@ services:
       context: .
       args:
         WITH_LIBREOFFICE: ${WITH_LIBREOFFICE:-0}
+        WITH_FIREFOX: ${WITH_FIREFOX:-0}
     image: meeting-bot:latest
     container_name: meeting-bot
     restart: unless-stopped
@@ -32,6 +36,7 @@ services:
     environment:
       MEETING_BOT_ROOT: /data/bot
       CHROME_PROFILE_DIR: /data/bot/chrome-profile
+      FIREFOX_PROFILE_DIR: /data/bot/firefox-profile
       RESOURCE_CACHE_DIR: /data/bot/resources
       FRAMES_DIR: /data/bot/frames
       RECORDINGS_DIR: /data/out/recordings
@@ -40,6 +45,8 @@ services:
       PDF_DIR: /data/out/pdf
       CLAUDE_CLI_BIN: /root/.local/bin/claude
       MEETING_BOT_BIND: 0.0.0.0
+      GDRIVE_LOGIN_BIND: 0.0.0.0
+      GDRIVE_LOGIN_PORT: "8766"
       TZ: ${TZ:-Asia/Bangkok}
     # Chrome needs more shared memory than Docker's 64MB default, or tabs
     # crash mid-meeting.
@@ -68,6 +75,9 @@ services:
       # noVNC for first_time_login.sh. Loopback only, always: it is an
       # unauthenticated browser holding your Google session.
       - "127.0.0.1:6080:6080"
+      # The Google Drive sign-in's redirect (lib/gdrive.py login). Loopback
+      # only; Google redirects the browser on THIS machine to 127.0.0.1:8766.
+      - "127.0.0.1:8766:8766"
 
 volumes:
   bot-data:

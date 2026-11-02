@@ -69,7 +69,7 @@ from pathlib import Path
 
 DEFAULT_MAX_CHARS = 40000
 DEFAULT_MAX_FILE_MB = 25
-DEFAULT_CACHE_DIR = "/opt/meeting-bot/resources"
+DEFAULT_CACHE_DIR = os.path.expanduser("~/.local/share/meeting-bot/resources")
 
 # Extensions we can pull text out of, cheapest first.
 TEXT_SUFFIXES = {

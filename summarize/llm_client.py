@@ -52,7 +52,8 @@ each of which only removes or shrinks, none of which renumbers:
 drop_uninformative() discards blank frames and consecutive repeats of an
 unchanged slide (framecrop.frame_hash - a texture hash over the slide region,
 so a moved cursor is the same slide and a changed title is not);
-thin_frames() applies CLAUDE_CLI_MAX_FRAMES to what is left; and
+thin_frames() applies CLAUDE_CLI_MAX_FRAMES to what is left (the Gemini
+backend runs all three passes too, under the same names); and
 _downscale_frames() writes a copy of each survivor cropped to the slide
 (framecrop.detect_crop, the PDF's own PDF_FRAME_CROP mode) and fitted to
 FRAME_MAX_DIMENSION px, under <frame dir>/llm-<px>-<mode>/. The saved frames
@@ -139,8 +140,8 @@ Env vars:
                         after the crop to the slide (default 768; 0 skips
                         the downscale). PDF_FRAME_CROP picks the crop mode.
   CLAUDE_CLI_MAX_FRAMES most frames offered to the model per call (default 0
-                        = every frame of the chunk); scene changes are kept
-                        first, periodic frames are thinned evenly
+                        = every frame of the chunk); slide changes are kept
+                        first, motion/safety-net frames are thinned evenly
   CLAUDE_CLI_MAX_WAIT_SECONDS  how long one call may sleep for the usage
                         window to reset before the stage fails (default 21600)
   CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS  retry interval when the CLI reports a
@@ -171,7 +172,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 from retry import with_retries, _status_of as _http_status  # noqa: E402
+from framecrop import SAME_SLIDE_MAX_DISTANCE  # noqa: E402
 from keyring import KeyRing, missing_keys_message  # noqa: E402
+import language  # noqa: E402
 
 DEFAULT_BACKEND = "fallback"
 DEFAULT_FALLBACK_CHAIN = "claude-cli,gemini"
@@ -181,6 +184,10 @@ DEFAULT_FALLBACK_CHAIN = "claude-cli,gemini"
 DEFAULT_CLAUDE_CLI_MODEL = "opus"
 DEFAULT_CLAUDE_CLI_TIMEOUT = 1800
 DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+# google-genai's client has no timeout of its own: a request Gemini accepts
+# and never answers blocks forever, and no retry or key rotation ever runs.
+# Seen 2026-10-06 — a combine run sat 65 minutes on silent sockets.
+DEFAULT_GEMINI_TIMEOUT = 600
 
 # The effort levels the CLI's --effort accepts, in order. Anything else is a
 # typo, and a typo that reaches the CLI comes back as an opaque usage error.
@@ -188,6 +195,29 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_EFFORT = "high"
 
 GEMINI_MAX_KEYS = 3
+
+# OpenRouter's free `:free` models (2026-10-14; Mistral was tried first and
+# its free plan has no API access). Plain HTTP through requests, no SDK.
+# Free variants come and go; the chain lets a withdrawn one be skipped.
+DEFAULT_OPENROUTER_MODEL = "dots-studio/dots-3-note-preview:free"
+DEFAULT_OPENROUTER_TIMEOUT = 600
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MAX_KEYS = 3
+# A chunk's answer is capped (max_tokens) so a runaway generation stops
+# sooner: successful chunks of the 2026-10-14 run were 10-22k tokens, the two
+# runaways ran to the provider's 65,536. The merge is not capped — it
+# legitimately wrote 38k. 0 = no cap.
+DEFAULT_OPENROUTER_MAX_TOKENS = 32768
+# A cut-off answer is retried this many times on the same model before the
+# chain moves on: the runaway was intermittent (the same chunk, re-sent,
+# came back at 9k tokens), so a free retry usually beats a paid fallback.
+DEFAULT_OPENROUTER_TRUNCATION_RETRIES = 1
+# More runs than this of a script that is neither the summary language's nor
+# the input's (language.foreign_runs) and the answer is rejected like a
+# cut-off one: retried on the same model, then the next. 2026-10-16: the
+# free dots-3-note wrote ~10 such runs per Thai chunk (การ预测, ซื้อ卖出);
+# a lecture that really quotes one Chinese word stays under the bar.
+DEFAULT_OPENROUTER_MAX_FOREIGN_RUNS = 2
 
 # Env vars that would flip the CLI from subscription auth to API-key billing.
 # Scrubbed from the subprocess environment, never from our own.
@@ -233,12 +263,20 @@ DEFAULT_FRAME_MAX_DIMENSION = 768
 LLM_FRAME_SUBDIR = "llm-{max_dim}{crop}"
 
 # Two frames whose texture hashes (framecrop.frame_hash, 4096 bits over the
-# slide region) are within this many bits are the same slide: a moved cursor
-# is ~2 bits, a fade ~5, a changed title ~58, changed body text ~176 (see the
-# measurements on frame_hash). Consecutive duplicates are dropped before the
+# slide region) are within this many bits are the same slide — the number
+# extract_frames.py also saves on, defined once in framecrop with its
+# measurements. Consecutive duplicates are dropped before the
 # frame cap is applied, so the cap covers distinct slides rather than
 # distinct minutes. Without Pillow nothing is a duplicate.
-FRAME_DEDUPE_MAX_DISTANCE = 16
+FRAME_DEDUPE_MAX_DISTANCE = SAME_SLIDE_MAX_DISTANCE
+
+# Stands in for the frame list when there are no frames — a voice-only run
+# (pipeline.sh --summary-source voice), an audio recording, an audio file.
+# Every prompt says "look at the frames" right under the list; an empty list
+# there invites the model to describe pictures it was never shown.
+NO_FRAMES_NOTE = ("(No frames: this summary is made from the audio transcript "
+                  "alone. There is nothing on screen to use — do not describe "
+                  "or refer to slides, images or anything shown.)")
 
 # Per-call frame cap. 0 = no cap, which is what every run did before the
 # setting existed. The frames are the bulk of a call's input, so this is the
@@ -279,9 +317,34 @@ LAST_BACKEND = None
 LAST_MODEL = None
 
 
+# Every backend/model that answered a call in this process, in first-use
+# order. A chunked run can mix them (a chunk the free model could not finish
+# goes to the next backend in the chain); the provenance names all of them.
+USED_MODELS = []
+_USED_LOCK = threading.Lock()
+_THREAD = threading.local()   # the last model this thread's call used
+
+
 def _record_used(backend, model):
     global LAST_BACKEND, LAST_MODEL
     LAST_BACKEND, LAST_MODEL = backend, model
+    label = f"{backend}/{model}" if backend and model else (model or backend)
+    _THREAD.last = label
+    with _USED_LOCK:
+        if label and label not in USED_MODELS:
+            USED_MODELS.append(label)
+
+
+def thread_last_used():
+    """The backend/model that answered this thread's latest call (chunks run
+    in parallel threads, so LAST_MODEL may belong to another chunk)."""
+    return getattr(_THREAD, "last", None)
+
+
+def used_models_label():
+    """"a + b" when more than one backend/model answered, else None."""
+    with _USED_LOCK:
+        return " + ".join(USED_MODELS) if len(USED_MODELS) > 1 else None
 
 
 class BackendUnavailable(RuntimeError):
@@ -482,7 +545,7 @@ class FrameMeta:
     assign_numbers() — see the warning there.
     """
     timestamp_s: float
-    kind: str  # "scene_change" or "periodic"
+    kind: str  # "scene_change", "motion" or "periodic" (extract_frames.py)
     path: str
     number: int = 0
     # Which video this frame came from when several are summarized as one
@@ -572,7 +635,7 @@ def _render(frames, transcript, prompt_template, with_paths=False):
         if with_paths:
             line = f"{line} {Path(frame.path).resolve()}"
         lines.append(line)
-    manifest = "\n".join(lines)
+    manifest = "\n".join(lines) or NO_FRAMES_NOTE
     user_text = prompt_template.format(transcript=transcript,
                                        frame_manifest=manifest)
     return sorted_frames, strip_static_markers(user_text)
@@ -661,7 +724,7 @@ def _claude_cli_cwd():
     have nothing to do with summarizing a lecture. --safe-mode also suppresses
     that, but controlling the cwd doesn't depend on a flag name staying put.
     """
-    root = Path(os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot"))
+    root = Path(os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot")))
     cwd = root / "tmp" / "claude-cli-cwd"
     try:
         cwd.mkdir(parents=True, exist_ok=True)
@@ -676,6 +739,41 @@ def _cli_timeout():
                                           DEFAULT_CLAUDE_CLI_TIMEOUT)))
     except ValueError:
         return DEFAULT_CLAUDE_CLI_TIMEOUT
+
+
+# Tokens Gemini charges per image, measured 2026-10-06 with count_tokens on
+# gemini-3.5/3.6-flash: a fixed price per image whatever its pixel size
+# (1280x720 and 384x216 cost the same), set only by media_resolution.
+GEMINI_IMAGE_TOKENS = {"low": 264, "medium": 527, "high": 1100, "": 1100}
+
+
+def _gemini_media_resolution():
+    """GEMINI_MEDIA_RESOLUTION: low | medium | high, or unset (the model's
+    default, which priced like high). Anything else warns and is ignored."""
+    raw = os.environ.get("GEMINI_MEDIA_RESOLUTION", "").strip().lower()
+    if raw in ("", "default"):
+        return ""
+    if raw in ("low", "medium", "high"):
+        return raw
+    print(f"  warning: GEMINI_MEDIA_RESOLUTION={raw!r} is not low, medium or "
+          f"high — using the model's default", file=sys.stderr)
+    return ""
+
+
+def _gemini_max_frames():
+    """GEMINI_MAX_FRAMES when set (0 = every frame left after the blank and
+    repeat pass), else the CLI's CLAUDE_CLI_MAX_FRAMES."""
+    if os.environ.get("GEMINI_MAX_FRAMES", "").strip() == "":
+        return _max_frames()
+    return _int_env("GEMINI_MAX_FRAMES", 0)
+
+
+def _gemini_timeout():
+    try:
+        return max(30, int(os.environ.get("GEMINI_TIMEOUT_SECONDS",
+                                          DEFAULT_GEMINI_TIMEOUT)))
+    except ValueError:
+        return DEFAULT_GEMINI_TIMEOUT
 
 
 def _flag_env(name, default="1"):
@@ -737,7 +835,7 @@ def _static_prompt_file(text):
     sending the instructions inline.
     """
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-    root = Path(os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot"))
+    root = Path(os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot")))
     path = root / "tmp" / "claude-cli-prompts" / f"{digest}.md"
     try:
         if path.is_file() and path.read_text() == text:
@@ -794,11 +892,12 @@ def _rate_limit_poll_seconds():
 def thin_frames(frames, cap):
     """At most `cap` frames, chosen to still cover the whole window.
 
-    Scene changes are kept first — there are rarely more than a handful, and
-    each one is a slide transition the notes should cite — and the periodic
-    frames fill the rest at an even stride, so a 36-minute chunk capped at 20
-    still shows the model something every couple of minutes rather than the
-    first twenty minutes in detail and nothing after.
+    Scene changes (a new slide that settled) are kept first — each one is a
+    slide the notes may cite — and the motion and safety-net frames fill the
+    rest at an even stride; either group over budget is itself strided, so a
+    36-minute chunk capped at 20 still shows the model something every couple
+    of minutes rather than the first twenty minutes in detail and nothing
+    after.
 
     The frames' numbers are untouched: they were assigned over the whole
     manifest by assign_numbers(), and the ones left out keep theirs, so a
@@ -1456,16 +1555,46 @@ def summarize_gemini(frames: List[FrameMeta], transcript: str,
                    "https://aistudio.google.com/apikey."),
         ))
 
-    sorted_frames, user_text = _render(frames, transcript, prompt_template)
+    # The same three passes as the Claude path — blanks and consecutive
+    # repeats out, then the CLAUDE_CLI_MAX_FRAMES cap, then a cropped,
+    # downscaled copy. Before 2026-10-06 Gemini was sent every frame at full
+    # size: a 910-frame video was one ~90MB request, over the free tier's
+    # 250k input tokens per minute on its own, so every retry in that minute
+    # came back 429 on every key. Numbers stay global, as on the Claude path.
+    offered, blanks, dupes = drop_uninformative(frames)
+    offered = thin_frames(offered, _gemini_max_frames())
+    thinned = len(frames) - blanks - dupes - len(offered)
+    llm_frames, resized = _downscale_frames(offered)
+    resolution = _gemini_media_resolution()
+
+    sorted_frames, user_text = _render(llm_frames, transcript, prompt_template)
+    detail = []
+    if blanks or dupes:
+        detail.append(f"{blanks} blank + {dupes} repeated frame(s) dropped")
+    if thinned:
+        detail.append(f"{thinned} more left out (GEMINI_MAX_FRAMES / "
+                      f"CLAUDE_CLI_MAX_FRAMES)")
+    if resized:
+        detail.append(f"{resized} cropped/downscaled to {_frame_max_dimension()}px")
+    detail.append(f"media_resolution={resolution or 'default'}, "
+                  f"~{GEMINI_IMAGE_TOKENS[resolution] * len(sorted_frames):,} "
+                  f"image tokens")
+    print(f"     gemini: {len(sorted_frames)} frame(s) of {len(frames)}"
+          + (", " + ", ".join(detail) if detail else ""), file=sys.stderr)
     parts = [{"text": user_text}]
     for frame in sorted_frames:
         data, mime = _read_image_b64(frame.path)
-        parts.append({
+        part = {
             "inline_data": {
                 "mime_type": mime,
                 "data": base64.standard_b64decode(data),
             }
-        })
+        }
+        if resolution:
+            # Per image: the only thing that changes what an image costs.
+            part["media_resolution"] = {
+                "level": f"MEDIA_RESOLUTION_{resolution.upper()}"}
+        parts.append(part)
 
     def _call(client, model_name):
         try:
@@ -1480,10 +1609,14 @@ def summarize_gemini(frames: List[FrameMeta], transcript: str,
                 raise GeminiModelUnavailable(str(exc)) from exc
             raise
 
+    timeout_ms = _gemini_timeout() * 1000
     last_error = None
     for model_name in models:
         for slot, key in ring.rotate():
-            client = new_genai.Client(api_key=key)
+            # HttpOptions.timeout is in milliseconds. A timeout raises
+            # httpx.ReadTimeout, which retry.is_retryable treats as transient.
+            client = new_genai.Client(
+                api_key=key, http_options={"timeout": timeout_ms})
             try:
                 response = with_retries(
                     _call, client, model_name,
@@ -1510,6 +1643,318 @@ def summarize_gemini(frames: List[FrameMeta], transcript: str,
         f"Last error: {last_error}")
 
 
+# ---------------------------------------------------------------------------
+# OpenRouter (free `:free` models)
+# ---------------------------------------------------------------------------
+
+class OpenRouterDailyLimit(Exception):
+    """The account's free-model allowance for the day is spent (50/day, or
+    1,000 after a $10 top-up). Limits are per account, not per model, so the
+    loop abandons this key for every model instead of walking the chain.
+    `retryable = False`: waiting minutes does not help."""
+    retryable = False
+
+
+class OpenRouterModelUnavailable(Exception):
+    """404, or a 400 naming the model (a `:free` variant withdrawn — the
+    roster changes often): skip this model for every key."""
+    retryable = False
+
+
+class OpenRouterRejected(Exception):
+    """An answer that came back but must not be used. Retried on the same
+    model OPENROUTER_TRUNCATION_RETRIES times, then the next model."""
+    retryable = False
+
+
+class OpenRouterTruncated(OpenRouterRejected):
+    """finish_reason "length": the model hit its output cap (32k on the
+    free Gemma) mid-answer. A cut-off summary looks finished, so it is never
+    returned; the loop moves to the next model, whose cap may be larger."""
+
+
+class OpenRouterOffScript(OpenRouterRejected):
+    """The answer drifts into a script nobody asked for (Chinese, Arabic …
+    inside Thai or English words): the PDF prints those letters as empty
+    boxes and the sentence stops making sense. See language.foreign_runs."""
+
+
+class OpenRouterHTTPError(Exception):
+    """Any other failure, carrying its status (and the response, for
+    Retry-After) so retry.py classifies it: 429 per-minute, 408, 502 and 503
+    are retried; 400/401/402/403 are not."""
+
+    def __init__(self, status, message, response=None):
+        super().__init__(f"HTTP {status}: {message[:500]}")
+        self.status_code = status
+        self.response = response
+
+
+def _openrouter_models():
+    raw = os.environ.get("OPENROUTER_MODEL") or DEFAULT_OPENROUTER_MODEL
+    seen = []
+    for name in re.split(r"[,\s]+", raw):
+        if name and name not in seen:
+            seen.append(name)
+    return seen or [DEFAULT_OPENROUTER_MODEL]
+
+
+def _openrouter_timeout():
+    try:
+        return max(30, int(os.environ.get("OPENROUTER_TIMEOUT_SECONDS",
+                                          DEFAULT_OPENROUTER_TIMEOUT)))
+    except ValueError:
+        return DEFAULT_OPENROUTER_TIMEOUT
+
+
+def _openrouter_max_frames():
+    """OPENROUTER_MAX_FRAMES when set (0 = every distinct frame), else the
+    CLI's CLAUDE_CLI_MAX_FRAMES — one cap for every backend unless told
+    otherwise."""
+    if os.environ.get("OPENROUTER_MAX_FRAMES", "").strip() == "":
+        return _max_frames()
+    return _int_env("OPENROUTER_MAX_FRAMES", 0)
+
+
+def _openrouter_text(content):
+    """message.content is normally a string; tolerate a list of parts."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(c.get("text", "") for c in content
+                       if isinstance(c, dict) and c.get("type") == "text")
+    return ""
+
+
+def _openrouter_reset_in(resp):
+    """Seconds until X-RateLimit-Reset (epoch milliseconds), or None."""
+    raw = (getattr(resp, "headers", None) or {}).get("X-RateLimit-Reset")
+    try:
+        return int(raw) / 1000.0 - time.time()
+    except (TypeError, ValueError):
+        return None
+
+
+def _openrouter_error(body):
+    """The error OpenRouter reports in a 200 body, if any: a top-level
+    `error`, or `choices[0].error` / finish_reason "error"."""
+    if not isinstance(body, dict):
+        return None
+    if isinstance(body.get("error"), dict):
+        return body["error"]
+    choices = body.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        if isinstance(choices[0].get("error"), dict):
+            return choices[0]["error"]
+        if choices[0].get("finish_reason") == "error":
+            return {"code": 502, "message": "generation ended with an error"}
+    return None
+
+
+def _save_rejected_answer(model_name, text):
+    """Keep a rejected (cut-off) answer for diagnosis, under
+    $MEETING_BOT_ROOT/tmp/rejected-answers/. Best-effort: never raises."""
+    try:
+        root = Path(os.environ.get("MEETING_BOT_ROOT")
+                    or Path.home() / ".local/share/meeting-bot")
+        out = root / "tmp" / "rejected-answers"
+        out.mkdir(parents=True, exist_ok=True)
+        name = re.sub(r"[^\w.-]+", "_", model_name)
+        path = out / f"{datetime.now():%Y%m%d_%H%M%S_%f}_{name}.md"
+        path.write_text(text or "")
+        print(f"     rejected answer kept: {path}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 - diagnostics only
+        pass
+
+
+def _openrouter_max_tokens(role):
+    if role == "merge":
+        return 0
+    return max(0, _int_env("OPENROUTER_MAX_TOKENS",
+                           DEFAULT_OPENROUTER_MAX_TOKENS))
+
+
+def build_openrouter_payload(model, user_text, frames, max_tokens=0):
+    """The chat-completions body (OpenAI shape): the text first, then each
+    frame's manifest label and its image as a data: URI, so the number
+    beside the picture is the one the model cites (as in build_inline_input)."""
+    content = [{"type": "text", "text": user_text}]
+    for i, frame in enumerate(frames):
+        data, mime = _read_image_b64(frame.path)
+        content.append({"type": "text",
+                        "text": frame.label(frame.number or (i + 1))})
+        content.append({"type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{data}"}})
+    body = {"model": model,
+            "messages": [{"role": "user", "content": content}]}
+    if max_tokens:
+        body["max_tokens"] = max_tokens
+    return body
+
+
+def summarize_openrouter(frames: List[FrameMeta], transcript: str,
+                         prompt_template: str, role: str = None) -> str:
+    """OpenRouter chat completions on free models: a chain of models
+    (OPENROUTER_MODEL), every key (OPENROUTER_API_KEY_1..3) on a model before
+    the next — the Gemini walk, over plain HTTP. Frames get the same three
+    passes as the other backends. `role` is accepted and ignored."""
+    try:
+        import requests
+    except ImportError as exc:
+        raise BackendUnavailable(f"requests not installed: {exc}") from exc
+
+    ring = KeyRing.from_env("OPENROUTER_API_KEY",
+                            max_slots=OPENROUTER_MAX_KEYS)
+    if not ring:
+        raise BackendUnavailable(missing_keys_message(
+            "OPENROUTER_API_KEY", OPENROUTER_MAX_KEYS,
+            extra="\nCreate one at https://openrouter.ai/settings/keys."))
+    models = _openrouter_models()
+
+    offered, blanks, dupes = drop_uninformative(frames)
+    offered = thin_frames(offered, _openrouter_max_frames())
+    thinned = len(frames) - blanks - dupes - len(offered)
+    llm_frames, resized = _downscale_frames(offered)
+    sorted_frames, user_text = _render(llm_frames, transcript, prompt_template)
+
+    detail = []
+    if blanks or dupes:
+        detail.append(f"{blanks} blank + {dupes} repeated frame(s) dropped")
+    if thinned:
+        detail.append(f"{thinned} more left out (OPENROUTER_MAX_FRAMES / "
+                      f"CLAUDE_CLI_MAX_FRAMES)")
+    if resized:
+        detail.append(f"{resized} cropped/downscaled to {_frame_max_dimension()}px")
+    print(f"     openrouter: {len(sorted_frames)} frame(s) of {len(frames)}"
+          + (", " + ", ".join(detail) if detail else ""), file=sys.stderr)
+
+    timeout = _openrouter_timeout()
+    max_tokens = _openrouter_max_tokens(role)
+    retries_left = max(0, _int_env("OPENROUTER_TRUNCATION_RETRIES",
+                                   DEFAULT_OPENROUTER_TRUNCATION_RETRIES))
+    max_foreign = max(0, _int_env("OPENROUTER_MAX_FOREIGN_RUNS",
+                                  DEFAULT_OPENROUTER_MAX_FOREIGN_RUNS))
+    url = os.environ.get("OPENROUTER_API_URL") or OPENROUTER_API_URL  # test seam
+
+    def _call(key, model_name):
+        body = build_openrouter_payload(model_name, user_text, sorted_frames,
+                                        max_tokens=max_tokens)
+        resp = requests.post(url, json=body, timeout=timeout, headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "X-Title": "meeting-transcriber"})
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        if resp.status_code == 200:
+            err = _openrouter_error(data)
+            if err is None:
+                usage = data.get("usage") or {}
+                if usage:
+                    print(f"     openrouter/{model_name}: "
+                          f"{usage.get('prompt_tokens', '?')} in, "
+                          f"{usage.get('completion_tokens', '?')} out",
+                          file=sys.stderr)
+                if data["choices"][0].get("finish_reason") == "length":
+                    _save_rejected_answer(
+                        model_name, _openrouter_text(
+                            data["choices"][0]["message"].get("content")))
+                    raise OpenRouterTruncated(
+                        f"answer cut off at the model's output limit "
+                        f"({usage.get('completion_tokens', '?')} tokens)")
+                text = _openrouter_text(
+                    data["choices"][0]["message"].get("content"))
+                runs = language.foreign_runs(text, user_text)
+                if len(runs) > max_foreign:
+                    _save_rejected_answer(model_name, text)
+                    shown = ", ".join(dict.fromkeys(runs))
+                    raise OpenRouterOffScript(
+                        f"answer drifts into other scripts ({len(runs)} "
+                        f"runs: {shown[:120]})")
+                # The model that actually answered: a router such as
+                # openrouter/free picks one per request and names it here.
+                answered[0] = data.get("model") or model_name
+                return text
+            status = err.get("code") if isinstance(err.get("code"), int) else 502
+            message = str(err.get("message", err))
+        else:
+            status = resp.status_code
+            err = (data or {}).get("error") if isinstance(data, dict) else None
+            message = str(err.get("message")) if isinstance(err, dict) \
+                else resp.text
+        if status == 429:
+            # The daily cap resets at midnight UTC; the per-minute one within
+            # a minute. Only the second is worth a backoff.
+            reset_in = _openrouter_reset_in(resp)
+            if (reset_in is not None and reset_in > 300) \
+                    or "per-day" in message.lower():
+                raise OpenRouterDailyLimit(f"HTTP 429: {message[:300]}")
+        lower = message.lower()
+        if status == 404 or (status == 400 and "model" in lower and (
+                "not a valid model" in lower or "not found" in lower
+                or "no endpoints" in lower)):
+            raise OpenRouterModelUnavailable(f"HTTP {status}: {message[:300]}")
+        raise OpenRouterHTTPError(status, message, resp)
+
+    last_error = None
+    answered = [None]
+    exhausted = set()   # key slots whose daily allowance is spent
+    for model_name in models:
+        for slot, key in ring.rotate():
+            if slot in exhausted:
+                continue
+            try:
+                while True:
+                    try:
+                        text = with_retries(
+                            _call, key, model_name,
+                            label=f"openrouter/{model_name} "
+                                  f"({ring.label(slot)})")
+                        break
+                    except OpenRouterRejected as exc:
+                        if retries_left <= 0:
+                            raise
+                        retries_left -= 1
+                        print(f"  !! openrouter/{model_name}: {exc} — "
+                              f"trying the same model again", file=sys.stderr)
+            except (OpenRouterModelUnavailable, OpenRouterRejected) as exc:
+                print(f"  !! openrouter/{model_name} unavailable: {exc}",
+                      file=sys.stderr)
+                last_error = exc
+                break
+            except OpenRouterDailyLimit as exc:
+                print(f"  !! openrouter {ring.label(slot)}: free daily limit "
+                      f"reached: {exc}", file=sys.stderr)
+                exhausted.add(slot)
+                last_error = exc
+                continue
+            except Exception as exc:  # noqa: BLE001 - try the next key
+                print(f"  !! openrouter/{model_name} {ring.label(slot)} "
+                      f"failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+                last_error = exc
+                continue
+            if not text.strip():
+                print(f"  !! openrouter/{model_name}: empty answer",
+                      file=sys.stderr)
+                last_error = RuntimeError("empty answer")
+                continue
+            ring.commit(slot)
+            used = answered[0] or model_name
+            _record_used("openrouter", used if used == model_name
+                         else f"{used} (via {model_name})")
+            return text.strip()
+        if len(exhausted) == len(ring):
+            break
+        if model_name != models[-1]:
+            print(f"  !! openrouter/{model_name}: no key succeeded — trying "
+                  f"the next model", file=sys.stderr)
+
+    raise RuntimeError(
+        f"All {len(models)} OpenRouter model(s) x {len(ring)} key(s) failed. "
+        f"Last error: {last_error}")
+
+
 # chain-name -> backend function.
 #
 # `anthropic`, `claude` and `fcc` are kept as aliases of the CLI backend so an
@@ -1524,6 +1969,7 @@ _BACKENDS = {
     "anthropic": summarize_claude_cli,
     "fcc": summarize_claude_cli,   # alias kept for the user's older configs
     "gemini": summarize_gemini,
+    "openrouter": summarize_openrouter,
 }
 
 
@@ -1593,6 +2039,6 @@ def summarize(frames: List[FrameMeta], transcript: str,
     if func is None:
         raise SystemExit(
             f"Unknown SUMMARY_BACKEND: {backend!r} "
-            f"(expected claude-cli, gemini, or fallback)"
+            f"(expected claude-cli, gemini, openrouter, or fallback)"
         )
     return func(frames, transcript, prompt_template, role=role)

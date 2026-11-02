@@ -53,6 +53,8 @@ class HostedMeetingTest(unittest.TestCase):
         self.ended = []
         self.left = []
         self.admit_calls = 0
+        self.in_call = [True]     # is_admitted() per call; last one repeats
+        self.silent_for = None    # the audio watcher: None = unknown
         self._saved = {}
         patches = {
             ("time", "time"): self.clock.time,
@@ -64,6 +66,8 @@ class HostedMeetingTest(unittest.TestCase):
             ("capture", "block_screen_share_dialog"): lambda page: False,
             ("capture", "stop_unwanted_presenting"): lambda page: False,
             ("capture", "kill_requested"): lambda: False,
+            ("capture", "meeting_audio_silent_for"): lambda: self.silent_for,
+            ("capture", "is_admitted"): lambda page: self.in_call.pop(0) if len(self.in_call) > 1 else self.in_call[0],
         }
         for (mod, name), value in patches.items():
             target = capture.time if mod == "time" else capture
@@ -92,6 +96,30 @@ class HostedMeetingTest(unittest.TestCase):
 
     def elapsed_min(self, ts):
         return (ts - 1_000_000.0) / 60
+
+    def test_the_self_view_is_minimised_only_with_company(self):
+        # Alone, the bot's tile is the stage and has no Minimize; trying
+        # then only put a menu in the recording and backed off five minutes.
+        calls = []
+
+        class MeetPage(FakePage):
+            url = "https://meet.google.com/abc-defg-hij"
+
+        saved = (capture.minimize_self_tile, capture.dismiss_notices)
+        capture.minimize_self_tile = lambda page: calls.append(self.clock.now)
+        capture.dismiss_notices = lambda page: []
+        capture._SELF_TILE_NEXT_TRY = 999e12
+        try:
+            self.counts = [1] * 10 + [2] * 10 + [1]
+            capture.wait_until_meeting_ends(MeetPage(), host=True)
+        finally:
+            capture.minimize_self_tile, capture.dismiss_notices = saved
+        self.assertTrue(calls, "never tried once someone was there")
+        first_guest_poll = 1_000_000.0 + 10 * capture.POLL_SECONDS
+        self.assertGreater(calls[0], first_guest_poll - 1,
+                           "tried while the bot was alone")
+        # And the back-off was lifted the moment the guest arrived.
+        self.assertEqual(capture._SELF_TILE_NEXT_TRY, 0.0)
 
     def test_recognises_every_spelling_of_meet_new(self):
         for url in ("meet.new", "https://meet.new", "http://meet.new/", "MEET.NEW"):
@@ -143,6 +171,96 @@ class HostedMeetingTest(unittest.TestCase):
         self.assertEqual(len(self.left), 1)
         self.assertLess(self.elapsed_min(self.left[0]), 6)
         self.assertEqual(self.admit_calls, 0, "a guest never clicks Admit")
+
+    def test_dropping_out_of_the_call_ends_the_recording(self):
+        # Live 2026-09-29: the bot fell back to the pre-join page and the
+        # recorder filmed an empty lobby. Two polls without the in-call
+        # controls end it — with nothing to click, since there is no call.
+        self.counts = [3]
+        # is_admitted is asked on each poll, and once more by leave().
+        self.in_call = [True, True, False, False]
+        capture.wait_until_meeting_ends(FakePage(), host=True)
+        self.assertEqual(self.ended, [], "no Leave/End clicks outside a call")
+        self.assertLess(self.elapsed_min(self.clock.now), 2)
+
+    def test_a_single_missed_reading_is_not_the_end(self):
+        # One poll without the controls (a re-render) and it's back: the call
+        # goes on until the hard cap, which then ends it the normal way.
+        self.counts = [3]
+        self.in_call = [True, False, True]
+        capture.MAX_MEETING_SECONDS = 5 * 60
+        capture.wait_until_meeting_ends(FakePage(), host=True)
+        self.assertEqual(len(self.ended), 1, "ended by the cap, not by one bad poll")
+        self.assertGreaterEqual(self.elapsed_min(self.ended[0]), 5)
+
+    def test_a_talking_one_to_one_is_not_idle(self):
+        # Joining someone's 1:1: two people, audio live — stays until the cap.
+        self.counts = [2]
+        self.silent_for = 0
+        capture.MAX_MEETING_SECONDS = 30 * 60
+        capture.wait_until_meeting_ends(FakePage(), host=False)
+        self.assertEqual(len(self.left), 1)
+        self.assertGreaterEqual(self.elapsed_min(self.left[0]), 30)
+
+    def test_a_silent_one_to_one_is_idle(self):
+        self.counts = [2]
+        self.silent_for = 300
+        capture.wait_until_meeting_ends(FakePage(), host=False)
+        self.assertLess(self.elapsed_min(self.left[0]), 6)
+
+    def test_most_people_left_but_the_lecturer_is_talking(self):
+        # Peak 40, twelve stay for questions: not the end while there's sound.
+        self.counts = [40, 40, 12]
+        self.silent_for = 0
+        capture.MAX_MEETING_SECONDS = 30 * 60
+        capture.wait_until_meeting_ends(FakePage(), host=False)
+        self.assertGreaterEqual(self.elapsed_min(self.left[0]), 30)
+
+    def test_most_people_left_and_it_went_quiet(self):
+        self.counts = [40, 40, 12]
+        self.silent_for = 180
+        capture.wait_until_meeting_ends(FakePage(), host=False)
+        self.assertLess(self.elapsed_min(self.left[0]), 2)
+
+    def test_alone_ends_even_with_sound(self):
+        # Everyone left: the bot's own page may still be making noise.
+        self.counts = [3, 1]
+        self.silent_for = 0
+        capture.wait_until_meeting_ends(FakePage(), host=True)
+        self.assertEqual(len(self.ended), 1)
+        self.assertLess(self.elapsed_min(self.ended[0]), 2)
+
+
+class SelfTileChoiceTest(unittest.TestCase):
+    """Which "More options for …" menu is the bot's own. The first live
+    guest join (2026-09-29) opened the operator's tile menu, because the
+    first in DOM order was taken; the bot's floating tile sits bottom-right."""
+
+    OTHER = {"label": "ตัวเลือกเพิ่มเติมสำหรับ Khattiya", "self": False, "corner": 400}
+    SELF = {"label": "ตัวเลือกเพิ่มเติมสำหรับ Meeting transcriber", "self": False,
+            "corner": 2300}
+    PRES = {"label": "ตัวเลือกเพิ่มเติมสำหรับ การนำเสนอ", "self": False, "corner": 900}
+
+    def test_nearest_the_bottom_right_first(self):
+        order = capture._self_menu_order([self.OTHER, self.PRES, self.SELF])
+        self.assertEqual(order[0], self.SELF["label"])
+        self.assertEqual(len(order), 3)
+
+    def test_the_doms_self_marker_wins(self):
+        marked = dict(self.OTHER, self=True)
+        self.assertEqual(capture._self_menu_order([marked, self.SELF]),
+                         [marked["label"]])
+
+    def test_a_remembered_label_is_the_only_one_tried(self):
+        self.assertEqual(
+            capture._self_menu_order([self.OTHER, self.SELF], self.OTHER["label"]),
+            [self.OTHER["label"]])
+
+    def test_probes_are_bounded(self):
+        many = [{"label": f"More options for P{i}", "corner": i} for i in range(9)]
+        self.assertEqual(len(capture._self_menu_order(many)),
+                         capture._SELF_MENU_MAX_PROBES)
+        self.assertEqual(capture._self_menu_order([]), [])
 
 
 if __name__ == "__main__":

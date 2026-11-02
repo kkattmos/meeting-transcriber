@@ -63,7 +63,7 @@ from pathlib import Path
 
 COMPONENTS = ("record", "fetch_video", "transcribe", "frames", "summarize")
 
-BOT_ROOT = Path(os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot"))
+BOT_ROOT = Path(os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot")))
 QUEUE_DIR = Path(os.environ.get("QUEUE_DIR", str(BOT_ROOT / "queue")))
 
 POLL_SECONDS = float(os.environ.get("QUEUE_POLL_SECONDS", "2"))

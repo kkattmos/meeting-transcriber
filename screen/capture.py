@@ -26,19 +26,24 @@ Usage:
     python3 screen/capture.py "<meeting_url>" ["Display Name"]
     python3 screen/capture.py meet.new ["Display Name"]
 """
+import json
 import subprocess
 import sys
 import os
 import re
 import time
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# The persistent Chrome profile, shared with first_time_login.sh. It lives
-# under MEETING_BOT_ROOT (not a user's $HOME) so it survives reinstalls and is
-# the same profile whichever script opens it.
-_BOT_ROOT = os.environ.get("MEETING_BOT_ROOT", "/opt/meeting-bot")
-PROFILE_DIR = os.environ.get("CHROME_PROFILE_DIR",
-                             os.path.join(_BOT_ROOT, "chrome-profile"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import browser  # noqa: E402  (screen/browser.py: which browser, how launched)
+
+# Playwright's TimeoutError and the Firefox adapter's, as one `except` target.
+PWTimeout = browser.timeout_errors()
+
+# The persistent browser profile, shared with first_time_login.sh. It lives
+# under MEETING_BOT_ROOT so it survives reinstalls and is the same profile
+# whichever script opens it. One per browser (MEETING_BROWSER).
+_BOT_ROOT = os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.local/share/meeting-bot"))
+PROFILE_DIR = browser.profile_dir()
 SCREENSHOT_DIR = os.environ.get("RECORDINGS_DIR",
                                 os.path.join(_BOT_ROOT, "recordings"))
 
@@ -56,6 +61,11 @@ MAX_MEETING_SECONDS = int(os.environ.get("MAX_MEETING_MINUTES", "240")) * 60
 # catches the "test call with just me" case that the mass-exit rule misses
 # (peak is 2, so 30% of peak is 0 — never triggers). Set to 0 to disable.
 IDLE_LEAVE_SECONDS = int(os.environ.get("IDLE_LEAVE_MINUTES", "5")) * 60
+# The softer auto-leave rules (idle with one other person, and "most people
+# have left") only fire once the meeting has also been silent this long —
+# settled with the operator 2026-09-29, so a 1:1 or the end of a lecture with
+# a few students left isn't cut off while someone is still talking.
+AUTO_LEAVE_SILENCE_SECONDS = int(os.environ.get("AUTO_LEAVE_SILENCE_SECONDS", "120"))
 # A meeting the bot created itself: how long to hold it open for the first
 # participant before ending it. Once somebody has joined, the ordinary
 # auto-leave rules take over.
@@ -68,44 +78,12 @@ MEET_LINK_RE = re.compile(r"https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}
 # Sentinels. Per-run when MEETING_BOT_RUN_DIR is set (the pipeline always sets
 # it), so concurrent recordings don't share a kill switch; /tmp otherwise, which
 # keeps a standalone `python3 screen/capture.py <url>` working as before.
-# Chrome's window has to match the Xvfb head exactly or the recording gets
-# black edges; record_screen.sh sets RECORD_GEOMETRY for both.
-WINDOW_SIZE = (os.environ.get("RECORD_GEOMETRY", "1920x1080")
-               .lower().replace("x", ","))
-# The Chrome command line, in one place so screen/browser_smoke.py can launch
-# an identical browser without a live meeting — a flag that breaks recording
-# should break the smoke test too.
-#
-# --kiosk launches Chrome in true fullscreen with no chrome (no tab bar, no
-# address bar, no system UI). The window fills the Xvfb head, so ffmpeg's
-# x11grab captures only the meeting UI - no black edges. --kiosk also disables
-# F11-toggle, which keeps the unattended recording from accidentally leaving
-# fullscreen. --window-size pins the drawable area to the head size; without it
-# some Xvfb/Chrome combinations leave a few px of margin on the right and
-# bottom (Chrome auto-sizes the window slightly smaller than the display in
-# --kiosk mode). The matching Xvfb geometry and ffmpeg -video_size come from
-# RECORD_GEOMETRY in screen/record_screen.sh.
-#
-# --no-sandbox is required because the pipeline runs as root; without it Chrome
-# aborts with "Running as root without --no-sandbox is not supported" before
-# the page ever loads.
-#
-# --disable-features=ScreenCapture is layer 1 of the screen-share defense: it
-# disables the getDisplayMedia API entirely. The bot has no legitimate reason
-# to share its screen; if Chrome ever renames this feature flag, layers 2 and 3
-# (in wait_until_meeting_ends) are the runtime catch-nets.
-CHROME_ARGS = [
-    "--kiosk",
-    f"--window-size={WINDOW_SIZE}",
-    # Without this Chrome places its window at (10,10) even in kiosk mode, and
-    # every recording gets a 10px black band down the left and top edges —
-    # found by verify_e2e.sh --browser-smoke, which measures the captured
-    # frame rather than trusting the window size.
-    "--window-position=0,0",
-    "--no-sandbox",
-    "--use-fake-ui-for-media-stream",
-    "--disable-features=ScreenCapture",
-]
+# The browser window has to match the Xvfb head exactly or the recording gets
+# black edges; record_screen.sh sets RECORD_GEOMETRY for both. The command
+# line lives in screen/browser.py (CHROME_ARGS / FIREFOX_PREFS) and is
+# re-exported here for screen/browser_smoke.py, so a flag that breaks
+# recording breaks the smoke test too.
+CHROME_ARGS = browser.CHROME_ARGS
 
 RUN_DIR = os.environ.get("MEETING_BOT_RUN_DIR", "")
 if RUN_DIR:
@@ -320,6 +298,35 @@ HOST_ADMIT_LABELS = [
 # Several people knocking at once collapse into "View all"; the Admit all
 # button is inside the panel that opens.
 HOST_VIEW_ALL_LABELS = ["View all", "ดูทั้งหมด"]
+# The green chip Meet shows the host at the top right while someone waits.
+# Its label carries the count ("ยอมรับผู้เข้าร่วม 1 คน" — "Admit 1
+# participant", verified live 2026-09-29), so it can only be matched as a
+# substring; clicking it opens the panel with the per-person Admit buttons.
+# Missing this chip is why the first live hosted call left its guest waiting.
+HOST_WAITING_CHIP_LABELS = [
+    "ยอมรับผู้เข้าร่วม", "Admit 1", "Admit 2", "Admit 3", "Admit guest",
+    "Admit people", "people waiting", "someone wants to join",
+]
+# Inside the panel, each knocker gets their own button whose label is the verb
+# PLUS the person's name — "ยอมรับ 03_ด.ช. ขัตติยะ …" (verified live
+# 2026-09-29), so neither an exact nor a substring match on "ยอมรับ" works
+# (the substring also hits "อยู่ระหว่างรอการยอมรับ 1", the waiting-list
+# toggle). Matched by prefix-with-a-space in the page instead; the chip
+# ("ยอมรับผู้เข้าร่วม…", "Admit 1 guest") is excluded by the second pattern.
+_ADMIT_PERSON_JS = r"""() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const isPerson = n => /^(ยอมรับ|Admit) \S/.test(n) && !/^Admit \d/.test(n)
+                        && !/^(Admit all|ยอมรับทั้งหมด)/.test(n);
+  const btn = Array.from(document.querySelectorAll('button,[role=button]'))
+    .filter(b => b.getBoundingClientRect().width > 0)
+    .find(b => isPerson(norm(b.getAttribute('aria-label') || b.innerText)));
+  if (!btn) return null;
+  btn.click();
+  return norm(btn.getAttribute('aria-label') || btn.innerText);
+}"""
+
+# Notices that sit over the call and should just be acknowledged.
+HOST_DISMISS_LABELS = ["Got it", "Dismiss", "รับทราบ"]
 HOST_END_FOR_ALL_LABELS = [
     "End the call for everyone", "End call for everyone", "End call for all",
     "สิ้นสุดการโทรสำหรับทุกคน", "วางสายสำหรับทุกคน", "ปิดการโทรสำหรับทุกคน",
@@ -366,7 +373,10 @@ def host_create_google_meet(page):
     accounts.google.com instead, which is the one failure worth naming.
     """
     print("Creating a new Google Meet (meet.new)...")
-    page.goto("https://meet.new", wait_until="domcontentloaded")
+    page.goto(browser.with_authuser("https://meet.google.com/new",
+                                    browser.expected_account())
+              if browser.expected_account() else "https://meet.new",
+              wait_until="domcontentloaded")
     try:
         page.wait_for_url(lambda u: bool(MEET_LINK_RE.search(u)), timeout=45000)
     except PWTimeout:
@@ -388,6 +398,31 @@ def host_dismiss_ready_dialog(page):
     except Exception:
         pass
     click_first_match(page, ["Close", "ปิด"], timeout=1500, exact=True)
+    # "Use Meet safely" and similar notices ("รับทราบ" = Got it).
+    click_first_match(page, HOST_DISMISS_LABELS, timeout=1500, exact=True)
+
+
+_ADMIT_DIAGNOSED = False
+
+
+def _log_admit_candidates(page):
+    """Once per call: name every visible button that looks like an admit
+    control, and save a screenshot — the data needed when Meet renames one."""
+    global _ADMIT_DIAGNOSED
+    if _ADMIT_DIAGNOSED:
+        return
+    _ADMIT_DIAGNOSED = True
+    try:
+        names = page.evaluate(
+            "() => Array.from(document.querySelectorAll('button,[role=button]'))"
+            ".filter(b => b.getBoundingClientRect().width > 0)"
+            ".map(b => (b.getAttribute('aria-label') || b.innerText || '').replace(/\\s+/g, ' ').trim())"
+            ".filter(n => /admit|ยอมรับ|อนุญาต|รับเข้า|wait|รอ/i.test(n))") or []
+        print(f"  Admit diagnostics: candidate buttons {names!r}")
+        if RUN_DIR:
+            page.screenshot(path=os.path.join(RUN_DIR, "host_admit.png"))
+    except Exception as e:
+        print(f"  Admit diagnostics failed ({e})")
 
 
 def host_admit_waiting(page):
@@ -403,16 +438,44 @@ def host_admit_waiting(page):
                 continue
         return None
 
-    clicked = click_visible(HOST_ADMIT_LABELS)
-    if not clicked and click_visible(HOST_VIEW_ALL_LABELS):
-        time.sleep(1)
-        clicked = click_visible(HOST_ADMIT_LABELS)
+    def click_containing(labels):
+        for label in labels:
+            try:
+                btn = page.get_by_role("button", name=label, exact=False).first
+                if btn.is_visible():
+                    btn.click()
+                    return label
+            except Exception:
+                continue
+        return None
+
+    def click_person():
+        try:
+            return page.evaluate(_ADMIT_PERSON_JS)
+        except Exception:
+            return None
+
+    # The panel may already be open from the previous poll — clicking the chip
+    # again would close it — so try the buttons inside it first.
+    clicked = click_visible(HOST_ADMIT_LABELS) or click_person()
+    if not clicked:
+        opener = (click_visible(HOST_VIEW_ALL_LABELS)
+                  or click_containing(HOST_WAITING_CHIP_LABELS))
+        if opener:
+            print(f"Someone is waiting — opened the admit panel ('{opener}').")
+            time.sleep(1.5)
+            clicked = click_visible(HOST_ADMIT_LABELS) or click_person()
+            if not clicked:
+                _log_admit_candidates(page)
     if not clicked:
         return False
     print(f"Admitted waiting participant(s) ('{clicked}').")
     # "Admit all" asks for confirmation with a second "Admit all".
     time.sleep(1)
     click_visible(HOST_ADMIT_LABELS)
+    # Opening the chip left the People panel over a third of the recording.
+    time.sleep(1)
+    dismiss_notices(page)
     return True
 
 
@@ -598,61 +661,300 @@ def leave_meeting(page):
     )
 
 
+def click_now(page, labels, exact=True):
+    """Click the first visible button among labels, without waiting.
+
+    For things polled every few seconds (notices, the side panel): the
+    waiting variant, click_first_match, would spend its timeout on every
+    label that isn't there, every poll.
+    """
+    for label in labels:
+        try:
+            btn = page.get_by_role("button", name=label, exact=exact).first
+            if btn.is_visible():
+                btn.click()
+                return label
+        except Exception:
+            continue
+    return None
+
+
+# Pop-ups and cards that sit over the meeting and are just acknowledged or
+# closed: "Got it" on "Use Meet safely", the "Your meeting's ready" card's
+# close, the People panel's close (opened by admitting someone). Exact labels
+# only — "ปิด" (close) is also the start of "ปิดกล้อง"/"ปิดไมโครโฟน".
+NOTICE_LABELS = ["รับทราบ", "Got it", "Dismiss", "ปิด", "Close"]
+
+
+def dismiss_notices(page):
+    """Close whatever is covering the call. Cheap enough to run every poll."""
+    closed = []
+    for _ in range(3):
+        label = click_now(page, NOTICE_LABELS)
+        if not label:
+            break
+        closed.append(label)
+        time.sleep(0.5)
+    if closed:
+        print(f"Closed {', '.join(repr(c) for c in closed)} over the call.")
+    return closed
+
+
+# The recording's layout: Spotlight (one big tile — the presentation, or the
+# person speaking) with "hide tiles without video" on, which takes the bot's
+# own tile (it has no camera) out of the picture. Found live 2026-09-29 under
+# More options → "ปรับมุมมอง" (Adjust view); Meet remembers the choice for the
+# account's later meetings, so this is idempotent.
+_LAYOUT_JS = r"""() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const dlg = Array.from(document.querySelectorAll('[role=dialog]')).filter(vis)
+    .find(d => /ปรับมุมมอง|เปลี่ยนเลย์เอาต์|Adjust view|Change layout/.test(d.innerText));
+  if (!dlg) return 'no-dialog';
+  const out = [];
+  const label = Array.from(dlg.querySelectorAll('label')).find(l => /^(สปอตไลท์|Spotlight)$/.test(norm(l.innerText)));
+  if (label) { label.click(); out.push('spotlight'); } else out.push('no-spotlight');
+  const hide = Array.from(dlg.querySelectorAll('label,span,div')).find(l =>
+      /^(ซ่อนหน้าต่างโดยไม่มีวิดีโอ|ซ่อนไทล์ที่ไม่มีวิดีโอ|Hide tiles without video|Hide tiles with no video)$/.test(norm(l.innerText)));
+  let sw = null;
+  if (hide) {
+    const forId = hide.getAttribute('for');
+    sw = forId ? document.getElementById(forId) : null;
+    if (!sw) { let p = hide.parentElement; for (let i = 0; i < 4 && p && !sw; i++, p = p.parentElement) sw = p.querySelector('[role=switch]'); }
+  }
+  if (sw) {
+    if (sw.getAttribute('aria-checked') !== 'true') { sw.click(); out.push('hide-no-video:on'); }
+    else out.push('hide-no-video:already');
+  } else out.push('no-hide-switch');
+  return out.join(',');
+}"""
+
+
+# The bot's own floating tile, shown whenever someone else is in the call —
+# "hide tiles without video" does not cover the self view. Its menu
+# ("ตัวเลือกเพิ่มเติมสำหรับ <bot name>") offers "ย่อเล็กสุด" (Minimize),
+# found live 2026-09-29; the tile itself can't be removed in this layout.
+#
+# Which "More options for …" button is the bot's? Every tile has one, and the
+# first live GUEST join (2026-09-29, with the operator presenting) opened
+# someone else's — "Self tile: no-minimize" — because the code took the first
+# in DOM order. When hosting, the bot is alone when it looks, so there was
+# only one. Now: a button inside Meet's self tile ([data-self-name]) if the
+# DOM marks it; else the label that worked before in this call; else the
+# candidates nearest the bottom-right corner first (where the floating self
+# view sits), opening each menu until one offers Minimize — and that label is
+# remembered, so later tries open only the bot's own menu.
+_SELF_MENU_CANDIDATES_JS = r"""() => {
+  return Array.from(document.querySelectorAll('button'))
+    .filter(b => /^(ตัวเลือกเพิ่มเติมสำหรับ|More options for) /.test(b.getAttribute('aria-label') || ''))
+    .map(b => { const r = b.getBoundingClientRect();
+      return {label: b.getAttribute('aria-label'), self: !!b.closest('[data-self-name]'),
+              corner: r.right + r.bottom}; });
+}"""
+# The item as the operator saw it (screenshot, 2026-09-29): an icon, then
+# "ย่อเล็กสุด", among "แสดงในเลย์เอาต์แบบเรียงชิดกัน", "ปักหมุดไว้ในหน้าจอ" and
+# "แสดงวิดีโอแบบเต็มของฉันให้ผู้อื่นเห็น". The icon is a ligature whose name
+# ("close_fullscreen") is part of innerText, so any leading icon word is
+# dropped, and the aria-label and the text are each tried on their own.
+_CLICK_MINIMIZE_JS = r"""() => {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim().replace(/^[a-z_]+ /, '');
+  const isMin = s => /^(ย่อเล็กสุด|Minimi[sz]e)$/.test(clean(s));
+  const item = Array.from(document.querySelectorAll('[role=menuitem]')).find(m =>
+      isMin(m.getAttribute('aria-label')) || isMin(m.innerText));
+  if (!item) return 'no-minimize';
+  item.click();
+  return 'minimized';
+}"""
+_MENU_ITEMS_JS = r"""() => Array.from(document.querySelectorAll('[role=menuitem]'))
+    .filter(m => m.getBoundingClientRect().width > 0)
+    .map(m => (m.getAttribute('aria-label') || m.innerText || '').replace(/\s+/g, ' ').trim())"""
+_SELF_TILE_NEXT_TRY = 0.0
+_SELF_MENU_LABEL = None
+_SELF_TILE_DIAGNOSED = False
+# Opening someone else's menu shows in the recording for a second; bound it.
+_SELF_MENU_MAX_PROBES = 4
+
+
+def self_tile_retry_now():
+    """Let the next poll try to minimise the self view straight away."""
+    global _SELF_TILE_NEXT_TRY
+    _SELF_TILE_NEXT_TRY = 0.0
+
+
+def _click_button_with_label_js(label):
+    return ("() => { const b = Array.from(document.querySelectorAll('button'))"
+            f".find(b => b.getAttribute('aria-label') === {json.dumps(label)});"
+            " if (b) b.click(); return !!b; }")
+
+
+def _self_menu_order(candidates, remembered=None):
+    """The labels to try, best first: the DOM's self tile, the label that
+    worked before, then nearest the bottom-right corner."""
+    if not candidates:
+        return []
+    marked = [c["label"] for c in candidates if c.get("self")]
+    if marked:
+        return marked[:1]
+    labels = [c["label"] for c in candidates]
+    if remembered in labels:
+        return [remembered]
+    ordered = sorted(candidates, key=lambda c: -(c.get("corner") or 0))
+    return [c["label"] for c in ordered][:_SELF_MENU_MAX_PROBES]
+
+
+def minimize_self_tile(page):
+    """Minimise the bot's floating tile whenever it is showing.
+
+    Not once per call: Meet restores the full tile when a presentation starts
+    (seen live 2026-09-29 — minimised while alone, back at full size once the
+    operator presented). While the tile is full-size its "more options"
+    button is present; when minimised it isn't, so this is a no-op then.
+    At most one attempt a minute, so the menu never flickers in the recording.
+    """
+    global _SELF_TILE_NEXT_TRY, _SELF_MENU_LABEL, _SELF_TILE_DIAGNOSED
+    now = time.time()
+    if now < _SELF_TILE_NEXT_TRY:
+        return
+    _SELF_TILE_NEXT_TRY = now + 60
+    try:
+        candidates = page.evaluate(_SELF_MENU_CANDIDATES_JS) or []
+        order = _self_menu_order(candidates, _SELF_MENU_LABEL)
+        if not order:
+            return
+        if _SELF_MENU_LABEL and _SELF_MENU_LABEL not in order:
+            # The remembered tile is gone: already minimised. Nothing to do,
+            # and no reason to open anyone else's menu.
+            return
+        result, seen_items = "no-minimize", []
+        for label in order:
+            if not page.evaluate(_click_button_with_label_js(label)):
+                continue
+            time.sleep(1)
+            result = page.evaluate(_CLICK_MINIMIZE_JS)
+            if result == "minimized":
+                _SELF_MENU_LABEL = label
+                break
+            seen_items.append((label, page.evaluate(_MENU_ITEMS_JS) or []))
+            page.keyboard.press("Escape")
+            time.sleep(0.5)
+        if result != "minimized":
+            # Look again in five minutes rather than every minute.
+            _SELF_TILE_NEXT_TRY = now + 300
+            if not _SELF_TILE_DIAGNOSED:
+                _SELF_TILE_DIAGNOSED = True
+                print(f"  Self tile diagnostics: menus opened {seen_items!r}")
+                if RUN_DIR:
+                    page.screenshot(path=os.path.join(RUN_DIR, "self_tile.png"))
+        print(f"  Self tile: {result}")
+    except Exception as e:
+        print(f"  WARNING: could not minimise the bot's own tile ({e})")
+
+
+# The toolbar's "More options" — not a tile's. Several buttons can carry the
+# exact label (a presentation's tile has one too), and the first live guest
+# join clicked a tile's, whose menu has no "Adjust view". The toolbar sits at
+# the bottom of the window, so take the lowest.
+_OPEN_TOOLBAR_MORE_JS = r"""() => {
+  const b = Array.from(document.querySelectorAll('button'))
+    .filter(b => /^(ตัวเลือกเพิ่มเติม|More options)$/.test((b.getAttribute('aria-label') || '').trim()))
+    .filter(b => b.getBoundingClientRect().width > 0)
+    .sort((a, c) => c.getBoundingClientRect().top - a.getBoundingClientRect().top)[0];
+  if (!b) return false;
+  b.click();
+  return true;
+}"""
+_OPEN_ADJUST_VIEW_JS = r"""() => { const m = Array.from(document.querySelectorAll('[role=menuitem]'))
+    .find(e => /ปรับมุมมอง|เปลี่ยนเลย์เอาต์|Adjust view|Change layout/.test(e.innerText));
+  if (m) m.click(); return !!m; }"""
+
+
+def set_recording_layout(page):
+    """Spotlight + hide tiles without video. Best-effort; never fails a call."""
+    try:
+        opened_menu = page.evaluate(_OPEN_TOOLBAR_MORE_JS)
+        if not opened_menu and not click_now(page, ["ตัวเลือกเพิ่มเติม", "More options"]):
+            print("  Layout: no 'More options' button - left as is.")
+            return
+        time.sleep(1)
+        if not page.evaluate(_OPEN_ADJUST_VIEW_JS):
+            items = page.evaluate(_MENU_ITEMS_JS) or []
+            page.keyboard.press("Escape")
+            print(f"  Layout: no 'Adjust view' menu item - left as is. "
+                  f"Menu offered: {items!r}")
+            if RUN_DIR:
+                page.screenshot(path=os.path.join(RUN_DIR, "layout_menu.png"))
+            return
+        time.sleep(1.5)
+        result = page.evaluate(_LAYOUT_JS)
+        print(f"  Layout: {result}")
+        time.sleep(0.5)
+        # The dialog's close is "Close" / "ปิดกล่องโต้ตอบ"; Escape as backup.
+        if not click_now(page, ["Close", "ปิดกล่องโต้ตอบ", "ปิด"]):
+            page.keyboard.press("Escape")
+    except Exception as e:
+        print(f"  WARNING: could not set the recording layout ({e})")
+
+
+def _any_visible(page, labels, exact=False):
+    """The first label whose button is visible — WITHOUT clicking it."""
+    for label in labels:
+        try:
+            if page.get_by_role("button", name=label, exact=exact).first.is_visible():
+                return label
+        except Exception:
+            continue
+    return None
+
+
 def mute_av(page, platform):
-    """Turn off camera and microphone so other participants can't see/hear the bot.
+    """Make sure the bot's camera and microphone are off.
 
-    Strategy:
-      1) Try keyboard shortcuts (Meet: Ctrl+E / Ctrl+D, Zoom: Alt+V / Alt+A).
-         The user explicitly suggested these as a fast path.
-      2) Fall back to clicking aria-label buttons: "Turn off camera" /
-         "Mute microphone" (also accept the inverse "Turn on camera" /
-         "Unmute" — if those are showing, the device is already off).
+    The browser blocks both devices (screen/browser.py), so normally there is
+    nothing to turn off and Meet shows "microphone/camera has a problem" —
+    that is the expected state and nothing is clicked. Only a device that is
+    actually ON (its "turn off" button is showing) gets clicked.
 
-    Best-effort: on any failure we log a warning and continue. Failing the
-    recording because the UI heuristic missed would block real meetings; the
-    bot's screen capture is the real product here.
+    Two earlier behaviours are gone on purpose, both seen live 2026-09-29:
+      * The "already off?" check CLICKED the label it found — "เปิดไมโครโฟน"
+        (turn mic ON) — so the check itself unmuted the bot.
+      * Blind Ctrl+E / Ctrl+D toggles: with a blocked device they open Meet's
+        device-problem dialog, and on a live device they flip whatever state
+        it was in.
+
+    Best-effort: a miss is a warning, never a failed recording.
     """
     if platform == "google_meet":
-        shortcuts = [("camera", "Control+e"), ("microphone", "Control+d")]
-        # English + Thai button labels.
-        # NOTE: Meet's already-off buttons are "Turn on camera" / "Unmute" —
-        # if we see those, the device is already off (we leave it alone).
-        camera_off = ["Turn off camera", "ปิดกล้อง"]
-        mic_off = ["Mute microphone", "ปิดไมโครโฟน"]
-        camera_already_off = ["Turn on camera", "เปิดกล้อง", "Camera is off"]
-        mic_already_off = ["Unmute", "เปิดไมโครโฟน", "Microphone is off"]
+        blocked = {"camera": ["กล้องมีปัญหา", "camera problem", "Camera is blocked",
+                              "Allow camera"],
+                   "microphone": ["ไมโครโฟนมีปัญหา", "microphone problem",
+                                  "Microphone is blocked", "Allow microphone"]}
+        on = {"camera": ["Turn off camera", "ปิดกล้อง"],
+              "microphone": ["Turn off microphone", "Mute microphone", "ปิดไมโครโฟน"]}
+        off = {"camera": ["Turn on camera", "เปิดกล้อง", "Camera is off"],
+               "microphone": ["Turn on microphone", "Unmute", "เปิดไมโครโฟน",
+                              "Microphone is off"]}
     elif platform == "zoom":
-        shortcuts = [("camera", "Alt+v"), ("microphone", "Alt+a")]
-        camera_off = ["Stop video", "Mute video"]
-        mic_off = ["Mute", "Mute microphone"]
-        camera_already_off = ["Start video"]
-        mic_already_off = ["Unmute"]
+        blocked = {"camera": [], "microphone": []}
+        on = {"camera": ["Stop video", "Mute video"], "microphone": ["Mute", "Mute microphone"]}
+        off = {"camera": ["Start video"], "microphone": ["Unmute"]}
     else:
         print(f"WARNING: unknown platform {platform!r} - skipping mute.")
         return
 
-    print(f"Muting camera + mic on {platform}...")
-    for kind, shortcut in shortcuts:
-        try:
-            page.keyboard.press(shortcut)
-            print(f"  Tried shortcut {shortcut} for {kind}.")
-        except Exception as e:
-            print(f"  Shortcut {shortcut} for {kind} failed: {e}")
-
-    # Brief settle, then verify + fall back to clicking aria-labels.
-    time.sleep(1)
-    for kind, off_labels, already_off_labels in [
-        ("camera", camera_off, camera_already_off),
-        ("microphone", mic_off, mic_already_off),
-    ]:
-        # If the already-off label is visible, we're done for this device.
-        if click_first_match(page, already_off_labels, timeout=800):
-            print(f"  {kind} already off (via already-off label).")
+    print(f"Checking camera + mic on {platform}...")
+    for kind in ("camera", "microphone"):
+        label = _any_visible(page, blocked[kind])
+        if label:
+            print(f"  {kind}: blocked by the browser ('{label}') - nothing to turn off.")
             continue
-        if click_first_match(page, off_labels, timeout=1500):
-            print(f"  Clicked {kind} off (via aria-label).")
+        label = _any_visible(page, off[kind])
+        if label:
+            print(f"  {kind}: already off ('{label}').")
             continue
-        print(f"  WARNING: could not confirm {kind} is off - check the recording.")
+        if click_first_match(page, on[kind], timeout=1500):
+            print(f"  {kind}: was ON - turned it off.")
+            continue
+        print(f"  WARNING: could not tell whether the {kind} is off - check the recording.")
 
 
 def block_screen_share_dialog(page):
@@ -730,6 +1032,28 @@ def _sleep_hosting(page, seconds):
         time.sleep(min(HOST_ADMIT_POLL_SECONDS, max(0.0, deadline - time.time())))
 
 
+def meeting_audio_silent_for():
+    """Seconds the meeting audio has been silent, from record_screen.sh's
+    audio watcher (runs/<id>/audio_level: "<epoch> <peak dB> <silent s>").
+    None when unknown — no file, or a stale one — and then the audio gate is
+    open, i.e. the rules behave as they did before audio was measured."""
+    if not RUN_DIR:
+        return None
+    try:
+        with open(os.path.join(RUN_DIR, "audio_level")) as fh:
+            at, _peak, silent = fh.read().split()[:3]
+        if time.time() - int(at) > 60:
+            return None
+        return int(silent)
+    except (OSError, ValueError):
+        return None
+
+
+def quiet_enough():
+    silent = meeting_audio_silent_for()
+    return silent is None or silent >= AUTO_LEAVE_SILENCE_SECONDS
+
+
 def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
     """Stay in the call until it is over.
 
@@ -740,7 +1064,17 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
     everyone instead of just leaving it.
     """
     print("In meeting. Monitoring participant count and end state...")
-    leave = host_end_call if host else leave_meeting
+    _leave = host_end_call if host else leave_meeting
+
+    def leave(page):
+        # Out of the call already (the lobby page, "you left the meeting"):
+        # there is nothing to click, and hunting for Leave buttons that don't
+        # exist took longer than kill_meeting.sh's grace period (2026-09-29).
+        if is_admitted(page):
+            _leave(page)
+        else:
+            print("Not in the call any more - nothing to leave.")
+    out_of_call = 0
     peak_count = None
     low_streak = 0
     idle_since_ts = None    # first poll at which count was in (1, 2)
@@ -748,8 +1082,17 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
     someone_joined = False  # host mode: has anyone but the bot been in?
     count_ever_read = False
     warned_unreadable = False
+    # The count at the previous poll. While the bot is alone there is no
+    # floating self view to minimise — its own tile IS the stage, and that
+    # menu has no Minimize — so the attempt waits for company. Mostly a
+    # hosted call's first minutes: trying then cost a failed menu in the
+    # recording and a five-minute back-off, which left the first guest
+    # looking at the bot's full-size tile.
+    last_count = None
+    polls = 0
 
     while True:
+        polls += 1
         try:
             if host:
                 _sleep_hosting(page, poll_seconds)
@@ -787,12 +1130,46 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
                     print(f"Clean leave failed ({e}) - exiting anyway.")
                 return
 
+            # Dropped out of the call without the page saying "ended": seen
+            # live 2026-09-29, the bot back on the pre-join page ("พร้อมจะ
+            # เข้าร่วมไหม") while the recorder kept filming an empty lobby for
+            # what would have been hours. Two polls in a row without the
+            # in-call controls is the end of this recording.
+            if is_admitted(page):
+                out_of_call = 0
+            else:
+                out_of_call += 1
+                if out_of_call >= 2:
+                    print("No longer in the call (its controls are gone) - "
+                          "ending the recording.")
+                    try:
+                        page.screenshot(path=os.path.join(SCREENSHOT_DIR, "left_call.png"))
+                    except Exception:
+                        pass
+                    return
+
+            # Anything Meet has put over the call since the last poll (a
+            # notice, the People panel) comes off the recording.
+            if "meet.google.com" in (getattr(page, "url", "") or ""):
+                dismiss_notices(page)
+                # An unreadable count (Meet renamed the chip) must not stop
+                # it for good: after a few polls it tries regardless.
+                if (last_count is not None and last_count >= 2) or \
+                        (last_count is None and polls > 3):
+                    minimize_self_tile(page)
+
             # Screen-share defenses (Layers 2 and 3). Layer 1 is the Chrome
             # flag set at launch; these two are the runtime catch-nets.
             block_screen_share_dialog(page)
             stop_unwanted_presenting(page)
 
             count = get_participant_count(page)
+            if count is not None:
+                if count >= 2 and (last_count is not None and last_count < 2):
+                    # Someone just arrived and the floating self view with
+                    # them: minimise it at the next poll, not after a back-off.
+                    self_tile_retry_now()
+                last_count = count
             if host:
                 if count is not None:
                     count_ever_read = True
@@ -828,7 +1205,8 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
                 # Hosting, a 1:1 with the bot is a meeting — only the bot alone
                 # is idle.
                 idle_counts = (1,) if host else (1, 2)
-                if IDLE_LEAVE_SECONDS > 0 and count in idle_counts:
+                # Idle needs silence too: two people talking is a meeting.
+                if IDLE_LEAVE_SECONDS > 0 and count in idle_counts and quiet_enough():
                     if idle_since_ts is None:
                         idle_since_ts = time.time()
                     elif time.time() - idle_since_ts >= IDLE_LEAVE_SECONDS:
@@ -842,6 +1220,10 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
                 else:
                     idle_since_ts = None
 
+                # Alone is alone. "Most people left" waits for silence: the
+                # lecturer may still be talking to the few who stayed.
+                if is_mass_exodus and not is_alone and not quiet_enough():
+                    is_mass_exodus = False
                 if is_alone or is_mass_exodus:
                     low_streak += 1
                     print(f"Low participant count ({count}, peak {peak_count}) - streak {low_streak}")
@@ -861,7 +1243,48 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
             return
 
 
+class _PageCloser:
+    """browser.open_page() owns the browser; `context.close()` is a no-op."""
+
+    def close(self):
+        pass
+
+
+def ensure_bot_account(page, expected):
+    """Refuse to join a Google Meet from any account but BOT_GOOGLE_ACCOUNT.
+
+    Unset: nothing is checked (a warning says so). Set: the profile must be
+    signed in and the account must be among those it holds; the Meet URL then
+    carries authuser=<account>, so Meet picks it even beside another one.
+    An unreadable answer (Google changed the endpoint) is a warning, not a
+    refusal — the authuser parameter still steers Meet to the right account.
+    """
+    accounts = browser.read_signed_in_accounts(page) if expected else None
+    verdict, message = browser.account_verdict(accounts, expected)
+    if verdict in ("ok", "unchecked"):
+        print(("Bot account: " if verdict == "ok" else "WARNING: bot account: ")
+              + message)
+        return True
+    print(f"Cannot join: {message}")
+    try:
+        page.screenshot(path=os.path.join(SCREENSHOT_DIR, "wrong_account.png"))
+    except Exception:
+        pass
+    return False
+
+
+def _exit_on_term(signum, frame):
+    # kill_meeting.sh / record_screen.sh stop this process with SIGTERM.
+    # Unhandled, SIGTERM ends Python on the spot: browser.open_page()'s
+    # cleanup never runs and geckodriver + Firefox are orphaned, still holding
+    # the profile (two were found on 2026-09-29, and the next recording
+    # couldn't start). As SystemExit, the `with` blocks unwind and quit them.
+    raise SystemExit(128 + signum)
+
+
 def main():
+    import signal
+    signal.signal(signal.SIGTERM, _exit_on_term)
     if len(sys.argv) < 2:
         print("Usage: capture.py <meeting_url> [display_name]")
         sys.exit(1)
@@ -876,36 +1299,17 @@ def main():
     if os.path.exists(KILL_SENTINEL):
         os.remove(KILL_SENTINEL)
 
-    # Chrome's SingletonLock encodes the hostname and pid of whoever last held
-    # the profile. A run killed before its cleanup ran (SIGKILL, reboot,
-    # Ctrl+C racing the trap) leaves one behind, and the next Chrome refuses to
-    # launch at all — "the profile appears to be in use by another computer".
-    # Any lock still present here is stale by definition: this process is about
-    # to be the only user of the profile.
-    for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-        lock_path = os.path.join(PROFILE_DIR, lock_name)
-        if os.path.exists(lock_path) or os.path.islink(lock_path):
-            os.remove(lock_path)
-
-    with sync_playwright() as p:
-        # channel="chrome" forces real Google Chrome (installed by setup.sh)
-        # rather than Playwright's bundled unbranded Chromium. Google blocks
-        # sign-in on the unbranded build ("This browser or app may not be
-        # secure"), and Meet itself is more reliable on the real browser.
-        context = p.chromium.launch_persistent_context(
-            PROFILE_DIR,
-            headless=False,
-            channel="chrome",
-            # --no-sandbox is required because record_screen.sh runs
-            # the whole pipeline as root (sudo -H, matching setup.sh). Without
-            # it, Chrome aborts with "Running as root without --no-sandbox is
-            # not supported" before the page ever loads.
-            args=CHROME_ARGS,
-            permissions=["camera", "microphone"],
-            no_viewport=True,
-            locale="th-TH",  # renders Thai participant names/chat correctly
-        )
-        page = context.new_page()
+    # The browser's own profile lock is cleared by browser.open_page(): a run
+    # killed before its cleanup leaves one behind, and the next launch then
+    # refuses the profile as "in use".
+    with browser.open_page(headless=False) as page:
+        context = _PageCloser()
+        expected = browser.expected_account()
+        if is_new_meet(url) or "meet.google.com" in url:
+            if not ensure_bot_account(page, expected):
+                return
+            if not is_new_meet(url):
+                url = browser.with_authuser(url, expected)
 
         host = is_new_meet(url)
         if host:
@@ -960,8 +1364,13 @@ def main():
             mute_av(page, platform)
         except Exception as e:
             print(f"WARNING: mute_av raised {e} - continuing anyway.")
-        if host:
-            host_dismiss_ready_dialog(page)
+        if platform == "google_meet":
+            # A clean picture for the recording: close the cards Meet opens
+            # on arrival, then Spotlight with tiles-without-video hidden
+            # (which removes the bot's own tile), then close anything left.
+            dismiss_notices(page)
+            set_recording_layout(page)
+            dismiss_notices(page)
 
         # Signal the orchestrator (record_screen.sh) that it's safe to start
         # recording now - we're actually in the call, not a lobby.

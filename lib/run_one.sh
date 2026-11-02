@@ -79,7 +79,7 @@ RUNSTATE="$SCRIPT_DIR/runstate.py"
 EXIT_PAUSED=75
 SLOTQUEUE="$SCRIPT_DIR/slotqueue.py"
 
-PYTHON_BIN="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
+PYTHON_BIN="${MEETING_BOT_VENV:-$LOADER_DIR/.venv}/bin/python3"
 [ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"
 
 RUN_DIR=""
@@ -130,6 +130,25 @@ while IFS= read -r _spec; do
   [ -n "$_spec" ] && RESOURCE_SPECS+=("$_spec")
 done < <(rs get --run-dir "$RUN_DIR" --key resources 2>/dev/null || true)
 [ -n "$DISPLAY_NAME" ] || DISPLAY_NAME="Meeting Bot"
+# The summary's own settings (pipeline.sh --summary-language / --pdf-font /
+# --instructions, or the web UI). Unset means .env's defaults apply; set, they
+# are exported to summarize.py as the variables it already reads, so a resume
+# writes the same language in the same face.
+SUMMARY_LANG_CFG="$(cfg summary_language)"
+PDF_FONT_CFG="$(cfg pdf_font)"
+INSTRUCTIONS="$(cfg instructions)"
+[ -n "$SUMMARY_LANG_CFG" ] && export SUMMARY_LANGUAGE="$SUMMARY_LANG_CFG"
+[ -n "$PDF_FONT_CFG" ] && export PDF_FONT="$PDF_FONT_CFG"
+# pipeline.sh --summary-source / --record-media (or the web UI), fixed in
+# state.json. A run from before they existed has neither: video + frames.
+RECORD_MEDIA_CFG="$(cfg record_media)"
+[ -n "$RECORD_MEDIA_CFG" ] || RECORD_MEDIA_CFG=video
+# Voice only: no frames stage, no frames offered to the model, and on the
+# YouTube path no download at all (it exists only to cut frames from). An
+# audio-only recording is voice only whatever was stored: it has no picture.
+VOICE_ONLY=0
+[ "$(cfg summary_source)" = "voice" ] && VOICE_ONLY=1
+[ "$INPUT_TYPE" = "meeting" ] && [ "$RECORD_MEDIA_CFG" = "audio" ] && VOICE_ONLY=1
 
 # What the summary document cites as its source. For every other input type
 # that is the input itself; a Kaltura input may be a 900-character <iframe>
@@ -141,6 +160,10 @@ if [ "$INPUT_TYPE" = "kaltura" ]; then
              | sed -nE 's/.*"url": "([^"]*)".*/\1/p')"
   [ -n "$_canon" ] && SOURCE_URL="$_canon"
 fi
+# pipeline.sh --source-url: a local recording of a call made elsewhere (the
+# Discord bot's mix) cites that call, not a path on this disk.
+_source_url_cfg="$(cfg source_url)"
+[ -n "$_source_url_cfg" ] && SOURCE_URL="$_source_url_cfg"
 [ -n "$LANGUAGE" ] || LANGUAGE="${ASSEMBLYAI_LANGUAGE:-th}"
 
 # --- Single-writer lock ------------------------------------------------------
@@ -171,6 +194,9 @@ trap 'rm -rf "$LOCK_DIR"' EXIT
 # Clear a kill sentinel left behind by a previous run, or capture.py would
 # leave the meeting the moment it joins.
 rm -f "$RUN_DIR/kill"
+# Being run again is the resume a stop waits for (kill_meeting.sh marks a run
+# it terminates `stopped`, and --resume-all leaves such a run alone).
+rs unstop --run-dir "$RUN_DIR" 2>/dev/null || true
 
 if [ "$FORCE" -eq 1 ]; then
   echo "==> --force: discarding previous stage results for $RUN_ID"
@@ -183,7 +209,9 @@ fi
 # The five directories are configured independently in .env — none of them is
 # assumed to be a subdirectory of another.
 paths_require || exit 2
+# The name says what is in it: an audio-only recording is an .m4a.
 MP4_FILE="${RECORDINGS_DIR}/${RUN_ID}.mp4"
+[ "$RECORD_MEDIA_CFG" = "audio" ] && MP4_FILE="${RECORDINGS_DIR}/${RUN_ID}.m4a"
 TRANSCRIPT_BASE="${TRANSCRIPTS_DIR}/${RUN_ID}"
 RUN_FRAMES_DIR="${FRAMES_DIR}/${RUN_ID}"
 # Lives in the run dir, beside the YouTube/Kaltura download it is cut from,
@@ -202,8 +230,23 @@ export MEETING_BOT_LANGUAGE="$LANGUAGE"
 # --- Stage helper ------------------------------------------------------------
 # Runs a stage unless it's already done, streaming its output to both the run
 # log and stdout with a [stage] prefix so parallel branches stay readable.
-# awk with an explicit fflush(), not `sed -u`: it flushes per line on every
-# sed/awk implementation rather than relying on a GNU extension.
+# Prefix each line as it arrives. A bash read loop, NOT awk: Debian's default
+# awk is mawk, which reads a pipe in blocks — fflush() flushes its output but
+# a line still waits in mawk's INPUT buffer until more text arrives. A
+# recorder prints the meeting link and then nothing for an hour, so the link
+# never reached the log the web UI polls (found live 2026-09-29; the VM must
+# have had gawk). `sed -u` is a GNU extension; this is plain bash.
+prefix_lines() {
+  local prefix="$1" line
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s%s\n' "$prefix" "$line"
+  done
+}
+
+# Python block-buffers stdout into a pipe, so a stage's progress (capture.py's
+# "Admitted…", "Muting…") would otherwise appear only when it exits.
+export PYTHONUNBUFFERED=1
+
 stage_status() { rs status --run-dir "$RUN_DIR" --stage "$1"; }
 
 run_stage() {
@@ -249,7 +292,7 @@ run_stage() {
   rs start --run-dir "$RUN_DIR" --stage "$stage"
   local log="$LOG_DIR/$stage.log"
   local rc
-  "$@" 2>&1 | tee -a "$log" | awk -v s="$stage" '{print "[" s "] " $0; fflush()}'
+  "$@" 2>&1 | tee -a "$log" | prefix_lines "[$stage] "
   rc=${PIPESTATUS[0]}
   release_slot
 
@@ -302,6 +345,61 @@ mark_done() {
   rs done --run-dir "$RUN_DIR" --stage "$stage" "${args[@]}"
 }
 
+# --- Stage 4: upload the PDF to Google Drive (lib/gdrive.py) -----------------
+# Only when the run names a Drive folder (pipeline.sh --drive-folder / the web
+# UI). Its own stage, settled with the operator 2026-11-02: a failure marks
+# only `upload` failed — the PDF is safe on disk — and a resume retries it
+# without touching summarize. The file id and link go into state.json for the
+# web UI. A same-named file in the folder is replaced (gdrive.py).
+DRIVE_FOLDER="$(cfg drive_folder)"
+DRIVE_NAME="$(cfg drive_name)"
+
+do_upload() {
+  local pdf="$1" md="$2" name="$DRIVE_NAME" out
+  # No name given: the summary's own title (the document's first heading),
+  # else the run's name.
+  if [ -z "$name" ] && [ -f "$md" ]; then
+    name="$(sed -nE '/^# /{s/^# +//;s/[*`]//g;p;q}' "$md")"
+  fi
+  [ -n "$name" ] || name="$NAME"
+  echo "Uploading $(basename "$pdf") to Google Drive folder ${DRIVE_FOLDER} as \"${name}\""
+  out="$("$PYTHON_BIN" "$SCRIPT_DIR/gdrive.py" upload \
+           --file "$pdf" --folder "$DRIVE_FOLDER" --name "$name")" || return 1
+  echo "$out"
+  "$PYTHON_BIN" - "$RUNSTATE" "$RUN_DIR" "$out" <<'PY' || return 1
+import json, subprocess, sys
+runstate, run_dir, out = sys.argv[1:4]
+r = json.loads(out)
+fields = {"drive_file_id": r.get("id"), "drive_link": r.get("webViewLink"),
+          "drive_file_name": r.get("name"), "drive_replaced": bool(r.get("replaced"))}
+cmd = [sys.executable, runstate, "annotate", "--run-dir", run_dir, "--stage", "upload"]
+for k, v in fields.items():
+    cmd += ["--set", f"{k}={json.dumps(v)}"]
+subprocess.run(cmd, check=True)
+print(("Replaced" if r.get("replaced") else "Uploaded") + f": {r.get('webViewLink')}")
+PY
+}
+
+# Returns 0 when there is nothing to upload or the upload is done.
+maybe_upload() {
+  local pdf="$1" md="$2"
+  [ -n "$DRIVE_FOLDER" ] || return 0
+  if [ "$(stage_status upload)" = "done" ]; then
+    echo "[upload] already in Google Drive: $(cfg stages.upload.drive_link)"
+    return 0
+  fi
+  if [ -z "$pdf" ] || [ ! -f "$pdf" ]; then
+    rs fail --run-dir "$RUN_DIR" --stage upload \
+      --error "no PDF to upload (${pdf:-PDF output is off}); re-render it, then resume"
+    echo "[upload] FAILED — there is no PDF to upload (${pdf:-PDF output is off})" >&2
+    return 1
+  fi
+  echo ""
+  run_stage upload do_upload "$pdf" "$md" || return 1
+  rs done --run-dir "$RUN_DIR" --stage upload
+  echo "Drive:      $(cfg stages.upload.drive_link)"
+}
+
 # --- A combine run: one summarize stage over several members' outputs -------
 # Lives up here, ahead of the per-input stages, because none of them apply:
 # there is no media to fetch, cut, transcribe or sample. Everything the
@@ -321,6 +419,8 @@ do_summarize_combined() {
     args+=(--no-pdf)
   fi
   [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
+  [ -n "$INSTRUCTIONS" ] && args+=(--instructions "$INSTRUCTIONS")
+  [ "$VOICE_ONLY" -eq 1 ] && args+=(--no-frames)
   local spec
   for spec in "${RESOURCE_SPECS[@]:-}"; do
     [ -n "$spec" ] && args+=(--resources "$spec")
@@ -411,6 +511,7 @@ run_combine() {
     echo "[summarize] already done — skipping (use --force to redo)"
     echo "Summary:    $COMBINE_MD"
     [ -n "$COMBINE_PDF" ] && [ -f "$COMBINE_PDF" ] && echo "PDF:        $COMBINE_PDF"
+    maybe_upload "$COMBINE_PDF" "$COMBINE_MD" || return 1
     return 0
   fi
 
@@ -428,14 +529,22 @@ run_combine() {
         --error "member run $member is missing"
       return 1
     fi
-    local manifest
-    manifest="$(rs get --run-dir "$member_dir" --key stages.frames.artifacts.manifest 2>/dev/null || true)"
-    if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
-      echo "==> $member: frames were swept or never extracted — extracting them"
-      rs reset --run-dir "$member_dir" --stage frames
+    local manifest need_frames=1
+    # A voice-only combined summary reads no member's frames, and a voice-only
+    # member never extracts any: waiting on them would loop forever.
+    [ "$VOICE_ONLY" -eq 1 ] && need_frames=0
+    [ "$(rs get --run-dir "$member_dir" --key summary_source 2>/dev/null || true)" = "voice" ] \
+      && need_frames=0
+    if [ "$need_frames" -eq 1 ]; then
+      manifest="$(rs get --run-dir "$member_dir" --key stages.frames.artifacts.manifest 2>/dev/null || true)"
+      if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
+        echo "==> $member: frames were swept or never extracted — extracting them"
+        rs reset --run-dir "$member_dir" --stage frames
+      fi
     fi
     if [ "$(rs status --run-dir "$member_dir" --stage transcribe)" != "done" ] \
-       || [ "$(rs status --run-dir "$member_dir" --stage frames)" != "done" ]; then
+       || { [ "$need_frames" -eq 1 ] \
+            && [ "$(rs status --run-dir "$member_dir" --stage frames)" != "done" ]; }; then
       echo ""
       echo "==> $member: finishing transcribe/frames before the combined summary"
       if ! bash "$SCRIPT_DIR/run_one.sh" --run-dir "$member_dir" --skip-summarize; then
@@ -478,6 +587,7 @@ run_combine() {
   echo "=================================================================="
   echo "Summary:    $COMBINE_MD"
   [ -n "$COMBINE_PDF" ] && [ -f "$COMBINE_PDF" ] && echo "PDF:        $COMBINE_PDF"
+  maybe_upload "$COMBINE_PDF" "$COMBINE_MD" || return 1
   return 0
 }
 
@@ -504,7 +614,7 @@ fi
 # --- Stage implementations ---------------------------------------------------
 
 do_record() {
-  bash "$ROOT_DIR/screen/record_screen.sh" \
+  RECORD_MEDIA="$RECORD_MEDIA_CFG" bash "$ROOT_DIR/screen/record_screen.sh" \
     "$INPUT" "$NAME" "$DISPLAY_NAME" "$MP4_FILE"
 }
 
@@ -520,14 +630,10 @@ do_fetch_video() {
     echo "yt-dlp is not installed. Run ./setup.sh first." >&2
     return 1
   fi
-  # No merge step on purpose: bestvideo+bestaudio needs a JS runtime for
-  # YouTube extraction and a postprocess merge that fails on this box. The
-  # chain below tries a muxed stream first, then falls back to a *video-only*
-  # stream — which is all this stage is for, since frames need no audio and
-  # YouTube transcripts come from captions, never from this file. See
-  # CLAUDE.md before changing the format string.
-  yt-dlp --no-playlist -f "best[ext=mp4]/best/bv*[ext=mp4][vcodec^=avc1][height<=720]/bv*[ext=mp4][height<=720]/bv*[height<=720]/bv*" \
-    -o "$RUN_DIR/video.%(ext)s" "$INPUT"
+  # The command (a muxed stream, else video-only; never a merge — see
+  # CLAUDE.md before changing the format) lives in lib/ytdownload.py, which
+  # also re-runs yt-dlp after a transient refusal (a 403 on the media URL).
+  "$PYTHON_BIN" "$SCRIPT_DIR/ytdownload.py" "$INPUT" "$RUN_DIR/video.%(ext)s"
 }
 
 # Kaltura: not yt-dlp. Its Kaltura extractor sends no Referer, which a
@@ -581,7 +687,6 @@ do_summarize() {
     "$video"
     "${TRANSCRIPT_BASE}.txt"
     "$SUMMARY_FILE"
-    --frames-manifest "$RUN_FRAMES_DIR/manifest.json"
     # PDF_DIR is independent of SUMMARIES_DIR, so the PDF path is passed
     # explicitly rather than derived from the .md path.
     --pdf-out "$SUMMARY_PDF"
@@ -597,6 +702,14 @@ do_summarize() {
   # way to tell that "0:00:00" in this summary is 00:05:00 in the source.
   [ -n "$CLIP" ] && args+=(--clip "$CLIP")
   [ -n "$PROMPT_NAME" ] && args+=(--prompt "$PROMPT_NAME")
+  [ -n "$INSTRUCTIONS" ] && args+=(--instructions "$INSTRUCTIONS")
+  # Voice only: summarize.py must not go and extract (or, for YouTube,
+  # download) frames itself, which is what it does without a manifest.
+  if [ "$VOICE_ONLY" -eq 1 ]; then
+    args+=(--no-frames)
+  else
+    args+=(--frames-manifest "$RUN_FRAMES_DIR/manifest.json")
+  fi
   # Kaltura has no yt-dlp to ask for a title, so the entry's own name (read at
   # fetch time into kaltura.json) is passed explicitly. Best-effort: a run
   # whose fetch predates this file just falls back to the meeting name.
@@ -644,7 +757,11 @@ echo "=================================================================="
 echo "Run: $RUN_ID"
 echo "  input:    $INPUT ($INPUT_TYPE)"
 echo "  language: $LANGUAGE   prompt: ${PROMPT_NAME:-(default)}"
+echo "  summary:  in ${SUMMARY_LANGUAGE:-th}, PDF font ${PDF_FONT:-(default)}${INSTRUCTIONS:+, with extra instructions}"
 [ -n "$CLIP" ] && echo "  clip:     $CLIP  (output timestamps are relative to it)"
+[ "$VOICE_ONLY" -eq 1 ] && echo "  media:    summary from the voice alone (no frames)"
+[ "$INPUT_TYPE" = "meeting" ] && [ "$RECORD_MEDIA_CFG" = "audio" ] \
+  && echo "  record:   audio only -> $MP4_FILE"
 echo "=================================================================="
 
 # --- Stage 1: record (meeting URLs only) -------------------------------------
@@ -757,6 +874,7 @@ branch_transcribe() {
 # refuse the missing manifest and fail a run that has nothing left to do.
 # Only when this run IS about to summarize are the frames needed again.
 frames_settled() {
+  [ "$VOICE_ONLY" -eq 1 ] && return 0
   [ "$(stage_status frames)" = "done" ] || return 1
   [ -f "$RUN_FRAMES_DIR/manifest.json" ] && return 0
   [ "$SKIP_SUMMARIZE" -eq 1 ] && return 0
@@ -773,6 +891,10 @@ media_needed() {
 }
 
 branch_frames() {
+  if [ "$VOICE_ONLY" -eq 1 ]; then
+    echo "[frames] skipped — summary from the voice only"
+    return 0
+  fi
   if [ "$(stage_status frames)" = "done" ]; then
     if frames_settled; then
       echo "[frames] already done — skipping"
@@ -900,7 +1022,7 @@ if [ "$SKIP_SUMMARIZE" -eq 1 ]; then
   echo "=================================================================="
   [ "$INPUT_TYPE" = "meeting" ] && echo "Recording:  $MP4_FILE"
   echo "Transcript: ${TRANSCRIPT_BASE}.txt"
-  echo "Frames:     $RUN_FRAMES_DIR/manifest.json"
+  [ "$VOICE_ONLY" -eq 1 ] || echo "Frames:     $RUN_FRAMES_DIR/manifest.json"
   exit 0
 fi
 
@@ -944,4 +1066,9 @@ echo "=================================================================="
 echo "Transcript: ${TRANSCRIPT_BASE}.txt"
 [ -f "$SUMMARY_FILE" ] && echo "Summary:    $SUMMARY_FILE"
 [ -f "$SUMMARY_PDF" ] && echo "PDF:        $SUMMARY_PDF"
+if ! maybe_upload "$SUMMARY_PDF" "$SUMMARY_FILE"; then
+  echo "    The summary is done; only the Drive upload failed. Retry it with:" >&2
+  echo "      ./pipeline.sh --run-id $RUN_ID" >&2
+  exit 1
+fi
 true

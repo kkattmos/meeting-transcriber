@@ -255,6 +255,27 @@ class RunStateTest(unittest.TestCase):
         self.assertNotIn("rate_limited", st)
         self.assertEqual(st["usage"], {"calls": 3})
 
+    def test_stop_fails_running_stages_and_unstop_clears_the_mark(self):
+        self.state.init()
+        self.state.done("transcribe")
+        self.state.start("summarize")
+        self.state.annotate("summarize", {"waiting_until": 5})
+        self.state.stop()
+        self.assertEqual(self.state.status("summarize"), FAILED)
+        self.assertEqual(self.state.stage("summarize")["error"], "stopped by the operator")
+        self.assertNotIn("waiting_until", self.state.stage("summarize"))
+        self.assertEqual(self.state.status("transcribe"), DONE)
+        stopped = self.state.get("stopped")
+        self.assertEqual(stopped["stages"], ["summarize"])
+        # Called again after the kill: keeps the first time and stage list.
+        self.state.start("frames")
+        self.state.stop()
+        self.assertEqual(self.state.get("stopped")["at"], stopped["at"])
+        self.assertEqual(self.state.get("stopped")["stages"], ["frames", "summarize"])
+        self.assertEqual(self.state.status("frames"), FAILED)
+        self.state.unstop()
+        self.assertIsNone(self.state.get("stopped"))
+
     def test_cli_annotate_takes_json_and_bare_words(self):
         run_dir = str(self.run_dir)
         self._cli("init", "--run-dir", run_dir)

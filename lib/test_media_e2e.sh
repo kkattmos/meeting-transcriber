@@ -31,7 +31,7 @@ mkdir -p "$TESTROOT"
 PASS=0
 FAIL=0
 
-PY="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
+PY="${MEETING_BOT_VENV:-$REPO/.venv}/bin/python3"
 [ -x "$PY" ] || PY="python3"
 
 ok()   { PASS=$((PASS + 1)); echo "  ok   — $1"; }
@@ -99,8 +99,7 @@ export CLAUDE_CLI_BIN="$REPO/lib/fake_claude_cli.py"
 export ANTHROPIC_API_KEY="must-not-reach-the-cli"
 export ASSEMBLYAI_LANGUAGE=th
 export ASSEMBLYAI_POLL_SECONDS=0.2
-export FRAME_PERIOD_SECONDS=5
-export SCENE_THRESHOLD=0.2
+export FRAME_CHECK_SECONDS=1
 
 RECORD_FILE="$TESTROOT/requests.jsonl"
 
@@ -135,15 +134,22 @@ echo "=================================================================="
 echo "1. Build a real lecture-shaped MP4"
 echo "=================================================================="
 LECTURE="$TESTROOT/Week 4 Lecture.mp4"
-# Three "slides": a bright panel on a dark background, changing colour twice —
-# scene-change detection has something real to find, and framecrop has a real
-# slide region to crop to.
+# Three "slides": a bright panel on a dark background, each with its own
+# "lines of text" (dark bars) — extract_frames.py saves a frame when the
+# slide's texture changes, so a colour change alone would be one slide; and
+# framecrop has a real slide region to crop to.
+SLIDE_PANEL="drawbox=x=80:y=50:w=800:h=440:color=0xf5f5f0:t=fill"
+slide_lines() {  # <from> <to> <y1> <y2> <y3>: three bars shown from..to
+  local y out=""
+  for y in "$3" "$4" "$5"; do
+    out+=",drawbox=x=140:y=$y:w=600:h=18:color=0x202020:t=fill:enable='between(t,$1,$2)'"
+  done
+  printf '%s' "$out"
+}
 ffmpeg -y -loglevel error \
   -f lavfi -i "color=c=0x101014:s=960x540:d=30" \
   -f lavfi -i "sine=frequency=440:duration=30" \
-  -filter_complex "[0:v]drawbox=x=80:y=50:w=800:h=440:color=0xf5f5f0:t=fill:enable='between(t,0,9)',\
-drawbox=x=80:y=50:w=800:h=440:color=0xf0e8d8:t=fill:enable='between(t,10,19)',\
-drawbox=x=80:y=50:w=800:h=440:color=0xe8f0f5:t=fill:enable='between(t,20,30)'[v]" \
+  -filter_complex "[0:v]${SLIDE_PANEL}$(slide_lines 0 9.9 90 150 210)$(slide_lines 10 19.9 250 330 410)$(slide_lines 20 30 120 280 440)[v]" \
   -map "[v]" -map 1:a -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p \
   -c:a aac -b:a 64k -t 30 "$LECTURE" 2>"$TESTROOT/ffmpeg.log"
 [ -s "$LECTURE" ] && ok "built a 30s MP4 with slides and audio" \
@@ -200,9 +206,9 @@ CLIP_START=$(probe start_time "$CLIPPED")
 
 echo "--- frames extracted from the clip carry clip-relative timestamps"
 CLIP_FRAMES="$FRAMES_DIR/week4-clip"
-# A short period, so the assertion is about WHERE the frames are rather than
-# about whether a 10s window happened to contain a scene change.
-FRAME_PERIOD_SECONDS=2 "$PY" "$REPO/screen/extract_frames.py" \
+# A frame is taken when the 10s window's slide settles, so the assertion is
+# about WHERE the frames are, not how many.
+"$PY" "$REPO/screen/extract_frames.py" \
   "$CLIPPED" "$CLIP_FRAMES" "week4-clip" > "$TESTROOT/clip-frames.log" 2>&1
 check "extract_frames on the clip exits 0" "$?" "0"
 LAST_TS=$("$PY" -c "
@@ -253,7 +259,7 @@ SUMMARY_PDF="$PDF_DIR/week4.pdf"
 "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$SUMMARY_MD" \
       --frames-manifest "$FRAME_OUT/manifest.json" \
       --pdf-out "$SUMMARY_PDF" \
-      --prompt lecture-claude \
+      --prompt lecture \
       --run-id week4_test > "$TESTROOT/summarize.log" 2>&1
 check "summarize.py exits 0" "$?" "0"
 [ -s "$SUMMARY_MD" ] && ok "markdown written" || bad "no markdown"
@@ -414,7 +420,7 @@ MEETING_BOT_RUN_DIR="$WAIT_RUN" FAKE_CLAUDE_MODE=rate-limited-once \
   FAKE_CLAUDE_STATE="$TESTROOT/wait.calls" FAKE_CLAUDE_RECORD="$WAIT_RECORD" \
   SUMMARY_FALLBACK_CHAIN=claude-cli,gemini GEMINI_API_KEY_1=would-be-wrong \
   "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$WAIT_MD" \
-    --frames-manifest "$FRAME_OUT/manifest.json" --no-pdf --prompt lecture-claude \
+    --frames-manifest "$FRAME_OUT/manifest.json" --no-pdf --prompt lecture \
     --run-id wait_test > "$TESTROOT/wait.log" 2>&1
 check "summarize.py exits 0 after the wait" "$?" "0"
 check "the CLI was called twice (refused, then answered)" \
@@ -481,8 +487,8 @@ grep -qi "unavailable" "$TESTROOT/noauth.log" \
   || bad "not classified as unavailable — the chain would retry pointlessly"
 
 echo "--- the unchanging instructions go in as a cacheable system prompt"
-# Claude caches an exact prefix. summarize-v2.md fences the half that never
-# varies; llm_client passes it as --append-system-prompt-file so the prefix is
+# Claude caches an exact prefix. Every prompt fences the half that never
+# varies (here meeting.md); llm_client passes it as --append-system-prompt-file so the prefix is
 # byte-identical across runs and across the chunks of one run. Anything that
 # varies leaking into that file makes the cache silently never hit.
 V2_MD="$SUMMARIES_DIR/v2.md"
@@ -490,8 +496,8 @@ V2_RECORD="$TESTROOT/claude_cli_v2.jsonl"
 FAKE_CLAUDE_RECORD="$V2_RECORD" \
   "$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" "$V2_MD" \
     --frames-manifest "$FRAME_OUT/manifest.json" --no-pdf \
-    --prompt summarize-v2 --run-id v2_test > "$TESTROOT/v2.log" 2>&1
-check "summarize.py --prompt summarize-v2 exits 0" "$?" "0"
+    --prompt meeting --run-id v2_test > "$TESTROOT/v2.log" 2>&1
+check "summarize.py --prompt meeting exits 0" "$?" "0"
 
 V2_ARGV=$("$PY" - "$V2_RECORD" <<'PYEOF'
 import json, sys
@@ -519,7 +525,7 @@ PYEOF
 )
 [ -s "$SYSFILE" ] && ok "the system prompt file exists on disk" \
   || bad "system prompt file missing: $SYSFILE"
-grep -q "output_format" "$SYSFILE" \
+grep -q "# Output Format" "$SYSFILE" \
   && ok "it carries the output format" || bad "no output format in it"
 grep -q "Dijkstra" "$SYSFILE" \
   && bad "the transcript leaked into the cacheable prefix" \
@@ -612,7 +618,7 @@ cat > "$PARTS_JSON" <<EOF
 EOF
 FAKE_CLAUDE_RECORD="$PARTS_RECORD" \
   "$PY" "$REPO/summarize/summarize.py" --parts "$PARTS_JSON" "$PARTS_MD" \
-      --pdf-out "$PARTS_PDF" --prompt lecture-claude \
+      --pdf-out "$PARTS_PDF" --prompt lecture \
       --run-id combine_test > "$TESTROOT/parts.log" 2>&1
 check "summarize.py --parts exits 0" "$?" "0"
 [ -s "$PARTS_MD" ] && ok "combined markdown written" || bad "no combined markdown"
@@ -676,7 +682,7 @@ EOF
       "$SUMMARIES_DIR/week4_res.md" \
       --frames-manifest "$FRAME_OUT/manifest.json" \
       --pdf-out "$PDF_DIR/week4_res.pdf" \
-      --prompt lecture-claude \
+      --prompt lecture \
       --resources "$TESTROOT/course notes" > "$TESTROOT/resources.log" 2>&1
 check "summarize with --resources exits 0" "$?" "0"
 # The prompt is what the CLI is handed on stdin, so that is where the slides
@@ -699,14 +705,55 @@ grep -q "does not exist" "$TESTROOT/badres.log" \
 
 echo ""
 echo "=================================================================="
-echo "6. YouTube captions (real client -> stub server)"
+echo "6. YouTube captions (yt-dlp first, then the real client -> stub server)"
 echo "=================================================================="
+# yt-dlp is a stub for every call in this section — exported, so no
+# transcribe.sh here can reach YouTube. It logs each call to $FAKE_YTDLP_CALLS;
+# FAKE_YTDLP_FAIL makes it fail outright (a bot check), FAKE_YTDLP_NOTRACK makes
+# it list no captions at all (yt_autocaptions.py then exits 3).
+FAKE_YTDLP="$TESTROOT/fake-yt-dlp"
+FAKE_YTDLP_CALLS="$TESTROOT/fake-yt-dlp.calls"
+export FAKE_YTDLP_CALLS
+cat > "$FAKE_YTDLP" <<'YTDLP'
+#!/bin/sh
+echo "$*" >> "$FAKE_YTDLP_CALLS"
+[ -n "$FAKE_YTDLP_FAIL" ] && { echo "ERROR: stub yt-dlp failing" >&2; exit 1; }
+case " $* " in
+  *" -J "*)
+    if [ -n "$FAKE_YTDLP_NOTRACK" ]; then echo '{"language": "th"}'; exit 0; fi
+    echo '{"language": "th", "automatic_captions": {"th-orig": [{"ext": "json3"}], "en": [{"ext": "json3"}]}}'; exit 0 ;;
+esac
+out=""
+while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
+printf '%s' '{"events": [{"tStartMs": 1000, "dDurationMs": 3000, "segs": [{"utf8": "สวัสดีครับ วันนี้เรียนเรื่องกราฟ"}]}]}' \
+  > "$(dirname "$out")/cap.th-orig.json3"
+YTDLP
+chmod +x "$FAKE_YTDLP"
+export YT_DLP_BIN="$FAKE_YTDLP"
+yt_api_calls() { grep -c '"api": "youtube"' "$RECORD_FILE" 2>/dev/null || true; }
+
+echo "--- yt-dlp is the first choice: the API is never asked"
+: > "$RECORD_FILE"; : > "$FAKE_YTDLP_CALLS"
+YT_TH_BASE="$TRANSCRIPTS_DIR/yt_stub_th"
+bash "$REPO/transcribe/transcribe.sh" \
+     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_th" "th" \
+     --out-base "$YT_TH_BASE" > "$TESTROOT/yt-th.log" 2>&1
+check "YouTube via yt-dlp: exits 0" "$?" "0"
+grep -q "วันนี้เรียนเรื่องกราฟ" "${YT_TH_BASE}.txt" \
+  && ok "used the spoken-language automatic captions" \
+  || bad "did not use yt-dlp's automatic captions: $(tail -5 "$TESTROOT/yt-th.log")"
+grep -q "00:00:01,000" "${YT_TH_BASE}.srt" \
+  && ok "automatic-caption timings preserved" || bad "automatic-caption timings lost"
+check "youtube-transcript.io not called when yt-dlp succeeds" "$(yt_api_calls)" "0"
+
+echo "--- yt-dlp failing: youtube-transcript.io is the fallback"
 : > "$RECORD_FILE"
 YT_BASE="$TRANSCRIPTS_DIR/yt_stub"
-bash "$REPO/transcribe/transcribe.sh" \
+FAKE_YTDLP_FAIL=1 bash "$REPO/transcribe/transcribe.sh" \
      "https://www.youtube.com/watch?v=stubvideo01" "yt_stub" "en" \
      --out-base "$YT_BASE" > "$TESTROOT/yt.log" 2>&1
-check "transcribe.sh (YouTube) exits 0" "$?" "0"
+check "transcribe.sh (YouTube, API fallback) exits 0" "$?" "0"
+check "youtube-transcript.io called once" "$(yt_api_calls)" "1"
 check "two timed segments, not one flat blob" "$(wc -l < "${YT_BASE}.txt")" "2"
 grep -q "Welcome to the lecture" "${YT_BASE}.txt" \
   && ok "caption markup unescaped and stripped" || bad "markup not cleaned"
@@ -721,48 +768,55 @@ check "YouTube key cursor advanced" \
   "$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['YT_TRANSCRIPT_KEY'])" \
      "$CURSOR" 2>/dev/null)" "1"
 
-# The stub video's only uploaded track is English. Asked for Thai, the client
-# says so (--strict, exit 3) and transcribe.sh tries YouTube's own captions
-# through yt-dlp — a stub here, never the network.
-FAKE_YTDLP="$TESTROOT/fake-yt-dlp"
-cat > "$FAKE_YTDLP" <<'YTDLP'
-#!/bin/sh
-[ -n "$FAKE_YTDLP_FAIL" ] && { echo "ERROR: stub yt-dlp failing" >&2; exit 1; }
-case " $* " in
-  *" -J "*) echo '{"language": "th", "automatic_captions": {"th-orig": [{"ext": "json3"}], "en": [{"ext": "json3"}]}}'; exit 0 ;;
-esac
-out=""
-while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
-printf '%s' '{"events": [{"tStartMs": 1000, "dDurationMs": 3000, "segs": [{"utf8": "สวัสดีครับ วันนี้เรียนเรื่องกราฟ"}]}]}' \
-  > "$(dirname "$out")/cap.th-orig.json3"
-YTDLP
-chmod +x "$FAKE_YTDLP"
-YT_TH_BASE="$TRANSCRIPTS_DIR/yt_stub_th"
-YT_DLP_BIN="$FAKE_YTDLP" bash "$REPO/transcribe/transcribe.sh" \
-     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_th" "th" \
-     --out-base "$YT_TH_BASE" > "$TESTROOT/yt-th.log" 2>&1
-check "YouTube, no uploaded Thai track: exits 0" "$?" "0"
-grep -q "วันนี้เรียนเรื่องกราฟ" "${YT_TH_BASE}.txt" \
-  && ok "fell back to the spoken-language automatic captions" \
-  || bad "did not use yt-dlp's automatic captions: $(tail -5 "$TESTROOT/yt-th.log")"
-grep -q "00:00:01,000" "${YT_TH_BASE}.srt" \
-  && ok "automatic-caption timings preserved" || bad "automatic-caption timings lost"
+echo "--- yt-dlp finds no track: the API is asked, and says which"
+: > "$RECORD_FILE"
+YT_NT_BASE="$TRANSCRIPTS_DIR/yt_stub_nt"
+FAKE_YTDLP_NOTRACK=1 bash "$REPO/transcribe/transcribe.sh" \
+     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_nt" "en" \
+     --out-base "$YT_NT_BASE" > "$TESTROOT/yt-nt.log" 2>&1
+check "no yt-dlp track, API has one: exits 0" "$?" "0"
+grep -q "yt-dlp found no 'en' captions" "$TESTROOT/yt-nt.log" \
+  && ok "the log says why the API was asked" || bad "no reason given for the fallback"
+grep -q "Welcome to the lecture" "${YT_NT_BASE}.txt" \
+  && ok "the API's track was used" || bad "the API's track was not used"
 
+echo "--- the API's track labelled in another language is the last resort"
 YT_TH2_BASE="$TRANSCRIPTS_DIR/yt_stub_th2"
-FAKE_YTDLP_FAIL=1 YT_DLP_BIN="$FAKE_YTDLP" bash "$REPO/transcribe/transcribe.sh" \
+FAKE_YTDLP_FAIL=1 bash "$REPO/transcribe/transcribe.sh" \
      "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_th2" "th" \
      --out-base "$YT_TH2_BASE" > "$TESTROOT/yt-th2.log" 2>&1
-check "YouTube, no Thai track and yt-dlp down: still exits 0" "$?" "0"
+check "YouTube, yt-dlp down and no Thai label: still exits 0" "$?" "0"
 grep -q "Welcome to the lecture" "${YT_TH2_BASE}.txt" \
   && ok "the other-language track is the last resort" || bad "last-resort track not used"
 grep -q "NOT in 'th'" "$TESTROOT/yt-th2.log" \
   && ok "and it says so, loudly" || bad "no warning about the wrong-language track"
 
+echo "--- YT_AUTOCAPTIONS=0: the API alone, yt-dlp never run"
+: > "$RECORD_FILE"; : > "$FAKE_YTDLP_CALLS"
+YT_OFF_BASE="$TRANSCRIPTS_DIR/yt_stub_off"
+YT_AUTOCAPTIONS=0 bash "$REPO/transcribe/transcribe.sh" \
+     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_off" "en" \
+     --out-base "$YT_OFF_BASE" > "$TESTROOT/yt-off.log" 2>&1
+check "YT_AUTOCAPTIONS=0: exits 0" "$?" "0"
+check "YT_AUTOCAPTIONS=0: yt-dlp not run" "$(wc -l < "$FAKE_YTDLP_CALLS" | tr -d ' ')" "0"
+check "YT_AUTOCAPTIONS=0: the API answered" "$(yt_api_calls)" "1"
+
+echo "--- both down: a real failure (exit 1), not \"no captions\""
+YT_DOWN_BASE="$TRANSCRIPTS_DIR/yt_stub_down"
+FAKE_YTDLP_FAIL=1 YT_TRANSCRIPT_API_URL="http://127.0.0.1:9/api/transcripts" \
+  bash "$REPO/transcribe/transcribe.sh" \
+     "https://www.youtube.com/watch?v=stubvideo01" "yt_stub_down" "en" \
+     --out-base "$YT_DOWN_BASE" > "$TESTROOT/yt-down.log" 2>&1
+check "yt-dlp and the API both failing exits 1" "$?" "1"
+grep -q "deno" "$TESTROOT/yt-down.log" \
+  && ok "the error points at updating yt-dlp / deno" || bad "no hint about yt-dlp"
+unset YT_DLP_BIN
+
 echo ""
 echo "=================================================================="
 echo "7. The whole pipeline over a local file"
 echo "=================================================================="
-out=$( cd "$REPO" && bash ./pipeline.sh "$LECTURE" --prompt lecture-claude \
+out=$( cd "$REPO" && bash ./pipeline.sh "$LECTURE" --prompt lecture \
        --resources "$TESTROOT/course notes" 2>&1 )
 rc=$?
 echo "$out" > "$TESTROOT/pipeline.log"
@@ -778,6 +832,39 @@ done
 if [ "$HAVE_PDF" -eq 1 ]; then
   [ -s "$PDF_DIR/$RUN.pdf" ] && ok "PDF written to PDF_DIR" || bad "no PDF in PDF_DIR"
 fi
+
+echo ""
+echo "=================================================================="
+echo "8. Voice only: the real summarize.py sends the model no pictures"
+echo "=================================================================="
+: > "$CLI_RECORD"
+FRAMES_BEFORE="$(find "$FRAMES_DIR" | sort)"
+"$PY" "$REPO/summarize/summarize.py" "$LECTURE" "${OUT_BASE}.txt" \
+      "$SUMMARIES_DIR/voice.md" --no-frames --no-pdf --prompt lecture \
+      > "$TESTROOT/voice.log" 2>&1
+check "summarize.py --no-frames exits 0" "$?" "0"
+[ -s "$SUMMARIES_DIR/voice.md" ] && ok "voice-only markdown written" || bad "no voice-only markdown"
+VOICE=$("$PY" - "$CLI_RECORD" <<'PYEOF'
+import json, sys
+rec = json.loads(open(sys.argv[1]).readline())
+print(len(rec.get("images") or []), "NOTE" if "No frames: this summary is made from the audio" in rec["prompt"] else "-")
+PYEOF
+)
+check "no image blocks, and the prompt says there are no frames" "$VOICE" "0 NOTE"
+[ "$(find "$FRAMES_DIR" | sort)" = "$FRAMES_BEFORE" ] \
+  && ok "nothing written to FRAMES_DIR" \
+  || bad "--no-frames extracted frames anyway: $(ls "$FRAMES_DIR")"
+
+echo "--- an audio-only file (empty manifest) is summarized, not refused"
+AUDIO="$TESTROOT/talk.m4a"
+ffmpeg -y -loglevel error -i "$LECTURE" -vn -c:a aac -b:a 64k "$AUDIO"
+"$PY" "$REPO/screen/extract_frames.py" "$AUDIO" "$FRAMES_DIR/talk" talk > /dev/null 2>&1
+: > "$CLI_RECORD"
+"$PY" "$REPO/summarize/summarize.py" "$AUDIO" "${OUT_BASE}.txt" "$SUMMARIES_DIR/talk.md" \
+      --frames-manifest "$FRAMES_DIR/talk/manifest.json" --no-pdf > "$TESTROOT/talk.log" 2>&1
+check "summarize.py on an empty manifest exits 0" "$?" "0"
+grep -q "summarizing from the transcript alone" "$TESTROOT/talk.log" \
+  && ok "and says why there are no frames" || bad "no note in $TESTROOT/talk.log"
 
 echo ""
 echo "=================================================================="
