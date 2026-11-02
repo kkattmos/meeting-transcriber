@@ -56,6 +56,35 @@ cp -r "$REPO"/{pipeline.sh,kill_meeting.sh,source_env.sh,lib,summarize,transcrib
 # keys and start making live API calls from a test run.
 : > "$STAGING/.env"
 
+# Google Drive (lib/gdrive.py): `parse` is the real module's, the rest a stub
+# that records every upload. STUB_GDRIVE_OUT=0 plays "not signed in".
+mv "$STAGING/lib/gdrive.py" "$STAGING/lib/gdrive_real.py"
+cat > "$STAGING/lib/gdrive.py" <<'STUB'
+#!/usr/bin/env python3
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gdrive_real
+cmd = sys.argv[1]
+if cmd == "parse":
+    sys.exit(gdrive_real.main(sys.argv[1:]))
+if cmd == "status":
+    on = os.environ.get("STUB_GDRIVE_OUT", "1") == "1"
+    print(json.dumps({"configured": on, "logged_in": on, "account_ok": True}))
+    sys.exit(0)
+if cmd == "upload":
+    a = dict(zip(sys.argv[2::2], sys.argv[3::2]))
+    with open(os.environ["STUB_GDRIVE_CALLS"], "a") as fh:
+        fh.write(json.dumps(a) + "\n")
+    if os.path.exists(os.environ.get("STUB_FAIL_UPLOAD", "/nonexistent")):
+        sys.stderr.write("ERROR: uploading the file: HTTP 403: stub refusal\n"); sys.exit(1)
+    assert open(a["--file"], "rb").read(4) == b"%PDF", "not a PDF"
+    print(json.dumps({"id": "FILE1", "name": a["--name"] + ".pdf",
+                      "webViewLink": "https://drive.google.com/file/d/FILE1/view",
+                      "replaced": False}))
+    sys.exit(0)
+sys.exit(2)
+STUB
+
 cat > "$STAGING/screen/record_screen.sh" <<'STUB'
 #!/bin/bash
 # stub recorder: writes an "MP4" at the path the orchestrator chose
@@ -566,6 +595,26 @@ for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
   done
 done
 check "multi: members' downloads swept after the combined render" "$leftover" "0"
+
+echo "--- --combine without a path writes to SUMMARIES_DIR / PDF_DIR, named for the run"
+out=$(pipeline "https://youtu.be/dfltcomb001" "https://youtu.be/dfltcomb002" \
+               --combine --jobs 2 2>&1)
+check "combine default: exits 0" "$?" "0"
+dflt_id="$(printf '%s\n' "$out" | sed -n 's/^ *run id: *//p' | head -n 1)"
+dflt_run="$RUNS/$dflt_id"
+[ -n "$dflt_id" ] || dflt_run=""
+[ -n "$dflt_run" ] && ok "combine default: combine run created" || bad "combine default: no combine run: $out"
+[ -f "$SUMMARIES_DIR/$dflt_id.md" ] && ok "combine default: markdown in SUMMARIES_DIR" \
+  || bad "combine default: no $SUMMARIES_DIR/$dflt_id.md"
+[ -f "$PDF_DIR/$dflt_id.pdf" ] && ok "combine default: pdf in PDF_DIR" \
+  || bad "combine default: no $PDF_DIR/$dflt_id.pdf"
+check "combine default: state records the markdown" \
+  "$(state get --run-dir "$dflt_run" --key output_md)" "$SUMMARIES_DIR/$dflt_id.md"
+out=$(pipeline "https://youtu.be/dfltcomb001" "https://youtu.be/dfltcomb002" --combine 2>&1)
+echo "$out" | grep -q "Resuming combined summary: $dflt_id" \
+  && ok "combine default resume: same run, same files" || bad "combine default resume: not resumed: $out"
+out=$(pipeline "https://youtu.be/dfltcomb001" "https://youtu.be/dfltcomb002" --combine --no-combine-pdf --force 2>&1)
+check "combine default --no-combine-pdf: exits 0" "$?" "0"
 
 echo "--- Re-running the same command resumes the combined summary, not a new one"
 : > "$STUB_SUMMARIZE_ARGS"
@@ -1435,7 +1484,7 @@ echo ""
 echo "--- An option left without its value errors instead of hanging"
 # Found 2026-09-23: "... --combine" as the last argument made `shift 2` a
 # no-op and the parse loop spun forever, silently, on one core.
-for opt in --combine --jobs --name --display-name --language --prompt --clip \
+for opt in --jobs --name --display-name --language --prompt --clip \
            --from-file --combine-pdf --run-id --resources; do
   out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" "$2"' _ "$STAGING" "$opt" 2>&1)
   rc=$?
@@ -1445,10 +1494,17 @@ for opt in --combine --jobs --name --display-name --language --prompt --clip \
     check "$opt with no value: exits 1" "$rc" "1"
   fi
 done
-out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" --combine --jobs 1' _ "$STAGING" 2>&1)
+out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" --name --jobs 1' _ "$STAGING" 2>&1)
 check "an option taken as another option's value is refused" "$?" "1"
-echo "$out" | grep -q -- "--combine needs a value" \
-  && ok "the error names the option" || bad "the error does not name --combine: $out"
+echo "$out" | grep -q -- "--name needs a value" \
+  && ok "the error names the option" || bad "the error does not name --name: $out"
+# --combine's path is optional since 2026-11-02: last on the line it means
+# the default paths, and must neither hang nor take the next option.
+out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" "https://youtu.be/hangtest002" --dry-run --combine' _ "$STAGING" 2>&1)
+check "--combine last on the line: a dry run exits 0" "$?" "0"
+echo "$out" | grep -q "^combine.*<combine run id>.md" \
+  && ok "--combine with no path: the plan names the default place" \
+  || bad "--combine with no path: no default plan line: $out"
 out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" --jobs abc' _ "$STAGING" 2>&1)
 check "--jobs that is not a number is refused" "$?" "1"
 ls -d "$RUNS"/yt_hangtest001_* >/dev/null 2>&1 \
@@ -1797,6 +1853,86 @@ out=$(pipeline "https://youtu.be/srcurlyt01" --source-url "$DISCORD_LINK" --dry-
 echo "$out" | grep -qP '^bad\t--source-url applies to a single local file only\t' \
   && ok "source-url: --dry-run reports it as a bad line" || bad "source-url dry-run: $out"
 check "source-url: nothing was created" "$(ls -1 "$RUNS" | wc -l)" "$before"
+
+echo ""
+echo "=================================================================="
+echo "Google Drive upload and run tags (2026-11-02)"
+echo "=================================================================="
+export STUB_GDRIVE_CALLS="$TESTROOT/gdrive_calls.jsonl"
+export STUB_FAIL_UPLOAD="$TESTROOT/fail_upload"
+: > "$STUB_GDRIVE_CALLS"
+DRIVE_LINK_IN="https://drive.google.com/drive/u/0/folders/1DriveFolderAbc?usp=sharing"
+out=$(pipeline "https://youtu.be/drivetest01" --drive-folder "$DRIVE_LINK_IN" \
+      --drive-folder-name "Course notes" --tag "Signals" --tag "week 1, midterm" 2>&1)
+check "drive: exits 0" "$?" "0"
+run="$(ls -1 "$RUNS" | grep '^yt_drivetest01_' | head -n 1)"
+check "drive: the folder id is stored, not the link" \
+  "$(state get --run-dir "$RUNS/$run" --key drive_folder)" "1DriveFolderAbc"
+check "drive: the upload stage is done" \
+  "$(state status --run-dir "$RUNS/$run" --stage upload)" "done"
+check "drive: one upload" "$(wc -l < "$STUB_GDRIVE_CALLS")" "1"
+grep -q "\"--name\": \"Stub\"" "$STUB_GDRIVE_CALLS" \
+  && ok "drive: the name defaults to the summary's title" || bad "drive: $(cat "$STUB_GDRIVE_CALLS")"
+grep -qF "\"--file\": \"$PDF_DIR/$run.pdf\"" "$STUB_GDRIVE_CALLS" \
+  && ok "drive: the run's own PDF is sent" || bad "drive: wrong file: $(cat "$STUB_GDRIVE_CALLS")"
+check "drive: the link is in state.json" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.upload.drive_link)" \
+  "https://drive.google.com/file/d/FILE1/view"
+check "tags: stored, split and trimmed" \
+  "$(state get --run-dir "$RUNS/$run" --key tags | tr '\n' '|')" "Signals|week 1|midterm|"
+
+echo "--- re-running the finished run uploads nothing again"
+: > "$STUB_GDRIVE_CALLS"
+pipeline --run-id "$run" >/dev/null 2>&1
+check "drive: no second upload" "$(wc -l < "$STUB_GDRIVE_CALLS" | tr -d ' ')" "0"
+
+echo "--- a new name on --run-id uploads the finished run's PDF again, only that"
+: > "$STUB_SUMMARIZE_ARGS"
+out=$(pipeline --run-id "$run" --drive-name "Week 1 notes" 2>&1)
+check "drive rename: exits 0" "$?" "0"
+grep -q '"--name": "Week 1 notes"' "$STUB_GDRIVE_CALLS" && ok "drive rename: uploaded under the new name" \
+  || bad "drive rename: $(cat "$STUB_GDRIVE_CALLS")"
+[ -s "$STUB_SUMMARIZE_ARGS" ] && bad "drive rename: summarize ran again" || ok "drive rename: no new summary"
+
+echo "--- a failed upload fails only that stage, and a resume retries it"
+: > "$STUB_GDRIVE_CALLS"
+touch "$STUB_FAIL_UPLOAD"
+out=$(pipeline "https://youtu.be/drivetest02" --drive-folder "1DriveFolderAbc" 2>&1)
+check "drive fail: exits 1" "$?" "1"
+run2="$(ls -1 "$RUNS" | grep '^yt_drivetest02_' | head -n 1)"
+check "drive fail: summarize is done" "$(state status --run-dir "$RUNS/$run2" --stage summarize)" "done"
+check "drive fail: upload failed" "$(state status --run-dir "$RUNS/$run2" --stage upload)" "failed"
+echo "$out" | grep -q "only the Drive upload failed" && ok "drive fail: says what to do" \
+  || bad "drive fail: $out"
+rm -f "$STUB_FAIL_UPLOAD"
+pipeline --run-id "$run2" >/dev/null 2>&1
+check "drive fail resume: uploaded" "$(state status --run-dir "$RUNS/$run2" --stage upload)" "done"
+
+echo "--- refusals before anything is created"
+before="$(ls -1 "$RUNS" | wc -l)"
+out=$(pipeline "https://youtu.be/drivetest03" --drive-folder "not a folder" 2>&1)
+check "drive: a bad folder is refused" "$?" "1"
+out=$(STUB_GDRIVE_OUT=0 pipeline "https://youtu.be/drivetest03" --drive-folder "1DriveFolderAbc" 2>&1)
+check "drive: not signed in is refused" "$?" "1"
+echo "$out" | grep -q "gdrive.py login" && ok "drive: says how to sign in" || bad "drive: $out"
+out=$(pipeline "https://youtu.be/drivetest03" "https://youtu.be/drivetest04" --combine \
+      --no-combine-pdf --drive-folder "1DriveFolderAbc" 2>&1)
+check "drive: refused with no combined PDF" "$?" "1"
+check "drive: nothing was created" "$(ls -1 "$RUNS" | wc -l)" "$before"
+
+echo "--- with --combine, only the combined PDF goes to Drive"
+: > "$STUB_GDRIVE_CALLS"
+out=$(pipeline "https://youtu.be/drivecmb01" "https://youtu.be/drivecmb02" --combine \
+      --drive-folder "1DriveFolderAbc" --drive-name "Both" --tag "pair" 2>&1)
+check "drive combine: exits 0" "$?" "0"
+cid="$(printf '%s\n' "$out" | sed -n 's/^ *run id: *//p' | head -n 1)"
+check "drive combine: one upload" "$(wc -l < "$STUB_GDRIVE_CALLS" | tr -d ' ')" "1"
+grep -qF "\"--file\": \"$PDF_DIR/$cid.pdf\"" "$STUB_GDRIVE_CALLS" \
+  && ok "drive combine: the combined PDF" || bad "drive combine: $(cat "$STUB_GDRIVE_CALLS")"
+m1="$(ls -1 "$RUNS" | grep '^yt_drivecmb01_' | head -n 1)"
+check "drive combine: members carry no Drive folder" \
+  "$(state get --run-dir "$RUNS/$m1" --key drive_folder)" ""
+check "drive combine: members carry the tags" "$(state get --run-dir "$RUNS/$m1" --key tags)" "pair"
 
 echo ""
 echo "=================================================================="

@@ -48,10 +48,11 @@ from pathlib import Path
 SECTION_SEPARATOR = "<br><br>"
 
 # Prompts whose output gets the link line and the transcript: the course-note
-# shaped ones, and `video` and `reality`, whose reader wants the link back to
+# shaped ones, and `video`, `reality` and `drama`, whose reader wants the link back to
 # what was summarized. `meeting` keeps the plain executive summary — those
 # don't go into the course files, and a meeting has no link worth printing.
-WRAPPED_PROMPT_PREFIXES = ("lecture", "tutorial", "video", "reality")
+WRAPPED_PROMPT_PREFIXES = ("lecture", "tutorial", "video", "reality",
+                           "drama")
 
 
 def wants_wrapper(prompt_name, mode="auto"):

@@ -247,6 +247,40 @@
     .detail dl { grid-template-columns: 1fr; }
     .detail dt { margin-top: 6px; }
   }
+  /* --- Google Drive picker (2026-11-02) --- */
+  .drivebox { margin: 4px 0 14px; }
+  .drive-panel { border: 1px solid var(--hairline); border-radius: 8px; padding: 10px 12px; margin-top: 6px; }
+  .crumbs { display: flex; flex-wrap: wrap; gap: 2px 6px; align-items: center; font-size: 13px; margin-bottom: 6px; }
+  .crumbs button { padding: 2px 8px; font-size: 12.5px; }
+  .crumbs .sep { color: var(--faint); }
+  .folders { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow-y: auto;
+             border: 1px solid var(--hairline); border-radius: 6px; }
+  .folders li { display: flex; gap: 8px; align-items: center; padding: 6px 10px; cursor: pointer;
+                border-top: 1px solid var(--hairline); font-size: 14px; overflow-wrap: anywhere; }
+  .folders li:first-child { border-top: 0; }
+  .folders li:hover, .folders li:focus-visible { background: var(--thead); outline: none; }
+  .folders li .ro { margin-left: auto; font-size: 11.5px; color: var(--faint); white-space: nowrap; }
+  .chosen { font-size: 14px; margin: 6px 0; }
+  .chosen b { color: var(--heading); }
+  /* --- Run history: filters, selection, bulk actions --- */
+  .runs-head input[type=search] { flex: 1 1 160px; min-width: 0; padding: 5px 10px; font-size: 13.5px; }
+  .filters { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-top: 8px; align-items: center; }
+  .filters .grp { font-size: 11.5px; color: var(--faint); font-weight: 700; text-transform: uppercase;
+                  letter-spacing: .4px; margin: 0 2px 0 6px; }
+  .filters .grp:first-child { margin-left: 0; }
+  .fchip { padding: 2px 9px; font-size: 12.5px; border-radius: 999px; }
+  .fchip[aria-pressed="true"] { background: var(--navy); color: var(--navy-ink); border-color: var(--navy); }
+  .fchip[aria-pressed="true"]::before { content: "✓ "; }
+  .fchip .n { color: var(--faint); font-size: 11px; margin-left: 3px; }
+  .fchip[aria-pressed="true"] .n { color: var(--navy-ink); }
+  .bulk { position: sticky; top: 0; z-index: 2; background: var(--panel); border: 1px solid var(--link);
+          border-radius: 8px; padding: 8px 10px; margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px;
+          align-items: center; }
+  .bulk .count { font-weight: 700; margin-right: 6px; }
+  .run .pick { width: 18px; height: 18px; margin: 0 2px 0 0; flex: none; }
+  .tagchip { background: var(--info-fill); color: var(--info-ink); }
+  .cache-row { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: 14px; margin: 6px 0; }
+  .cache-row label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -330,6 +364,13 @@
         <textarea id="meetInstructions" placeholder="e.g. List every decision with its owner; skip the small talk at the start."></textarea>
         <div class="fb" id="fb-meetInstructions"></div>
       </div>
+      <div class="grid">
+        <div class="field">
+          <label class="lbl" for="meetTags">Tags <span class="opt">(optional, comma-separated)</span></label>
+          <input type="text" id="meetTags" list="tagList" placeholder="e.g. Team sync, Q4">
+        </div>
+      </div>
+      <div id="mDrive" class="drivebox"></div>
 
       <div class="actions">
         <button class="go" id="startMeet">▶ Create meeting</button>
@@ -410,11 +451,12 @@
           <div class="fb" id="fb-name"></div>
         </div>
         <div class="field">
-          <label class="lbl" for="combine">Combine into one document <span class="opt">(optional .md path)</span></label>
-          <input type="text" id="combine" class="mono" spellcheck="false" placeholder="/home/you/notes/midterm-review.md">
-          <div class="fb" id="fb-combine"></div>
+          <label class="lbl" for="tags">Tags <span class="opt">(optional, comma-separated)</span></label>
+          <input type="text" id="tags" list="tagList" placeholder="e.g. Signals 2110203, midterm">
+          <div class="fb" id="fb-tags"></div>
         </div>
       </div>
+      <datalist id="tagList"></datalist>
       <div class="field">
         <label class="lbl" for="resources">Reference material <span class="opt">(optional, one per line)</span></label>
         <textarea id="resources" class="mono" spellcheck="false" style="min-height:60px"
@@ -423,6 +465,12 @@
           course / source / citation_label frontmatter; the lecture style then cites it by that label.</div>
       </div>
       <div class="switches">
+        <div>
+          <label class="switch"><input type="checkbox" id="combine" role="switch"><span class="track" aria-hidden="true"></span>
+            <span class="txt"><b>Combine into one document <span class="state" data-for="combine"></span></b>
+              <small>All inputs summarized together, into the usual summaries and PDF folders.</small></span></label>
+          <div class="fb" id="fb-combine"></div>
+        </div>
         <div>
           <label class="switch"><input type="checkbox" id="playlist" role="switch"><span class="track" aria-hidden="true"></span>
             <span class="txt"><b>Expand YouTube playlists <span class="state" data-for="playlist"></span></b>
@@ -443,6 +491,8 @@
         </div>
       </div>
 
+      <div id="sDrive" class="drivebox"></div>
+
       <h2 class="banner"><span class="n">4</span> Check &amp; start</h2>
       <div id="checkBox"></div>
       <div class="actions">
@@ -457,8 +507,13 @@
     <section class="panel hidden" data-panel="runs">
       <div class="runs-head">
         <button class="small" id="refreshRuns">↻ Refresh</button>
+        <input type="search" id="runSearch" placeholder="Search runs…" aria-label="Search runs">
+        <button class="small" id="selectMode" aria-pressed="false">☐ Select</button>
+        <button class="small" id="clearTmp" title="Rejected answers, prompt files and scratch files; all recreated on demand">🧹 Temp files</button>
         <span class="legend">✓ done · ▶ running · ✗ failed · ○ not yet</span>
       </div>
+      <div id="runFilters" class="filters"></div>
+      <div id="bulkBar" class="bulk hidden"></div>
       <div id="runsList"></div>
       <div id="runDetail" class="detail hidden"></div>
     </section>
@@ -587,6 +642,183 @@
     document.querySelectorAll('input[name="' + id + '"]').forEach((r) => { r.disabled = locked; });
   }
   function notify(node) { node.dispatchEvent(new Event("input", { bubbles: true })); }
+  function fmtBytes(n) {
+    if (!n) return "0 B";
+    const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i ? n.toFixed(n < 10 ? 1 : 0) : n) + " " + u[i];
+  }
+  // A switch like the form's others, built in code (the Drive picker, the
+  // detail's options).
+  function makeSwitch(id, title, small) {
+    const lab = el("label", "switch");
+    const cb = el("input"); cb.type = "checkbox"; cb.id = id; cb.setAttribute("role", "switch");
+    const txt = el("span", "txt");
+    const b = el("b", null, title + " ");
+    const st = el("span", "state"); st.dataset.for = id;
+    b.appendChild(st); txt.appendChild(b);
+    if (small) txt.appendChild(el("small", null, small));
+    lab.append(cb, el("span", "track"), txt);
+    lab.querySelector(".track").setAttribute("aria-hidden", "true");
+    cb.addEventListener("change", () => { st.textContent = cb.checked ? "ON" : "OFF"; });
+    st.textContent = "OFF";
+    return { label: lab, input: cb };
+  }
+
+  // --- Google Drive: the bot account's folders (lib/gdrive.py) ---------------
+  // The status is asked once per page load; the folder last chosen is
+  // remembered in this browser (a convenience; the run stores its own).
+  let DRIVE = null;
+  async function driveStatus(force) {
+    if (!DRIVE || force) {
+      try { DRIVE = await api("/api/drive/status"); } catch (e) { DRIVE = { error: e.message }; }
+    }
+    return DRIVE;
+  }
+  function lastFolder() { try { return JSON.parse(localStorage.getItem("mbDriveFolder") || "null"); } catch (e) { return null; } }
+  function rememberFolder(f) { try { localStorage.setItem("mbDriveFolder", JSON.stringify(f)); } catch (e) {} }
+  const DRIVE_ROOTS = [{ id: "root", name: "My Drive" }, { id: "shared", name: "Shared with me" },
+                       { id: "drives", name: "Shared drives" }];
+  const PSEUDO = new Set(["shared", "drives"]);
+
+  // A folder browser: crumbs from a root, the sub-folders as a list, and a
+  // button to take the folder shown. onPick({id, name}).
+  function folderBrowser(onPick, onCancel) {
+    const wrap = el("div", "drive-panel");
+    const roots = el("div", "crumbs");
+    const crumbs = el("div", "crumbs");
+    const list = el("ul", "folders");
+    const msg = el("div");
+    const actions = el("div", "actions");
+    const use = el("button", "primary small", "✓ Use this folder");
+    const cancel = el("button", "small", "Cancel");
+    actions.append(use, cancel);
+    wrap.append(roots, crumbs, list, msg, actions);
+    let path = [];
+    DRIVE_ROOTS.forEach((r) => {
+      const b = el("button", "small", r.name);
+      b.onclick = (e) => { e.preventDefault(); path = [r]; load(); };
+      roots.appendChild(b);
+    });
+    function drawCrumbs() {
+      crumbs.innerHTML = "";
+      path.forEach((p, i) => {
+        if (i) crumbs.appendChild(el("span", "sep", "›"));
+        const b = el("button", "small", p.name);
+        b.disabled = i === path.length - 1;
+        b.onclick = (e) => { e.preventDefault(); path = path.slice(0, i + 1); load(); };
+        crumbs.appendChild(b);
+      });
+      const here = path[path.length - 1];
+      use.disabled = !here || PSEUDO.has(here.id) || here.can_write === false;
+      use.textContent = here && !PSEUDO.has(here.id) ? "✓ Use “" + here.name + "”" : "✓ Use this folder";
+      use.title = here && here.can_write === false ? "The bot account can only view this folder" : "";
+    }
+    async function load() {
+      drawCrumbs();
+      list.innerHTML = ""; msg.innerHTML = "";
+      list.appendChild(el("li", null, "◌ Loading…"));
+      const here = path[path.length - 1];
+      try {
+        const r = await api("/api/drive/folders?parent=" + encodeURIComponent(here.id));
+        if (path[path.length - 1] !== here) return;   // navigated on meanwhile
+        list.innerHTML = "";
+        if (!r.folders.length) list.appendChild(el("li", null, "No folders here."));
+        r.folders.forEach((f) => {
+          const li = el("li"); li.tabIndex = 0;
+          li.append(el("span", null, (f.drive ? "🗄 " : f.shared ? "👥 " : "📁 ") + f.name));
+          if (f.can_write === false) li.appendChild(el("span", "ro", "view only"));
+          const go = () => { path.push({ id: f.id, name: f.name, can_write: f.can_write }); load(); };
+          li.onclick = go;
+          li.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); go(); } };
+          list.appendChild(li);
+        });
+      } catch (e) {
+        list.innerHTML = "";
+        msg.appendChild(callout("bad", "Could not list the folders", e.message));
+      }
+    }
+    use.onclick = (e) => {
+      e.preventDefault();
+      const here = path[path.length - 1];
+      onPick({ id: here.id, name: path.filter((p) => p.id !== "root" || path.length === 1).map((p) => p.name).join(" › ") });
+    };
+    cancel.onclick = (e) => { e.preventDefault(); onCancel(); };
+    const last = lastFolder();
+    path = [DRIVE_ROOTS[0]];
+    load();
+    if (last) msg.appendChild(el("div", "help", "Last used: " + last.name));
+    return wrap;
+  }
+
+  // The form's "Send PDF to Google Drive" block. value() is what goes into
+  // the request: {} when off. onChange is called whenever it changes.
+  function drivePicker(container, idPrefix, onChange) {
+    const box = $(container); box.innerHTML = "";
+    const sw = makeSwitch(idPrefix + "DriveOn", "Send the PDF to Google Drive",
+                          "Into a folder of the bot account (BOT_GOOGLE_ACCOUNT), after the summary.");
+    const fbl = el("div", "fb"); fbl.id = "fb-" + idPrefix + "DriveOn";
+    const panel = el("div", "drive-panel hidden");
+    const chosen = el("div", "chosen");
+    const change = el("button", "small", "Choose folder…");
+    const nameField = el("div", "field");
+    const nameLbl = el("label", "lbl", "File name in Drive ");
+    nameLbl.appendChild(el("span", "opt", "(optional; .pdf is added)"));
+    const name = el("input"); name.type = "text"; name.id = idPrefix + "DriveName";
+    name.placeholder = "the summary's title"; nameLbl.htmlFor = name.id;
+    nameField.append(nameLbl, name,
+      el("div", "help", "A file with this name in the folder is replaced (a new version, same link)."));
+    const browserSlot = el("div");
+    const head = el("div", "actions"); head.style.marginTop = "0";
+    head.append(chosen, change);
+    panel.append(head, browserSlot, nameField);
+    box.append(sw.label, fbl, panel);
+    let folder = lastFolder();
+    const say = (lvl, t) => { fbl.className = "fb " + (lvl || ""); fbl.innerHTML = "";
+      if (t) fbl.append(el("span", "ic", ICON[lvl] || ""), el("span", null, t)); };
+    function draw() {
+      chosen.innerHTML = "";
+      if (folder) { chosen.append(document.createTextNode("Folder: ")); chosen.appendChild(el("b", null, folder.name)); }
+      else chosen.textContent = "No folder chosen yet.";
+      change.textContent = folder ? "Change…" : "Choose folder…";
+    }
+    function openBrowser() {
+      browserSlot.innerHTML = "";
+      browserSlot.appendChild(folderBrowser((f) => {
+        folder = f; rememberFolder(f); browserSlot.innerHTML = ""; draw(); sync();
+      }, () => { browserSlot.innerHTML = ""; }));
+    }
+    change.onclick = (e) => { e.preventDefault(); openBrowser(); };
+    let ready = false;
+    async function sync() {
+      panel.classList.toggle("hidden", !sw.input.checked);
+      if (!sw.input.checked) { say("", ""); ready = false; onChange && onChange(); return; }
+      // Asked again while the last answer was "not set up": signing in on the
+      // PC then needs no reload here.
+      const s = await driveStatus(!!DRIVE && !(DRIVE.configured && DRIVE.logged_in && DRIVE.account_ok));
+      ready = false;
+      if (s.error) say("bad", "Could not ask the server: " + s.error);
+      else if (!s.configured) say("bad", "Not set up: GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET are missing from .env (README: \"Google Drive upload\").");
+      else if (!s.logged_in) say("bad", "Not signed in: on the PC run  python3 lib/gdrive.py login");
+      else if (!s.account_ok) say("bad", "Drive is signed in as " + s.account + ", not " + s.expected + ". Sign in again.");
+      else if (!folder) say("warn", "Choose a folder for the PDF.");
+      else { ready = true; say("ok", "The PDF goes to " + folder.name + " as " + (name.value.trim() ? "“" + name.value.trim().replace(/\.pdf$/i, "") + ".pdf”" : "the summary's title") + "."); }
+      if (sw.input.checked && !folder && !browserSlot.childNodes.length && !s.error && s.logged_in) openBrowser();
+      onChange && onChange();
+    }
+    sw.input.addEventListener("change", sync);
+    name.addEventListener("input", sync);
+    draw();
+    return {
+      value() {
+        if (!sw.input.checked || !folder) return {};
+        return { drive_folder: folder.id, drive_folder_name: folder.name,
+                 drive_name: name.value.trim() || undefined };
+      },
+      on() { return sw.input.checked; },
+      ready() { return ready; },
+    };
+  }
 
   // --- Labels ---------------------------------------------------------------
   const FONT_LABELS = { "CMU Serif": "Computer Modern (CMU Serif)" };
@@ -595,13 +827,14 @@
   const RECORD_LABELS = { video: "Video", audio: "Audio only" };
   const PROMPT_LABELS = { video: "Video — talks, news, interviews", meeting: "Meeting — decisions and actions",
     lecture: "Lecture — study sheet", tutorial: "Tutorial — step-by-step guide",
-    reality: "Reality show — episode recap" };
+    reality: "Reality show — episode recap", drama: "Thai drama — episode recap" };
   const PROMPT_HELP = {
     video: "Key points of a talk, news piece or interview.",
     meeting: "Executive summary: decisions, action items with owners, open questions.",
     lecture: "A study sheet with concepts, examples and exam warnings; cites reference material by its label.",
     tutorial: "The steps, commands and gotchas, in order.",
     reality: "Episode recap with [mm:ss] highlights (linked on YouTube), quotes, and the results last.",
+    drama: "Lakorn episode recap: characters and relationships, scene by scene with [mm:ss] links and Thai quotes, spoiler-free opening, what changed last.",
   };
   function promptHelp(selId, fbId) {
     const f = () => fb(fbId, "note", PROMPT_HELP[$(selId).value] || "");
@@ -673,7 +906,8 @@
       buildSeg("mLang", opt.languages, opt.default_language, SPOKEN_LABELS);
       countHint("instructions", "instructions"); countHint("meetInstructions", "meetInstructions");
       $("jobs").value = opt.default_jobs || 2;
-      if (opt.summaries_dir) $("combine").placeholder = opt.summaries_dir.replace(/\/$/, "") + "/combined.md";
+      sDrive = drivePicker("sDrive", "s", () => formChanged());
+      mDrive = drivePicker("mDrive", "m", null);
       switchStates();
       formChanged();
       refreshRuns();
@@ -697,6 +931,9 @@
   }
   document.querySelectorAll("[data-tab]").forEach((b) => { b.onclick = () => selectTab(b.dataset.tab); });
 
+  let sDrive = null, mDrive = null;
+  const tagList = (v) => (v || "").split(",").map((t) => t.trim()).filter(Boolean);
+
   // --- New Google Meet --------------------------------------------------------
   const MEET_RE = /^https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
   let meetRunPoll = null, meetRun = null;
@@ -709,6 +946,11 @@
   function meetState(level, title, extra, icon) { show("meetBox", callout(level, title, extra, icon)); }
 
   $("startMeet").onclick = async () => {
+    if (mDrive && mDrive.on() && !mDrive.ready()) {
+      meetState("warn", "Google Drive is switched on but not ready", "Choose a folder, or switch it off.");
+      $("meetBox").classList.remove("hidden");
+      return;
+    }
     $("startMeet").disabled = true;
     $("meetBox").classList.remove("hidden");
     meetRun = null;
@@ -719,6 +961,8 @@
         prompt: $("meetPrompt").value || undefined, language: seg("mLang"),
         summary_language: seg("mOutLang"), pdf_font: $("meetFont").value,
         record_media: seg("mRecord"), summary_source: seg("mSource"),
+        tags: tagList($("meetTags").value),
+        ...(mDrive ? mDrive.value() : {}),
         instructions: $("meetInstructions").value.trim() || undefined } });
       pollMeet(r.log_name, Date.now());
     } catch (e) {
@@ -804,10 +1048,12 @@
       summary_source: seg("sSource"), record_media: seg("sRecord"),
       instructions: $("instructions").value.trim() || undefined,
       jobs: $("jobs").value || undefined, name: $("name").value.trim() || undefined,
-      combine: $("combine").value.trim() || undefined,
-      no_combine_pdf: $("noCombinePdf").checked && !!$("combine").value.trim(),
+      combine: $("combine").checked || undefined,
+      no_combine_pdf: $("noCombinePdf").checked && $("combine").checked,
+      tags: tagList($("tags").value),
       resources: $("resources").value,
       force: $("force").checked, playlist: $("playlist").checked,
+      ...(sDrive ? sDrive.value() : {}),
     };
   }
 
@@ -842,18 +1088,23 @@
                          mark($("name"), "warn"); warns.push("Name is ignored with more than one input."); }
     else { fb("name", name ? "ok" : "", name ? "Used for the run and its files." : ""); mark($("name")); }
 
-    const combine = $("combine").value.trim();
+    const combine = $("combine").checked;
     const noPdf = $("noCombinePdf");
     noPdf.disabled = !combine;
+    if (!combine) noPdf.checked = false;
     $("sw-noCombinePdf").classList.toggle("off-limits", !combine);
-    fb("noCombinePdf", combine ? "" : "note", combine ? "" : "Only with a combine path.");
-    if (!combine) { fb("combine", "", ""); mark($("combine")); }
-    else if (!/\.md$/i.test(combine)) { fb("combine", "warn", "Should be a .md file path."); mark($("combine"), "warn");
-                                        warns.push("The combine path should end in .md."); }
-    else if (!combine.startsWith("/") && !combine.startsWith("~")) {
-      fb("combine", "warn", "Relative path: it is resolved from the project folder."); mark($("combine"), "warn");
-    } else if (n < 2) { fb("combine", "note", "One document from all inputs; this is for two or more."); mark($("combine")); }
-    else { fb("combine", "ok", "One document from all " + n + " inputs, summarized together."); mark($("combine"), "ok"); }
+    fb("noCombinePdf", combine ? "" : "note", combine ? "" : "Only with Combine on.");
+    const dir = ((OPT && OPT.summaries_dir) || "SUMMARIES_DIR").replace(/\/$/, "");
+    if (!combine) fb("combine", "", "");
+    else if (n < 2) fb("combine", "note", "One document from all inputs; this is for two or more.");
+    else fb("combine", "ok", "One document from all " + n + " inputs → " + dir + "/combine_" + n + "x_….md" +
+            (noPdf.checked ? "" : ", and its PDF in the PDF folder") + ".");
+    if (combine && noPdf.checked && sDrive && sDrive.on())
+      warns.push("Google Drive needs the combined PDF: switch off \"Markdown only\".");
+
+    const tags = tagList($("tags").value);
+    fb("tags", tags.length ? "ok" : "", tags.length ? "Labels for the run history: " + tags.join(" · ") : "");
+    if (sDrive && sDrive.on() && !sDrive.ready()) warns.push("Google Drive is on but not ready (see above).");
 
     fb("playlist", $("playlist").checked ? "warn" : "", $("playlist").checked
        ? "Every video in a playlist becomes its own run; the check lists them all." : "");
@@ -867,7 +1118,8 @@
 
   let lastOkKey = null, checkSeq = 0, checkTimer = null, lastCheck = null, localWarns = [];
   function updateStart() {
-    const ready = lastOkKey !== null && lastOkKey === JSON.stringify(formBody());
+    const ready = lastOkKey !== null && lastOkKey === JSON.stringify(formBody())
+      && !(sDrive && sDrive.on() && !sDrive.ready());
     $("start").disabled = !ready;
     const runs = ready && lastCheck ? lastCheck.plan.filter((p) => p.status === "ok" && p.kind !== "combine").length : 0;
     $("start").textContent = ready ? "▶ Start " + runs + (runs === 1 ? " run" : " runs") : "▶ Start";
@@ -987,8 +1239,9 @@
     // The dry run's own summary lines ("Summary: …", "Media: …") are useful
     // confirmation; the rest (errors) goes in the details.
     const msgs = (r.messages || "").split("\n");
-    const facts = msgs.filter((m) => /^(Summary|Media): /.test(m));
-    const other = msgs.filter((m) => m.trim() && !/^(Summary|Media): /.test(m)).join("\n");
+    const FACT_RE = /^(Summary|Media|Google Drive|Tags): /;
+    const facts = msgs.filter((m) => FACT_RE.test(m));
+    const other = msgs.filter((m) => m.trim() && !FACT_RE.test(m)).join("\n");
 
     if (r.ok) {
       lastOkKey = key;
@@ -1058,12 +1311,14 @@
 
   // --- Runs -----------------------------------------------------------------------
   const STAGE_NAMES = { record: "record", fetch_video: "download", clip: "clip",
-                        transcribe: "transcribe", frames: "frames", summarize: "summarize" };
+                        transcribe: "transcribe", frames: "frames", summarize: "summarize",
+                        upload: "drive" };
   const STAGE_MARK = { done: "✓", failed: "✗", running: "▶", pending: "○" };
   // Stages that never run for this kind of run stay pending forever; they are
   // left out unless something actually happened in them.
   function expected(stage, run) {
     const t = run.input_type;
+    if (stage === "upload") return !!run.drive;
     if (t === "combine") return stage === "summarize";
     switch (stage) {
       case "record": return t === "meeting";
@@ -1088,6 +1343,21 @@
     });
     return box;
   }
+  // The status as a filter key (the history's categories), and its label.
+  const STATUS_LABELS = { running: "▶ running", paused: "⏸ paused", stopped: "■ stopped",
+    failed: "✗ failed", member: "⧉ in a set", done: "✓ done", unfinished: "○ unfinished" };
+  function statusKey(run) {
+    const st = run.stages;
+    if (run.active) return "running";
+    if (run.paused) return "paused";
+    if (run.stopped) return "stopped";
+    if (Object.values(st).includes("failed")) return "failed";
+    if (run.combined_into) return "member";
+    if (st.summarize === "done") return "done";
+    return "unfinished";
+  }
+  const TYPE_LABELS = { meeting: "Meeting", youtube: "YouTube", kaltura: "Kaltura",
+                        local_file: "File", combine: "Combined" };
   function runStatus(run) {
     const st = run.stages;
     if (run.active) return ["info", st.record === "running" ? "● recording" : "▶ running"];
@@ -1113,38 +1383,211 @@
            " " + p(d.getHours()) + ":" + p(d.getMinutes());
   }
   let currentRunDetail = null;
+  // --- The history's filters, search and selection --------------------------
+  // Within a group the chips are OR, across groups AND. Remembered in this
+  // browser only.
+  const FILTER_GROUPS = [["status", "Status"], ["type", "Type"], ["prompt", "Style"], ["tag", "Tags"]];
+  let filters = { status: [], type: [], prompt: [], tag: [] };
+  try { Object.assign(filters, JSON.parse(localStorage.getItem("mbFilters") || "{}")); } catch (e) {}
+  const selected = new Set();
+  let selectMode = false, lastRuns = [];
+  function facets(run) {
+    return { status: [statusKey(run)], type: [run.input_type || "?"],
+             prompt: [run.prompt || "video"], tag: run.tags || [] };
+  }
+  function passes(run, skipGroup) {
+    const f = facets(run);
+    for (const [g] of FILTER_GROUPS) {
+      if (g === skipGroup || !filters[g].length) continue;
+      if (!f[g].some((v) => filters[g].includes(v))) return false;
+    }
+    const q = $("runSearch").value.trim().toLowerCase();
+    if (q) {
+      const hay = [run.run_id, run.name, run.input, (run.tags || []).join(" "),
+                   (run.drive && run.drive.folder_name) || ""].join(" ").toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  }
+  function saveFilters() { try { localStorage.setItem("mbFilters", JSON.stringify(filters)); } catch (e) {} }
+  function drawFilters(runs) {
+    const box = $("runFilters"); box.innerHTML = "";
+    const labelOf = { status: (v) => STATUS_LABELS[v] || v, type: (v) => TYPE_LABELS[v] || v,
+                      prompt: (v) => (PROMPT_LABELS[v] || v).split(" — ")[0], tag: (v) => "# " + v };
+    let any = false;
+    FILTER_GROUPS.forEach(([g, title]) => {
+      const counts = new Map();
+      // Counts honour the other groups' filters, so a chip says how many it would show.
+      runs.filter((r) => passes(r, g)).forEach((r) => facets(r)[g].forEach((v) => counts.set(v, (counts.get(v) || 0) + 1)));
+      filters[g].forEach((v) => { if (!counts.has(v)) counts.set(v, 0); });
+      if (counts.size < (g === "tag" ? 1 : 2) && !filters[g].length) return;
+      any = true;
+      box.appendChild(el("span", "grp", title));
+      [...counts.entries()].sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(b[0])).forEach(([v, n]) => {
+        const b = el("button", "small fchip", labelOf[g](v));
+        b.appendChild(el("span", "n", String(n)));
+        const on = filters[g].includes(v);
+        b.setAttribute("aria-pressed", on ? "true" : "false");
+        b.onclick = () => {
+          filters[g] = on ? filters[g].filter((x) => x !== v) : [...filters[g], v];
+          saveFilters(); drawRuns();
+        };
+        box.appendChild(b);
+      });
+    });
+    if (FILTER_GROUPS.some(([g]) => filters[g].length)) {
+      const c = el("button", "small", "✕ Clear filters");
+      c.onclick = () => { filters = { status: [], type: [], prompt: [], tag: [] }; saveFilters(); drawRuns(); };
+      box.appendChild(c);
+    }
+    box.classList.toggle("hidden", !any);
+    // The form's tag suggestions: every tag in use.
+    const all = new Set(); runs.forEach((r) => (r.tags || []).forEach((t) => all.add(t)));
+    const dl = $("tagList"); dl.innerHTML = "";
+    [...all].sort().forEach((t) => { const o = el("option"); o.value = t; dl.appendChild(o); });
+  }
+
+  function bulkResult(r, what) {
+    const res = r.results || [];
+    const errs = res.filter((x) => x.error).map((x) => x.run_id + ": " + x.error);
+    let freed = 0, n = 0;
+    res.forEach((x) => {
+      if (x.error || x.skipped) return;
+      n++;
+      if (x.bytes) freed += x.bytes;
+      if (x.freed) Object.values(x.freed).forEach((b) => { freed += b; });
+    });
+    const title = what + ": " + n + " run" + (n === 1 ? "" : "s") + (freed ? ", " + fmtBytes(freed) + " freed" : "");
+    return callout(errs.length ? "warn" : "ok", title, errs.length ? errs : null);
+  }
+  function drawBulk() {
+    const bar = $("bulkBar"); bar.innerHTML = "";
+    bar.classList.toggle("hidden", !selectMode);
+    if (!selectMode) return;
+    const shown = lastRuns.filter((r) => passes(r));
+    [...selected].forEach((id) => { if (!lastRuns.some((r) => r.run_id === id)) selected.delete(id); });
+    bar.appendChild(el("span", "count", selected.size + " selected"));
+    const all = el("button", "small", "Select all shown (" + shown.length + ")");
+    all.onclick = () => { shown.forEach((r) => selected.add(r.run_id)); drawRuns(); };
+    const none = el("button", "small", "None");
+    none.onclick = () => { selected.clear(); drawRuns(); };
+    const tagIn = el("input"); tagIn.type = "text"; tagIn.placeholder = "tag to add"; tagIn.setAttribute("list", "tagList");
+    tagIn.style.width = "140px"; tagIn.style.padding = "4px 8px";
+    const tagB = el("button", "small", "+ Tag");
+    const cacheB = el("button", "small", "🧹 Remove cache…");
+    const clearB = el("button", "small danger", "🗑 Clear from history…");
+    [tagB, cacheB, clearB].forEach((b) => { b.disabled = !selected.size; });
+    const ids = () => {
+      // Combined runs first, so their members go with them rather than
+      // being refused as members of a set that still exists.
+      const byId = new Map(lastRuns.map((r) => [r.run_id, r]));
+      return [...selected].sort((a, b) => ((byId.get(b) || {}).input_type === "combine") - ((byId.get(a) || {}).input_type === "combine"));
+    };
+    tagB.onclick = async () => {
+      const t = tagList(tagIn.value); if (!t.length) { tagIn.focus(); return; }
+      try { const r = await api("/api/runs/bulk", { method: "POST", body: { action: "tags", run_ids: ids(), tags: t } });
+            bar.after(bulkResult(r, "Tagged")); refreshRuns(); } catch (e) { bar.after(callout("bad", "Could not tag", e.message)); }
+    };
+    cacheB.onclick = async () => {
+      const opts = el("div", "cache-row");
+      const boxes = {};
+      [["frames", "Frames"], ["chunks", "Chunk cache"], ["media", "Downloads"]].forEach(([k, label]) => {
+        const l = el("label"); const c = el("input"); c.type = "checkbox"; c.checked = true; boxes[k] = c;
+        l.append(c, document.createTextNode(label)); opts.appendChild(l);
+      });
+      bar.after(opts);
+      const ok = await confirmInline(opts, "Remove these caches from " + selected.size + " run(s)? All of them can be made again (frames from the video, downloads re-fetched, chunks re-summarized).", "Remove");
+      const what = Object.keys(boxes).filter((k) => boxes[k].checked);
+      opts.remove();
+      if (!ok || !what.length) return;
+      try { const r = await api("/api/runs/bulk", { method: "POST", body: { action: "cache", run_ids: ids(), what } });
+            bar.after(bulkResult(r, "Caches removed")); refreshRuns(); } catch (e) { bar.after(callout("bad", "Could not remove", e.message)); }
+    };
+    clearB.onclick = async () => {
+      if (!await confirmInline(bar, "Clear " + selected.size + " run(s) from the history? Their recordings, transcripts, summaries and PDFs stay in their folders; the runs' state, logs and caches are deleted (a combined run takes its member runs with it). This cannot be undone.", "Yes, clear them")) return;
+      try {
+        const r = await api("/api/runs/bulk", { method: "POST", body: { action: "clear", run_ids: ids(), with_members: true } });
+        if (selected.has(currentRunDetail)) { currentRunDetail = null; $("runDetail").classList.add("hidden"); }
+        selected.clear();
+        bar.after(bulkResult(r, "Cleared")); refreshRuns();
+      } catch (e) { bar.after(callout("bad", "Could not clear", e.message)); }
+    };
+    bar.append(all, none, tagIn, tagB, cacheB, clearB);
+  }
+
+  function drawRuns() {
+    const runs = lastRuns;
+    drawFilters(runs);
+    drawBulk();
+    const list = $("runsList"); list.innerHTML = "";
+    if (!runs.length) { list.appendChild(callout("note", "No runs yet", "Start one from the other two tabs.")); return; }
+    const shown = runs.filter((r) => passes(r));
+    if (!shown.length) list.appendChild(callout("note", "No run matches", "Change the filters or the search."));
+    shown.forEach((run) => {
+      const card = el("div", "run" + (run.run_id === currentRunDetail ? " sel" : ""));
+      card.tabIndex = 0; card.setAttribute("role", "button");
+      const top = el("div", "top");
+      if (selectMode) {
+        const pick = el("input", "pick"); pick.type = "checkbox"; pick.checked = selected.has(run.run_id);
+        pick.setAttribute("aria-label", "Select " + run.run_id);
+        pick.onclick = (e) => { e.stopPropagation(); if (pick.checked) selected.add(run.run_id); else selected.delete(run.run_id); drawBulk(); };
+        top.appendChild(pick);
+      }
+      const [lvl, txt] = runStatus(run);
+      top.append(el("span", "badge " + lvl, txt), el("span", "id", run.run_id));
+      const a = audioBadge(run); if (a) top.appendChild(a);
+      if (run.drive && run.drive.link) top.appendChild(el("span", "badge ok", "☁ in Drive"));
+      top.appendChild(el("span", "when", fmtTime(run.updated_at)));
+      const src = el("div", "src");
+      if (run.meet_url && MEET_RE.test(run.meet_url)) {
+        src.appendChild(meetAnchor(run.meet_url));
+        if (run.active) {
+          const j = el("button", "primary small", "Join");
+          j.style.marginLeft = "8px";
+          j.onclick = (e) => { e.stopPropagation(); window.open(run.meet_url, "_blank", "noopener"); };
+          src.appendChild(j);
+        }
+      } else src.textContent = (run.input || "").slice(0, 140);
+      card.append(top, src);
+      if ((run.tags || []).length) {
+        const t = el("div");
+        run.tags.forEach((tag) => t.appendChild(el("span", "chip tagchip", "# " + tag)));
+        card.appendChild(t);
+      }
+      card.appendChild(pills(run));
+      card.onclick = () => showRun(run.run_id);
+      card.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); showRun(run.run_id); } };
+      list.appendChild(card);
+    });
+  }
   async function refreshRuns() {
     if ($("app").classList.contains("hidden")) return;
+    // Typing in the bulk bar's tag box: don't rebuild it away.
+    if ($("bulkBar").contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
     try {
-      const r = await api("/api/runs?limit=40");
-      const list = $("runsList"); list.innerHTML = "";
-      if (!r.runs.length) list.appendChild(callout("note", "No runs yet", "Start one from the other two tabs."));
-      r.runs.forEach((run) => {
-        const card = el("div", "run" + (run.run_id === currentRunDetail ? " sel" : ""));
-        card.tabIndex = 0; card.setAttribute("role", "button");
-        const top = el("div", "top");
-        const [lvl, txt] = runStatus(run);
-        top.append(el("span", "badge " + lvl, txt), el("span", "id", run.run_id));
-        const a = audioBadge(run); if (a) top.appendChild(a);
-        top.appendChild(el("span", "when", fmtTime(run.updated_at)));
-        const src = el("div", "src");
-        if (run.meet_url && MEET_RE.test(run.meet_url)) {
-          src.appendChild(meetAnchor(run.meet_url));
-          if (run.active) {
-            const j = el("button", "primary small", "Join");
-            j.style.marginLeft = "8px";
-            j.onclick = (e) => { e.stopPropagation(); window.open(run.meet_url, "_blank", "noopener"); };
-            src.appendChild(j);
-          }
-        } else src.textContent = (run.input || "").slice(0, 140);
-        card.append(top, src, pills(run));
-        card.onclick = () => showRun(run.run_id);
-        card.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); showRun(run.run_id); } };
-        list.appendChild(card);
-      });
+      const r = await api("/api/runs?limit=400");
+      lastRuns = r.runs;
+      drawRuns();
       if (currentRunDetail) showRun(currentRunDetail, true);
     } catch (e) {}
   }
+  $("runSearch").addEventListener("input", drawRuns);
+  $("selectMode").onclick = () => {
+    selectMode = !selectMode;
+    $("selectMode").setAttribute("aria-pressed", selectMode ? "true" : "false");
+    $("selectMode").textContent = selectMode ? "☑ Selecting" : "☐ Select";
+    if (!selectMode) selected.clear();
+    drawRuns();
+  };
+  $("clearTmp").onclick = async () => {
+    let size = 0;
+    try { size = (await api("/api/cache")).tmp; } catch (e) {}
+    const head = document.querySelector(".runs-head");
+    if (!await confirmInline(head, "Empty the temp folder (" + fmtBytes(size) + ")? Rejected model answers, cached prompt files and scratch files; all are recreated when needed. Not while a run is being processed.", "Empty it")) return;
+    try { const r = await api("/api/cache/tmp", { method: "POST", body: {} });
+          head.after(callout("ok", "Temp files removed", fmtBytes(r.bytes) + " freed.")); }
+    catch (e) { head.after(callout("bad", "Could not empty the temp folder", e.message)); }
+  };
   $("refreshRuns").onclick = refreshRuns;
 
   function outFile(label, path) {
@@ -1167,8 +1610,11 @@
     currentRunDetail = id;
     if (changed) openLogs.clear();
     document.querySelectorAll(".run").forEach((c) => c.classList.toggle("sel", c.querySelector(".id").textContent === id));
-    // A confirm bar is waiting for an answer: don't rebuild it away.
-    if (quiet && $("runDetail").querySelector(".confirm-bar")) return;
+    // A confirm bar is waiting for an answer, the folder browser is open, or
+    // a box is being typed in: don't rebuild it away.
+    const det = $("runDetail"), act = document.activeElement;
+    if (quiet && (det.querySelector(".confirm-bar") || det.querySelector(".drive-panel")
+                  || (det.contains(act) && /^(INPUT|TEXTAREA)$/.test(act.tagName)))) return;
     try {
       const r = await api("/api/runs/" + encodeURIComponent(id));
       const s = r.summary, st = r.state;
@@ -1191,12 +1637,25 @@
       if (s.input_type === "meeting") row("Recording", st.record_media === "audio" ? "Audio only (.m4a)" : "Video");
       row("Instructions", st.instructions);
       row("Combined into", s.combined_into);
+      if (s.input_type === "combine" && s.members.length) row("Members", s.members.join(", "));
+      if (s.drive) row("Google Drive", (s.drive.folder_name || s.drive.folder) +
+                       (s.drive.name ? " — as “" + s.drive.name + "”" : ""));
+      row("Created", st.created_at ? fmtTime(st.created_at) : "");
       box.appendChild(dl);
 
       if (s.artifacts.md || s.artifacts.pdf) {
         box.appendChild(el("h3", null, "Output"));
         if (s.artifacts.md) box.appendChild(outFile("Summary", s.artifacts.md));
         if (s.artifacts.pdf) box.appendChild(outFile("PDF", s.artifacts.pdf));
+      }
+      if (s.drive && s.drive.link) {
+        const row2 = el("div", "outfile");
+        const a = el("a", null, s.drive.link); a.href = s.drive.link; a.target = "_blank"; a.rel = "noopener";
+        row2.append(el("span", null, "In Drive"), a);
+        box.appendChild(row2);
+      } else if (s.drive && s.stages.upload === "failed") {
+        box.appendChild(callout("bad", "The Drive upload failed", (s.drive.error || "").split("\n").slice(-4).join("\n") +
+                                "\nResume retries only the upload."));
       }
 
       const actions = el("div", "actions");
@@ -1238,6 +1697,7 @@
       };
       actions.append(resume, stop);
       box.appendChild(actions);
+      runExtras(box, id, s);
 
       const logs = Object.entries(r.logs);
       if (logs.length) box.appendChild(el("h3", null, "Logs"));
@@ -1253,6 +1713,123 @@
       });
       if (!quiet) box.scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (e) {}
+  }
+  // The detail's history tools: tags, Drive, caches, clear.
+  const sizeCache = new Map();
+  function runExtras(box, id, s) {
+    const busy = s.active;
+    // Tags
+    box.appendChild(el("h3", null, "Tags"));
+    const tagRow = el("div", "actions"); tagRow.style.marginTop = "0";
+    const tagIn = el("input"); tagIn.type = "text"; tagIn.value = (s.tags || []).join(", ");
+    tagIn.placeholder = "comma-separated"; tagIn.setAttribute("list", "tagList"); tagIn.style.flex = "1 1 200px";
+    const tagSave = el("button", "small", "Save tags");
+    tagSave.onclick = async () => {
+      try { await api("/api/runs/" + encodeURIComponent(id) + "/tags", { method: "POST", body: { tags: tagList(tagIn.value) } });
+            tagSave.textContent = "✓ Saved"; tagIn.blur(); setTimeout(refreshRuns, 300); }
+      catch (e) { tagRow.after(callout("bad", "Could not save the tags", e.message)); }
+    };
+    tagIn.addEventListener("keydown", (e) => { if (e.key === "Enter") tagSave.click(); });
+    tagRow.append(tagIn, tagSave);
+    box.appendChild(tagRow);
+
+    // Google Drive: send a finished run's PDF (or send it again elsewhere).
+    if (s.artifacts.pdf) {
+      box.appendChild(el("h3", null, "Google Drive"));
+      const dr = el("div", "actions"); dr.style.marginTop = "0";
+      const send = el("button", "small", s.drive && s.drive.link ? "☁ Send again / elsewhere…" : "☁ Send PDF to Drive…");
+      send.disabled = busy;
+      const slot = el("div");
+      send.onclick = async () => {
+        const st = await driveStatus(true);
+        slot.innerHTML = "";
+        if (!st.configured || !st.logged_in || !st.account_ok) {
+          slot.appendChild(callout("bad", "Google Drive is not ready",
+            !st.configured ? "Set GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET in .env." :
+            !st.logged_in ? "On the PC run  python3 lib/gdrive.py login" :
+            "Signed in as " + st.account + ", not " + st.expected + "."));
+          return;
+        }
+        const nameIn = el("input"); nameIn.type = "text";
+        nameIn.placeholder = "file name (default: the summary's title)";
+        nameIn.value = (s.drive && s.drive.name) || "";
+        const browser = folderBrowser(async (f) => {
+          rememberFolder(f);
+          try {
+            await api("/api/runs/" + encodeURIComponent(id) + "/resume", { method: "POST",
+              body: { drive_folder: f.id, drive_folder_name: f.name, drive_name: nameIn.value.trim() || undefined } });
+            slot.innerHTML = "";
+            slot.appendChild(callout("info", "Uploading to " + f.name, "The run shows ☁ when it is there.", "spin"));
+            setTimeout(refreshRuns, 2500);
+          } catch (e) { slot.appendChild(callout("bad", "Could not start the upload", e.message)); }
+        }, () => { slot.innerHTML = ""; });
+        slot.append(nameIn, browser);
+        nameIn.style.width = "100%";
+      };
+      dr.appendChild(send);
+      box.append(dr, slot);
+    }
+
+    // Caches: each removable, each regenerable.
+    box.appendChild(el("h3", null, "Cache"));
+    const cache = el("div", "cache-row");
+    box.appendChild(cache);
+    const drawCache = (sz) => {
+      cache.innerHTML = "";
+      const boxes = {};
+      [["frames", "Frames"], ["chunks", "Chunk cache"], ["media", "Download"]].forEach(([k, label]) => {
+        const l = el("label"); const c = el("input"); c.type = "checkbox";
+        c.disabled = !sz[k] || busy; boxes[k] = c;
+        l.append(c, document.createTextNode(label + " (" + fmtBytes(sz[k]) + ")"));
+        cache.appendChild(l);
+      });
+      const rm = el("button", "small", "🧹 Remove selected");
+      rm.disabled = busy;
+      rm.onclick = async () => {
+        const what = Object.keys(boxes).filter((k) => boxes[k].checked);
+        if (!what.length) return;
+        try {
+          const r = await api("/api/runs/" + encodeURIComponent(id) + "/cache", { method: "POST", body: { what } });
+          const freed = Object.values(r.freed || {}).reduce((a, b) => a + b, 0);
+          sizeCache.delete(id);
+          cache.after(callout("ok", "Removed", fmtBytes(freed) + " freed. A resume makes them again if it needs them."));
+          loadSizes();
+        } catch (e) { cache.after(callout("bad", "Could not remove", e.message)); }
+      };
+      cache.appendChild(rm);
+      cache.appendChild(el("span", "help", "Run folder in all: " + fmtBytes(sz.bookkeeping)));
+    };
+    const loadSizes = async () => {
+      if (!sizeCache.has(id)) {
+        try { sizeCache.set(id, await api("/api/runs/" + encodeURIComponent(id) + "/sizes")); } catch (e) { return; }
+      }
+      drawCache(sizeCache.get(id));
+    };
+    if (sizeCache.has(id)) drawCache(sizeCache.get(id)); else { cache.textContent = "◌ measuring…"; loadSizes(); }
+
+    // Clear from the history.
+    const clr = el("div", "actions");
+    const memberOfLive = s.combined_into && lastRuns.some((r) => r.run_id === s.combined_into);
+    let withMembers = null;
+    if (s.input_type === "combine" && s.members.length) {
+      const l = el("label"); withMembers = el("input"); withMembers.type = "checkbox"; withMembers.checked = true;
+      l.append(withMembers, document.createTextNode(" also clear its " + s.members.length + " member run(s)"));
+      clr.appendChild(l);
+    }
+    const clearB = el("button", "danger", "🗑 Clear from history");
+    clearB.disabled = busy || memberOfLive;
+    clearB.title = busy ? "It is running" : memberOfLive ? "Part of " + s.combined_into + ": clear that run instead" : "";
+    clearB.onclick = async () => {
+      if (!await confirmInline(clr, "Clear " + id + " from the history? The recording, transcript, summary and PDF stay in their folders; the run's state, logs and caches are deleted. This cannot be undone.", "Yes, clear it")) return;
+      try {
+        await api("/api/runs/" + encodeURIComponent(id) + "/clear", { method: "POST",
+          body: { with_members: !!(withMembers && withMembers.checked) } });
+        currentRunDetail = null; box.classList.add("hidden"); box.innerHTML = "";
+        refreshRuns();
+      } catch (e) { clr.after(callout("bad", "Could not clear", e.message)); }
+    };
+    clr.appendChild(clearB);
+    box.appendChild(clr);
   }
   setInterval(refreshRuns, 10000);
 

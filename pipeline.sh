@@ -43,9 +43,10 @@
 #   --name N            meeting name (single input only; otherwise derived)
 #   --display-name D    name the bot shows in the meeting (default "Meeting Bot")
 #   --language L        th (default), en, auto, or any AssemblyAI language code
-#   --prompt P          the summary style: video, meeting, lecture, tutorial
-#                       or reality (a reality-show episode recap, with
-#                       timestamps; a file in summarize/prompts/; the older
+#   --prompt P          the summary style: video, meeting, lecture, tutorial,
+#                       reality (a reality-show episode recap, with
+#                       timestamps) or drama (a Thai drama episode recap,
+#                       with timestamps; a file in summarize/prompts/; the older
 #                       names such as lecture-claude still work)
 #   --summary-language L  the language the summary is WRITTEN in: th or en
 #                       (default SUMMARY_LANGUAGE). --language is the SPOKEN one.
@@ -118,8 +119,12 @@
 #   --jobs N            how many inputs to process at once (default 2)
 #   --from-file F       read inputs from a file, one per line, # for comments
 #   --playlist          expand YouTube playlist URLs into their videos
-#   --combine F         summarize ALL the inputs together, as one lecture, into
-#                       one document F (and a PDF beside it). Each input is
+#   --combine [F.md]    summarize ALL the inputs together, as one lecture, into
+#                       one document. With no path (the next argument does not
+#                       end in .md) it goes to the default places, like any
+#                       run's: SUMMARIES_DIR/<combine run id>.md and
+#                       PDF_DIR/<combine run id>.pdf. With F.md, into F (and a
+#                       PDF beside it). Each input is
 #                       still transcribed and frame-sampled on its own, but
 #                       none of them gets an individual summary: the model
 #                       reads every transcript, in input order, and writes a
@@ -128,8 +133,22 @@
 #                       The combined summary is a run of its own
 #                       (combine_<n>x_<hash>_<time>) and resumes like any other.
 #   --combine-pdf F     where the combined PDF goes (default: --combine's path
-#                       with a .pdf extension)
+#                       with a .pdf extension, or PDF_DIR without a path)
 #   --no-combine-pdf    write only the combined markdown
+#   --drive-folder F    also put the summary PDF into this Google Drive folder
+#                       (an id or a folder link) of the bot account — an
+#                       `upload` stage after summarize. Needs a one-time
+#                       `python3 lib/gdrive.py login` (README "Google Drive
+#                       upload"). A same-named file there is replaced (new
+#                       revision, same link). With --combine, the combined PDF
+#                       only. Stored with the run; given on a --run-id
+#                       resume, it uploads a finished run's PDF.
+#   --drive-name N      the file's name in Drive (".pdf" added; default: the
+#                       summary's title)
+#   --drive-folder-name N  the folder's name, for display only (the web UI)
+#   --no-drive          turn a stored Drive upload off
+#   --tag T             a label for the run history (repeatable, or
+#                       comma-separated); given on a resume, replaces the old
 #
 # The legacy positional form still works:
 #   ./pipeline.sh <input> [name] [display_name] [language] [prompt]
@@ -167,6 +186,9 @@ RESUME_ALL=0
 EXPLICIT_RUN_ID=""
 FROM_FILE=""
 COMBINE_FILE=""
+# --combine with no .md path: the documents go to SUMMARIES_DIR / PDF_DIR,
+# named for the combine run id (settled 2026-11-02, the web UI's toggle).
+COMBINE_DEFAULT=0
 COMBINE_PDF=""
 COMBINE_WANT_PDF=1
 CLIP_SPEC=""
@@ -182,6 +204,11 @@ INSTRUCTIONS_OPT=""
 SUMMARY_SOURCE_OPT=""
 RECORD_MEDIA_OPT=""
 SOURCE_URL_OPT=""
+DRIVE_FOLDER_OPT=""
+DRIVE_NAME_OPT=""
+DRIVE_FOLDER_NAME_OPT=""
+NO_DRIVE=0
+declare -a TAGS_OPT=()
 declare -a POSITIONAL=()
 declare -a RESOURCE_SPECS=()
 # RESOURCES in .env is the default for every run; --resources adds to it.
@@ -220,12 +247,24 @@ while [ "$#" -gt 0 ]; do
     --summary-source) need_value "$1" "$#" "${2:-}"; SUMMARY_SOURCE_OPT="$2"; shift 2 ;;
     --record-media) need_value "$1" "$#" "${2:-}"; RECORD_MEDIA_OPT="$2"; shift 2 ;;
     --source-url)   need_value "$1" "$#" "${2:-}"; SOURCE_URL_OPT="$2"; shift 2 ;;
+    --drive-folder) need_value "$1" "$#" "${2:-}"; DRIVE_FOLDER_OPT="$2"; shift 2 ;;
+    --drive-name)   need_value "$1" "$#" "${2:-}"; DRIVE_NAME_OPT="$2"; shift 2 ;;
+    --drive-folder-name) need_value "$1" "$#" "${2:-}"; DRIVE_FOLDER_NAME_OPT="$2"; shift 2 ;;
+    --no-drive)     NO_DRIVE=1; shift ;;
+    --tag)          need_value "$1" "$#" "${2:-}"; TAGS_OPT+=("$2"); shift 2 ;;
     --voice-only)   SUMMARY_SOURCE_OPT=voice; shift ;;
     --audio-only)   RECORD_MEDIA_OPT=audio; shift ;;
     --jobs)         need_value "$1" "$#" "${2:-}"; JOBS="$2"; shift 2 ;;
     --clip)         need_value "$1" "$#" "${2:-}"; CLIP_SPEC="$2"; shift 2 ;;
     --from-file)    need_value "$1" "$#" "${2:-}"; FROM_FILE="$2"; shift 2 ;;
-    --combine)      need_value "$1" "$#" "${2:-}"; COMBINE_FILE="$2"; shift 2 ;;
+    --combine)
+      # The path is optional, so only a next argument ending in .md is one;
+      # anything else (an input, an option, nothing) means the default paths.
+      case "${2:-}" in
+        --*|"") COMBINE_DEFAULT=1; shift ;;
+        *.md|*.MD|*.markdown) COMBINE_FILE="$2"; COMBINE_DEFAULT=0; shift 2 ;;
+        *) COMBINE_DEFAULT=1; shift ;;
+      esac ;;
     --combine-pdf)  need_value "$1" "$#" "${2:-}"; COMBINE_PDF="$2"; shift 2 ;;
     --no-combine-pdf) COMBINE_WANT_PDF=0; shift ;;
     --run-id)       need_value "$1" "$#" "${2:-}"; EXPLICIT_RUN_ID="$2"; shift 2 ;;
@@ -318,6 +357,57 @@ if [ -n "$SOURCE_URL_OPT" ]; then
   esac
   SUMMARY_INIT_ARGS+=(--source-url "$SOURCE_URL_OPT")
 fi
+
+# --- Google Drive and tags -------------------------------------------------------
+# Checked here, offline, before anything is paid for: the folder must parse,
+# the bot account must be signed in to Drive, and there must be a PDF to send.
+# Whether the folder exists and is writable is the web UI's folder browser's
+# job (and the upload stage's error if it is not); this never calls Google.
+declare -a DRIVE_INIT_ARGS=()
+if [ "$NO_DRIVE" -eq 1 ]; then
+  DRIVE_INIT_ARGS+=(--drive-folder "" --drive-folder-name "")
+elif [ -n "$DRIVE_FOLDER_OPT" ]; then
+  DRIVE_FOLDER_OPT="$("$PYTHON_BIN" "$SCRIPT_DIR/lib/gdrive.py" parse "$DRIVE_FOLDER_OPT" \
+                      | sed -nE 's/.*"id": "([^"]*)".*/\1/p')"
+  if [ -z "$DRIVE_FOLDER_OPT" ] || [ "$DRIVE_FOLDER_OPT" = shared ] || [ "$DRIVE_FOLDER_OPT" = drives ]; then
+    echo "ERROR: --drive-folder: not a Google Drive folder id or link" >&2
+    exit 1
+  fi
+  if ! "$PYTHON_BIN" "$SCRIPT_DIR/lib/gdrive.py" status | "$PYTHON_BIN" -c \
+       'import json, sys; s = json.load(sys.stdin); sys.exit(0 if s["configured"] and s["logged_in"] and s["account_ok"] else 1)'; then
+    echo "ERROR: --drive-folder: Google Drive is not set up for the bot account." >&2
+    echo "  Set GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET in .env, then on this PC run:" >&2
+    echo "      python3 lib/gdrive.py login" >&2
+    exit 1
+  fi
+  case "$(printf '%s' "${SUMMARY_WRITE_PDF:-1}" | tr 'A-Z' 'a-z')" in
+    0|false|no) echo "ERROR: --drive-folder uploads the PDF, and SUMMARY_WRITE_PDF turns it off" >&2
+                exit 1 ;;
+  esac
+  if { [ -n "$COMBINE_FILE" ] || [ "$COMBINE_DEFAULT" -eq 1 ]; } && [ "$COMBINE_WANT_PDF" -eq 0 ]; then
+    echo "ERROR: --drive-folder uploads the combined PDF, and --no-combine-pdf turns it off" >&2
+    exit 1
+  fi
+  DRIVE_INIT_ARGS+=(--drive-folder "$DRIVE_FOLDER_OPT"
+                    --drive-folder-name "${DRIVE_FOLDER_NAME_OPT:-$DRIVE_FOLDER_OPT}")
+fi
+[ -n "$DRIVE_NAME_OPT" ] && DRIVE_INIT_ARGS+=(--drive-name "$DRIVE_NAME_OPT")
+declare -a TAG_INIT_ARGS=()
+for _tag in "${TAGS_OPT[@]:-}"; do
+  [ -n "$_tag" ] && TAG_INIT_ARGS+=(--tags "$_tag")
+done
+# A run that already exists takes the Drive settings given now, and an
+# upload already done to the old place is done again to the new one.
+apply_run_settings() {  # <run dir> <with drive: 1|0>
+  local dir="$1" with_drive="$2"
+  local -a a=("${TAG_INIT_ARGS[@]}")
+  [ "$with_drive" -eq 1 ] && a+=("${DRIVE_INIT_ARGS[@]}")
+  [ "${#a[@]}" -gt 0 ] && rs init --run-dir "$dir" "${a[@]}"
+  if [ "$with_drive" -eq 1 ] && [ "${#DRIVE_INIT_ARGS[@]}" -gt 0 ]; then
+    rs reset --run-dir "$dir" --stage upload
+  fi
+  return 0
+}
 
 # --- Meetings run in the background -------------------------------------------
 # A recording lasts as long as the meeting, and it must not die with the
@@ -692,10 +782,12 @@ if [ -n "$EXPLICIT_RUN_ID" ]; then
     exit 1
   fi
   RUN_DIRS+=("$RUNS_DIR/$EXPLICIT_RUN_ID")
+  [ "$DRY_RUN" -eq 1 ] || apply_run_settings "$RUNS_DIR/$EXPLICIT_RUN_ID" 1
 elif [ "$RESUME_LAST" -eq 1 ]; then
   last="$(rs latest --root "$RUNS_DIR")" || {
     echo "ERROR: no runs found under $RUNS_DIR" >&2; exit 1; }
   RUN_DIRS+=("$RUNS_DIR/$last")
+  [ "$DRY_RUN" -eq 1 ] || apply_run_settings "$RUNS_DIR/$last" 1
 elif [ "$RESUME_ALL" -eq 1 ]; then
   PAUSED_SKIPPED=0
   STOPPED_SKIPPED=0
@@ -821,7 +913,8 @@ else
       exit 1
     fi
     if [ -n "$SOURCE_URL_OPT" ] && { [ "$kind" != "local_file" ] \
-         || [ "${#INPUTS[@]}" -ne 1 ] || [ -n "$COMBINE_FILE" ]; }; then
+         || [ "${#INPUTS[@]}" -ne 1 ] || [ -n "$COMBINE_FILE" ] \
+         || [ "$COMBINE_DEFAULT" -eq 1 ]; }; then
       echo "ERROR: --source-url names the call ONE local recording came from;" >&2
       echo "  it cannot go with a $kind input, several inputs, or --combine." >&2
       if [ "$DRY_RUN" -eq 1 ]; then
@@ -856,6 +949,12 @@ else
       if [ "${#SUMMARY_INIT_ARGS[@]}" -gt 0 ]; then
         rs init --run-dir "$run_dir" "${SUMMARY_INIT_ARGS[@]}"
       fi
+      # Drive belongs to the combined document when there is one.
+      if [ -n "$COMBINE_FILE" ] || [ "$COMBINE_DEFAULT" -eq 1 ]; then
+        apply_run_settings "$run_dir" 0
+      else
+        apply_run_settings "$run_dir" 1
+      fi
     else
       safe="$(derive_safe_name "$input" "$kind")"
       [ -z "$safe" ] && safe="meeting"
@@ -874,8 +973,12 @@ else
         --language "$LANGUAGE" --prompt "$PROMPT_NAME"
         --display-name "$DISPLAY_NAME"
         "${SUMMARY_INIT_ARGS[@]}"
+        "${TAG_INIT_ARGS[@]}"
         --summary-source "$SUMMARY_SOURCE_EFF"
       )
+      if [ -z "$COMBINE_FILE" ] && [ "$COMBINE_DEFAULT" -eq 0 ]; then
+        init_args+=("${DRIVE_INIT_ARGS[@]}")
+      fi
       if [ "$kind" = "meeting" ]; then
         init_args+=(--record-media "$RECORD_MEDIA_EFF")
         # No picture, no frames: stored as voice so --status says what the
@@ -895,7 +998,10 @@ else
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  if [ -n "$COMBINE_FILE" ]; then
+  if [ "$COMBINE_DEFAULT" -eq 1 ]; then
+    paths_require SUMMARIES_DIR || exit 1
+    printf 'combine\t%s\n' "${SUMMARIES_DIR%/}/<combine run id>.md"
+  elif [ -n "$COMBINE_FILE" ]; then
     combine_dir="$(dirname "$COMBINE_FILE")"
     case "$combine_dir" in /*) ;; *) combine_dir="$PWD/$combine_dir" ;; esac
     if [ ! -d "$combine_dir" ]; then
@@ -913,6 +1019,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
   _extra=""
   [ -n "$INSTRUCTIONS_OPT" ] && _extra=", with extra instructions (${#INSTRUCTIONS_OPT} chars)"
   echo "Summary: prompt ${PROMPT_NAME:-video (default)}, written in $_lang, PDF font $_font$_extra" >&2
+  [ -n "$DRIVE_FOLDER_OPT" ] && echo "Google Drive: the PDF goes to ${DRIVE_FOLDER_NAME_OPT:-folder $DRIVE_FOLDER_OPT}${DRIVE_NAME_OPT:+ as \"$DRIVE_NAME_OPT\"}" >&2
+  [ "${#TAG_INIT_ARGS[@]}" -gt 0 ] && echo "Tags: ${TAGS_OPT[*]}" >&2
   echo "Media: summary from $SUMMARY_SOURCE_EFF$([ "$SUMMARY_SOURCE_EFF" = voice ] && echo ' (transcript only, no frames)'); a meeting records $RECORD_MEDIA_EFF$([ "$RECORD_MEDIA_EFF" = audio ] && echo ' (an .m4a, summarized from the voice)')" >&2
   if [ "$DRY_BAD" -gt 0 ]; then
     echo "ERROR: $DRY_BAD input(s) can't be used (the bad/badarg/extra lines above)." >&2
@@ -929,26 +1037,35 @@ fi
 # --resume-all leaves them alone), and the auto-resume key — the member run
 # ids, in order — is only known once they are.
 COMBINE_RUN_DIR=""
-if [ -n "$COMBINE_FILE" ]; then
+if [ -n "$COMBINE_FILE" ] || [ "$COMBINE_DEFAULT" -eq 1 ]; then
   if [ -n "$EXPLICIT_RUN_ID" ] || [ "$RESUME_LAST" -eq 1 ] || [ "$RESUME_ALL" -eq 1 ]; then
     echo "ERROR: --combine takes inputs, not --run-id/--resume-last/--resume-all." >&2
     echo "  To resume a combined summary, re-run the original command, or" >&2
     echo "  ./pipeline.sh --run-id <combine_...>  (see --list)." >&2
     exit 1
   fi
-  case "$COMBINE_FILE" in
-    /*) ;;
-    *) COMBINE_FILE="$PWD/$COMBINE_FILE" ;;
-  esac
+  if [ "$COMBINE_DEFAULT" -eq 1 ]; then
+    paths_require SUMMARIES_DIR PDF_DIR || exit 1
+  else
+    case "$COMBINE_FILE" in
+      /*) ;;
+      *) COMBINE_FILE="$PWD/$COMBINE_FILE" ;;
+    esac
+  fi
   if [ "$COMBINE_WANT_PDF" -eq 1 ]; then
     case "$(printf '%s' "${SUMMARY_WRITE_PDF:-1}" | tr 'A-Z' 'a-z')" in
       0|false|no) COMBINE_PDF="" ;;
       *)
-        [ -n "$COMBINE_PDF" ] || COMBINE_PDF="${COMBINE_FILE%.md}.pdf"
-        case "$COMBINE_PDF" in
-          /*) ;;
-          *) COMBINE_PDF="$PWD/$COMBINE_PDF" ;;
-        esac
+        # A default-path PDF is named once the run id is known (below).
+        if [ "$COMBINE_DEFAULT" -eq 0 ] || [ -n "$COMBINE_PDF" ]; then
+          [ -n "$COMBINE_PDF" ] || COMBINE_PDF="${COMBINE_FILE%.md}.pdf"
+          case "$COMBINE_PDF" in
+            /*) ;;
+            *) COMBINE_PDF="$PWD/$COMBINE_PDF" ;;
+          esac
+        else
+          COMBINE_PDF="@default"
+        fi
         ;;
     esac
   else
@@ -981,6 +1098,14 @@ if [ -n "$COMBINE_FILE" ]; then
       suffix=$((suffix + 1))
     done
   fi
+  # The default paths are a function of the run id, like every run's
+  # artifacts, so a resumed set lands on the same files.
+  if [ "$COMBINE_DEFAULT" -eq 1 ]; then
+    COMBINE_FILE="${SUMMARIES_DIR%/}/$(basename "$COMBINE_RUN_DIR").md"
+    [ "$COMBINE_PDF" = "@default" ] && COMBINE_PDF="${PDF_DIR%/}/$(basename "$COMBINE_RUN_DIR").pdf"
+    mkdir -p "$SUMMARIES_DIR"
+    [ -n "$COMBINE_PDF" ] && mkdir -p "$(dirname "$COMBINE_PDF")"
+  fi
   # `init` refreshes the metadata on a resume too, so a re-run that names a
   # different --combine path writes there.
   declare -a combine_init=(
@@ -991,6 +1116,8 @@ if [ -n "$COMBINE_FILE" ]; then
     --display-name "$DISPLAY_NAME"
     --output-md "$COMBINE_FILE"
     "${SUMMARY_INIT_ARGS[@]}"
+    "${TAG_INIT_ARGS[@]}"
+    "${DRIVE_INIT_ARGS[@]}"
   )
   # A new combine run takes the invocation's choice; a resumed one keeps its
   # own unless --summary-source was given (it is in SUMMARY_INIT_ARGS then).
@@ -1004,6 +1131,8 @@ if [ -n "$COMBINE_FILE" ]; then
   done
   mkdir -p "$RUNS_DIR"
   rs init "${combine_init[@]}"
+  [ -n "$existing" ] && [ "${#DRIVE_INIT_ARGS[@]}" -gt 0 ] \
+    && rs reset --run-dir "$COMBINE_RUN_DIR" --stage upload
   # And the reverse pointer on every member.
   for run_dir in "${RUN_DIRS[@]}"; do
     rs init --run-dir "$run_dir" --combined-into "$(basename "$COMBINE_RUN_DIR")"

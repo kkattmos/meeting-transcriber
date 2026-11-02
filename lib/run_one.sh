@@ -345,6 +345,61 @@ mark_done() {
   rs done --run-dir "$RUN_DIR" --stage "$stage" "${args[@]}"
 }
 
+# --- Stage 4: upload the PDF to Google Drive (lib/gdrive.py) -----------------
+# Only when the run names a Drive folder (pipeline.sh --drive-folder / the web
+# UI). Its own stage, settled with the operator 2026-11-02: a failure marks
+# only `upload` failed — the PDF is safe on disk — and a resume retries it
+# without touching summarize. The file id and link go into state.json for the
+# web UI. A same-named file in the folder is replaced (gdrive.py).
+DRIVE_FOLDER="$(cfg drive_folder)"
+DRIVE_NAME="$(cfg drive_name)"
+
+do_upload() {
+  local pdf="$1" md="$2" name="$DRIVE_NAME" out
+  # No name given: the summary's own title (the document's first heading),
+  # else the run's name.
+  if [ -z "$name" ] && [ -f "$md" ]; then
+    name="$(sed -nE '/^# /{s/^# +//;s/[*`]//g;p;q}' "$md")"
+  fi
+  [ -n "$name" ] || name="$NAME"
+  echo "Uploading $(basename "$pdf") to Google Drive folder ${DRIVE_FOLDER} as \"${name}\""
+  out="$("$PYTHON_BIN" "$SCRIPT_DIR/gdrive.py" upload \
+           --file "$pdf" --folder "$DRIVE_FOLDER" --name "$name")" || return 1
+  echo "$out"
+  "$PYTHON_BIN" - "$RUNSTATE" "$RUN_DIR" "$out" <<'PY' || return 1
+import json, subprocess, sys
+runstate, run_dir, out = sys.argv[1:4]
+r = json.loads(out)
+fields = {"drive_file_id": r.get("id"), "drive_link": r.get("webViewLink"),
+          "drive_file_name": r.get("name"), "drive_replaced": bool(r.get("replaced"))}
+cmd = [sys.executable, runstate, "annotate", "--run-dir", run_dir, "--stage", "upload"]
+for k, v in fields.items():
+    cmd += ["--set", f"{k}={json.dumps(v)}"]
+subprocess.run(cmd, check=True)
+print(("Replaced" if r.get("replaced") else "Uploaded") + f": {r.get('webViewLink')}")
+PY
+}
+
+# Returns 0 when there is nothing to upload or the upload is done.
+maybe_upload() {
+  local pdf="$1" md="$2"
+  [ -n "$DRIVE_FOLDER" ] || return 0
+  if [ "$(stage_status upload)" = "done" ]; then
+    echo "[upload] already in Google Drive: $(cfg stages.upload.drive_link)"
+    return 0
+  fi
+  if [ -z "$pdf" ] || [ ! -f "$pdf" ]; then
+    rs fail --run-dir "$RUN_DIR" --stage upload \
+      --error "no PDF to upload (${pdf:-PDF output is off}); re-render it, then resume"
+    echo "[upload] FAILED — there is no PDF to upload (${pdf:-PDF output is off})" >&2
+    return 1
+  fi
+  echo ""
+  run_stage upload do_upload "$pdf" "$md" || return 1
+  rs done --run-dir "$RUN_DIR" --stage upload
+  echo "Drive:      $(cfg stages.upload.drive_link)"
+}
+
 # --- A combine run: one summarize stage over several members' outputs -------
 # Lives up here, ahead of the per-input stages, because none of them apply:
 # there is no media to fetch, cut, transcribe or sample. Everything the
@@ -456,6 +511,7 @@ run_combine() {
     echo "[summarize] already done — skipping (use --force to redo)"
     echo "Summary:    $COMBINE_MD"
     [ -n "$COMBINE_PDF" ] && [ -f "$COMBINE_PDF" ] && echo "PDF:        $COMBINE_PDF"
+    maybe_upload "$COMBINE_PDF" "$COMBINE_MD" || return 1
     return 0
   fi
 
@@ -531,6 +587,7 @@ run_combine() {
   echo "=================================================================="
   echo "Summary:    $COMBINE_MD"
   [ -n "$COMBINE_PDF" ] && [ -f "$COMBINE_PDF" ] && echo "PDF:        $COMBINE_PDF"
+  maybe_upload "$COMBINE_PDF" "$COMBINE_MD" || return 1
   return 0
 }
 
@@ -1009,4 +1066,9 @@ echo "=================================================================="
 echo "Transcript: ${TRANSCRIPT_BASE}.txt"
 [ -f "$SUMMARY_FILE" ] && echo "Summary:    $SUMMARY_FILE"
 [ -f "$SUMMARY_PDF" ] && echo "PDF:        $SUMMARY_PDF"
+if ! maybe_upload "$SUMMARY_PDF" "$SUMMARY_FILE"; then
+  echo "    The summary is done; only the Drive upload failed. Retry it with:" >&2
+  echo "      ./pipeline.sh --run-id $RUN_ID" >&2
+  exit 1
+fi
 true

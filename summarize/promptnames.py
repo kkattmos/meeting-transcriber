@@ -6,7 +6,8 @@ canonical_prompt_name() too, so the two cannot disagree.
 
 Four prompts since 2026-09-29 — video, meeting, lecture, tutorial — each one
 file for every backend, and a fifth since 2026-09-30, `reality`, for episodes
-of competition reality shows. `video` is the default when neither --prompt
+of competition reality shows; a sixth since 2026-11-02, `drama`, for Thai
+drama (lakorn) episodes. `video` is the default when neither --prompt
 nor SUMMARY_PROMPT names one.
 """
 
@@ -30,9 +31,9 @@ PROMPT_ALIASES = {
 # Prompts that are shown the transcript with a [mm:ss] mark on every line
 # (chunking.timed_transcript) and may cite those times in the summary. Every
 # other prompt reads the plain text and is told to write no timestamps; the
-# reality prompt's highlights are the one place the operator asked for them,
+# reality and drama prompts' highlights are where the operator asked for them,
 # and summarize.py links them back into the video (document.link_timestamps).
-TIMED_TRANSCRIPT_PROMPTS = ("reality",)
+TIMED_TRANSCRIPT_PROMPTS = ("reality", "drama")
 
 
 def wants_timed_transcript(prompt_name):

@@ -1509,7 +1509,7 @@ class ShippedMarkedPromptsTest(unittest.TestCase):
     def test_the_expected_files_carry_the_markers(self):
         names = {path.name for path, _ in self._marked()}
         self.assertEqual(names, {"lecture.md", "tutorial.md", "meeting.md",
-                                 "video.md", "reality.md"})
+                                 "video.md", "reality.md", "drama.md"})
 
     def test_each_splits_cleanly(self):
         for path, text in self._marked():
@@ -2145,11 +2145,11 @@ class PromptSetTest(unittest.TestCase):
         import summarize as summarize_main
         self.sm = summarize_main
 
-    def test_exactly_five_selectable_prompts(self):
+    def test_exactly_six_selectable_prompts(self):
         names = sorted(p.stem for p in self.PROMPTS_DIR.glob("*.md")
                        if not p.stem.startswith("_"))
-        self.assertEqual(names, ["lecture", "meeting", "reality", "tutorial",
-                                 "video"])
+        self.assertEqual(names, ["drama", "lecture", "meeting", "reality",
+                                 "tutorial", "video"])
 
     def test_old_names_resolve_to_their_replacements(self):
         for old, new in (("lecture-claude", "lecture"),
@@ -2166,7 +2166,7 @@ class PromptSetTest(unittest.TestCase):
     def test_an_unknown_prompt_lists_them(self):
         with self.assertRaises(SystemExit) as cm:
             self.sm.resolve_prompt_path("nope")
-        self.assertIn("lecture, meeting, reality, tutorial, video",
+        self.assertIn("drama, lecture, meeting, reality, tutorial, video",
                       str(cm.exception))
 
     def test_no_prompt_asks_for_timestamps_or_frame_citations(self):
@@ -2187,7 +2187,8 @@ class PromptSetTest(unittest.TestCase):
                     self.assertIn("no timestamps", text)
 
     def test_every_prompt_speaks_the_callout_vocabulary(self):
-        for name in ("lecture", "tutorial", "meeting", "video", "reality"):
+        for name in ("lecture", "tutorial", "meeting", "video", "reality",
+                     "drama"):
             text = (self.PROMPTS_DIR / f"{name}.md").read_text()
             with self.subTest(prompt=name):
                 for tag in ("[!CONCEPT]", "[!EXAMPLE]", "[!WARNING]",
@@ -2236,10 +2237,11 @@ class RealityPromptTest(unittest.TestCase):
 
     # --- which prompts read the timed transcript -------------------------
 
-    def test_only_reality_reads_timed_lines(self):
+    def test_only_reality_and_drama_read_timed_lines(self):
         from promptnames import wants_timed_transcript
         self.assertTrue(wants_timed_transcript("reality"))
         self.assertTrue(wants_timed_transcript("reality.md"))
+        self.assertTrue(wants_timed_transcript("drama"))
         for name in (None, "", "video", "lecture", "meeting", "tutorial",
                      "lecture-claude", "summarize"):
             with self.subTest(prompt=name):
@@ -2470,6 +2472,64 @@ class RealityPromptTest(unittest.TestCase):
             self.sm.main()
         self.assertEqual(seen["transcript"], "hello")
         self.assertNotIn("&t=", (self.dir / "o.md").read_text())
+
+
+class DramaPromptTest(unittest.TestCase):
+    """The Thai drama (lakorn) recap (2026-11-02): timed like reality, with a
+    characters-and-relationships table, scene-by-scene sections with Thai
+    quotes, a spoiler-free opening and what changed last."""
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+
+    def test_it_is_timed_wrapped_and_labelled(self):
+        from promptnames import wants_timed_transcript
+        import pdf
+        self.assertTrue(wants_timed_transcript("drama"))
+        self.assertTrue(wants_timed_transcript("drama.md"))
+        self.assertTrue(document.wants_wrapper("drama"))
+        self.assertEqual(pdf._doc_kind_label("drama", {}), "Drama episode recap")
+
+    def test_the_prompt_asks_for_the_recap(self):
+        static, dynamic = llm_client.split_static_prompt(
+            (self.PROMPTS_DIR / "drama.md").read_text())
+        for asks in ("titled \"Characters\"", "Relationships",
+                     "never guess a name", "`[mm:ss]`", "[Video N, mm:ss]",
+                     "If the transcript carries no marks, write no timestamps",
+                     "**The opening paragraph reveals nothing**",
+                     "## Highlights", "## What changed", "Cliffhanger",
+                     "ตัวอย่างตอนต่อไป", "Keep each quote in Thai",
+                     "never cite them", "{language_rule}"):
+            with self.subTest(asks=asks):
+                self.assertIn(asks, static)
+        self.assertLess(static.index("5. **`## Highlights`**"),
+                        static.index("6. **`## What changed`**"))
+        for placeholder in ("{transcript}", "{frame_manifest}"):
+            self.assertIn(placeholder, dynamic)
+            self.assertNotIn(placeholder, static)
+
+    def test_the_template_formats(self):
+        template = self.sm.load_prompt_template(self.PROMPTS_DIR / "drama.md")
+        out = template.format(transcript="T", frame_manifest="F")
+        self.assertIn("[mm:ss]", out)
+        self.assertNotIn("{language_rule}", out)
+
+    def test_its_own_merge_keeps_timestamps(self):
+        from mapreduce import load_merge_template
+        merge = load_merge_template("drama")
+        self.assertIn("Keep every timestamp exactly as written", merge)
+        self.assertIn("ONE `## What changed` section", merge)
+        self.assertNotIn("{language_rule}", merge)
+        merge.format(transcript="P")
+
+    def test_timestamps_become_youtube_links(self):
+        doc = document.link_timestamps(
+            "* **พลอย** [02:05]", [("https://youtu.be/abcdefghijk", 0)])
+        self.assertIn("[02:05](https://www.youtube.com/watch?v=abcdefghijk"
+                      "&t=125s)", doc)
 
 
 class InstructionsTest(unittest.TestCase):

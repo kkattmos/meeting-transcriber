@@ -80,7 +80,10 @@ DEFAULT_ROOT = Path(os.environ.get("MEETING_BOT_ROOT", os.path.expanduser("~/.lo
 # a YouTube or Kaltura input is the download. It stays `pending` forever on an
 # unclipped run, which is the same thing `record` does on every non-meeting
 # input — a stage that never applies is not a stage that failed.
-STAGES = ("record", "fetch_video", "clip", "transcribe", "frames", "summarize")
+# `upload` (2026-11-02) is the PDF's copy in Google Drive, after summarize; it
+# stays pending forever on a run that names no Drive folder.
+STAGES = ("record", "fetch_video", "clip", "transcribe", "frames", "summarize",
+          "upload")
 
 PENDING, RUNNING, DONE, FAILED = "pending", "running", "done", "failed"
 
@@ -337,6 +340,19 @@ class RunState:
 # --- CLI --------------------------------------------------------------------
 
 
+def normalize_tags(values):
+    """Tags as stored: split on commas, trimmed, de-duplicated (case-
+    insensitively, first spelling wins), at most 20 of at most 40 chars."""
+    out, seen = [], set()
+    for value in values or []:
+        for tag in str(value).split(","):
+            tag = " ".join(tag.split())[:40]
+            if tag and tag.lower() not in seen:
+                seen.add(tag.lower())
+                out.append(tag)
+    return out[:20]
+
+
 def _parse_artifacts(pairs):
     out = {}
     for pair in pairs or []:
@@ -414,6 +430,16 @@ def main():
     # frames out of a recording that has no picture.
     p.add_argument("--summary-source", choices=("both", "voice"))
     p.add_argument("--record-media", choices=("video", "audio"))
+    # The PDF's Google Drive destination (lib/gdrive.py): a folder id, the
+    # folder's name as the web UI's browser showed it (for display only), and
+    # the file name in Drive (empty = the summary's title). An empty
+    # --drive-folder turns the upload off. Replaced on a resume when given.
+    p.add_argument("--drive-folder")
+    p.add_argument("--drive-folder-name")
+    p.add_argument("--drive-name")
+    # The operator's own labels for the run history (the web UI's filter
+    # chips). Repeatable; given at all, they replace the stored list.
+    p.add_argument("--tags", action="append", default=None)
 
     p = with_run_dir(sub.add_parser("status"))
     p.add_argument("--stage", required=True)
@@ -543,7 +569,12 @@ def main():
                     summary_language=args.summary_language,
                     pdf_font=args.pdf_font, instructions=args.instructions,
                     summary_source=args.summary_source,
-                    record_media=args.record_media)
+                    record_media=args.record_media,
+                    drive_folder=args.drive_folder,
+                    drive_folder_name=args.drive_folder_name,
+                    drive_name=args.drive_name,
+                    tags=(None if args.tags is None
+                          else normalize_tags(args.tags)))
         # `init` with no --resources still records an empty list — but only
         # when it creates or refreshes a run (it names the input). Stamping
         # --combined-into on an existing member, --meet-url from inside a

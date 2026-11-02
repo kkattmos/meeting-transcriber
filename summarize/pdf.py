@@ -1009,7 +1009,7 @@ figure.thumb figcaption {{ font-size: 0.85em; color: #666; margin-top: 2pt; }}
 KIND_LABELS = {
     "lecture": "Lecture notes", "tutorial": "Tutorial guide",
     "meeting": "Meeting summary", "video": "Video summary",
-    "reality": "Episode recap",
+    "reality": "Episode recap", "drama": "Drama episode recap",
 }
 
 

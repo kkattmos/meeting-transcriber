@@ -37,6 +37,8 @@ without the others — and `pipeline.sh` chains them.
 - [Discord voice bot](#discord-voice-bot) (in progress)
 - [Summarizing part of a video](#summarizing-part-of-a-video)
 - [Slides and reference material](#slides-and-reference-material)
+- [Google Drive upload](#google-drive-upload)
+- [Clearing the run history](#clearing-the-run-history)
 - [Resuming a failed run](#resuming-a-failed-run)
 - [Parallelism](#parallelism)
 - [Output format](#output-format)
@@ -343,8 +345,10 @@ as you type.
   and summarizes. **End & stop recording** ends it early, after a red
   confirmation bar. See [Hosting a new Google Meet](#hosting-a-new-google-meet).
 - **Record / summarize** — the pipeline's options as a form: inputs one per
-  line (with `#t=` windows), spoken language, clip, combine, reference
-  material. About a second after you stop typing the page runs
+  line (with `#t=` windows), spoken language, clip, tags, reference
+  material, and switches for **Combine into one document** (written to the
+  usual summaries and PDF folders, named for the combine run),
+  **Combined: Markdown only**, playlists and start over. About a second after you stop typing the page runs
   `pipeline.sh --dry-run` with exactly those options — the real parser, so a
   typo is caught before anything is downloaded or billed — and marks **every
   input line** ✓ (its kind, new run or which run it resumes, its window) or ✗
@@ -353,19 +357,36 @@ as you type.
   **Start N runs** only unlocks once the current form has passed a check;
   when the runs end the page says how many finished, failed or paused.
 - **Summary**, on both tabs: the style (`video`, `meeting`, `lecture`,
-  `tutorial`, `reality`), the language it is written in (Thai or English), the PDF
+  `tutorial`, `reality`, `drama`), the language it is written in (Thai or English), the PDF
   font (only the ones that language offers; defaults from `PDF_FONT_TH` /
   `PDF_FONT_EN`), and a free-text **Extra instructions** box for this run
   ("focus on the exam hints", "list every decision with its owner"). Also
   **Save recording** (video, or audio only — meetings) and **Summarize from**
   (frames and voice, or voice only); audio only forces voice only. See
   [Voice only and audio-only recordings](#voice-only-and-audio-only-recordings).
-- **Runs** — every run with a status badge (recording, running, paused,
-  failed, done, in a combined set), its stages as labelled pills (`✓ transcribe`,
-  `✗ summarize` … — stages that never run for that kind of input are left
-  out), live meeting audio, the created meeting's link and **Join**. Open one
-  for its settings, the summary and PDF paths (with **Copy path**), the tail of
-  each stage log, and **Resume** / **Stop** (confirmed in the page).
+- **Send the PDF to Google Drive**, on both tabs: a switch, then a folder
+  browser over the bot account's Drive (My Drive, Shared with me, shared
+  drives) and a file-name box (empty = the summary's title). See
+  [Google Drive upload](#google-drive-upload).
+- **Runs** — the run history. Every run with a status badge (recording,
+  running, paused, failed, done, in a combined set), its tags, ☁ when its PDF
+  is in Drive, and its stages as labelled pills (`✓ transcribe`,
+  `✗ summarize`, `✓ drive` … — stages that never run for that kind of input
+  are left out), live meeting audio, the created meeting's link and **Join**.
+  - **Categories**: filter chips by status, type (meeting, YouTube, Kaltura,
+    file, combined), style and your own **tags** (OR within a group, AND
+    across groups; each chip shows how many runs it would show), plus a
+    search box over the id, input, name and tags.
+  - Open a run for its settings, the summary and PDF paths (with **Copy
+    path**), the Drive link, the tail of each stage log, **Resume** /
+    **Stop**, a **Tags** editor, **Send PDF to Drive…** (for a finished run,
+    or to send it again elsewhere — only the upload runs), its **Cache** —
+    frames, the chunk cache and the download, each with its size, removable
+    — and **Clear from history**.
+  - **☐ Select** turns on checkboxes for bulk **+ Tag**, **Remove cache…**
+    and **Clear from history…**; **🧹 Temp files** empties
+    `$MEETING_BOT_ROOT/tmp`. Every destructive action asks in a red bar
+    first. See [Clearing the run history](#clearing-the-run-history).
 
 The same server takes scripted requests (a phone shortcut, say):
 
@@ -461,6 +482,16 @@ Summarize several videos **as one lecture** — one document, one study guide,
 the model reads every transcript:
 
 ```bash
+./pipeline.sh --from-file chapter3_links.txt --prompt lecture --combine
+```
+
+With no path, the document goes where every run's does —
+`SUMMARIES_DIR/<combine run id>.md` and `PDF_DIR/<combine run id>.pdf` (the
+web UI's **Combine** switch does exactly this). To name it yourself, give a
+path ending in `.md` (only a next argument ending in `.md` is taken as the
+path):
+
+```bash
 ./pipeline.sh --from-file chapter3_links.txt --prompt lecture \
   --combine ~/courses/2_Transcripts/chapter3.md
 ```
@@ -519,7 +550,7 @@ keeps the frames too).
 | `--name N` | Meeting name (single input only; otherwise derived) |
 | `--display-name D` | Name the bot shows in the meeting (default `Meeting Bot`) |
 | `--language L` | `th` (default), `en`, `auto`, or any AssemblyAI code |
-| `--prompt P` | The summary style: `video` (default), `meeting`, `lecture`, `tutorial` or `reality` — see [Summary styles](#summary-styles) |
+| `--prompt P` | The summary style: `video` (default), `meeting`, `lecture`, `tutorial`, `reality` or `drama` — see [Summary styles](#summary-styles) |
 | `--summary-language L` | The language the summary is **written** in: `th` or `en` (default `SUMMARY_LANGUAGE`) |
 | `--pdf-font F` | The PDF's body font: `"Bai Jamjuree"` or `Sarabun` for Thai; `"CMU Serif"` (Computer Modern), `Sarabun` or `"Bai Jamjuree"` for English (default `PDF_FONT_TH` / `PDF_FONT_EN`) |
 | `--instructions T` | Extra instructions for the summarizer, this run only — e.g. `"Focus on what will be on the midterm"` |
@@ -532,9 +563,13 @@ keeps the frames too).
 | `--jobs N` | Inputs processed at once (default 2) |
 | `--from-file F` | Read inputs from a file, one per line |
 | `--playlist` | Expand YouTube playlist URLs |
-| `--combine F` | Summarize all the inputs together, as one document (no per-input summaries) |
-| `--combine-pdf F` | Where the combined PDF goes (default: `--combine`'s path with `.pdf`) |
+| `--combine [F.md]` | Summarize all the inputs together, as one document (no per-input summaries); without a path, into `SUMMARIES_DIR` / `PDF_DIR` named for the combine run |
+| `--combine-pdf F` | Where the combined PDF goes (default: `--combine`'s path with `.pdf`, or `PDF_DIR`) |
 | `--no-combine-pdf` | Write only the combined markdown |
+| `--drive-folder F` | Also put the PDF into this Google Drive folder (id or link) of the bot account — see [Google Drive upload](#google-drive-upload) |
+| `--drive-name N` | The file's name in Drive (`.pdf` added; default: the summary's title) |
+| `--no-drive` | Turn a run's stored Drive upload off |
+| `--tag T` | A label for the run history; repeatable or comma-separated |
 | `--new-meet` | Create a new Google Meet, host it and record it (also: `meet.new` as an input) — see [Hosting a new Google Meet](#hosting-a-new-google-meet) |
 | `--foreground` | Don't detach a meeting into the background (see above) |
 | `--dry-run` | Check every input, window and reference file, print what would run, start nothing. Every unusable input is reported (not just the first), and the exit is 1 if there was one |
@@ -545,9 +580,10 @@ keeps the frames too).
 The legacy positional form still works when unambiguous:
 `./pipeline.sh <input> [name] [display_name] [language] [prompt]`.
 
-An option that needs a value and doesn't get one (`... --combine` as the last
-argument, or `--combine --jobs 1`) is an error naming the option. It used to
-make `pipeline.sh` loop forever without printing anything.
+An option that needs a value and doesn't get one (`... --jobs` as the last
+argument, or `--name --jobs 1`) is an error naming the option. It used to
+make `pipeline.sh` loop forever without printing anything. (`--combine` no
+longer needs one.)
 
 ### Individual stages
 
@@ -909,6 +945,90 @@ where that shows.
 
 ---
 
+## Google Drive upload
+
+The summary PDF can also go to a Google Drive folder — any folder the bot
+account (`BOT_GOOGLE_ACCOUNT`) can add files to, its own or one shared with
+it. It is its own stage, `upload`, after summarize: a failed upload leaves
+the summary done and only `upload` failed, and **Resume** (or
+`./pipeline.sh --run-id <id>`) retries just the upload. A file with the same
+name already in the folder is **replaced** — a new version of the same file,
+so its link stays the same. With `--combine`, only the combined PDF goes.
+
+**Set it up once:**
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create
+   (or pick) a project, enable the **Google Drive API**, and set up the
+   OAuth consent screen (External, Testing; add the bot account as a test
+   user).
+2. **Credentials → Create credentials → OAuth client ID → Desktop app.** Put
+   its id and secret in `.env`:
+
+   ```
+   GDRIVE_CLIENT_ID=….apps.googleusercontent.com
+   GDRIVE_CLIENT_SECRET=…
+   ```
+
+3. On the PC (the sign-in page redirects to `127.0.0.1`, so it has to open
+   there), sign in as the bot account and allow Drive access:
+
+   ```bash
+   .venv/bin/python lib/gdrive.py login
+   ```
+
+   It opens the consent page in the bot's own browser profile, already
+   signed in as the bot (or prints the link, if that profile is busy with a
+   recording, or with `--no-browser`). It refuses to save a login for any
+   other account. The refresh token is kept in
+   `~/.local/share/meeting-bot/state/gdrive_token.json` (mode 600).
+   `lib/gdrive.py status` says whether it is set up; `lib/gdrive.py logout`
+   forgets it. The scope is full Drive access, which the folder browser
+   needs to list folders shared with the bot.
+
+**Use it:** in the web UI, switch on **Send the PDF to Google Drive**, pick
+the folder in the browser and, optionally, a file name. On the command line:
+
+```bash
+./pipeline.sh "https://youtu.be/…" --drive-folder "https://drive.google.com/drive/folders/1AbC…" \
+  --drive-name "Signals — Week 1"
+```
+
+`--drive-folder` takes a folder id or a link pasted from Drive. Without
+`--drive-name` the file is named after the summary's own title. To send a
+run that has already finished (or to send it again, elsewhere or under
+another name), give the Drive options to its `--run-id`, or use **Send PDF
+to Drive…** in its detail: only the upload runs. `--no-drive` turns a
+stored upload off. The link is stored in the run and shown in the web UI.
+
+## Clearing the run history
+
+Runs pile up in `~/.local/share/meeting-bot/runs/`. From the web UI's
+**Runs** tab (or `lib/runadmin.py` with `.env` loaded):
+
+- **Clear from history** removes the run's bookkeeping — its `runs/<id>/`
+  folder (state, logs, the chunk cache, any download) and its frames — so it
+  disappears from the list. **The recording, transcript, summary and PDF are
+  never touched**; they stay in their output folders. A combined run can
+  take its member runs with it; a member of a combined set that still exists
+  cannot be cleared on its own (the set reads its transcript). A run being
+  processed is refused.
+- **Remove cache**, per run or in bulk, any of: **frames**
+  (`FRAMES_DIR/<id>`), the **chunk cache** (finished chunk summaries a
+  resume reuses) and the **download** (a YouTube/Kaltura video in the run
+  folder). All are made again if a resume needs them; a finished run stays
+  finished.
+- **🧹 Temp files** empties `$MEETING_BOT_ROOT/tmp` — rejected model
+  answers, cached prompt files, the CLI's scratch folder — all recreated on
+  demand; refused while any run is being processed.
+- **Tags** — your own labels, from the form (`--tag`), the run's detail, or
+  in bulk; the Runs tab filters on them alongside status, type and style.
+
+```bash
+set -a; . ./.env; set +a
+.venv/bin/python lib/runadmin.py cache --run-id yt_abc_20261101_100000 --what frames,chunks,media
+.venv/bin/python lib/runadmin.py clear --run-id combine_3x_… --with-members
+```
+
 ## Resuming a failed run
 
 Every run records what it finished and where the output went, so nothing
@@ -1072,7 +1192,7 @@ queue can't wedge permanently and needs no cleanup daemon.
 
 ### Summary styles
 
-There are five prompts, one per kind of recording, shared by the Claude and
+There are six prompts, one per kind of recording, shared by the Claude and
 the Gemini backends (`summarize/prompts/`):
 
 | `--prompt` | For | What it writes |
@@ -1082,9 +1202,10 @@ the Gemini backends (`summarize/prompts/`):
 | `lecture` | classes | a cheat sheet (about 300 words per hour, at most 1,200 per call): what the instructor flagged, then terse numbered sections — key formulas, decision rules, pitfalls, an example only where needed; cites a `--resources` textbook excerpt when it has frontmatter |
 | `tutorial` | walkthroughs, coding videos | prerequisites and takeaways, then the steps with every command and code block verbatim, and a quick-reference table |
 | `reality` | competition reality-show episodes (The Face, Drag Race, MasterChef, …) | an episode recap: the teams, then the episode's segments in order with `[mm:ss]` timestamps and quotes from the mentors, judges and contestants, a highlights table, and last the results — the winner, who was up for elimination, who was eliminated |
+| `drama` | Thai drama (ละคร) episodes — lakorn, BL/GL series, period dramas | a spoiler-free opening, a characters-and-relationships table (as things stand at the start), the episode scene by scene with `[mm:ss]` timestamps and quotes in Thai, a highlights table, then **what changed** by the end (relationships, secrets, who knows what) and the cliffhanger, and the next-episode preview if there is one |
 
-None of them but `reality` writes timestamps, and none cites frames: the
-notes stand on their own. All five mark their key points with callout boxes that the PDF styles
+None of them but `reality` and `drama` writes timestamps, and none cites frames: the
+notes stand on their own. All six mark their key points with callout boxes that the PDF styles
 (see [DESIGN.md](DESIGN.md)). The names from before the merge
 (`lecture-claude`, `lecture-gemini`, `lecture-reference`, `meeting-claude`,
 `tutorial-gemini`, `summarize`, …) still work and resolve to the new file, so
@@ -1105,6 +1226,18 @@ eliminated, saved. A long episode is chunked and merged with its own merge
 prompt (`_merge-reality.md`), which keeps every timestamp and quote and puts
 the results at the end. Without an `.srt` beside the transcript there are
 no timestamps, with a warning in the log.
+
+**Thai drama recaps** (`--prompt drama`). Timed and linked exactly like
+`reality`, with its own merge prompt (`_merge-drama.md`). Names come from
+the opening credits and on-screen text, then from how characters address
+each other (nicknames, titles, kinship words — a bare พี่ or แม่ is kept as
+the relationship it states, not taken for a name), then a cast list in
+`--resources` if you give one; never guessed. Nothing is revealed in the
+opening paragraph or the characters table; revelations appear where they
+happen, and again under **What changed**. The recap at the start of an
+episode and the preview at its end are not treated as the episode's events.
+It follows `SUMMARY_LANGUAGE` like every prompt; quotes stay in Thai, with a
+translation when the recap is in English.
 
 **Per-run settings.** `--summary-language`, `--pdf-font` and `--instructions`
 (and the matching fields on both tabs of the web UI) are stored with the run,
@@ -1383,15 +1516,15 @@ end the scan.
 | `OPENROUTER_TRUNCATION_RETRIES` | 1 | A cut-off or off-script answer is retried this many times on the same model before the next model / backend. Rejected answers are kept in `$MEETING_BOT_ROOT/tmp/rejected-answers/` |
 | `OPENROUTER_MAX_FOREIGN_RUNS` | 2 | An answer with more runs than this of a script that is neither the summary language's nor the transcript's (Chinese or Arabic inside Thai words, say) is rejected like a cut-off one. `0` = reject any |
 | `SUMMARY_CHUNK_CACHE` | 1 | Keep each finished chunk summary in `runs/<id>/chunks/` and reuse it on a resume. `0` = always summarize every chunk again |
-| `SUMMARY_PROMPT` | `video` | `video`, `meeting`, `lecture`, `tutorial` or `reality` (`lecture` in `.env.example`); `--prompt` overrides. Older names still resolve |
+| `SUMMARY_PROMPT` | `video` | `video`, `meeting`, `lecture`, `tutorial`, `reality` or `drama` (`lecture` in `.env.example`); `--prompt` overrides. Older names still resolve |
 | `SUMMARY_INSTRUCTIONS` | — | Extra instructions for every summary; `--instructions` (or the web UI's field) overrides it per run |
 | `SUMMARY_MAX_TOKENS` | 16000 | **Gemini only.** The Claude CLI has no output cap, and output is not what spends a subscription window anyway — see below |
-| `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture`/`tutorial`/`video`/`reality` output; `always`/`never` override |
+| `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture`/`tutorial`/`video`/`reality`/`drama` output; `always`/`never` override |
 | `SUMMARY_LANGUAGE` | `th` | The language the summary is *written* in: `th` or `en`; `--summary-language` overrides it per run. Independent of `ASSEMBLYAI_LANGUAGE`, which is the language the audio is in — see below |
 
 **Output language.** `SUMMARY_LANGUAGE` decides what every prompt tells the
 model to write in — `th` (the default) or `en`. Every shipped template
-(`video`, `meeting`, `lecture`, `tutorial`, `reality` and the merge prompts) carries a
+(`video`, `meeting`, `lecture`, `tutorial`, `reality`, `drama` and the merge prompts) carries a
 `{language_rule}` placeholder that is filled from this setting before the
 prompt is sent, on both the Claude and the Gemini backends. In Thai the
 model is asked for ordinary Thai academic prose with each technical term's
@@ -1742,6 +1875,12 @@ again with `first_time_login.sh`.
 | `MEETING_BOT_PORT` | 8765 | |
 | `MEETING_BOT_FOREGROUND` | 0 | `1` = never detach a meeting into the background (same as `--foreground`) |
 
+### Google Drive
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GDRIVE_CLIENT_ID` / `GDRIVE_CLIENT_SECRET` | — | The OAuth "Desktop app" client the bot account signs in through (`lib/gdrive.py login`); see [Google Drive upload](#google-drive-upload) |
+
 ### Discord voice bot (in progress)
 
 | Variable | Default | Meaning |
@@ -1800,17 +1939,18 @@ python3 lib/test_slotqueue.py                # cross-session component queue (23
 python3 lib/test_keyring.py                  # numbered keys + rotation cursor (22)
 python3 lib/test_resources.py                # resource specs, extraction, GitHub, frontmatter, binary files (36)
 python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions, retries (51)
+python3 lib/test_gdrive.py                   # Google Drive: folder links, names, the upload (create vs replace), folders (13)
 python3 lib/test_clip.py                     # --clip parsing, the cut, caption windowing (33)
 python3 lib/test_discord_spool.py            # Discord recordings: placing each speaker on one timeline, the mix, real ffmpeg (22)
-python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain, the course reference, the output language, the four prompts, --instructions, no frames (200)
+python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain, the course reference, the output language, the six prompts (drama included), --instructions, no frames (253)
 python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, the design (callouts, code, maths symbols), font choice and size matching, PDF render (107)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
 python3 transcribe/test_yt_autocaptions.py   # yt-dlp captions: track choice, json3 (13)
 python3 screen/test_extract_frames.py        # frames on change: settle, motion cap, safety net, blanks, real ffmpeg (19)
 python3 screen/test_capture_host.py          # hosting a created Meet: when it ends, and when it must not (7)
 python3 screen/test_browser.py               # browser choice, fake devices, the bot-account check (16)
-python3 test_trigger_server.py               # the web UI API: argument mapping, auth, dry-run check, paths, summary settings, record/summary source, per-line check results (12)
-bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings, summary settings, voice only / audio only, dry-run reports, --source-url (460)
+python3 test_trigger_server.py               # the web UI API: argument mapping, auth, dry-run check, paths, summary settings, record/summary source, per-line check results, the combine switch, tags, Drive, the run history (20)
+bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings, summary settings, voice only / audio only, dry-run reports, --source-url, --combine without a path, the Drive upload stage, tags (520)
 bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (131)
 ```
 

@@ -143,7 +143,7 @@ echo "inherited chain: ${SUMMARY_FALLBACK_CHAIN:-unset}"
         status, opt = self.call("/api/options")
         self.assertEqual(status, 200)
         self.assertEqual(opt["prompts"],
-                         ["lecture", "meeting", "reality", "tutorial", "video"])
+                         ["drama", "lecture", "meeting", "reality", "tutorial", "video"])
         self.assertEqual(opt["summary_languages"], ["en", "th"])
         self.assertEqual(opt["fonts"]["th"], ["Bai Jamjuree", "Sarabun"])
         self.assertIn("CMU Serif", opt["fonts"]["en"])
@@ -249,6 +249,113 @@ echo "inherited chain: ${SUMMARY_FALLBACK_CHAIN:-unset}"
         self.assertEqual(run["stages"]["record"], "done")
         _, d = self.call("/api/runs/" + run["run_id"])
         self.assertIn("New Google Meet", d["logs"]["record"])
+
+    # --- 2026-11-02: the combine toggle, tags, Drive, the run history -----
+
+    def test_combine_is_a_toggle_tags_and_drive_are_arguments(self):
+        args, err = self.ts.build_args({
+            "urls": ["https://youtu.be/a", "https://youtu.be/b"], "combine": True,
+            "tags": "Signals, midterm", "drive_folder": "1AbCdEfGhIjKlMn",
+            "drive_folder_name": "Notes", "drive_name": "Week 1"})
+        self.assertIsNone(err)
+        self.assertEqual(args, [
+            "https://youtu.be/a", "https://youtu.be/b",
+            "--drive-folder", "1AbCdEfGhIjKlMn", "--drive-folder-name", "Notes",
+            "--drive-name", "Week 1", "--combine",
+            "--tag", "Signals", "--tag", "midterm"])
+        # Off is no argument; an old shortcut's .md path still works.
+        self.assertNotIn("--combine", self.ts.build_args(
+            {"url": "https://youtu.be/a", "combine": False})[0])
+        self.assertEqual(self.ts.build_args(
+            {"url": "https://youtu.be/a", "combine": "/x/y.md"})[0][-2:],
+            ["--combine", "/x/y.md"])
+
+    def _make_run(self, run_id, **state):
+        run = self.ts.RUNS_DIR / run_id
+        (run / "logs").mkdir(parents=True, exist_ok=True)
+        data = {"input": "https://youtu.be/x", "input_type": "youtube",
+                "stages": {"frames": {"status": "done",
+                                      "artifacts": {"manifest": "/gone"}},
+                           "fetch_video": {"status": "done"}}}
+        data.update(state)
+        (run / "state.json").write_text(json.dumps(data))
+        self.addCleanup(lambda: __import__("shutil").rmtree(run, ignore_errors=True))
+        return run
+
+    def test_run_history_tags_cache_and_clear(self):
+        frames = Path(self.tmp.name) / "frames"
+        os.environ["FRAMES_DIR"] = str(frames)
+        self.addCleanup(os.environ.pop, "FRAMES_DIR", None)
+        run = self._make_run("yt_hist_20261102_100000", prompt="lecture-claude")
+        (run / "video.mp4").write_bytes(b"x" * 1000)
+        (run / "chunks").mkdir()
+        (run / "chunks" / "k.json").write_text("{}")
+        (frames / run.name).mkdir(parents=True)
+        (frames / run.name / "f1.jpg").write_bytes(b"y" * 500)
+
+        _, sz = self.call(f"/api/runs/{run.name}/sizes")
+        self.assertEqual((sz["frames"], sz["media"]), (500, 1000))
+        status, r = self.call(f"/api/runs/{run.name}/tags", {"tags": ["A", "a", " B "]})
+        self.assertEqual((status, r["tags"]), (200, ["A", "B"]))
+        _, d = self.call(f"/api/runs/{run.name}")
+        self.assertEqual(d["summary"]["tags"], ["A", "B"])
+        self.assertEqual(d["summary"]["prompt"], "lecture")
+
+        status, r = self.call(f"/api/runs/{run.name}/cache", {"what": ["frames", "media"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(r["freed"], {"frames": 500, "media": 1000})
+        self.assertFalse((run / "video.mp4").exists())
+        self.assertTrue((run / "chunks").exists())
+        state = json.loads((run / "state.json").read_text())
+        self.assertTrue(state["stages"]["frames"]["cleaned"])
+        self.assertEqual(self.call(f"/api/runs/{run.name}/cache", {"what": ["nope"]})[0], 409)
+
+        status, r = self.call(f"/api/runs/{run.name}/clear", {})
+        self.assertEqual((status, r["cleared"]), (200, [run.name]))
+        self.assertFalse(run.exists())
+
+    def test_clear_refuses_a_busy_run_and_a_member_of_a_live_set(self):
+        busy = self._make_run("yt_busy_20261102_100000")
+        (busy / "run.lock").mkdir()
+        (busy / "run.lock" / "pid").write_text(str(os.getpid()))
+        self.assertEqual(self.call(f"/api/runs/{busy.name}/clear", {})[0], 409)
+        self.assertTrue(busy.exists())
+        member = self._make_run("yt_mem_20261102_100000",
+                                combined_into="combine_1x_abc_20261102_100001")
+        combine = self._make_run("combine_1x_abc_20261102_100001", input_type="combine",
+                                 members=[member.name])
+        self.assertEqual(self.call(f"/api/runs/{member.name}/clear", {})[0], 409)
+        _, r = self.call("/api/runs/bulk", {"action": "clear",
+                                            "run_ids": [combine.name, member.name],
+                                            "with_members": True})
+        self.assertEqual(r["results"][0]["cleared"], [combine.name, member.name])
+        self.assertEqual(r["results"][1]["skipped"], "no such run")
+        self.assertFalse(member.exists())
+
+    def test_tmp_cache_and_drive_status(self):
+        tmp = self.ts.BOT_ROOT / "tmp" / "rejected-answers"
+        tmp.mkdir(parents=True, exist_ok=True)
+        (tmp / "a.md").write_text("x" * 10)
+        self.assertGreaterEqual(self.call("/api/cache")[1]["tmp"], 10)
+        status, r = self.call("/api/cache/tmp", {})
+        self.assertEqual(status, 200)
+        self.assertFalse(tmp.exists())
+        status, r = self.call("/api/drive/status")
+        self.assertEqual(status, 200)
+        self.assertFalse(r["logged_in"])
+
+    def test_resume_can_name_a_drive_folder(self):
+        run = self._make_run("yt_drv_20261102_100000")
+        status, r = self.call(f"/api/runs/{run.name}/resume",
+                              {"drive_folder": "1AbCdEfGhIjKlMn", "drive_name": "N"})
+        self.assertEqual(status, 202)
+        log = self.ts.LOG_DIR / r["log"]
+        for _ in range(50):
+            if "argv:" in log.read_text():
+                break
+            time.sleep(0.05)
+        self.assertIn(f"argv: --run-id {run.name} --drive-folder 1AbCdEfGhIjKlMn "
+                      "--drive-name N", log.read_text())
 
     def test_paths_from_requests_are_refused(self):
         self.assertEqual(self.call("/api/runs/..%2F..%2Fetc")[0], 404)

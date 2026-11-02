@@ -46,6 +46,15 @@ GET  /api/runs/<id>    one run: state.json plus the tail of each stage log
 POST /api/runs/<id>/resume   ./pipeline.sh --run-id <id>, detached
 POST /api/runs/<id>/stop     ./kill_meeting.sh --run-id <id> (leaves cleanly)
 GET  /api/log?name=trigger_<...>.log   the tail of one trigger log
+GET  /api/runs/<id>/sizes    bytes of its frames / chunk cache / download
+POST /api/runs/<id>/clear    {"with_members": bool} — drop its bookkeeping
+POST /api/runs/<id>/cache    {"what": ["frames","chunks","media"]}
+POST /api/runs/<id>/tags     {"tags": ["…"]}
+POST /api/runs/bulk          {"action": "clear"|"cache", "run_ids": [...], ...}
+GET  /api/cache              the global tmp size; POST /api/cache/tmp empties it
+GET  /api/drive/status       is Drive set up for the bot account (lib/gdrive.py)
+GET  /api/drive/folders?parent=root|shared|drives|<id>   the folder browser
+GET  /api/drive/folder?id=<id or link>                   one folder's name
 
 GET /health
   No auth. Returns 200 so you can check the service is up from your phone.
@@ -73,7 +82,9 @@ import sys
 # what summarize.py accepts: the four prompts and their old names, the output
 # languages, and the fonts each language may use.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "summarize"))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import fontchoice  # noqa: E402
+import runadmin  # noqa: E402
 import language  # noqa: E402
 from promptnames import canonical_prompt_name  # noqa: E402
 
@@ -148,7 +159,9 @@ RUNS_DIR = BOT_ROOT / "runs"
 PROMPTS_DIR = REPO / "summarize" / "prompts"
 INDEX_HTML = REPO / "web" / "index.html"
 
-STAGES = ("record", "fetch_video", "clip", "transcribe", "frames", "summarize")
+STAGES = ("record", "fetch_video", "clip", "transcribe", "frames", "summarize",
+          "upload")
+GDRIVE = REPO / "lib" / "gdrive.py"
 # A run id is a directory name under runs/; nothing else may reach a path.
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 # trigger_*: started from here. pipeline_*: a meeting started from the command
@@ -193,15 +206,34 @@ def build_args(body):
                         ("display_name", "--display-name"),
                         ("jobs", "--jobs"),
                         ("clip", "--clip"),
-                        ("combine", "--combine")):
+                        ("drive_folder", "--drive-folder"),
+                        ("drive_folder_name", "--drive-folder-name"),
+                        ("drive_name", "--drive-name")):
         value = body.get(field)
         if value not in (None, ""):
             args += [flag, str(value).strip()]
+    # The combine toggle (2026-11-02): true = one document in the default
+    # places (SUMMARIES_DIR / PDF_DIR, named for the combine run). A string
+    # ending in .md is still taken as the path, for older phone shortcuts.
+    combine = body.get("combine")
+    if combine is True or (isinstance(combine, str)
+                           and combine.strip().lower() in ("1", "true", "yes", "on")):
+        args.append("--combine")
+    elif isinstance(combine, str) and combine.strip():
+        args += ["--combine", combine.strip()]
+    tags = body.get("tags")
+    if isinstance(tags, str):
+        tags = tags.split(",")
+    for tag in tags or []:
+        if isinstance(tag, str) and tag.strip():
+            args += ["--tag", tag.strip()]
     # Free text, possibly several lines: passed as one argument, never
     # through a shell. pipeline.sh stores it with the run.
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
         args += ["--instructions", instructions.strip()]
+    if body.get("no_drive"):
+        args.append("--no-drive")
     if body.get("no_combine_pdf"):
         args.append("--no-combine-pdf")
     # `resources` may be a single spec, a list, or newline-separated text;
@@ -309,7 +341,37 @@ def run_summary(run_dir, data):
         # voice-only run, summarize on a member of a combined set.
         "summary_source": data.get("summary_source"),
         "combined_into": data.get("combined_into"),
+        "members": data.get("members") or [],
+        # The run history's categories: automatic (input_type, status from
+        # the stages, prompt) and the operator's own tags.
+        "prompt": canonical_prompt_name(data.get("prompt") or ""),
+        "tags": data.get("tags") or [],
+        "created_at": data.get("created_at"),
+        "drive": ({"folder": data.get("drive_folder"),
+                   "folder_name": data.get("drive_folder_name"),
+                   "name": data.get("drive_name"),
+                   "link": (stages.get("upload") or {}).get("drive_link"),
+                   "error": ((stages.get("upload") or {}).get("error") or "")[-600:]}
+                  if data.get("drive_folder") else None),
     }
+
+
+def gdrive(*args, timeout=60):
+    """lib/gdrive.py in a child, with .env as it is now (current_config):
+    (returncode, parsed JSON or None, stderr)."""
+    env = {k: v for k, v in current_config().items()
+           if k not in ("NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE",
+                        "NODE_APP_INSTANCE")}
+    try:
+        proc = subprocess.run([sys.executable, str(GDRIVE), *args], capture_output=True,
+                              text=True, timeout=timeout, cwd=str(REPO), env=env)
+    except subprocess.TimeoutExpired:
+        return 1, None, "Google Drive did not answer in time"
+    try:
+        out = json.loads(proc.stdout) if proc.stdout.strip() else None
+    except ValueError:
+        out = None
+    return proc.returncode, out, proc.stderr.strip()[-2000:]
 
 
 def options():
@@ -446,6 +508,32 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"summary": run_summary(run_dir, data),
                              "state": data, "logs": logs})
             return
+        m = re.match(r"^/api/runs/([^/]+)/sizes$", path)
+        if m:
+            run_dir = self._run_dir(m.group(1))
+            if run_dir is None:
+                return
+            self._json(200, runadmin.sizes(run_dir, runadmin.frames_root(current_config())))
+            return
+        if path == "/api/cache":
+            self._json(200, {"tmp": runadmin.tmp_size(BOT_ROOT)})
+            return
+        if path.startswith("/api/drive/"):
+            q = parse_qs(url.query)
+            if path == "/api/drive/status":
+                rc, out, err = gdrive("status", timeout=20)
+            elif path == "/api/drive/folders":
+                rc, out, err = gdrive("folders", "--parent", (q.get("parent") or ["root"])[0])
+            elif path == "/api/drive/folder":
+                rc, out, err = gdrive("folder", "--id", (q.get("id") or [""])[0])
+            else:
+                self._json(404, {"error": "not found"})
+                return
+            if rc == 0 and out is not None:
+                self._json(200, out)
+            else:
+                self._json(502, {"error": err.replace("ERROR: ", "", 1) or "Google Drive failed"})
+            return
         if path == "/api/log":
             name = (parse_qs(url.query).get("name") or [""])[0]
             if not LOG_NAME_RE.match(name):
@@ -461,20 +549,60 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in ("/trigger", "/api/check") and not path.startswith("/api/runs/"):
+        if (path not in ("/trigger", "/api/check", "/api/cache/tmp")
+                and not path.startswith("/api/runs/")):
             self.send_response(404)
             self.end_headers()
             return
         if not self._authorized():
             return
 
+        if path == "/api/cache/tmp":
+            try:
+                self._json(200, runadmin.clear_tmp(BOT_ROOT, RUNS_DIR))
+            except runadmin.AdminError as exc:
+                self._json(409, {"error": str(exc)})
+            return
+        if path == "/api/runs/bulk":
+            body = self._body()
+            if body is None:
+                return
+            self._json(200, self._bulk(body))
+            return
+        m = re.match(r"^/api/runs/([^/]+)/(clear|cache|tags)$", path)
+        if m:
+            run_dir = self._run_dir(m.group(1))
+            if run_dir is None:
+                return
+            body = self._body()
+            if body is None:
+                return
+            try:
+                self._json(200, self._admin(m.group(2), run_dir, body))
+            except runadmin.AdminError as exc:
+                self._json(409, {"error": str(exc)})
+            return
         m = re.match(r"^/api/runs/([^/]+)/(resume|stop)$", path)
         if m:
             run_dir = self._run_dir(m.group(1))
             if run_dir is None:
                 return
             if m.group(2) == "resume":
-                log = launch([SCRIPT, "--run-id", run_dir.name])
+                # Optionally with a (new) Drive destination: a finished run
+                # then only uploads its PDF (pipeline.sh resets `upload`).
+                body = self._body()
+                if body is None:
+                    return
+                extra = []
+                for field, flag in (("drive_folder", "--drive-folder"),
+                                    ("drive_folder_name", "--drive-folder-name"),
+                                    ("drive_name", "--drive-name")):
+                    value = body.get(field)
+                    if isinstance(value, str) and value.strip():
+                        extra += [flag, value.strip()]
+                if body.get("no_drive"):
+                    extra.append("--no-drive")
+                log = launch([SCRIPT, "--run-id", run_dir.name, *extra])
                 self._json(202, {"status": "started", "log": log.name})
             else:
                 proc = subprocess.run([KILL_SCRIPT, "--run-id", run_dir.name],
@@ -537,6 +665,52 @@ class Handler(BaseHTTPRequestHandler):
             "log": str(log),
             "log_name": log.name,
         })
+
+    def _admin(self, action, run_dir, body):
+        frames = runadmin.frames_root(current_config())
+        if action == "clear":
+            return runadmin.clear(RUNS_DIR, run_dir.name, frames,
+                                  with_members=bool(body.get("with_members")))
+        if action == "cache":
+            what = body.get("what") or []
+            if isinstance(what, str):
+                what = what.split(",")
+            return {"freed": runadmin.remove_cache(run_dir, what, frames)}
+        tags = body.get("tags") or []
+        if isinstance(tags, str):
+            tags = tags.split(",")
+        return runadmin.set_tags(run_dir, [t for t in tags if isinstance(t, str)])
+
+    def _bulk(self, body):
+        """The same actions over several runs; one result per run, so one
+        refusal (a run being processed) does not hide the rest."""
+        action = body.get("action")
+        if action not in ("clear", "cache", "tags"):
+            return {"error": "action must be clear, cache or tags", "results": []}
+        results = []
+        for run_id in body.get("run_ids") or []:
+            if not isinstance(run_id, str) or not RUN_ID_RE.match(run_id):
+                results.append({"run_id": str(run_id), "error": "bad run id"})
+                continue
+            run_dir = RUNS_DIR / run_id
+            if not (run_dir / "state.json").is_file():
+                # Already gone — a combine run cleared with its members first.
+                results.append({"run_id": run_id, "skipped": "no such run"})
+                continue
+            try:
+                payload = dict(body)
+                if action == "tags":
+                    # Bulk tagging adds to each run's own tags.
+                    data = read_state(run_dir) or {}
+                    add = body.get("tags") or []
+                    if isinstance(add, str):
+                        add = add.split(",")
+                    payload["tags"] = (data.get("tags") or []) + list(add)
+                results.append({"run_id": run_id,
+                                **self._admin(action, run_dir, payload)})
+            except runadmin.AdminError as exc:
+                results.append({"run_id": run_id, "error": str(exc)})
+        return {"results": results}
 
     def log_message(self, fmt, *args):
         print(f"[trigger-server] {self.address_string()} - {fmt % args}")

@@ -59,7 +59,9 @@ inlined — combining the transcript with keyframes extracted from the recording
 and, optionally, the lecturer's own slides from a GitHub repo or a folder. It
 accepts several inputs per invocation, runs them concurrently, and resumes
 anything that failed partway. A stdlib web UI (`trigger_server.py`), run by
-pm2 and off until switched on, drives all of it.
+pm2 and off until switched on, drives all of it — including the run
+history (filter, tag, clear, remove caches) and, optionally, a copy of the
+PDF in a Google Drive folder of the bot account.
 
 ## Everything runs on one host — read this first
 
@@ -828,6 +830,10 @@ record ─┐                     (meeting URLs only)
 input ──┤                    ├─> summarize
         └─> fetch_video ──> frames
 ```
+
+`upload` (2026-11-02) is a seventh, after summarize, run only when the run
+names a Google Drive folder — see "Settled 2026-11-02" below. On every other
+run it stays `pending`, like `record` on non-meetings.
 
 `clip` is a sixth stage, run only when `--clip` is given; see the section below
 for where it sits. On an unclipped run it stays `pending` forever, the same way
@@ -2127,6 +2133,10 @@ Shaped to match the user's course files (`2_Transcripts/chapter1.md`,
 
 ### `--combine`: several videos summarized as ONE (`--combine-pdf`, `--no-combine-pdf`)
 
+(Since 2026-11-02 the path is optional — see "Settled 2026-11-02" below:
+`--combine` alone writes `SUMMARIES_DIR/<combine run id>.md` and
+`PDF_DIR/<combine run id>.pdf`, and the web UI's field is a switch.)
+
 Reworked 2026-09-11 with the operator. Until then `--combine` summarized every
 input on its own and stapled the `.md` files together, renumbering frame
 citations per section so the combined PDF's pictures lined up. That whole
@@ -2490,6 +2500,115 @@ Analysis runs on a 200px-wide grayscale copy, so cost is a few milliseconds per
 frame regardless of source resolution. Pillow is optional: without it frames
 are copied through uncropped with one warning, and nothing is blank.
 
+## Settled 2026-11-02: Drive upload, run history, the drama prompt, the combine switch
+
+Four requests from the operator, settled in three rounds of questions.
+
+### Google Drive upload (`lib/gdrive.py`, the `upload` stage)
+
+- **OAuth "Desktop app" client, signed in as the bot account**
+  (`GDRIVE_CLIENT_ID` / `GDRIVE_CLIENT_SECRET` in `.env`; `lib/gdrive.py
+  login`). The operator chose it over rclone, a service account (owns what
+  it uploads, sees only folders shared with it) and their personal account.
+  Loopback redirect + PKCE + `login_hint=BOT_GOOGLE_ACCOUNT`; the consent
+  page opens in the bot's own browser profile by a **direct launch** (same
+  rule as first_time_login.sh — never a driven browser), or the URL is
+  printed. A login as any other account is refused and not saved. Refresh
+  token in `$MEETING_BOT_ROOT/state/gdrive_token.json`, mode 600. Scope:
+  full `drive` — `drive.file` cannot list folders shared with the bot, which
+  the folder browser needs. Login is CLI-only on the PC: Google requires a
+  loopback redirect for desktop clients, so it cannot be done from a phone.
+- **Own stage, replace in place** (the operator's choices): `upload` runs
+  after summarize (and after the sweeps) in `run_one.sh` `maybe_upload`,
+  for single and combine runs; a failure fails only `upload` (summarize
+  stays done; run_one exits 1 with "only the Drive upload failed") and a
+  resume retries just it. A same-named file in the folder gets a new
+  revision (`PATCH` upload), same link. Resumable uploads only. PDF only.
+  `--resume-all` does NOT pick up a failed upload (its loop keys on
+  summarize); Resume / `--run-id` does.
+- **Name**: `--drive-name`, else the summary's first `# ` heading, else the
+  run name; `.pdf` appended, `/` replaced. **Folder**: `--drive-folder`
+  takes an id or a pasted folder link (`gdrive.parse_folder_id`).
+  `--drive-folder-name` is display only (the browser's path).
+- **State**: `drive_folder`, `drive_folder_name`, `drive_name` at top level;
+  `stages.upload.{drive_file_id, drive_link, drive_file_name,
+  drive_replaced}` via `annotate`. Given on any resume (auto-resume,
+  `--run-id`, `--resume-last`, the combine run), Drive settings replace the
+  stored ones and **reset `upload`**, so a finished run's PDF is sent again
+  — that is how the web UI's "Send PDF to Drive…" works (resume with the
+  folder; summarize is skipped as done). `--no-drive` clears the folder.
+  With `--combine` the Drive settings go to the combine run only.
+- **Checked offline in pipeline.sh** before anything is paid for: the folder
+  parses, `gdrive.py status` says configured + logged in + the right
+  account, and a PDF will exist (not `SUMMARY_WRITE_PDF=0`, not
+  `--no-combine-pdf`). Whether the folder exists and is writable is the
+  folder browser's job, or the stage's error.
+- **Web UI**: a switch on both tabs, then a folder browser
+  (`/api/drive/folders?parent=root|shared|drives|<id>`; crumbs; "view only"
+  folders can be entered but not chosen) and a name box; the last folder
+  is remembered in localStorage. Start stays locked while the switch is on
+  without a folder. The server runs gdrive.py as a child with
+  `current_config()` (so an `.env` edit applies without a restart).
+- Test seams: `GDRIVE_AUTH_URL`, `GDRIVE_TOKEN_URL`, `GDRIVE_API_URL`,
+  `GDRIVE_UPLOAD_URL`, `GDRIVE_TOKEN_FILE`; `lib/test_gdrive.py` drives a
+  fake `requests`; `test_pipeline_e2e.sh` replaces gdrive.py (except
+  `parse`) with a stub. **Not verified against the real Drive API** — no
+  OAuth client existed in the session that built it.
+
+### The run history (`lib/runadmin.py`)
+
+- **Clear = bookkeeping only** (the operator's choice): `runs/<id>/` and
+  `FRAMES_DIR/<id>` (nothing can reach those frames once the run is gone).
+  Recordings, transcripts, summaries and PDFs are never touched. Refused for
+  a run being processed (live `run.lock` owner) and for a member of a
+  combined set whose combine run still exists. A combine run may take its
+  members (`--with-members`; the UI's default); cleared alone, it leaves
+  them pointing at the gone run — deliberately: `--resume-all` keeps
+  skipping them instead of billing individual summaries, and re-running the
+  same `--combine` makes a new combine run over them.
+- **Cache = frames, chunks, media, and global tmp** (all four chosen). Each
+  regenerable; frames / fetch_video / clip are marked `cleaned` exactly like
+  the post-summary sweep, so a finished run stays finished. `media` never
+  applies to a meeting (its recording is not in the run dir anyway). `tmp`
+  is refused while any run is processed (prompt files are in use).
+- **Categories = automatic facets + the operator's tags**: status
+  (`statusKey` in the page), type (input_type), style (canonical prompt),
+  and `tags` (state.json; `--tag` repeatable / comma-split;
+  `runstate.normalize_tags`: trimmed, case-insensitively unique, ≤ 20 × 40
+  chars). Filtering is client side over `/api/runs?limit=400`.
+- API: `/api/runs/<id>/{sizes,clear,cache,tags}`, `/api/runs/bulk`
+  (`clear|cache|tags`; bulk tags ADD), `/api/cache`, `/api/cache/tmp`.
+  runadmin is imported in-process (stdlib only); FRAMES_DIR comes from
+  `current_config()`.
+
+### The `drama` prompt (Thai drama / lakorn episodes)
+
+A sixth prompt, asked for by the operator. Their choices: clickable
+`[mm:ss]` timestamps, characters & relationships, scene-by-scene recap with
+quotes, a spoiler-free opening; and it follows `SUMMARY_LANGUAGE` (quotes
+stay Thai, translated when the recap is English). So it joins `reality` in
+`TIMED_TRANSCRIPT_PROMPTS` (timed transcript, `link_timestamps`) and
+`WRAPPED_PROMPT_PREFIXES`, and has its own `_merge-drama.md`. Its specifics:
+names from credits/on-screen text, then forms of address (a bare
+kinship word is a relationship, not a name), then a `--resources` cast
+list, never guessed; the Characters table describes relationships as they
+stand at the START (no spoilers); revelations go where they happen and in
+`## What changed` (always written); the opening recap and the closing
+preview are not the episode's events. PDF kind label "Drama episode recap".
+
+### `--combine` is a switch
+
+The web UI's field became a toggle; the documents go to the default paths
+named for the combine run id (the operator's choice), like every run's
+artifacts, so resuming the set lands on the same files. In `pipeline.sh`
+`--combine`'s value is optional: **only a next argument ending in `.md`
+(`.markdown`) is taken as the path** — anything else (an input, an option,
+nothing) means `COMBINE_DEFAULT=1`. The run dir is resolved first, then
+`COMBINE_FILE` / `COMBINE_PDF` are derived from it (`@default` is the
+placeholder in between). The dry run prints
+`combine<TAB>SUMMARIES_DIR/<combine run id>.md`. `/trigger` still accepts a
+`.md` string in `combine` for old shortcuts; `true` means the switch.
+
 ## Cross-session queueing (`lib/slotqueue.py`)
 
 `--jobs` throttles concurrency *within one* `pipeline.sh` invocation. It does
@@ -2826,9 +2945,10 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   the operator asked not to have.
 - **Computer Modern is never offered for Thai.** No Thai glyphs.
 - **No prompt asks for timestamps or frame citations** — except the
-  timestamps of `reality` (`TIMED_TRANSCRIPT_PROMPTS`), the operator's
-  explicit exception of 2026-09-30; no prompt cites frames. One file per
-  prompt for every backend; don't add a sixth without asking. The old names
+  timestamps of `reality` and `drama` (`TIMED_TRANSCRIPT_PROMPTS`), the
+  operator's explicit exceptions of 2026-09-30 and 2026-11-02; no prompt
+  cites frames. One file per prompt for every backend; don't add a seventh
+  without asking. The old names
   stay as aliases in `promptnames.py` — unfinished runs and `.env` files
   carry them.
 - **A timed prompt's timestamps come from the transcript's marks, and the
@@ -2926,6 +3046,17 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   lines; the page's own hints check shapes, never what an input is. An
   `extra` line is a failure in the form (a typo'd path would become the
   run's name).
+- **The Drive upload is its own stage and never fails the summary.** The
+  PDF on disk is the deliverable; `upload` failing leaves summarize done.
+  Drive settings given on a resume reset `upload`. A same-named file is
+  replaced (new revision), never duplicated.
+- **Drive signs in as `BOT_GOOGLE_ACCOUNT` only**, through a direct browser
+  launch, never a driven one; a login for another account is not saved.
+- **Clearing a run never touches the deliverables** (recording, transcript,
+  summary, PDF) — only `runs/<id>/` and its frames. Never clear or sweep a
+  run whose `run.lock` owner is alive; never clear a member of a live set.
+- **`--combine`'s path is optional; only an `.md` next argument is one.**
+  Don't make it a required value again (the web UI sends it bare).
 - **A meet.new run is never auto-resumed**, and a hosted call is never ended
   on an unreadable participant count.
 - **Captions are never taken from a YouTube machine translation.** Spoken
@@ -2957,6 +3088,7 @@ without API keys or network, against temp directories
 
 | File | Covers | Count |
 |---|---|---|
+| `lib/test_gdrive.py` | folder ids from links, PDF names, query escaping, gmail comparison, status / token file mode, not-logged-in and a revoked login, the consent URL, upload create vs replace (resumable, no parents on a revision), folder listing (pages, Shared with me), a file is not a folder, CLI errors | 13 |
 | `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI, `annotate` and the pause fields, `stop`/`unstop` | 20 |
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
@@ -2965,15 +3097,15 @@ without API keys or network, against temp directories
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
 | `lib/test_ytdownload.py` | the YouTube download retry: transient vs permanent errors (a failed challenge solver beats "not available"), a 403 then served, doubling waits, the attempt cap, the command never merges, no pm2 Node IPC variables passed on | 11 |
 | `lib/test_discord_spool.py` | Discord spool placement from synthetic packet timings (arrival only; RTP: bunching, loss, wraparound, a pause, a resync), crash tolerance, the int32 mix and clipping, real ffmpeg (words where spoken, speaker tracks, the spool kept on failure) | 22 |
-| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the five prompts (old names resolve, no timestamps outside `reality`, the callout vocabulary), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`), the Gemini request timeout, Gemini's frame filtering, media resolution and own cap, the per-chunk frame cap, the OpenRouter backend (payload, key/model walk, the per-account daily cap, an error inside a 200, a truncated answer retried once then the next model, the chunk cap, the rejected-answer dump, the real model of a router), the chunk flow (the merge's instructions, every model named, finished chunks reused and re-keyed on a model change), an off-script answer rejected (and a few foreign words or the input's own script let through) | 248 |
+| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the six prompts (old names resolve, no timestamps outside `reality`/`drama`, the callout vocabulary), the drama prompt (timed, wrapped, its asks, its merge, links), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`), the Gemini request timeout, Gemini's frame filtering, media resolution and own cap, the per-chunk frame cap, the OpenRouter backend (payload, key/model walk, the per-account daily cap, an error inside a 200, a truncated answer retried once then the next model, the chunk cap, the rejected-answer dump, the real model of a router), the chunk flow (the merge's instructions, every model named, finished chunks reused and re-keyed on a model change), an off-script answer rejected (and a few foreign words or the input's own script let through) | 253 |
 | `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), loose callout markers (`### [!KIND]`, a bare `[!KIND]`), real PDF render, Thai words inside a formula set as text (or the whole formula as text when they can't be cut out) | 113 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
 | `transcribe/test_yt_autocaptions.py` | yt-dlp captions: track choice (never a translation; `auto` prefers an upload in the spoken language), json3, the CLI against a stub yt-dlp, an auto-dubbed video's original audio over the dub | 15 |
 | `screen/test_extract_frames.py` | frames on change: settle, a transient change, blanks, the motion cap, the safety net, the last sample, the shared distance; the PPM reader; real ffmpeg (black lead-in skipped, audio-only empty, retired settings named) | 19 |
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
 | `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
-| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source, an `.env` edit reaching the next run and the form without a restart, the `.env` parser, no pm2 Node IPC variables in a child | 15 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line), Stop on a summarizing run (`kill_meeting.sh --run-id` terminates it, `STOPPED`, `--resume-all` skips it, `--run-id` finishes it and clears the mark), a YouTube download refused with a 403 and re-run (served, given up, a non-transient failure not retried) | 485 |
+| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source, an `.env` edit reaching the next run and the form without a restart, the `.env` parser, no pm2 Node IPC variables in a child, the combine switch / tags / Drive arguments, run history (sizes, tags, cache removal marking stages `cleaned`, clear; a busy run and a live set's member refused; bulk clear with members), the tmp cache, Drive status, a resume naming a Drive folder | 20 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line), Stop on a summarizing run (`kill_meeting.sh --run-id` terminates it, `STOPPED`, `--resume-all` skips it, `--run-id` finishes it and clears the mark), a YouTube download refused with a 403 and re-run (served, given up, a non-transient failure not retried), `--combine` without a path (default places, resumed onto the same files, last on the line in a dry run), the Drive upload (folder id from a link, the title as the name, the link stored, not repeated, renamed on `--run-id` without re-summarizing, a failure failing only `upload` and retried, refusals, only the combined PDF), tags (stored, split, on members too) | 520 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, YouTube captions through a stub yt-dlp first (the API never asked when it succeeds), youtube-transcript.io when yt-dlp fails or finds no track, the other-language-labelled track as last resort, `YT_AUTOCAPTIONS=0`, both down = exit 1, `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 141 |
 | `verify_e2e.sh --browser-smoke` | the real browser (Firefox ESR or Chrome) under Xvfb, recorded and measured for black edges | 6 |
 
@@ -3083,6 +3215,9 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── clip.py                   <- --clip: window parsing + the ffmpeg cut
 │   ├── ytdownload.py             <- the YouTube download (yt-dlp), re-run on a transient 403/429/5xx
 │   ├── combine.py                <- --combine: parts.json from the member runs, the run key
+│   ├── gdrive.py                 <- Google Drive: the bot account's OAuth login, folders, the PDF upload
+│   ├── runadmin.py               <- run history: clear, cache removal, tags (stdlib; the web UI imports it)
+│   ├── test_gdrive.py
 │   ├── discord_spool.py          <- Discord recordings: per-speaker spool, timeline placement, the .m4a mix
 │   ├── test_discord_spool.py
 │   ├── run_one.sh                <- the per-run stage DAG
@@ -3122,7 +3257,7 @@ own flags, which is everything about stage 1 except the call itself.
     ├── document.py
     ├── language.py               <- SUMMARY_LANGUAGE: the {language_rule} every prompt carries
     ├── fontchoice.py             <- per-language PDF fonts, defaults, x-height size matching (+ CLI check)
-    ├── promptnames.py            <- the five prompts, the old names' aliases, which read timed lines (stdlib only)
+    ├── promptnames.py            <- the six prompts, the old names' aliases, which read timed lines (stdlib only)
     ├── pdf.py                    <- markdown -> PDF (DESIGN.md)
     ├── framecrop.py              <- slide-region detection, blank frames
     ├── mathrender.py             <- LaTeX -> Computer Modern SVG
@@ -3135,7 +3270,9 @@ own flags, which is everything about stage 1 except the call itself.
         ├── tutorial.md
         ├── reality.md            <- reality-show episode recap: [mm:ss], quotes, results last
         ├── _merge.md             <- internal; leading _ keeps it off the menu
-        └── _merge-reality.md     <- the reality prompt's own merge
+        ├── drama.md              <- Thai drama (lakorn) episode recap: characters, [mm:ss], Thai quotes, what changed
+        ├── _merge-reality.md     <- the reality prompt's own merge
+        └── _merge-drama.md       <- the drama prompt's own merge
 ```
 
 ## The web UI (`trigger_server.py`, `web/index.html`)
