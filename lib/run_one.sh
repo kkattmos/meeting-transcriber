@@ -172,20 +172,24 @@ _source_url_cfg="$(cfg source_url)"
 # gone is stale and gets taken over — otherwise a SIGKILL'd run could never be
 # resumed, which is exactly the situation resume exists for.
 LOCK_DIR="$RUN_DIR/run.lock"
+# The pid written is the one Python and every other script can test
+# (lib/platform.sh: the Windows pid under Git Bash, $$ elsewhere).
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/platform.sh"
 acquire_lock() {
   if mkdir "$LOCK_DIR" 2>/dev/null; then
-    echo $$ > "$LOCK_DIR/pid"
+    mb_pid > "$LOCK_DIR/pid"
     return 0
   fi
   local owner
   owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-  if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+  if [ -n "$owner" ] && mb_alive "$owner"; then
     echo "ERROR: run $RUN_ID is already being processed by PID $owner." >&2
     echo "  Wait for it, or stop it with: ./kill_meeting.sh --run-id $RUN_ID" >&2
     return 1
   fi
   echo "==> Taking over a stale lock from PID ${owner:-unknown}"
-  echo $$ > "$LOCK_DIR/pid"
+  mb_pid > "$LOCK_DIR/pid"
   return 0
 }
 acquire_lock || exit 3
@@ -276,7 +280,11 @@ run_stage() {
   # $BASHPID to the command substitution's own throwaway subshell, which exits
   # the instant the substitution completes — the queue would then see a dead
   # holder and immediately reclaim the slot, serializing nothing.
-  local holder_pid=$BASHPID
+  # (mb_pid only translates it to a Windows pid under Git Bash; it is given
+  # the value read here, never $BASHPID inside its own substitution.)
+  local bash_pid=$BASHPID
+  local holder_pid
+  holder_pid="$(mb_pid "$bash_pid")"
   local ticket
   ticket="$("$PYTHON_BIN" "$SLOTQUEUE" acquire \
               --component "$stage" --pid "$holder_pid" --label "$RUN_ID")" || return 1
@@ -613,8 +621,13 @@ fi
 
 # --- Stage implementations ---------------------------------------------------
 
+# MEETING_BOT_RECORDER swaps the recorder for one with the same arguments and
+# contract: the Alpine branch's runs in a Debian container, the Windows
+# branch's records a visible window (screen/record_windows.sh). Unset here.
 do_record() {
-  RECORD_MEDIA="$RECORD_MEDIA_CFG" bash "$ROOT_DIR/screen/record_screen.sh" \
+  local recorder="${MEETING_BOT_RECORDER:-screen/record_screen.sh}"
+  case "$recorder" in /*|[A-Za-z]:*) ;; *) recorder="$ROOT_DIR/$recorder" ;; esac
+  RECORD_MEDIA="$RECORD_MEDIA_CFG" bash "$recorder" \
     "$INPUT" "$NAME" "$DISPLAY_NAME" "$MP4_FILE"
 }
 

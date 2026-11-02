@@ -162,6 +162,8 @@ FOREGROUND="${MEETING_BOT_FOREGROUND:-0}"
 . "$SCRIPT_DIR/source_env.sh"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/paths.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/platform.sh"
 
 RUNS_DIR="$MEETING_BOT_ROOT/runs"
 RUNSTATE="$SCRIPT_DIR/lib/runstate.py"
@@ -433,9 +435,9 @@ if [ "$FOREGROUND" != "1" ] && [ "$DRY_RUN" -eq 0 ] && [ "$RESUME_ALL" -eq 0 ] \
   BG_LOG_DIR="$MEETING_BOT_ROOT/logs"
   mkdir -p "$BG_LOG_DIR"
   BG_LOG="$BG_LOG_DIR/pipeline_$(date +%Y%m%d_%H%M%S)_$$.log"
-  MEETING_BOT_FOREGROUND=1 setsid nohup bash "$SCRIPT_DIR/pipeline.sh" "${ORIGINAL_ARGS[@]}" \
-    > "$BG_LOG" 2>&1 < /dev/null &
-  BG_PID=$!
+  : > "$BG_LOG"
+  # setsid nohup on Linux; nohup + disown under Git Bash (lib/platform.sh).
+  BG_PID="$(MEETING_BOT_FOREGROUND=1 mb_detach "$BG_LOG" bash "$SCRIPT_DIR/pipeline.sh" "${ORIGINAL_ARGS[@]}")"
   echo "==> Recording in the background (pid $BG_PID). Closing this terminal won't stop it."
   echo "    Log:    tail -f '$BG_LOG'"
   # The run id (and a created meeting's link) appear in the log within a few
@@ -809,7 +811,7 @@ elif [ "$RESUME_ALL" -eq 1 ]; then
     # terminal run is mid-summary, say). run_one.sh would refuse the lock
     # anyway; skipping here keeps that out of the report.
     owner="$(cat "${run_dir}run.lock/pid" 2>/dev/null || true)"
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+    if [ -n "$owner" ] && mb_alive "$owner"; then
       echo "==> $(basename "${run_dir%/}"): in progress under PID $owner — left alone"
       continue
     fi

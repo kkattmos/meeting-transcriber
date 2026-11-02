@@ -29,20 +29,29 @@ that request surface moved twice in 2025-2026 and memorized patterns are wrong.
 
 ## Branches
 
+**Features are developed here, on `debian13`, and merged into the deployment
+branches**, each of which keeps only its own layer (setup, services,
+container, docs) and describes it in a "This branch" section of its own
+CLAUDE.md. Synced on 2026-11-02 (see "Shared code runs on every branch").
+
 - **`debian13`** — Debian 13 on the operator's own **desktop PC**,
   as the operator's user (not root), Firefox ESR by default, pm2 for the web
   UI. Ported from the VM layout on 2026-09-29; see "Running on a PC" below.
-- **`debian13-in-proxmox`** — the same system as it ran on the Proxmox VM
-  until 2026-09-29: root, `/opt/meeting-bot`, google-chrome-stable, systemd
-  trigger unit + resume timer. Consult it before reintroducing anything
-  root- or VM-shaped.
-- **`docker`** — the one-container build (branched 2026-09-27). Its non-Docker
-  work (web UI, `--new-meet`, `--dry-run`/`need_value`, the yt-dlp caption
-  fallback, course-reference frontmatter) was ported here on 2026-09-29;
-  the Dockerfile, compose file and entrypoint were not.
-- **`alpinelinux`** — the Alpine host plus a Debian container for the browser
-  stages. Where `docker/recorder_lib.sh` and `audio-setup.sh` still live.
-- `main` — the Alpine tree as it was when the Debian port started.
+- **`debian13-in-proxmox`** (this one) — the server deployment: Debian 13 VM, root,
+  `/opt/meeting-bot`, google-chrome-stable, systemd web UI unit + resume
+  timer. Consult it before reintroducing anything root- or VM-shaped here.
+- **`deprecated_proxmox_ubuntu`** — the same server deployment on Ubuntu
+  (uv-managed Python 3.13, Firefox ESR from the Mozilla PPA). The name is
+  historical; it is kept in sync.
+- **`docker`** — the one-container build (Dockerfile, compose,
+  `docker/install.sh`, the entrypoint's resume loop).
+- **`main`** — the Alpine host + a Debian recorder container (Chrome has no
+  musl build): `MEETING_BOT_RECORDER=screen/record_in_container.sh`,
+  OpenRC + crond, `requirements-alpine.txt`.
+- **`windows`** — native Windows 10/11: the bash scripts under Git Bash,
+  meetings recorded as a visible window + VB-CABLE
+  (`screen/record_windows.py`), Firefox ESR in its own folder, pm2,
+  `setup.ps1`, `requirements-windows.txt`. Not yet run on Windows.
 
 ## What this project is, in one paragraph
 
@@ -2642,6 +2651,39 @@ placeholder in between). The dry run prints
 `combine<TAB>SUMMARIES_DIR/<combine run id>.md`. `/trigger` still accepts a
 `.md` string in `combine` for old shortcuts; `true` means the switch.
 
+## Shared code runs on every branch, Windows included (2026-11-02)
+
+The operator asked for all deployment branches to be kept in sync and for a
+native Windows branch. The decision: **features are developed here, on
+`debian13`, and merged into the others**, each of which keeps only a
+deployment layer (setup, services, container, docs) — so the shared code
+must be correct on each of them:
+
+- **Process liveness and file locks go through `lib/procutil.py`** (Python)
+  and **`lib/platform.sh`** (bash). On Linux they are exactly the old
+  `os.kill(pid, 0)` / `fcntl.flock` / `kill -0` / `setsid nohup` / `ps
+  --ppid` walk. Under Git Bash on Windows, `$$` is an MSYS pid nobody else
+  knows, so `mb_pid` writes the Windows pid (`/proc/<pid>/winpid`) into
+  `run.lock` and the slot queue, `mb_alive` asks `tasklist`, `mb_kill_tree`
+  is `taskkill /T /F`, and `mb_detach` is `nohup` + `disown` (no setsid);
+  Python's `pid_alive` uses OpenProcess, because **`os.kill(pid, 0)` on
+  Windows sends CTRL_C**, it does not test anything; and `lock_file` uses
+  `msvcrt.locking`.
+- **`MEETING_BOT_RECORDER`** (run_one.sh `do_record`) swaps the recorder for
+  one with record_screen.sh's arguments and contract: the Alpine branch's
+  container wrapper, the Windows branch's `screen/record_windows.sh`. Unset
+  here.
+- `trigger_server._shell` runs a `.sh` through bash on Windows;
+  `first_time_login.sh` always opens a desktop window there;
+  `kill_meeting.sh` escalates with `taskkill` there (no TERM/INT on
+  Windows); `MEETING_BOT_KIOSK_MONITOR` puts Firefox's kiosk on a chosen
+  monitor (`--kiosk-monitor`) — the Windows recorder films a visible window.
+- `gdrive.py login --bind/--port` (the Docker build's published port).
+
+`lib/test_procutil.py` holds the Linux behaviour and that Windows never
+reaches `os.kill`. The branches' own layers are described in each branch's
+"This branch" section of its CLAUDE.md.
+
 ## Cross-session queueing (`lib/slotqueue.py`)
 
 `--jobs` throttles concurrency *within one* `pipeline.sh` invocation. It does
@@ -3090,6 +3132,13 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   run whose `run.lock` owner is alive; never clear a member of a live set.
 - **`--combine`'s path is optional; only an `.md` next argument is one.**
   Don't make it a required value again (the web UI sends it bare).
+- **Never `os.kill(pid, 0)`, `fcntl`, `kill -0` on a lock's pid, or
+  `setsid` directly in shared code** — `lib/procutil.py` / `lib/platform.sh`.
+  On Windows the first sends CTRL_C and the others don't exist or test the
+  wrong pid. Every deployment branch runs this code.
+- **Features go to `debian13` first, then are merged into the deployment
+  branches**, which keep only their layer. Don't develop a feature on a
+  deployment branch.
 - **A meet.new run is never auto-resumed**, and a hosted call is never ended
   on an unreadable participant count.
 - **Captions are never taken from a YouTube machine translation.** Spoken
@@ -3122,6 +3171,7 @@ without API keys or network, against temp directories
 | File | Covers | Count |
 |---|---|---|
 | `lib/test_gdrive.py` | folder ids from links, PDF names, query escaping, gmail comparison, status / token file mode, not-logged-in and a revoked login, the consent URL, upload create vs replace (resumable, no parents on a revision), folder listing (pages, Shared with me), a file is not a folder, CLI errors | 13 |
+| `lib/test_procutil.py` | pid liveness (and that Windows never calls `os.kill`), the cross-process lock, `platform.sh` on Linux: `mb_pid`, `mb_alive`, `mb_tree` / `mb_kill_tree`, `mb_detach` in its own session | 10 |
 | `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI, `annotate` and the pause fields, `stop`/`unstop` | 20 |
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
@@ -3250,6 +3300,9 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── combine.py                <- --combine: parts.json from the member runs, the run key
 │   ├── gdrive.py                 <- Google Drive: the bot account's OAuth login, folders, the PDF upload
 │   ├── runadmin.py               <- run history: clear, cache removal, tags (stdlib; the web UI imports it)
+│   ├── procutil.py               <- pid liveness + file locks, Linux and Windows (stdlib)
+│   ├── platform.sh               <- the same for bash: mb_pid, mb_alive, mb_kill_tree, mb_detach
+│   ├── test_procutil.py
 │   ├── test_gdrive.py
 │   ├── discord_spool.py          <- Discord recordings: per-speaker spool, timeline placement, the .m4a mix
 │   ├── test_discord_spool.py

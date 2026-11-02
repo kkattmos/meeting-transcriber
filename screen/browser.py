@@ -118,6 +118,11 @@ FIREFOX_PREFS = {
     "devtools.jsonview.enabled": False,
 }
 FIREFOX_ARGS = ["--kiosk", "--width", str(_W), "--height", str(_H)]
+# Windows (the `windows` branch) records a visible window, so the kiosk goes
+# to the monitor the operator gives up for it (Firefox's --kiosk-monitor,
+# 0-based). Unset on Linux, where the kiosk is on the run's own Xvfb display.
+if os.environ.get("MEETING_BOT_KIOSK_MONITOR", "").strip():
+    FIREFOX_ARGS += ["--kiosk-monitor", os.environ["MEETING_BOT_KIOSK_MONITOR"].strip()]
 
 
 def browser_kind(value=None):
@@ -167,7 +172,13 @@ def _lock_owner_pid(path):
 def _pid_alive(pid):
     """True for a running process. A zombie (exited, not yet reaped by an
     orphaned parent) counts as dead: kill -0 succeeds on it, and that made a
-    dead recording's Firefox block the next one (2026-09-29)."""
+    dead recording's Firefox block the next one (2026-09-29). On Windows
+    (no /proc, and os.kill(pid, 0) would send CTRL_C) lib/procutil asks
+    the Win32 API."""
+    if os.name == "nt":
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+        from procutil import pid_alive
+        return pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
