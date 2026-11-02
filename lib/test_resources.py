@@ -195,6 +195,78 @@ class CollectTest(unittest.TestCase):
         self.assertFalse(self.collect([]))
 
 
+class FrontmatterTest(unittest.TestCase):
+    def test_parses_known_fields_quotes_and_comments(self):
+        meta, body, problems = resources.parse_frontmatter(
+            "---\ncourse: Networks\nsource: \"Kurose: Top-Down # 7e\"\n"
+            "citation_label: Kurose   # renders (Kurose §2.4)\nfuture_key: x\n"
+            "---\n\n# Body\n")
+        self.assertEqual(meta, {"course": "Networks", "source": "Kurose: Top-Down # 7e",
+                                "citation_label": "Kurose"})
+        self.assertEqual(body, "# Body\n")
+        self.assertEqual(problems, [])
+
+    def test_no_frontmatter_leaves_the_text_alone(self):
+        text = "# Title\n---\nnot frontmatter\n"
+        self.assertEqual(resources.parse_frontmatter(text), (None, text, []))
+        # An opening rule with no closing one is a horizontal rule.
+        self.assertIsNone(resources.parse_frontmatter("---\nabc\n")[0])
+
+    def test_malformed_lines_are_reported_not_fatal(self):
+        meta, _, problems = resources.parse_frontmatter("---\njust words\ncourse: A\n---\nx")
+        self.assertEqual(meta, {"course": "A"})
+        self.assertEqual(problems, ["just words"])
+
+    def test_missing_course_falls_back_to_the_file_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "embedded-notes.md"
+            ref.write_text("---\nsource: Lecture notes\n---\nbody\n")
+            bundle = resources.collect([str(ref)], cache_root=tmp, want_images=False)
+        f = bundle.files[0]
+        self.assertEqual(f.meta["course"], "embedded-notes")
+        self.assertEqual(f.meta["citation_label"], "embedded-notes")
+        self.assertEqual(f.text, "body")
+
+
+class BinaryTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_pdf_named_md_is_refused_when_named_directly(self):
+        fake = self.root / "notes.md"
+        fake.write_bytes(b"%PDF-1.7\n...")
+        with self.assertRaisesRegex(ValueError, "binary document; convert it to Markdown"):
+            resources.collect([str(fake)], cache_root=self.root, want_images=False)
+        self.assertTrue(resources.check_specs([str(fake)]))
+
+    def test_zip_and_nul_count_as_binary(self):
+        for name, data in (("a.txt", b"PK\x03\x04rest"), ("b.md", b"abc\x00def")):
+            (self.root / name).write_bytes(data)
+            self.assertTrue(resources.looks_binary(self.root / name), name)
+        (self.root / "c.md").write_text("ปกติ normal text")
+        self.assertFalse(resources.looks_binary(self.root / "c.md"))
+
+    def test_in_a_folder_it_is_skipped_with_a_note(self):
+        (self.root / "good.md").write_text("fine")
+        (self.root / "bad.md").write_bytes(b"%PDF-1.4")
+        bundle = resources.collect([str(self.root)], cache_root=self.root / "c",
+                                   want_images=False)
+        self.assertEqual([f.label for f in bundle.files], ["good.md"])
+        self.assertTrue(any("bad.md" in n for n in bundle.notes))
+
+    def test_a_real_pdf_extension_is_not_binary_rejected(self):
+        pdf = self.root / "slides.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+        self.assertEqual(resources.check_specs([str(pdf)]), [])
+
+    def test_check_reports_a_missing_path(self):
+        self.assertTrue(resources.check_specs([str(self.root / "nope.md")]))
+
+
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
 class GitHubTest(unittest.TestCase):
     """The GitHub path, against a local repo — no network involved.

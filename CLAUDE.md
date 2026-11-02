@@ -5,9 +5,11 @@ and non-obvious facts about this project. Read it before exploring the source
 so you don't re-derive context that's already settled. After every edit, update
 it so it stays accurate. **Always ask the user questions first.**
 
-User-facing docs (what this does, how to run it) live in `README.md` — the only
-other Markdown file in the repo, deliberately. This file is for the things that
-aren't obvious from reading code or git history.
+User-facing docs (what this does, how to run it) live in `README.md`. The
+one other Markdown file is `DESIGN.md`, the specification of the summary
+PDF's look (added at the operator's request 2026-09-29; `pdf.py`'s `_css()`
+implements it, and the two change together). This file is for the things
+that aren't obvious from reading code or git history.
 
 ### Note from AssemblyAI
 Before writing AssemblyAI code, read https://www.assemblyai.com/docs/agent-instructions.md
@@ -27,28 +29,44 @@ that request surface moved twice in 2025-2026 and memorized patterns are wrong.
 
 ## Branches
 
-- **`debian13`** (this one) — Debian 13 host, everything native.
-- **`alpinelinux`** — the previous architecture, preserved verbatim: Alpine
-  host plus a Debian container for the browser stages. Consult it before
-  reintroducing anything container-shaped; it is also where the Docker files,
-  `docker/recorder_lib.sh` and `audio-setup.sh` still live.
-- `main` — the Alpine tree as it was when the port started.
+- **`debian13`** — Debian 13 on the operator's own **desktop PC**,
+  as the operator's user (not root), Firefox ESR by default, pm2 for the web
+  UI. Ported from the VM layout on 2026-09-29; see "Running on a PC" below.
+- **`debian13-in-proxmox`** — the same system as it ran on the Proxmox VM
+  until 2026-09-29: root, `/opt/meeting-bot`, google-chrome-stable, systemd
+  trigger unit + resume timer. Consult it before reintroducing anything
+  root- or VM-shaped.
+- **`docker`** — the one-container build (branched 2026-09-27). Its non-Docker
+  work (web UI, `--new-meet`, `--dry-run`/`need_value`, the yt-dlp caption
+  fallback, course-reference frontmatter) was ported here on 2026-09-29;
+  the Dockerfile, compose file and entrypoint were not.
+- **`alpinelinux`** — the Alpine host plus a Debian container for the browser
+  stages. Where `docker/recorder_lib.sh` and `audio-setup.sh` still live.
+- `main` — the Alpine tree as it was when the Debian port started.
 
 ## What this project is, in one paragraph
 
-A meeting/lecture bot for a **Debian 13** guest on Proxmox. It joins a Google
-Meet or Zoom call in a persistent real-Chrome profile (so Google's sign-in flow
-doesn't get blocked by automation-detection heuristics), records both the screen
+A meeting/lecture bot for the operator's **Debian 13 desktop PC**. It joins a
+Google Meet or Zoom call — or creates a new Google Meet and hosts it — in a
+persistent browser profile signed in as one bot account (Firefox ESR by
+default, Chrome as the fallback), on a hidden Xvfb display, in the background,
+and records both the screen
 and the meeting audio into an MP4, transcribes the audio with the AssemblyAI
-pre-recorded API (or youtube-transcript.io for YouTube URLs, or the entry's own
+pre-recorded API (or YouTube's own captions via yt-dlp for YouTube URLs, or the entry's own
 captions for a Kaltura embed), and produces a
 Claude summary (through the `claude` CLI, on a subscription — no API key) — Markdown plus a PDF with the cited keyframes cropped to the slide and
 inlined — combining the transcript with keyframes extracted from the recording
 and, optionally, the lecturer's own slides from a GitHub repo or a folder. It
 accepts several inputs per invocation, runs them concurrently, and resumes
-anything that failed partway.
+anything that failed partway. A stdlib web UI (`trigger_server.py`), run by
+pm2 and off until switched on, drives all of it — including the run
+history (filter, tag, clear, remove caches) and, optionally, a copy of the
+PDF in a Google Drive folder of the bot account.
 
 ## Everything runs on one host — read this first
+
+(Written for the VM; everything in it holds on the PC too, where "the host" is
+the operator's desktop session — one X server namespace, one PipeWire.)
 
 The Alpine branch split the system in two because **Alpine is musl and Chrome is
 glibc-only**: Google ships no musl build, and Playwright doesn't support Alpine
@@ -63,11 +81,16 @@ one X server and one PulseAudio daemon for the whole box, so both are now
 allocated per run in `lib/xsession.sh`:
 
 - **Display.** `xsession_pick_display` claims the first free number in
-  `DISPLAY_MIN..DISPLAY_MAX` (90-119) by creating `/tmp/.X<n>-lock` with
-  `set -o noclobber` — an atomic `O_EXCL` create. That is what makes two runs
-  starting in the same second pick different numbers; a "check then start"
-  scheme races. Xvfb is then started with `-nolock`, because the lock we just
-  made would otherwise look to it like a server already running.
+  `DISPLAY_MIN..DISPLAY_MAX` (90-119) by creating **our own claim file**,
+  `/tmp/.meeting-bot-X<n>.claim`, with `set -o noclobber` — an atomic
+  `O_EXCL` create. That is what makes two runs starting in the same second
+  pick different numbers; a "check then start" scheme races. On the VM the
+  claim *was* Xvfb's `/tmp/.X<n>-lock` and Xvfb ran with `-nolock` — which
+  only works as root: a user's Xvfb ignores `-nolock` ("can only be used by
+  root"), finds a lock naming a live pid (ours) and refuses to start. Found
+  2026-09-29 on the PC. So Xvfb keeps its own lock, a number is free only when
+  there is no socket, no live Xvfb lock and no live claim, and a claim or lock
+  whose pid is dead is taken over.
 - **Audio.** Each run loads its own `module-null-sink` named after the run id,
   and Chrome is pointed at it with the **`PULSE_SINK` environment variable**.
   `pactl set-default-sink` is deliberately NOT used: the default sink is global
@@ -76,6 +99,403 @@ allocated per run in `lib/xsession.sh`:
 
 If you are tempted to hardcode a display number again, don't — that only worked
 because of the container boundary that no longer exists.
+
+## This branch: `debian13-in-proxmox` (the server deployment)
+
+**Features are developed on `debian13` and merged here**; this branch keeps
+only its deployment layer on top. Synced 2026-11-02 (everything up to the
+Drive upload / run history / drama prompt / combine switch). The layer:
+
+- `setup.sh` — one root step: apt (incl. the **PulseAudio daemon** — a server
+  has no PipeWire; `lib/xsession.sh` starts it on demand), real
+  google-chrome-stable, uv venv at `/opt/meeting-bot-venv`, yt-dlp + deno in
+  `/usr/local/bin`, fonts in `/usr/local/share/fonts/meeting-bot`, `.env`,
+  and `--with-trigger` / `--with-resume-timer` install the units.
+- `meeting-bot-trigger.service` (runs `web/serve.sh`, `KillMode=process` so
+  a UI restart doesn't kill runs it started), `meeting-bot-resume.service`
+  (`MEETING_BOT_FOREGROUND=1`, `SuccessExitStatus=75`) and
+  `meeting-bot-resume.timer`. A oneshot service is never killed by its
+  timer, so pm2's cron_restart problem (and `web/resume.sh`) does not exist
+  here; `ecosystem.config.js` and `web/resume.sh` are deleted.
+- `webui.sh` — the same commands, driving systemd; `on` **enables at boot**
+  (a server has nobody to switch it on), unlike the desktop's pm2.
+- `.env.example` / `source_env.sh` defaults: `/opt/meeting-bot`,
+  `/opt/meeting-bot-venv`, `MEETING_BROWSER=chrome`,
+  `CLAUDE_CLI_BIN=/root/.local/bin/claude`.
+- README's intro, install and web UI notes.
+
+Everything below that talks about "the PC", `~/.local`, pm2 or Firefox as
+the default describes `debian13`; the code paths are the same here (Chrome
+gets `--no-sandbox` because it runs as root — `browser._open_chrome`). When
+syncing again: merge `debian13`, keep these files, re-run the suites.
+
+## Running on a PC (2026-09-29)
+
+Settled with the operator 2026-09-29, moving off the Proxmox VM onto their
+desktop. The decisions, each asked and answered:
+
+- **As the operator's user, not root.** Bot state in
+  `~/.local/share/meeting-bot` (`MEETING_BOT_ROOT`'s default everywhere, in
+  shell and Python), `sudo` only for `setup.sh --system` (apt). Chrome keeps
+  its sandbox; `--no-sandbox` is added only when `geteuid() == 0`.
+- **The venv is `.venv` in the repo, built by uv** (`uv venv --seed`, so pip
+  is inside for the troubleshooting steps). "Easy to remove" was the explicit
+  requirement: `rm -rf .venv`. `source_env.sh` defaults `MEETING_BOT_VENV` to
+  it; every `${MEETING_BOT_VENV:-…}` fallback reads `$LOADER_DIR/.venv`.
+  uv itself comes from astral.sh into `~/.local/bin` — it is now the
+  installer, not an optional speed-up.
+- **Output directories** on this PC: recordings, transcripts, summaries and
+  PDFs in the SeaDrive library `~/SeaDrive/My Libraries/3_Transcriptor/…`,
+  frames local (`~/.local/share/meeting-bot/frames`). The SeaDrive hazard in
+  the configuration section applies unchanged.
+- **Firefox ESR is the default browser** (`MEETING_BROWSER=firefox-esr`,
+  Debian's own `firefox-esr` package), Chrome selectable
+  (`MEETING_BROWSER=chrome`). See "The browser: Firefox ESR" below.
+- **One bot account, never hardcoded**: `BOT_GOOGLE_ACCOUNT` in `.env`.
+  `first_time_login.sh` requires it, prefills Google's sign-in with it
+  (`ServiceLogin?Email=…` — verified to fill `#identifierId`), and checks the
+  profile when the window closes; the recorder checks before every Google
+  Meet and refuses a profile signed in as anyone else (or signed out). See
+  "The bot account" below.
+- **A meeting records in the background.** `pipeline.sh` with a Meet/Zoom
+  input or `--new-meet` re-launches itself under `setsid nohup` (log in
+  `$MEETING_BOT_ROOT/logs/pipeline_<stamp>_<pid>.log`) and returns with the
+  run id, the log and the stop command. Decided *before* any state is written,
+  so only the background copy creates runs — a meet.new run is never
+  auto-resumed and two copies would make two calls. `--foreground` /
+  `MEETING_BOT_FOREGROUND=1` keep it attached; `--dry-run`, `--run-id`,
+  `--resume-*` never detach. The web UI and the pm2 resume job set
+  `MEETING_BOT_FOREGROUND=1` — they are already detached and logged, and a
+  second detach would put the output in a log the UI doesn't know. The scan
+  for "is there a meeting" is a loose regex over the positionals and
+  `--from-file`; the background copy does the real classification.
+- **pm2, off at boot.** `ecosystem.config.js` defines `meeting-bot-web`
+  (`web/serve.sh` → `trigger_server.py`, loading `.env`) and
+  `meeting-bot-resume` (`pipeline.sh --resume-all`, `cron_restart */15`,
+  replacing the systemd timer; since 2026-10-06 through `web/resume.sh`,
+  which starts the resume under `setsid` and exits — **pm2's cron_restart
+  kills a still-running app**, so a resume run directly by pm2 died at every
+  tick and a chunked summary restarted from chunk 1 for ever; log in
+  `logs/resume.log`). `./webui.sh on|off|restart|status|url|logs`.
+  Nothing calls `pm2 startup` or `pm2 save`; don't add either. The three
+  systemd unit files are gone from this branch (they are on
+  `debian13-in-proxmox`). **`webui.sh` starts pm2 with the `.env` keys
+  unset** (`start_clean`, delete-then-start): pm2 replays the environment of
+  the `pm2 start` call on every restart, and `serve.sh` fills in only unset
+  variables, so a snapshot taken after sourcing `.env` froze it — found
+  2026-09-29 when the UI kept `PDF_FONT_SIZE=8` after `.env` said 9.5, and
+  every run it started inherited that. It also keeps the API keys out of
+  pm2's process list. **Since 2026-10-14 an `.env` edit reaches the next
+  run with no restart at all.** Found when a run started from the UI used
+  the Gemini chain six minutes after `.env` had switched it to `claude`:
+  the UI had loaded `.env` at its start, every child inherited that copy,
+  and `source_env.sh` never overrides a set variable. (`start_clean` alone
+  could not prevent it either: its first `pm2 delete` spawned the daemon
+  *before* the unset, and the daemon's environment is merged into every
+  app.) Now `trigger_server.child_env()` hands `pipeline.sh` (runs, Check,
+  Stop) an environment with every `.env` key removed, so the child loads
+  the file as it is at launch; `/api/options` reads the form defaults from
+  the file (`current_config`); `web/serve.sh` and `web/resume.sh` source
+  with `MEETING_BOT_ENV_FRESH=1` (`.env` wins over whatever pm2 replays);
+  and the delete runs inside the clean subshell. Only the UI's own token,
+  port and bind address still need `./webui.sh restart`.
+- **The web UI listens on localhost + Tailscale**: `MEETING_BOT_BIND` is a
+  comma list and the word `tailscale` resolves to `tailscale ip -4` at start
+  (skipped with a warning when Tailscale is down); one `ThreadingHTTPServer`
+  per address. `./webui.sh url` prints `http://…/#token=…` — the fragment
+  never reaches the server or a log, and the page moves it into localStorage
+  and strips it from the address bar.
+- **`~/` in `.env` means `$HOME`**, in both loaders (`source_env.sh`,
+  `summarize._load_dotenv`), so `.env.example` can ship per-user paths
+  without naming anyone's home.
+
+### The browser: Firefox ESR (`screen/browser.py`)
+
+Playwright can drive only its own patched Firefox build, never the stock ESR
+binary, so the Firefox path is **Selenium + geckodriver** (Marionette).
+`capture.py` is written against Playwright's `page` API, and rather than fork
+it, `browser.FirefoxPage` implements the subset capture.py uses — `goto`,
+`evaluate` (a `"() => …"` source is called; a returned promise is awaited by
+WebDriver), `keyboard.press("Control+e")`, `get_by_role("button", name=,
+exact=)` (accessible name computed in-page: aria-label, aria-labelledby, text,
+value, title; substring + case-insensitive unless `exact`), `locator(css)`
+with `.first`/`.all()`/`is_visible(timeout)`/`fill`/`inner_text`,
+`inner_text`, `title`, `url`, `wait_for_url`, `is_closed`, `screenshot`. **If
+capture.py starts using another Playwright call, add it to the adapter**, or
+the Firefox path dies with an AttributeError on a live call.
+`capture.PWTimeout` is `browser.timeout_errors()`, a tuple of Playwright's
+TimeoutError (when importable) and the adapter's `BrowserTimeout`.
+
+One behavioural difference: Playwright's `is_visible(timeout=)` ignores the
+timeout and answers at once; the adapter polls up to it. That makes some
+Firefox waits longer (an unmatched `click_first_match` over six labels at 3s
+each), never shorter.
+
+`browser.open_page()` is the one launch, used by capture.py and by
+`browser_smoke.py`; the Chrome command line (`CHROME_ARGS`) and the Firefox
+prefs (`FIREFOX_PREFS`) live there, and capture.py re-exports `CHROME_ARGS`.
+
+Non-obvious details, all found live on 2026-09-29:
+
+- **`-profile <dir>` as an argument, not `Options.profile`.** The latter copies
+  the profile to a temp dir, and every sign-in would evaporate at the end of
+  the run. geckodriver does write its automation prefs into the profile's
+  `user.js`; `first_time_login.sh` moves it aside (`user.js.recorder`) so the
+  sign-in window is an undriven browser. The recorder rewrites it each run.
+- **`GDK_BACKEND=x11` + `unset WAYLAND_DISPLAY XDG_SESSION_TYPE`** wherever
+  the browser is sent to Xvfb (record_screen.sh, verify_e2e.sh's smoke,
+  first_time_login.sh --novnc). On a Wayland desktop session Firefox's GTK
+  otherwise tries Wayland and dies with "cannot open display :90" even though
+  `DISPLAY` is right — or, for Chrome, puts the kiosk window on the
+  operator's screen.
+- **geckodriver takes ~4s to map the window**, where Playwright's Chrome was
+  near-instant. The smoke test's black-band check samples a *late* frame
+  (`-sseof -2` of a 14s capture) — a frame from before the window exists is
+  the bare root window and reads as 953px of band on every side.
+- **`navigator.webdriver` is `true`** under Marionette on ESR 140 even with
+  `dom.webdriver.enabled=false` (verified in the smoke log). Joining a Meet
+  with an already-signed-in profile is not the check sign-in makes, so this
+  is accepted — but it is the first suspect if Meet starts refusing the bot,
+  and `MEETING_BROWSER=chrome` is the fallback the operator asked to keep.
+- **The PC's real camera and microphone are never offered.** On the VM there
+  were none. Firefox: camera refused (`permissions.default.camera=2`,
+  `media.navigator.video.enabled=false`), microphone allowed without a prompt
+  but pointed at silence — `record_screen.sh` loads a second null sink
+  `<sink>_mic` and exports `PULSE_SOURCE=<sink>_mic.monitor`. Chrome:
+  `--use-fake-device-for-media-stream` fed from a black `.y4m` and a silent
+  `.wav` (`browser.make_blank_media`, made once under `$MEETING_BOT_ROOT/tmp`).
+  `xsession_audio_stop` matches `sink_name=` as a whole word so stopping the
+  main sink can't unload `<sink>_mic` in its place.
+- **Firefox honours `PULSE_SINK`** (verified: the smoke tone reached the
+  per-run sink at −14 dB peak) and needs `media.autoplay.default=0` for
+  Meet's audio to play without a gesture.
+- `intl.accept_languages = th-TH, …` stands in for Playwright's
+  `locale="th-TH"`; Meet came up in Thai in the live check, and the Thai
+  refusal text was matched.
+- **geckodriver** is installed by `setup.sh` into `~/.local/bin` from
+  Mozilla's GitHub releases (Debian doesn't package it). Without one on PATH
+  Selenium Manager downloads one at launch — which needs the network at the
+  moment a meeting starts. `GECKODRIVER_BIN` / `FIREFOX_BIN` override.
+- Stale locks: Firefox's `lock` / `.parentlock`, Chrome's `Singleton*`,
+  cleared by `open_page()`; `first_time_login.sh` refuses a profile whose lock
+  names a live pid (a recording in progress).
+
+### Live output: no awk in a pipe, no buffered Python (2026-09-29)
+
+Found on the first `--new-meet` from the web UI: the page never showed the
+link. `run_one.sh` prefixed stage output with `awk '{…; fflush()}'`, and
+Debian's awk is **mawk**, which reads a pipe in blocks — `fflush()` flushes
+its *output*, but a line waits in its *input* buffer until more text arrives.
+The recorder prints the link and then nothing for the whole meeting, so the
+line never reached the trigger log the page polls (the VM evidently had gawk).
+Both prefixers (`run_one.sh` `prefix_lines`, `pipeline.sh`'s multi-run
+prefix) are bash `while read` loops now; don't put awk back in a live pipe.
+`run_one.sh` also exports `PYTHONUNBUFFERED=1` and `record_screen.sh` runs
+`capture.py -u`, or its progress lines sit in Python's buffer until exit.
+The page additionally falls back to `/api/runs/<id>`'s `meet_url` when the
+log has no link line.
+
+The operator gets into a created meeting **from the web page**, not by
+invitation (settled the same day): the Runs list and the run detail show the
+link as a link plus a **Join** button while the run is active, and times are
+shown in the browser's local zone (state.json is UTC). Only a URL matching
+`https://meet.google.com/xxx-xxxx-xxx` becomes an href.
+
+### What the recording shows, and hears (2026-09-29, after three live calls)
+
+Settled with the operator after reading a real recording:
+
+- **Mic and camera are BLOCKED, not muted.** Firefox: both
+  `permissions.default.*=2` and `media.navigator.permission.disabled=False`
+  (True would skip the check and *grant*). Chrome: `--deny-permission-prompts`
+  and no permissions granted; the fake-device files are gone. Meet then shows
+  "ไมโครโฟนมีปัญหา / กล้องมีปัญหา" (device has a problem) with a "!" —
+  expected. `mute_av` now only LOOKS: blocked → nothing; "turn on" label
+  showing → already off; only a visible "turn off" is clicked. It used to
+  test "already off" by clicking the label it found, which clicked
+  "เปิดไมโครโฟน" (turn mic ON) live, and it pressed blind Ctrl+E/D toggles.
+  Order matters: "ปิดไมโครโฟน" (off) is a substring of "เปิดไมโครโฟน" (on), so
+  the "already off" check must run before any "turn off" match.
+- **Layout: Spotlight + hide tiles without video** (`set_recording_layout`,
+  More options → "ปรับมุมมอง"). Meet remembers it for the account. It does
+  NOT remove the bot's floating self view once someone else is in the call
+  (seen live while presenting), and the tile can't be removed
+  ("นำไทล์ของคุณในเลย์เอาต์นี้ออกไม่ได้") — so `minimize_self_tile` opens the
+  tile's menu ("ตัวเลือกเพิ่มเติมสำหรับ <name>") and picks "ย่อเล็กสุด"
+  (Minimize), once per call, from the polling loop. Labels found live;
+  the click itself verified on a mock only.
+- **As a guest, pick the right button among several** (first live guest
+  join, 2026-09-29, the operator presenting: "no 'Adjust view' menu item"
+  and "Self tile: no-minimize"). A call already under way has a "More
+  options" button per tile, and the code took the first in DOM order — a
+  tile's, whose menu has neither item. When hosting, the bot is alone when
+  it looks, so there was only one. Now `set_recording_layout` clicks the
+  *lowest* exact "ตัวเลือกเพิ่มเติม"/"More options" (the toolbar), and
+  `minimize_self_tile` tries, in order: a button inside `[data-self-name]`,
+  the label that worked earlier in this call, then the candidates nearest
+  the bottom-right corner (where the floating self view sits), at most 4,
+  remembering the one whose menu offered Minimize so later tries open only
+  it. Both log the menu items they saw and save `layout_menu.png` /
+  `self_tile.png` in the run dir when they fail. Verified in headless Firefox
+  on a mock of that DOM; not yet on a live guest join. The Minimize item is
+  matched on its aria-label or its text, with the icon ligature word
+  ("close_fullscreen") dropped — the menu, from the operator's screenshot:
+  "แสดงในเลย์เอาต์แบบเรียงชิดกัน", "ย่อเล็กสุด", "ปักหมุดไว้ในหน้าจอ",
+  "แสดงวิดีโอแบบเต็มของฉันให้ผู้อื่นเห็น".
+- **The self view is only minimised with company** (`last_count` in
+  `wait_until_meeting_ends`). Alone — a hosted call's first minutes — the
+  bot's tile is the stage and its menu has no Minimize; trying put a menu in
+  the recording and a 5-minute back-off in front of the first guest. Now it
+  waits for a count ≥ 2 (or, if the count is unreadable, tries from the 4th
+  poll on), and a count rising to 2 lifts the back-off (`self_tile_retry_now`).
+- **Notices and the People panel are closed every poll** (`dismiss_notices`,
+  exact labels "รับทราบ"/"Got it"/"ปิด"/"Close"; `click_now` never waits, so
+  it is cheap to repeat). Admitting someone opens the panel; it is closed
+  right after.
+- **Per-site zoom is ignored** (`browser.zoom.siteSpecific=False`): the
+  sign-in window had saved meet.google.com at 50%, which rendered every call
+  at half size (devicePixelRatio 0.5, a 3840x2160 CSS viewport).
+- **Live audio check** (`audio_watch` in record_screen.sh): 3s of the sink
+  monitor every 10s → `runs/<id>/audio_level` ("<epoch> <peak dB> <seconds
+  silent>"), "Hearing meeting audio" / a warning after
+  `AUDIO_SILENCE_WARN_SECONDS` (120) of silence in the log, and a 🔊/🔇 badge
+  on the web UI's Runs row. Cause of the third call's failure: a
+  presentation shared without "Also share tab audio" is picture only.
+- **No AssemblyAI upload of silence** (`lib/audiocheck.py`, run by
+  transcribe.sh): sums ffmpeg silencedetect and requires
+  `TRANSCRIBE_MIN_SOUND_SECONDS` (30) of sound. NOT the peak level — the
+  silent call peaked at −14 dB from Meet's join/leave chimes.
+- **A live profile lock is refused, never deleted** (`browser.ProfileInUse`):
+  `clear_stale_locks` deleted the lock of an open sign-in window.
+
+### The bot's audio must not be "Firefox" (2026-09-29)
+
+Found in the sixth live test: the bot recorded silence while the meeting had
+sound, because its Firefox played the meeting into the dummy mic sink instead
+of the recording sink. PULSE_SINK is only a request — WirePlumber restores
+routing per `application.name`, and the operator's own browser is also
+"Firefox": streams moved in pavucontrol (following the MeetShare advice) were
+restored onto the bot's, and vice versa (the operator's YouTube and Meet
+ended up in the bot's sinks). Now:
+
+- record_screen.sh exports `PULSE_PROP_OVERRIDE` → the bot's client is
+  `application.name "Meeting Bot"`, `application.id "meeting-bot"` (verified:
+  libpulse honours it for Firefox), so the two never share a restore entry.
+- `lib/pinaudio.py <join pid> <sink>`, run every 10s by `audio_watch`, moves
+  any playback stream of the bot's process tree back onto the recording sink.
+- The `<sink>_mic` dummy sink and PULSE_SOURCE are gone: the browser blocks
+  the microphone, and that extra "meeting_…" device is what the operator's
+  Firefox got attached to.
+- `minimize_self_tile` retries (at most once a minute): Meet restores the
+  full tile when a presentation starts.
+
+### Auto-leave listens as well as counts (2026-09-29)
+
+The operator's choice after reviewing the rules: "idle" (a guest with one
+other person for IDLE_LEAVE_MINUTES) and "mass exit" (count ≤30% of peak) now
+also require AUTO_LEAVE_SILENCE_SECONDS (120) of meeting silence, read from
+the recorder's `runs/<id>/audio_level` (`meeting_audio_silent_for`; a missing
+or stale file means unknown, and unknown leaves the old behaviour). "Alone",
+"nobody came", "dropped out", kill and the cap are not gated. The earlier
+live drop-out at 15:33 coincided with the operator leaving; Meet evidently
+closed the bot's session, which the "dropped out" rule now ends cleanly.
+
+### Stopping a recording without breaking it (2026-09-29)
+
+Two recordings were unplayable: header `mdat` size 0, no `moov`, and in the
+ffmpeg log "Error closing file: Immediate exit requested" right before
+"Exiting normally, received signal 2". ffmpeg aborts its remaining writes on a
+SECOND SIGINT while closing the file, and both runs got two: one from
+kill_meeting.sh's escalation, one from record_screen.sh. Now:
+
+- record_screen.sh `stop_ffmpeg`: exactly one SIGINT, then a loop until
+  ffmpeg has really exited (a trapped TERM interrupts `wait`), and it runs
+  before the sink and display are torn down. The finished MP4 is checked with
+  ffprobe; an unreadable one fails the record stage there, with the reason.
+- kill_meeting.sh's escalation TERMs only the browser driver, gives it 15s,
+  then waits up to KILL_FINALISE_SECONDS (120) for record_screen.sh to
+  finalise; it signals ffmpeg itself only when record_screen.sh is gone, and
+  never SIGKILLs it. Verified live on SeaDrive with KILL_GRACE_SECONDS=1.
+- capture.py turns SIGTERM into SystemExit, so `open_page()` quits geckodriver
+  and Firefox. The old SIGKILL orphaned both; the orphan's zombie Firefox kept
+  the profile lock "alive" and blocked the next recording. `_pid_alive`
+  treats a zombie as dead.
+- transcribe.sh refuses a file lib/audiocheck.py can't read (exit 2) instead
+  of uploading it.
+- The bot also ends a recording when it is no longer in the call (in-call
+  controls gone on two polls): it was once found back on the pre-join page,
+  filming an empty lobby, cause unknown. Its leave() skips clicking when
+  there is no call, which used to outlast kill_meeting.sh's grace period.
+
+### Stop on a run past its recording (2026-10-12)
+
+Found when the operator pressed Stop in the web UI on a local file's summary
+(Gemini looping over 403s) and nothing happened: `kill_meeting.sh --run-id`
+only touched the `kill` sentinel, which nothing but capture.py reads, and
+escalated only through `record.pid`. Settled with the operator:
+
+- **Not recording → terminate, resumable.** With `--run-id` and no live
+  recorder, `stop_processing` SIGTERMs the run's own process tree — the
+  `run.lock` owner (run_one.sh) and every descendant, KILL after 10s — never
+  its pipeline.sh (it may be running other inputs; it reports the run
+  `STOPPED`). Finished stages are kept; the sentinel is removed (nothing would
+  read it); the stale `run.lock` is removed.
+- **`rs stop`** sets top-level `stopped = {at, stages}` and marks running
+  stages failed ("stopped by the operator"); it is called before the kill (so
+  pipeline.sh sees it) and after (a stage started in between). **`--resume-all`
+  skips a stopped run** — pm2's 15-minute timer must not restart it.
+  `run_one.sh` runs `rs unstop` at start, so `--run-id`, the UI's Resume or
+  the same command again resumes and clears it.
+- **Recording → unchanged.** Stop leaves the call and finalises the file,
+  and transcribe + summarize then run; a second Stop terminates those. A
+  record stage running without a live `record.pid` (still joining) is left to
+  the sentinel.
+- The page shows "■ stopped"; the button reads "Stop / leave meeting" only
+  while recording. The global `kill_meeting.sh` (no `--run-id`) is unchanged
+  and does not mark runs stopped.
+
+### The bot account (`BOT_GOOGLE_ACCOUNT`)
+
+The operator's words: "use the account … only (do not hardcode the email)".
+`test_the_account_is_not_hardcoded` holds the second half.
+
+- **How the account is read:** Chrome's own `ListAccounts` endpoint
+  (`/ListAccounts?gpsia=1&source=ChromiumBrowser&json=standard`), which
+  answers any browser holding the Google cookies — but only to a **POST from
+  Google's own origin**; a GET is a bare 400. So the check loads
+  `accounts.google.com/robots.txt` and `fetch()`es from there. Signed out is
+  `["gaia.l.a.r",[]]` → `[]`; a body that is neither that JSON nor contains
+  an address is `None` ("unknown"), never "signed out".
+- **Verdicts** (`account_verdict`): `ok` (the account is among those held),
+  `wrong`, `signed-out`, `unchecked` (variable unset, or the answer
+  unreadable). `capture.ensure_bot_account` refuses `wrong`/`signed-out` with
+  `wrong_account.png`; `unchecked` is a warning — an endpoint Google changed
+  must not stop a meeting, and `authuser` still steers it. Gmail addresses
+  compare case- and dot-insensitively.
+- **`authuser=<account>` on every Meet URL** (and `meet.google.com/new?authuser=`
+  in place of `meet.new` when hosting), so a profile holding two accounts
+  still joins as the bot. Zoom is not checked — its web join doesn't use the
+  Google session.
+- `python3 screen/browser.py check-account` (headless, the same code) is what
+  `first_time_login.sh` and `verify_e2e.sh --preflight` run.
+
+### Live checks on this PC, 2026-09-29
+
+Without sudo (Xvfb and `pactl` were not installed yet; the checks used
+Debian's own `.deb`s unpacked into a scratch dir) and without a signed-in bot
+profile or a signed-in claude CLI:
+
+- `verify_e2e.sh --browser-smoke` on Firefox ESR 140: 6/6 — window
+  1920x1080 with no black bands, picture and a −14 dB tone in the MP4.
+- The operator's test Meet: with `BOT_GOOGLE_ACCOUNT` set, refused in seconds
+  ("not signed into Google"); as a guest, the Firefox driver reached the Thai
+  UI and recognised Meet's own refusal ("คุณไม่สามารถเข้าร่วม…" — guests can't
+  join while the organizer is absent). Joining and admission on a live call
+  are therefore still unverified on Firefox.
+- The operator's test YouTube video (Thai news, 16 min): fetch, transcribe
+  (youtube-transcript.io had no keys → yt-dlp `th-orig` automatic captions,
+  415 segments) and frames (73) all done; summarize failed only for want of a
+  signed-in CLI and Gemini keys. Resumable with `--run-id`.
 
 ## Configuration
 
@@ -88,7 +508,9 @@ there is one place to update when a default changes. Don't re-add prose to the
 template.
 
 `pipeline.sh`, `lib/run_one.sh`, `transcribe.sh`, `first_time_login.sh`,
-`verify_e2e.sh` and `record_screen.sh` all source `source_env.sh`;
+`verify_e2e.sh`, `record_screen.sh`, `webui.sh` and `web/serve.sh` all source
+`source_env.sh` (which also sets the `MEETING_BOT_ROOT` / `MEETING_BOT_VENV`
+defaults after loading `.env`);
 `summarize.py` carries its own `_load_dotenv()` for direct invocation. The
 loader fills in unset values only — an already-exported var always wins.
 
@@ -96,8 +518,8 @@ loader fills in unset values only — an already-exported var always wins.
 
 `RECORDINGS_DIR`, `TRANSCRIPTS_DIR`, `FRAMES_DIR`, `SUMMARIES_DIR`, `PDF_DIR`.
 None of them is derived from another or from `MEETING_BOT_ROOT`, which now holds
-only the pipeline's own bookkeeping (`runs/`, `state/`, `tmp/`, `resources/`,
-`chrome-profile/`). `lib/paths.py` and `lib/paths.sh` resolve them and **fail
+only the pipeline's own bookkeeping (`runs/`, `state/`, `tmp/`, `logs/`,
+`resources/`, `firefox-profile/`, `chrome-profile/`). `lib/paths.py` and `lib/paths.sh` resolve them and **fail
 with the variable's name if one is unset** rather than falling back to a
 default. That is deliberate: with independent paths a wrong default doesn't
 error, it silently writes the deliverable somewhere the operator will never
@@ -135,7 +557,7 @@ re-download, since 2026-09-13 — see "The download is swept" below), and
 **Don't put `FRAMES_DIR` on `/tmp` here** — though the reason is durability,
 not size. `/tmp` on this host is **tmpfs**: 3.9GB of RAM, no disk behind it.
 Measured against real runs on this box (`$FRAMES_DIR/*/manifest.json`), frames
-are 27-113KB each and `FRAME_PERIOD_SECONDS=30` yields ~120/hour, so a 3-hour
+are 27-113KB each and `FRAME_PERIOD_SECONDS=30` (then) yielded ~120/hour, so a 3-hour
 lecture is only 10-40MB. RAM pressure is therefore **not** the problem for one
 run; it only becomes one if runs accumulate and nothing sweeps them. The real
 costs are:
@@ -152,7 +574,11 @@ is correct. Keeping frames *off* a network mount is right; tmpfs is the wrong
 way to do it. If RAM-backed frames are ever wanted deliberately, size the tmpfs
 and say so in `.env`, don't inherit the host's `/tmp`.
 
-### Measured capacity of this box (4 vCPU QEMU, 7.8GB RAM, 15GB disk)
+### Measured capacity of the VM (4 vCPU QEMU, 7.8GB RAM, 15GB disk)
+
+(The Proxmox VM this ran on until 2026-09-29. The PC — 12 threads, 38GB RAM —
+is faster; the ratios still hold: frames are the CPU-bound stage, frame count
+drives summarize cost.)
 
 Benchmarked 2026-09-07 at the recorder's real settings (1920x1080, 15fps,
 `libx264 -preset ultrafast -crf 28`, `aac 128k`), so a future session can size
@@ -171,11 +597,10 @@ The frame count is what drives summarize cost, because
 about 1,844 tokens after Claude's downscale, so **360 frames is ~660k tokens if
 the model reads all of them**. It does not have to — with the CLI it chooses —
 but nothing caps it, and one chunk covering 36 minutes carries ~72 frames
-(~133k tokens) which alone crowds a 200k context. For long lectures raise
-`FRAME_PERIOD_SECONDS` (60-90 is plenty for slides) rather than relying on the
-model to be sparing. `SCENE_THRESHOLD=0.3` contributes very little here — real
-runs show 0-5 scene-change frames per video, so the periodic pass is
-effectively the whole budget.
+(~133k tokens) which alone crowds a 200k context. (Written when frames were
+taken every `FRAME_PERIOD_SECONDS`; since 2026-09-30 they are taken on
+change — see "Frames on change" — so a slide lecture yields about one frame
+per slide, and `FRAME_MOTION_SECONDS` is the lever for video-heavy input.)
 
 **A network mount under an output directory needs the mount checked, not just
 the path.** This box points four of the five at `/mnt/My Libraries/...`, a
@@ -188,6 +613,154 @@ local disk — which the mount then hides the moment it comes back. Nothing
 errors. Nothing is reported. The operator looks in the library and the lecture
 isn't there. If this bites, the fix is a liveness check (a marker file that
 must already exist inside each configured directory) rather than a `mkdir`.
+
+### Measured compute on the PC (`benchmark.sh`, 2026-09-29)
+
+Asked by the operator: rank what uses the most computing power and say
+whether each can be switched off, with a script to run on other PCs.
+`./benchmark.sh` pushes synthetic 1920x1080@15 media through the real
+commands/modules (the recorder's ffmpeg line, extract_frames.py's two passes,
+`clip.py`, `audiocheck.py`, `framecrop`, `pdf.py`); `--browser` plays a
+full-screen 720p30 VP8 video in Firefox ESR on an Xvfb display claimed through
+`lib/xsession.sh`; `--watch-run <id>` samples a live recording's process tree
+from `record.pid`. Its commands copy the pipeline's: if the recorder's or
+extract_frames.py's ffmpeg arguments change, change the script too.
+
+Results on the Core 7 150U (12 threads), in CPU-minutes per media hour:
+browser stand-in ≥ 60 (≈1.0-1.4 cores, a floor: no WebRTC, no Meet JS),
+x264 20 (slides) / 56 (full-screen camera), `CLIP_REENCODE=1` 29, frames 13
+(scene 7 + periodic 6 — two full decodes of the same file; replaced
+2026-09-30, see "Frames on change"), silence check
+0.5. Per document: PDF ≈ 10 CPU-s, ≈ 4 with `PDF_MATH=0`. Frame prep for the
+model 0.2-0.3 CPU-s per frame. A U-series laptop chip varies ±50% between
+runs (turbo/thermals); rank, don't quote to the second.
+
+The ranking that follows: a live meeting (browser + encoder, for its whole
+length) dwarfs every post-processing stage; frames are the heaviest stage
+after it and have no off switch; the summary's real cost is the
+subscription window, not local CPU. The two frame passes were replaced by one
+decode on 2026-09-30 (next section).
+
+### Frames on change (`screen/extract_frames.py`, 2026-09-30)
+
+The operator: "ONLY cut it when the image changes, not repeatedly … (it
+would be too expensive)" — the cost meant being CPU/time and disk. Settled
+in a round of questions:
+
+- **One ffmpeg decode** samples every `FRAME_CHECK_SECONDS` (2) and pipes
+  full-resolution PPM frames to Python (`image2pipe`, one `read(n)` per
+  frame, `Image.frombuffer` — nothing is written until a frame is kept).
+- **The change test is `framecrop.frame_hash`** (texture hash over the
+  slide region) against the last *saved* frame, at `FRAME_CHANGE_DISTANCE`
+  = `framecrop.SAME_SLIDE_MAX_DISTANCE` = 16 — the one number the model-side
+  duplicate pass (`FRAME_DEDUPE_MAX_DISTANCE`) also uses, so the two agree
+  on what a new slide is. ffmpeg's scene score was rejected: it is
+  whole-frame, and a text-only change on the same white slide scores
+  under 0.3.
+- **Settle, with a cap** (`ChangeDetector`): a changed picture is saved
+  when the NEXT sample matches it (no mid-fade frames) as `scene_change`;
+  a picture that keeps moving gets one `motion` frame per
+  `FRAME_MOTION_SECONDS` (30); a change that goes straight back saves
+  nothing. Kinds downstream: `thin_frames` keeps `scene_change` first.
+- **Safety net, not a periodic pass**: one `periodic` frame after
+  `FRAME_SAFETY_SECONDS` (300) without any. Note it is by definition within
+  16 bits of the frame before it, so llm_client's duplicate pass drops it
+  before the model; it survives for the PDF and with
+  `CLAUDE_CLI_FRAME_DEDUPE=0`.
+- **Blank samples are never saved** and are invisible to the detector.
+- **`FRAME_DECODE_THREADS` = 1** by default: ffmpeg's automatic threading
+  spent ~2x the CPU for the same decode on this PC (86 vs 40 CPU-s on a
+  15-minute recording). `0` = automatic.
+- **JPEG quality 60 + optimize**: same PSNR as ffmpeg's default (36.4 dB on
+  a real Meet frame) at about its size; Pillow's 85 was +50% on disk.
+- `SCENE_THRESHOLD` / `FRAME_PERIOD_SECONDS` are retired; setting one prints
+  a note rather than being silently obeyed. Pillow is required here (it is
+  pinned); without it the stage fails with the install command.
+
+Speed work in `framecrop` the extractor needed, all result-identical
+(`FrameAnalysisPathsTest`): `detect_crop`/`is_blank`/`frame_hash` take a
+decoded image as well as a path (`_opened`); the per-pixel loops have numpy
+twins (exact integer arithmetic — the texture test is
+`Σ(n·v − Σv)² > level²·n³`); and `_downscaled` remembers the last analysis
+resize by image identity, so `is_blank` + `detect_crop` on one sample resize
+once. Resizing is now most of the per-sample cost (~30 ms); it was kept
+bicubic from full resolution so no crop or hash moves.
+
+Measured on three real Meet recordings (Core 7 150U), old two-pass vs new:
+883s — 183 → 77 CPU-s, 18 → 37 frames (a shared YouTube news broadcast:
+genuinely moving, so `motion` every ~32s where the old period was 60s);
+564s — 176 → 72 CPU-s, 24 → 22 frames; 168s — 32 → 15 CPU-s, 6 → 10. Wall
+time with one decoder thread is ~1.5-2x the old (43 vs 28s on the 883s
+file); `FRAME_DECODE_THREADS=0` matched or beat the old wall at ~37% less
+CPU.
+
+Known limit, reported to the operator and not addressed: a small element
+that moves on EVERY sample *inside* the hashed region (a lecturer's camera
+inset on the slide; benchmark.sh's animated corner tile, 19-35 bits per
+sample) keeps the picture from ever settling, and the detector falls back
+to one `motion` frame per 30s. A participant filmstrip beside the slide is
+outside the crop and does not do this. A skipped "pixel-identical sample"
+shortcut was tried and rejected: 3-21% of real samples qualified (the Meet
+clock, camera tiles), and a near-identical sample can flip `detect_crop`'s
+box and move the hash by 800+ bits.
+
+### Voice only and audio-only recordings (2026-09-30)
+
+The operator: when a meeting is only voices and cameras, opt out of frames,
+and let the web UI choose "Summarize only from voice / both" and "Save
+recording: audio only / video", for all sources. Settled in two rounds of
+questions:
+
+- **Voice only skips the frames stage entirely** (`--summary-source voice`,
+  `--voice-only`, `SUMMARY_SOURCE=voice`) — not "extract but don't send".
+  `run_one.sh` `VOICE_ONLY`: `branch_frames` returns at once,
+  `frames_settled` is true (so `media_needed` doesn't fetch for frames), and
+  `summarize.py --no-frames` replaces `--frames-manifest` — without it
+  summarize.py would download/extract frames itself. YouTube is therefore
+  never downloaded; Kaltura still is when transcribe needs the media.
+- **Audio only is meetings only** (`--record-media audio`, `--audio-only`,
+  `RECORD_MEDIA=audio`): `record_screen.sh` records `<sink>.monitor` alone as
+  AAC 128k stereo into `<run id>.m4a` (the operator's choice: the MP4's own
+  track, AssemblyAI takes it directly). YouTube/Kaltura downloads stay
+  temporary, as before — "save recording" does not apply to them.
+- **Audio only forces voice only** (no picture). `pipeline.sh` refuses an
+  explicit `--summary-source both` with audio for a meeting input; the web
+  UI disables the select. A meeting run stores `summary_source=voice`.
+- **The browser renders at `RECORD_AUDIO_GEOMETRY` (960x540) for audio** —
+  the operator chose "the smallest Meet tolerates" over 1280x720. Verified
+  live 2026-09-30 on two hosted calls (`zz_*_size_test_*`, archived in
+  `runs-archive/`): at 960x540 the call was created, the device check read
+  "blocked", the "Adjust view" menu was found, and the .m4a (AAC stereo)
+  was valid. NOT verified at that size: admitting a guest, and the
+  self-tile minimise (both need a second participant).
+  Measured with the bot alone in the call (`benchmark.sh --watch-run`):
+  1.12 cores at 1920x1080 video (ffmpeg 0.69, browser 0.37, Xvfb 0.05) →
+  0.43 at 960x540 audio (browser 0.37, ffmpeg 0.04). The browser's own
+  share did not move with nothing to paint; with cameras on it should,
+  but that is unmeasured.
+- **Both are flags, `.env` defaults and state.json fields**
+  (`summary_source`, `record_media`; `runstate init --summary-source
+  --record-media`). A new run stores the effective values. On a resume,
+  `--summary-source` given again replaces the stored one (a voice-only run
+  resumed with `both` extracts its frames then); `record_media` never
+  changes after creation — the file is named for it.
+- **`--combine`**: the combine run passes `--no-frames` when voice-only;
+  `combine.py parts` gives a voice-only member (or an audio meeting) a null
+  manifest instead of refusing it; `run_combine` doesn't wait on frames
+  for those members.
+- **No frames is a note, not an error, in summarize.py** — an empty manifest
+  (an audio file as input) used to `SystemExit("No frames extracted")`
+  after transcription had been paid for, contradicting the Discord plan's
+  "verified" claim below. extract_frames.py fails outright on a decode
+  error, so empty now means "nothing to show". `llm_client._render` puts
+  `NO_FRAMES_NOTE` where the list would be, so the prompts' "look at the
+  frames" does not invite the model to describe pictures it never saw.
+
+Seen in both live calls, at either size, and NOT caused by this change:
+`kill_meeting.sh` on a hosted call logs "Ending the call for everyone",
+clicks "ออกจากการโทร" (Leave call), and still needs the forced stop after
+25s — the end-for-everyone Thai labels remain unverified (see "Hosting a new
+Google Meet").
 
 ### API keys are numbered slots with a persisted cursor
 
@@ -214,7 +787,7 @@ The youtube-transcript.io tokens used to live in
 and its support is removed; `.env` is the only source. The error message says so
 explicitly, because operators following an older README will go looking for it.
 
-### Python dependencies are pinned, and uv is optional
+### Python dependencies are pinned, and uv installs them
 
 `requirements.in` / `requirements-browser.in` are the files a human edits;
 `requirements.txt` / `requirements-browser.txt` are generated from them by
@@ -240,14 +813,14 @@ opens a browser and shouldn't carry playwright's bundled Node driver. The
 browser file is compiled with `-c requirements.txt` so shared transitive deps
 (typing-extensions today) land on the same version in both.
 
-**`setup.sh` uses uv when it is on PATH and pip when it isn't.** uv installs
-the same pinned set about 40x faster (4s vs 2m43s cold, measured on the target
-box), but it is not in Debian's archive — it comes from astral.sh — so it
-cannot be a hard requirement of a script whose whole job is bootstrapping a
-fresh machine. Both paths verify the hashes, so the resulting venv is identical.
-The venv itself is still created by `python3 -m venv`, not `uv venv`: a uv-made
-venv has no `pip` inside it, and the pip fallback plus the troubleshooting
-steps in README both need one.
+**On the PC, uv is the installer and the venv manager** (settled
+2026-09-29): `setup.sh` fetches uv into `~/.local/bin` when it's missing, and
+builds `.venv` with `uv venv --seed --python-preference only-system --python
+3.13` — Debian's own 3.13, the version the lockfiles are compiled for, and
+`--seed` so a `pip` is inside for README's troubleshooting steps (the reason
+the VM used `python3 -m venv`). The VM's "uv optional, pip fallback" logic is
+on `debian13-in-proxmox`. `selenium` joined `requirements-browser.in` for the
+Firefox path; `requirements.txt` did not change.
 
 ## The run model
 
@@ -286,6 +859,10 @@ record ─┐                     (meeting URLs only)
 input ──┤                    ├─> summarize
         └─> fetch_video ──> frames
 ```
+
+`upload` (2026-11-02) is a seventh, after summarize, run only when the run
+names a Google Drive folder — see "Settled 2026-11-02" below. On every other
+run it stays `pending`, like `record` on non-meetings.
 
 `clip` is a sixth stage, run only when `--clip` is given; see the section below
 for where it sits. On an unclipped run it stays `pending` forever, the same way
@@ -394,6 +971,36 @@ Non-obvious details:
 - **`--clip` on a live meeting URL is refused** in `pipeline.sh`, with the
   command to clip the recording afterwards. There is no source to cut.
 
+#### Argument parsing: `need_value`, `--dry-run`, `usage()`
+
+- **Every value-taking option goes through `need_value`.** Before
+  2026-09-27, `--combine` as the last argument made `shift 2` a no-op (under
+  `set -u` without `-e` a failed shift changes nothing) and the parse loop
+  spun forever, silent, on one core — the operator lost a run to it on
+  2026-09-23. A value that itself starts with `--` is the same typo one step
+  earlier and is refused too. `--jobs` must be a positive integer.
+- **`--dry-run`** runs the whole parse, the resources pre-flight and the
+  per-input classification, prints one tab-separated line per input
+  (`ok kind clip existing-run-or-new input`, plus `combine` / `resume` lines)
+  and exits before `rs init`. The web UI's **Check** is exactly this, so the
+  form can never disagree with the pipeline about what an input is. Don't
+  reimplement classification in Python (or JavaScript) for the UI.
+  **Since 2026-09-30 it reports every unusable input and goes on** rather
+  than stopping at the first, and exits 1 at the end (`DRY_BAD`):
+  `bad<TAB>reason<TAB>input` from the classification loop (unrecognised, a
+  window on a live meeting, audio-only + `both`) — the input as classified,
+  in input order; `badarg<TAB>reason<TAB>arg` for a `#t=` window that did
+  not parse — the argument *as typed*, printed at parse time; and
+  `extra<TAB>arg` for every positional that is not an input at all. An
+  `extra` alone does not fail the dry run: on the command line it may be the
+  legacy form's name. It does fail the web form (`trigger_server.py` sets
+  `ok: false`), because a form line is always meant as an input — before
+  this, a mistyped path beside one good link silently became that run's
+  `--name`. The real (non-dry) path still stops at the first error, as
+  before.
+- **`usage()` prints up to `set -uo pipefail`**, not a fixed line range: the
+  range had silently gone stale and cut `--help` off halfway.
+
 #### The `#t=` suffix
 
 `split_clip_suffix` in `pipeline.sh`, and three details that are easy to undo:
@@ -449,13 +1056,16 @@ Non-obvious details:
 
 One script now, not a host wrapper plus an in-container body.
 
-- Allocates a display and a sink (`lib/xsession.sh`), starts Xvfb, exports
-  `DISPLAY` and `PULSE_SINK`, runs `capture.py`, waits for the `admitted`
-  marker, then starts ffmpeg.
-- **Geometry must agree everywhere**: the Xvfb head, Chrome's `--kiosk` window
-  (`capture.py` reads `RECORD_GEOMETRY`), and ffmpeg's `-video_size`. A
-  mismatch produces black edges. `--kiosk` alone isn't enough on some
-  Xvfb/Chrome combos, which is why `--window-size` is also passed.
+- Allocates a display, a sink and a silent mic sink (`lib/xsession.sh`),
+  starts Xvfb, exports `DISPLAY`, `PULSE_SINK`, `PULSE_SOURCE` and
+  `GDK_BACKEND=x11` (see the Firefox section), runs `capture.py`, waits for
+  the `admitted` marker, then starts ffmpeg. Which binary and which Python
+  driver it checks for follows `MEETING_BROWSER` (`browser.py info`).
+- **Geometry must agree everywhere**: the Xvfb head, the browser's kiosk
+  window (`browser.py` reads `RECORD_GEOMETRY` — Chrome's `--window-size`,
+  Firefox's `--width/--height`), and ffmpeg's `-video_size`. A mismatch
+  produces black edges. `--kiosk` alone isn't enough on some Xvfb/Chrome
+  combos, which is why `--window-size` is also passed.
 - Encoder: `libx264 -preset ultrafast -crf 28`, audio `aac -b:a 128k`.
 - Writes `runs/<id>/record.pid` (record/join/ffmpeg pids, display, sink) so
   `kill_meeting.sh` can escalate against the right processes without guessing.
@@ -465,6 +1075,55 @@ One script now, not a host wrapper plus an in-container body.
   finalised and playable.
 - Failure artifacts (`join_failed.png`, `not_admitted.png`) go in the run dir,
   not a shared directory where the next run would overwrite them.
+
+#### Hosting a meeting the bot creates (`--new-meet`, `meet.new`)
+
+Settled with the operator 2026-09-27: created through **meet.new in the
+bot's own signed-in browser** (no Meet/Calendar API, no OAuth client), link
+**printed and saved in the run**, **auto-admit everyone**, and **wait for the
+first participant, then end the call for everyone when it empties**.
+
+- `pipeline.sh` canonicalises `meet.new`, `new-meet`, `https://meet.new/` and
+  the `--new-meet` flag to one input string, `https://meet.new`, classified
+  `meeting`. **It is never auto-resumed**: every meet.new is a different call,
+  and `rs find` on that input would otherwise resume last week's unfinished
+  run and transcribe it in place of recording this one. Explicit `--run-id`
+  still works (a finished recording whose summary failed).
+- With `BOT_GOOGLE_ACCOUNT` set, `host_create_google_meet` opens
+  `meet.google.com/new?authuser=<account>` instead of `meet.new`, so the
+  meeting belongs to the bot account even in a profile holding two.
+- `capture.py` `host_create_google_meet` waits for the redirect to
+  `meet.google.com/xxx-xxxx-xxx`; landing on `accounts.google.com` is named as
+  "not signed in". `announce_meet_link` writes the link to stdout, to
+  `runs/<id>/meet_url` and to `state.json` (`runstate init --meet-url`, which,
+  like `--combined-into`, must not blank `resources`). `run_one.sh` then uses
+  it as `SOURCE_URL`, so the document cites the real call, not meet.new.
+- `wait_until_meeting_ends(host=True)`: knockers are admitted every
+  `HOST_ADMIT_POLL_SECONDS` (3s) between polls; before anyone has joined
+  (count ≥ 2 never seen) the idle/low-count rules are off and only
+  `NEW_MEET_WAIT_MINUTES` (15) ends the call; **an unreadable participant
+  count never ends a hosted call early** (Meet renames the chip class — people
+  may be in it), only `MAX_MEETING_MINUTES` or a kill does; a 1:1 with the bot
+  is not idle (`idle_counts = (1,)`); every exit is `host_end_call` (End the
+  call for everyone), never a plain leave. `screen/test_capture_host.py` holds
+  all of it with a fake clock.
+- Admit buttons are matched with `exact=True` — "Admit" would match anything
+  containing the word, and `click_first_match` gained `exact=` because the
+  Thai "ปิด" (Close, for the "meeting's ready" card) is a prefix of "ปิดกล้อง"
+  (turn off camera). **The first live hosted call (2026-09-29) left its guest waiting**: Meet
+  shows the host a green chip labelled with the count, "ยอมรับผู้เข้าร่วม 1
+  คน" ("Admit 1 participant"), which no exact label could match. The chip is
+  now matched as a substring (`HOST_WAITING_CHIP_LABELS`) and clicked to open
+  the panel, then the exact "ยอมรับ"/"Admit" inside it. If that panel's
+  button isn't found, `_log_admit_candidates` logs every admit-looking button
+  name once and saves `runs/<id>/host_admit.png`. That diagnostic, on the
+  second live call, showed the panel's button is the verb plus the person's
+  name — "ยอมรับ 03_ด.ช. …" — beside a look-alike toggle
+  "อยู่ระหว่างรอการยอมรับ 1"; `_ADMIT_PERSON_JS` matches `^(ยอมรับ|Admit) `
+  by prefix and excludes the chip. Verified on a mock of that DOM, not yet on
+  a live call. The end-for-everyone Thai labels are still unverified.
+  Workaround meanwhile: join as the bot account from another browser and set
+  Host controls → Meeting access → Open (per meeting; only the host can).
 
 ### Stage 2 — Transcribe (`transcribe/transcribe.sh`)
 
@@ -481,8 +1140,11 @@ One script now, not a host wrapper plus an in-container body.
   a silent file, an unsupported language — is raised immediately, because
   another key would fail identically and three uploads of the same video is a
   real cost.
-- YouTube URLs → youtube-transcript.io (`yt_transcript_client.py`). No audio
-  download; captions come back as `{text, offset_ms, duration_ms}` segments.
+- YouTube URLs → YouTube's own captions through yt-dlp
+  (`yt_autocaptions.py`) first, youtube-transcript.io
+  (`yt_transcript_client.py`) as the fallback — swapped 2026-10-03, see
+  "yt-dlp first" below. No audio download; both print
+  `{text, offset_ms, duration_ms}` segments.
 - **The timed segments live in `tracks[].transcript`**, as
   `{start, dur, text}` with seconds-as-strings. The entry's flat `text` field
   is the whole transcript in one string with no timing; parsing that instead
@@ -496,6 +1158,35 @@ One script now, not a host wrapper plus an in-container body.
   translates, and many videos expose just one track (often not English).
   Caption text arrives HTML-escaped (`&lt;i&gt;`, `&amp;`), so
   `_clean_caption_text` unescapes and drops the markup.
+- **yt-dlp first, youtube-transcript.io second** (the operator's choice,
+  2026-10-03, after a comparison for a 100-video playlist). `yt_autocaptions.py`
+  picks: an uploaded track in the requested language, else the **automatic
+  captions of the spoken language** — yt-dlp's `<lang>-orig` key, or the
+  video's `language` on an older yt-dlp — and **never** one of YouTube's
+  machine translations (every other `automatic_captions` key). With `auto`,
+  an uploaded track in the spoken language (the `-orig` language, else the
+  declared one) comes before the ASR track — it used to take the ASR, or
+  with no ASR the alphabetically first upload.
+  Why the swap: the API returns the same YouTube captions for a credit each,
+  and **labels them unreliably** — measured live, a Thai lecture's `th-orig`
+  ASR came back as a track labelled `en` (identical text and offsets), so
+  `--strict` rejected it (exit 3) and every Thai run had paid a credit and
+  then fetched the same text through yt-dlp. The API is now the fallback for
+  yt-dlp failing (exit 1: a bot check, a 429, a breaking YouTube change) or
+  finding no track (exit 3); its `--strict` exit 3 still means "label isn't
+  the language", and that track is the last resort, with a warning that
+  says the label may be wrong. No keys is "not configured", not a failure:
+  both "no track" answers end in exit 2, a real failure of either in exit 1.
+  `YT_AUTOCAPTIONS=0` skips yt-dlp (API only); `YT_DLP_BIN` is the test seam.
+  Both calls capture their status with `|| RC=$?` — `transcribe.sh` is
+  `set -e`, and a bare `RC=$?` on the next line never runs.
+- **yt-dlp needs deno** (`setup.sh` installs it into `~/.local/bin`). Since
+  2025.11 yt-dlp solves YouTube's JS challenges with an external runtime;
+  Debian 13's Node 20 is below its minimum (22). Without one, a Khan Academy
+  lecture was "This video is not available" (2026-10-03) and worked once
+  deno 2.9.7 was installed. Rate limits to know for a big playlist (yt-dlp
+  wiki): ~300 videos/hour per IP signed out; the pipeline makes about three
+  YouTube extractions per video (two for captions, one download for frames).
 - Both feed one shared writer producing `.txt` + `.srt`.
 - `--clip-captions WINDOW` trims a *caption-derived* transcript to a window and
   rebases it, immediately before that shared writer. It is a no-op on the
@@ -587,6 +1278,90 @@ Stage 3), and the 446MB download used to stay in the run dir after the frames
 were swept. Since 2026-09-13 it is swept with them (next section); a resume
 that needs the frames back re-downloads, ~10s here.
 
+### A refused YouTube download is re-run (`lib/ytdownload.py`, 2026-10-16)
+
+Found on a 15-video `--combine`: 2 downloads failed with `HTTP Error 403:
+Forbidden` on the first request for the media, after extraction had
+succeeded (format 136), and the combined summary was never attempted. The
+pm2 resume 10 minutes later fetched both in seconds. yt-dlp's `--retries`
+does not help: it re-requests the same signed googlevideo URL. So
+`ytdownload.py` re-runs yt-dlp itself — a fresh extraction, a fresh URL —
+settled with the operator:
+
+- **4 attempts, waits 30s/60s/120s** (doubling, +0-25% jitter so a batch
+  refused together doesn't return together). `YT_DOWNLOAD_ATTEMPTS`,
+  `YT_DOWNLOAD_RETRY_SECONDS` (tests set 0). A `.part` from a cut-off
+  attempt is resumed by the next (yt-dlp's `--continue`).
+- **Transient failures only** (`TRANSIENT_RE`: 403, 408, 429, 5xx,
+  timeouts, dropped connections). `PERMANENT_RE` is checked first and wins
+  — unavailable, private, removed, members-only, age/bot check, format not
+  available — and anything unrecognised is not retried either.
+- **Queues unchanged**: `QUEUE_SLOTS_FETCH_VIDEO` stays opt-in.
+- It is the one place the download command and the format string live;
+  `do_fetch_video` runs it, `summarize.download_youtube_video` imports it
+  (`quiet=True`). `YT_DLP_BIN` is its test seam, as for the captions.
+
+### The KGI combine: script drift, a dub's captions, cheat sheets (2026-10-16)
+
+The operator read `pre-video-summary.pdf` (15 KGI videos, ~10 h, Thai,
+`openrouter,claude` chain) and reported it too long, mixing English in, and
+with text that did not render. Found and settled with the operator:
+
+- **Script drift.** 14 of 15 chunks and the merge came from the free
+  `dots-3-note-preview`, which wrote 168 runs of Chinese, Arabic, Japanese
+  and Cyrillic inside Thai words (`ต้นทุนการซื้อ卖出`, `การ预测แนวโน้ม`) and
+  half-sentences of English. The PDF's fonts have none of those glyphs:
+  blank boxes. The operator kept OpenRouter first; now
+  `language.foreign_runs(answer, input)` counts runs of letters whose
+  script is neither the summary language's nor present (≥ 20 letters) in
+  the model's input, and more than `OPENROUTER_MAX_FOREIGN_RUNS` (2) makes
+  the answer `OpenRouterOffScript` — an `OpenRouterRejected` like
+  `OpenRouterTruncated`: kept in `rejected-answers/`, retried once on the
+  same model, then the next model / backend. Only OpenRouter is checked.
+  Thai left in an *English* summary of a Thai transcript is not caught (it
+  is the input's script); the language rule now forbids it in words. Both
+  rules also say "never switch into English mid-sentence" / "never another
+  script".
+- **A dub's captions.** Video 15 (*KGI ALGO Trading 2026*) is spoken Thai
+  and YouTube auto-dubbed it into English, so it has `en-orig` (speech
+  recognition of the machine dub) and `th-orig`; `choose_track` took
+  `sorted(orig)[0]`. Now `_orig_keys` puts first the `-orig` of the audio
+  format marked "original" (yt-dlp's `format_note`, e.g. "Thai original
+  (default)"), else of the declared `language`. Not the requested language:
+  transcribe.sh always passes one (`th`), which would pick a Thai dub over
+  an English original.
+- **Thai inside maths** (`$0.08 \text{ หรือ } 8\%$`) reached mathtext,
+  which has no Thai glyph ("Font 'rm' does not have a glyph", one dummy box
+  per letter). `mathrender._row_html` now cuts such `\text`-type groups out
+  as `<span class="math-words">` in the body face and typesets the rest;
+  when they can't be cut cleanly (an argument of `\frac`, a subscript, bare
+  Thai) the whole formula is the text fallback, whose stack now has the
+  body face before generic serif. The lecture prompt asks for no words in
+  `$…$` at all.
+- **Length.** 38 pages: each video was one chunk and `_merge.md` said
+  "do not compress". The operator chose "cheat sheet" as the only
+  behaviour: `lecture.md` budgets ~300 words per hour, ≤ 1,200 per call,
+  terse bullets/tables, one example at most per section; `_merge.md`
+  (shared by every prompt but `reality`) now consolidates — at most two
+  thirds of the partials' length, overlapping topics folded, no fact that
+  appears once dropped.
+
+### pm2's Node IPC variables must not reach deno (2026-10-16)
+
+A 193-video `--combine` lost 37 downloads: the web UI runs under pm2, which
+sets `NODE_CHANNEL_FD=3` (+ `NODE_CHANNEL_SERIALIZATION_MODE`,
+`NODE_APP_INSTANCE`) on its apps; they flowed pipeline.sh → yt-dlp → deno,
+which reads the fd as its own IPC channel and dies ("Failed to open IPC
+channel"). yt-dlp then lacks the solved n-challenge, YouTube hides the
+formats and the error reads "This video is not available" — which
+`PERMANENT_RE` called final, so no retry. Now: `web/serve.sh` and
+`web/resume.sh` unset the three variables, `trigger_server.child_env()` and
+`ytdownload` strip them from the child's environment, and
+`ytdownload.CHALLENGE_RE` ("n challenge solving failed", "Failed to open IPC
+channel") is checked *before* `PERMANENT_RE` and means transient. Captions
+(yt-dlp `--skip-download`) never needed the solver, which is why the 37 had
+transcripts. Don't pass `os.environ` unfiltered to a yt-dlp child.
+
 ### The download is swept after the summary; the recording never is
 
 Settled with the operator 2026-09-13: the box was filling with
@@ -652,8 +1427,8 @@ Split across eight modules:
 - `pdf.py` + `framecrop.py` + `mathrender.py` — the PDF export, its frame
   cropping and its LaTeX typesetting.
 
-Backends: `claude-cli` (default, aliases `claude`/`anthropic`/`cli`/`fcc`) and
-`gemini`. `SUMMARY_BACKEND=fallback` is the default mode and walks
+Backends: `claude-cli` (default, aliases `claude`/`anthropic`/`cli`/`fcc`),
+`gemini` and `openrouter` (2026-10-14; see below). `SUMMARY_BACKEND=fallback` is the default mode and walks
 `SUMMARY_FALLBACK_CHAIN` (default `claude-cli,gemini`). **NVIDIA NIM and Ollama
 were removed** in the Debian 13 port — neither had been on a configured path,
 and both carried env surface and untested code. **The API-key `anthropic`
@@ -753,8 +1528,9 @@ only, and then the model cites frames it has never seen.
 **Frames are filtered before they are offered** (`drop_uninformative`, same
 pass). Two kinds cost tokens and teach nothing: blank frames — the PDF already
 drops them (`framecrop.is_blank`) but the model was still being shown them,
-and the scene-change pass *prefers* them — and consecutive periodic samples of
-a slide that has not changed. The repeat test is `framecrop.frame_hash`: a
+and the old scene-change pass *preferred* them — and consecutive samples of
+a slide that has not changed. (Since 2026-09-30 extraction saves neither;
+the pass still matters for older manifests and the safety-net frames.) The repeat test is `framecrop.frame_hash`: a
 **texture** hash (per-cell pixel spread, 64x64 cells) over the *slide region*
 found by `detect_crop`, so a participant filmstrip beside the slide never
 enters it. Measured on synthetic 1920x1080 frames: a moved cursor flips 2 of
@@ -801,16 +1577,16 @@ reference material, the transcript, the frame paths — stays in the piped user
 turn. Both flags exist but are undocumented in `--help`; they were verified by
 invocation (an unknown flag errors immediately, these don't).
 
-The split is **opt-in per prompt file**. `prompts/summarize-v2.md` and
-`prompts/lecture-claude.md` (the configured default) carry the markers; every
-other template splits to `(None, itself)` and is sent exactly as it always was.
+The split is **opt-in per prompt file**. All four shipped prompts
+(`video`, `meeting`, `lecture`, `tutorial`) carry the markers; a template
+without them splits to `(None, itself)` and is sent exactly as written.
 `CLAUDE_CLI_STATIC_PROMPT=0` turns the whole thing off for a CLI too old to
 know the flags. The markers are stripped in `_render` so they never reach any
 model, gemini included.
 
-For `lecture-claude.md` the split is 5,473 static characters against 346
-dynamic ones, so on a chunked lecture every chunk after the first reuses the
-whole instruction set.
+On a chunked lecture every chunk after the first reuses the whole
+instruction set — role, structure, callout vocabulary, rules and (in
+`lecture.md`) the course-reference section.
 
 Note the trap this design avoids: if the varying part label ended up inside the
 static block, every chunk would write a *different* system prompt file, the
@@ -822,9 +1598,9 @@ only the tail — unless the static-prompt markers are present, in which case th
 file is returned whole. That legacy path is a trap, because the cut lands on
 the first *substring* match rather than on a heading:
 
-- `prompts/summarize.md` (the unused fallback default) loses its entire
-  role/format/rules section — its first match is the real `# Input` at line 46.
-- `prompts/lecture-claude.md` used to lose its opening role sentence and start
+- The old `prompts/summarize.md` lost its entire role/format/rules section —
+  its first match was the real `# Input` at line 46.
+- The old `prompts/lecture-claude.md` used to lose its opening role sentence and start
   the prompt with the orphaned word `Data`, because its first match was the
   *"# Input Data"* heading near the top. Adding the static-prompt markers
   fixed that as a side effect: the marker path returns the file whole, so
@@ -835,17 +1611,103 @@ the first *substring* match rather than on a heading:
 Prefer the markers over relying on the cut. If you write a new prompt file
 without them, check what `load_prompt_template` actually returns.
 
-**The lecture/tutorial prompts no longer ask for frame citations or a visual
-index** (operator's call, 2026-09-13, after reading a real sheet). The
-frames are still sent — slides carry the equations and the exam notes — but
-the model is told to use them as content and never write `(Frame N @ …)`,
-and the closing "Visual & Board Work Index" table is gone from all four
-(`lecture-*`, `tutorial-*`; `meeting-*` untouched). Tutorial chapter
-timestamps (`[mm:ss]`) stay — they are navigation, not citations. The PDF's
-citation fade and `PDF_FRAMES=contact|inline` still work for documents that
-do cite (older runs, custom prompts); they just have nothing to do on new
-ones. `_merge.md` was told to keep exactly one `# Title` at the top, since
-every partial now opens with one.
+### Four prompts, no timestamps, callouts (2026-09-29)
+
+Settled with the operator 2026-09-29, after the 09-13 pass had removed frame
+citations from the lecture prompts only:
+
+- **Four prompts, one file each, shared by every backend** (`lecture` is a
+  cheat sheet since 2026-10-16, see "The KGI combine"): `video`
+  (the in-code default — talks, news, interviews), `meeting`, `lecture`,
+  `tutorial`. The claude/gemini pairs, the `-old` archives, `summarize.md`,
+  `summarize-v2.md` and `lecture-reference.md` are gone; the course-reference
+  rules are a section of `lecture.md` that the model is told to ignore when
+  there is no `<course_reference>` block. **The old names still resolve**
+  (`promptnames.PROMPT_ALIASES`: `lecture-*` → lecture, `tutorial-*` →
+  tutorial, `meeting-*`/`summarize`/`summarize-v2` → meeting), because
+  `.env`, `state.json` of unfinished runs and phone shortcuts carry them.
+  `promptnames.py` is stdlib-only so `trigger_server.py` can use it.
+- **No timestamps and no frame citations in any prompt** — the tutorial's
+  `[mm:ss]` chapter list and the meeting's "Context Timestamp" / visuals
+  table went too (the operator: "update ALL the rest of the prompt to follow
+  the no-timestamp and frame"). A time that is content (a deadline) stays.
+  The chunk preamble tells the model the part label is orientation only, and
+  `_merge.md` no longer asks to preserve timestamp citations.
+  `PromptSetTest` holds all of it. The PDF's citation fade and
+  `PDF_FRAMES=contact|inline` still work for older documents.
+- **Callouts**: every prompt asks for `> [!CONCEPT|EXAMPLE|WARNING|IMPORTANT|NOTE] Title`
+  blockquotes, which `pdf._extract_callouts` turns into the coloured boxes of
+  DESIGN.md (and which GitHub/Obsidian still render). The vocabulary is in
+  each prompt's static half. Every formula and maths symbol is asked for
+  inside `$…$`; code in language-tagged fences.
+- **The `video` prompt gets the wrapper** (link + transcript), like lecture
+  and tutorial; `meeting` stays plain. `wants_wrapper` is now called with the
+  *resolved* prompt stem, so an alias decides like its target.
+- **`--instructions` / `SUMMARY_INSTRUCTIONS`**: the operator's free text for
+  one run (the web UI's "Extra instructions"). `inject_instructions` puts it
+  right after the static end marker — above the reference material, which
+  `inject_resources` put there first — framed as the operator's instructions
+  (not data), taking precedence over the default structure but not over the
+  language rule or the no-timestamp rule unless it says so. Braces doubled
+  for `.format()`. Never in the static half: it varies per run.
+
+### The reality prompt: the one that cites times (2026-09-30)
+
+`--prompt reality`, for competition reality-show episodes (tuned on The
+Face; generic wording for Drag Race, MasterChef, Survivor …). The operator
+asked for "what happened, highlight timestamps, quotes from the mentors and
+contestants, which team won, who is eliminated" and settled, when asked:
+
+- **Timestamps, accurate and clickable.** The deliberate exception to the
+  no-timestamp rule, for this prompt only (`promptnames.
+  TIMED_TRANSCRIPT_PROMPTS`). Before this the model never saw *when*
+  anything was said — it reads the `.txt`; only frame labels carried times,
+  one per ~30s on a moving picture. Now `summarize.model_transcript` gives a
+  timed prompt `chunking.timed_transcript`: the `.srt` grouped into lines of
+  ~`TIMED_LINE_SECONDS` (10), each opening `[mm:ss]` (`[h:mm:ss]` past the
+  hour), long ASR segments first cut to 30s so AssemblyAI-Thai still gets
+  dense marks. Measured on a 1h54m episode: 73k → 78k chars (+7%), 587
+  lines; a mark on every caption cue would have been ~+30%. The marks ride
+  inside the segment text, so `build_chunks(..., timed=True)` chunks and
+  frame-windows them like any other. The document's `<details>` transcript
+  stays the plain `.txt`. No `.srt` → plain text and a warning; the prompt
+  then writes no timestamps.
+- **The code, not the model, makes the links** (`document.link_timestamps`,
+  run in `main`/`main_parts` for timed prompts, before the wrapper). YouTube
+  only (`youtube_id`), `watch?v=<id>&t=<s>s`; `--clip` start is added to the
+  link, the visible text stays clip-relative (the document's clock). A
+  combined set writes `[Video N, mm:ss]`; a bare mark among several videos
+  stays text. Code spans/fences and marks already followed by `(` are
+  skipped — except a code span holding only a timestamp, which Gemini wrote
+  in the live run's Highlights table and is unwrapped and linked.
+  Kaltura/recordings: plain text.
+- **Live run, 2026-09-30** (Take Hormones Thailand EP.2, 1h54m, Thai auto
+  captions, on the operator's Gemini-only chain): 220 frames, 2 chunks +
+  the reality merge, 8 segments, 78 linked marks, results last ("no one
+  eliminated — a walkout"). Speaker attributions were not checked against
+  the video.
+- **Speakers from the frames.** The transcript has no names (no
+  diarization; YouTube captions never have it). The operator: the names
+  "will be stated there" — on-screen name captions — so the prompt ranks
+  captions, then names said aloud, then context, and says never guess a
+  name. No cast file, no AssemblyAI speaker labels.
+- **Results at the end** (the operator's choice over a results box first):
+  opening paragraph reveals nothing; sections in episode order with a
+  `[mm:ss]` in each heading and an `[!EXAMPLE] Quotes` box per section
+  (`* **Name** (role, team) [mm:ss]: "…"`, original language + translation
+  when it differs from SUMMARY_LANGUAGE); `## Highlights` table; `## Results`
+  last, `[!IMPORTANT]` table (winner, prize, nominees, eliminated, saved,
+  who decided); "not shown" rather than a guessed result.
+- **Its own merge prompt**, `prompts/_merge-reality.md`
+  (`mapreduce.load_merge_template(prompt)` picks `_merge-<stem>.md` when it
+  exists; `summarize_chunked(merge_template=)`). The shared `_merge.md` says
+  "do not add timestamps" and would scatter partial results; this one keeps
+  every mark and quote byte for byte and builds one Highlights and one
+  Results section, last.
+- `inject_instructions` now says "the prompt's rules on timestamps", not
+  "the rule against timestamps". PDF: `KIND_LABELS` "Episode recap"; a link
+  in an H2 banner is pale blue (DESIGN.md) — the body blue was unreadable on
+  navy.
 
 ### The output language is a setting, not a property of the transcript
 
@@ -903,8 +1765,8 @@ originals never move, because `pdf.py` crops and embeds them and needs the
 resolution — `_downscale_frames` builds new `FrameMeta` objects with
 `dataclasses.replace` rather than touching the ones `summarize.py` passes on to
 the PDF. Pillow is optional: without it the originals are sent with one
-warning. `SCENE_THRESHOLD` and `FRAME_PERIOD_SECONDS` are untouched — this
-changes resolution, never which frames exist.
+warning. The frame-extraction settings are untouched — this changes
+resolution, never which frames exist.
 
 **The chunk label is appended, not prepended, and the reference material sits
 at the top of the dynamic half.** Both in the same pass. Caching keys on a
@@ -975,10 +1837,13 @@ Gemini. Four decisions:
 4. **`--resume-all` is the resume, and a timer is its backstop.** It skips a
    run whose `rate_limited.resets_at` is still in the future (and one whose
    `run.lock` owner is alive), so firing it every 15 minutes never retries
-   into the same wall. `meeting-bot-resume.{service,timer}` do exactly that
-   (`setup.sh --with-resume-timer`, `SuccessExitStatus=75`,
-   `OnBootSec=5min` so a reboot mid-wait recovers on its own). The in-process
-   wait is the primary path; the timer exists for the process being gone.
+   into the same wall. On the PC that is pm2's `meeting-bot-resume`
+   (`ecosystem.config.js`, `cron_restart */15`, only while `./webui.sh on`);
+   the VM's systemd `meeting-bot-resume.{service,timer}` (with
+   `OnBootSec=5min` for a reboot mid-wait) are on `debian13-in-proxmox`. The
+   in-process wait is the primary path; the timer exists for the process
+   being gone. With pm2 off at boot, a reboot mid-wait needs `./webui.sh on`
+   or a manual `./pipeline.sh --resume-all`.
 
 `CLAUDE_CLI_MAX_FRAMES` came out of the same conversation: frames are the
 bulk of a call's input, so `thin_frames` caps what the model is *offered* —
@@ -991,7 +1856,8 @@ summaries. **The recommended Pro-plan values live in `.env.example` instead**
 (settled with the operator 2026-09-12): `CLAUDE_CLI_MAX_FRAMES=20` (raised
 from 12 the same day — with duplicates gone and each frame a third of its old
 cost, 20 distinct slides per chunk is cheaper than 12 samples were),
-`FRAME_PERIOD_SECONDS=60`, `SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`,
+`FRAME_PERIOD_SECONDS=60` (retired 2026-09-30 with the periodic pass),
+`SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`,
 `SUMMARY_CHUNK_CHARS=60000`, `CLAUDE_CLI_MERGE_MODEL=sonnet`,
 `SUMMARY_MERGE_EFFORT=low`. The README's table still lists the code defaults;
 the two differing on purpose is documented there.
@@ -1040,6 +1906,93 @@ backoff. `_record_used` names the model that actually answered, so the
 provenance header says which link of the chain paid. `GeminiModelChainTest`
 drives all of it through a fake `google.genai`.
 
+**Every Gemini client has a timeout** (`GEMINI_TIMEOUT_SECONDS`, 600;
+`http_options={"timeout": ms}` — the SDK's unit is milliseconds). google-genai
+has none of its own: on 2026-10-06 a 9-video combine run sat 65 minutes on
+sockets Gemini had stopped answering, with no log line, no retry and no key
+rotation, because nothing ever raised. A timeout raises `httpx.ReadTimeout`,
+which `retry.is_retryable` takes as transient by its type name — so it gets
+the backoff, then the next key, then the next model. 600s, not less: one
+Thai chunk with ~100 inline frames can legitimately take minutes.
+
+**Gemini gets the same frame passes as the CLI** (2026-10-06):
+`drop_uninformative` → `thin_frames(CLAUDE_CLI_MAX_FRAMES)` →
+`_downscale_frames`, under the CLI's variable names (the operator's choice:
+one cap for both backends). Before, `summarize_gemini` sent every frame at
+full size — a 910-frame video was one ~90MB request, larger than the free
+tier's 250k input tokens per minute (`GenerateContentInputTokensPerModelPer
+MinuteFreeTier`), so the retries within that minute came back 429 on every
+key and model, and a 9-video combine run crawled for hours.
+`test_gemini_gets_the_same_filtering_as_the_cli`.
+
+**Every distinct frame to Gemini, priced by `media_resolution`** (same
+day, the operator: "all non-repeat frames are sent", request small enough).
+Measured with `count_tokens` on gemini-3.5/3.6-flash: **an image costs a
+fixed number of tokens whatever its pixels** — 1280x720 and 384x216 both
+1,100 by default, 527 at MEDIUM, 264 at LOW (`GEMINI_IMAGE_TOKENS`). So
+shrinking or recompressing frames saves bytes, never quota; only
+`GEMINI_MEDIA_RESOLUTION` (set per image part) does. Even at LOW the
+lectures of that run had 685-877 distinct frames a video (218-251k tokens),
+at or over the free tier's 250k a minute in one request — so
+`SUMMARY_CHUNK_MAX_FRAMES` cuts a chunk at every Nth frame
+(`chunking._split_by_frames`, segments never split; the cap alone also
+starts chunking, and with `SUMMARY_CHUNK_CHARS=0` only it cuts). Keep a
+request near half the per-minute quota: a 503'd attempt seems to count, and
+the retry lands in the same minute. `GEMINI_MAX_FRAMES` is Gemini's own cap
+(unset = `CLAUDE_CLI_MAX_FRAMES`, `0` = all distinct frames), so the CLI
+keeps its 20.
+
+**OpenRouter is a third backend, and the operator's primary** (2026-10-14;
+the operator's `.env` chain is `openrouter,claude`, on a key without the
+$10 top-up, so 50 free requests a day). Mistral was built first
+and removed the same day: its Free plan no longer activates API keys (the
+console offers only paid plans). `summarize_openrouter`: plain `requests`
+POSTs to `/api/v1/chat/completions` (no SDK — `requests` was already
+pinned), content = the text, then per frame its manifest label and an
+OpenAI-shaped `image_url: {url: data:…}`. `OPENROUTER_MODEL` is a chain
+(default `dots-studio/dots-3-note-preview:free`, the one free image model
+that answered in the operator's live trial) walked keys-first
+like Gemini's. Non-obvious:
+
+- **The free limits are per account**, not per model or key. A 429 whose
+  `X-RateLimit-Reset` is > 5 min away (or that says "per-day") is
+  `OpenRouterDailyLimit`: that key is dropped for *every* model — walking
+  the chain would only spend more calls on the same wall. A per-minute 429
+  is an ordinary retryable error (`Retry-After` honoured by retry.py).
+- **An error can arrive inside a 200** (top-level `error`, or
+  `choices[0].error` / `finish_reason: "error"`); `_openrouter_error`
+  checks the body before taking the content.
+- **`finish_reason: "length"` is `OpenRouterTruncated`** → next model. The
+  free Gemma caps output at 32k tokens; a 9-video combine merge is larger,
+  and a cut-off guide would otherwise be marked done.
+- **Runaway answers (2026-10-14, the first full run on
+  `dots-3-note-preview:free`):** 2 of 10 calls ran to the provider's
+  65,536-token cap (successful chunks were 10-22k) — chunk 4, the shortest
+  video, and chunk 8. Re-sending chunk 4 alone came back at 9.4k tokens, so
+  it is intermittent, not the content. Now: a chunk is capped at
+  `OPENROUTER_MAX_TOKENS` (32768; the merge is not capped — it wrote 38k),
+  a cut-off answer is retried `OPENROUTER_TRUNCATION_RETRIES` (1) time on
+  the same model before the chain moves on, and every rejected answer is
+  kept in `$MEETING_BOT_ROOT/tmp/rejected-answers/` — the text of the two
+  failures was not kept, so "a repetition loop" is still a guess.
+- The response's `model` field is recorded, so a router
+  (`openrouter/free`) is named as `<real model> (via openrouter/free)`.
+- dots-3-note sometimes writes `### [!EXAMPLE] T` or a bare `[!NOTE]`
+  line instead of `> [!EXAMPLE] T`; `pdf._normalize_callout_markers`
+  rewrites both (summarize.py runs it on the body too, so the `.md` gets
+  real callouts).
+- Free models tried 2026-10-14 and rejected: `gemma-4-31b-it:free` /
+  `gemma-4-26b-a4b-it:free` (upstream 429 all day), `inkling:free` (403,
+  "only available on agentic harnesses"), `nemotron-3-nano-omni…:free`
+  (at most 12 images per prompt).
+- 404 / a 400 naming the model = `OpenRouterModelUnavailable` (next model);
+  free variants are withdrawn without notice.
+- Same three frame passes as the others; cap `OPENROUTER_MAX_FRAMES`
+  (unset = `CLAUDE_CLI_MAX_FRAMES`). `role="merge"` is accepted and ignored.
+  Usage goes to the stage log, not the Claude usage ledger.
+  `OpenRouterBackendTest` drives it through a fake `requests`;
+  `OPENROUTER_API_URL` is the test seam. Not yet verified live.
+
 **`BackendUnavailable` carries `retryable = False`, and `retry.is_retryable`
 honours that before every other check.** It is raised from *inside*
 `with_retries` (the CLI only reveals "not logged in" once it has run), and
@@ -1076,6 +2029,23 @@ had an equal claim on every sentence in it. After the split: 3 segments become
 the windows are sequential. Interpolating on character offset assumes an even
 speaking rate — wrong in detail, and enormously closer than one 29-minute atom.
 
+**Chunked runs, three fixes of 2026-10-14** (found on a 9-video combine
+run that mixed dots-3-note and Claude Haiku):
+- **The merge gets the operator's instructions** (`inject_merge_instructions`,
+  before "Partial summaries, in order:"), told to satisfy them for the whole
+  document. Before, only the chunk calls saw `--instructions`; the merge
+  rebuilt the guide from the partials and dropped the 1-day study plan they
+  asked for.
+- **Every model that wrote part of a document is named** —
+  `llm_client.USED_MODELS`, provenance `model: a + b` when more than one.
+  It used to name the merge's model only.
+- **Finished chunks are kept** in `runs/<id>/chunks/<key>.json` (text + the
+  model that wrote it; `mapreduce._chunk_key` hashes the chunk prompt, the
+  transcript slice, the frames and the backend/model settings), so a resume
+  or re-merge pays only for what is missing. Pipeline runs only
+  (`MEETING_BOT_RUN_DIR`); `SUMMARY_CHUNK_CACHE=0` turns it off. The model
+  per chunk is `llm_client.thread_last_used()` — chunks run in threads.
+
 **Chunking.** Above `SUMMARY_CHUNK_CHARS` (24000), the transcript is split and
 chunks are summarized concurrently, then merged by one more LLM call using
 `prompts/_merge.md`. Chunking prefers the `.srt` sibling of the `.txt`, because
@@ -1085,9 +2055,9 @@ Without an `.srt` it falls back to splitting text and dividing frames
 proportionally. A chunk that fails does not discard the others: the merge
 proceeds over what succeeded and the document says which parts are missing.
 
-**Frames.** `screen/extract_frames.py` does a scene-change pass
-(`SCENE_THRESHOLD`, default 0.3) plus a periodic pass (`FRAME_PERIOD_SECONDS`,
-default 30), deduplicated by ±half-period, into `$FRAMES_DIR/<run_id>/manifest.json`.
+**Frames.** `screen/extract_frames.py` saves a frame each time the picture
+changes and settles (see "Frames on change"), into
+`$FRAMES_DIR/<run_id>/manifest.json`.
 The pipeline runs this as its own stage and passes `--frames-manifest` to
 `summarize.py`.
 
@@ -1108,6 +2078,39 @@ Two non-obvious details:
   the summary, so it becomes a note.
 - OOXML text is extracted with `zipfile` + a regex, not python-pptx/python-docx:
   we want the words, not the layout, and that is two fewer dependencies.
+- **Checked in `pipeline.sh` before anything is paid for** (`resources.py
+  check`, offline; GitHub specs are only parsed). A missing local path, or a
+  text-named file whose bytes are `%PDF`, `PK\x03\x04` or contain a NUL,
+  fails at second zero ("this looks like a binary document; convert it to
+  Markdown first"). A real `.pdf` passes. `--from-file` gets the same binary
+  check (`resources.py is-binary`) — the operator lost an hour to a PDF read as
+  a line list.
+
+#### Frontmatter: the course reference (`--resources` + the `lecture` prompt)
+
+Settled 2026-09-27, replacing the 09-26 `--context` spec: **frontmatter on
+`--resources`, not a second flag** (one channel, one state field, one prompt
+block), and **the block sits after the static prompt, verified through the
+usage ledger** — no API-key backend. A `.md` whose first line is `---` may
+carry `course`, `source`, `citation_label`, `coverage` (hand-parsed, flat
+`key: value`, quotes and `# comments`; unknown keys ignored; malformed lines
+reported, never fatal; a missing `course` falls back to the file stem,
+`citation_label` to `course`). That file's text is wrapped in
+`<course_reference course=… source=… citation_label=… coverage=…
+lecture_language=…>` — `lecture_language` from `MEETING_BOT_LANGUAGE`, which
+`run_one.sh` exports from the run's state, so no language pair is hardcoded.
+
+**The metadata is never substituted into the prompt's instructions.** The
+spec asked for template slots; that would give every course its own static
+system-prompt file, so the cache would never be shared — and it would put
+per-run data in the static block, which the rule below forbids. So the
+"Using the course reference" section of `prompts/lecture.md` (static half)
+refers to "the block's `citation_label`" generically; since 2026-09-29 it is
+part of the one lecture prompt rather than a separate `lecture-reference.md`,
+and book-only additions go in a `[!NOTE] From <citation_label>` box. A file
+without frontmatter produces byte-identical output to before
+(`test_a_reference_without_frontmatter_is_unchanged`).
+
 
 ## Output document format
 
@@ -1129,6 +2132,9 @@ Shaped to match the user's course files (`2_Transcripts/chapter1.md`,
 - **Code builds the wrapper, the model writes only the body.** The link,
   transcript and provenance can then never be hallucinated or truncated, and an
   ~80KB transcript doesn't round-trip through the model just to be echoed back.
+- **A recorded call's link is a `Meeting Link:`** (`document.looks_like_meeting`:
+  Meet, Zoom, Teams), `source_type: meeting`. It used to fall through to
+  `Source File:` — seen on the first live guest recording, 2026-09-29.
 - **Provenance is an HTML comment**, so it survives being pasted into a bigger
   chapter file without adding visual noise. Values are escaped so a `-->` in a
   source can't terminate the comment early.
@@ -1147,14 +2153,18 @@ Shaped to match the user's course files (`2_Transcripts/chapter1.md`,
 - **The 4-space indent inside `<details>` is deliberate**, reproducing what the
   existing chapter files do (most renderers show it as a code block). Don't
   "fix" it.
-- Applies to `lecture-*` and `tutorial-*` prompts only (`document.wants_wrapper`);
-  `meeting-*` keeps the plain executive format. Override with
-  `--format always|never`.
+- Applies to the `lecture`, `tutorial`, `video` and `reality` prompts
+  (`document.wants_wrapper`, on the resolved name); `meeting` keeps the plain
+  executive format. Override with `--format always|never`.
 - `--combine` produces one such document for several videos: one title, one
   link line per video tagged `(Video N)`, one transcript block, one body. See
   the `--combine` section below.
 
 ### `--combine`: several videos summarized as ONE (`--combine-pdf`, `--no-combine-pdf`)
+
+(Since 2026-11-02 the path is optional — see "Settled 2026-11-02" below:
+`--combine` alone writes `SUMMARIES_DIR/<combine run id>.md` and
+`PDF_DIR/<combine run id>.pdf`, and the web UI's field is a switch.)
 
 Reworked 2026-09-11 with the operator. Until then `--combine` summarized every
 input on its own and stapled the `.md` files together, renumbering frame
@@ -1297,6 +2307,59 @@ Reworked 2026-09-13 after the operator read a real 71-page combined sheet
 - **The provenance line and the source go under the title**, not over it.
 - **Environments are composed in `mathrender`** — see the LaTeX section.
 
+#### The design and the per-run font (2026-09-29)
+
+Settled with the operator 2026-09-29, with their exercise sheet
+(`Signal_Exercise_2110203`, headless-Chrome + KaTeX) as the style guide —
+**for styling only**, not its content structure. `DESIGN.md` is the spec;
+the decisions behind it:
+
+- **Title block + navy H2 banners + colour-coded callouts + tinted table
+  headers**, for all four prompt types. The wrapper's link lines
+  (`Youtube Link: …`, `Clip: …`) are lifted out of the body
+  (`_take_link_lines`) and printed grey under the title; model/prompt/run/
+  font go to a small colophon at the end instead of a line under the title.
+  `---` is not drawn (the banners separate sections).
+- **Callouts before maths.** `_extract_callouts` runs before
+  `mathrender.extract`: a `$$` block inside a quote has `> ` on every line
+  until the quote is gone. Top-level blockquotes only (≤3 spaces), fenced
+  code skipped; the result is `<div class="callout …" markdown="1">`, which
+  needs the `md_in_html` extension. A plain quote is an untitled grey box.
+- **Maths is always Computer Modern**: mathtext SVG as before, and
+  `_wrap_math_symbols` puts any ω/≤/⇒/²/ℝ typed into the prose into
+  `<span class="msym">` (CMU Serif), skipping `pre`/`code` and tag
+  attributes. It runs before `mathrender.restore` so it never scans a
+  data: URI.
+- **Code is JetBrains Mono on a dark "editor window"** — Pygments `one-dark`
+  via codehilite (Pygments is now a pinned dependency), a window bar with the
+  fence's language (`_fence_languages`, matched to the blocks by position;
+  labels dropped if the counts disagree), inline code as a dark chip. Font
+  from `fonts-jetbrains-mono` (setup.sh `--system`) or the operator's
+  JetBrainsMono Nerd Font in `~/.local`.
+- **The body font is a per-run choice from a fixed list** (`fontchoice.py`):
+  Thai — Bai Jamjuree, Sarabun; English — CMU Serif, Sarabun, Bai Jamjuree.
+  Defaults `PDF_FONT_TH` / `PDF_FONT_EN`. Precedence: the document's
+  provenance `font:` > `PDF_FONT` (run_one.sh, from state) > `PDF_FONT_FAMILY`
+  (legacy whole stack, only when nothing chose a font) > `PDF_FONT_<LANG>` >
+  built-in. An invalid choice at render time warns and falls back — the PDF
+  never fails a run; `pipeline.sh` refuses it up front instead.
+- **"The font size should be similar to all three" = x-height matching.**
+  `PDF_FONT_SIZE` (now **9.5**, the sheet's size) is the size *as Computer
+  Modern*; a face is set at `nominal × 0.431 / its x-height` (measured from
+  the font files: CMU 0.431, Sarabun 0.500, Bai Jamjuree 0.499, JetBrains
+  Mono 0.550), so Sarabun is 8.19pt. Maths stays at the nominal size and so
+  matches whatever face the text is in. `.msym`/`.math-fallback` are
+  `1/factor` em for the same reason.
+- **Summary language, font and instructions are per run** — pipeline.sh
+  `--summary-language`, `--pdf-font`, `--instructions`, validated before the
+  background detach and before anything is paid for; stored in state.json
+  (`summary_language`, `pdf_font`, `instructions`); replayed by run_one.sh as
+  `SUMMARY_LANGUAGE`, `PDF_FONT` and `--instructions`. **On a resume,
+  explicitly given ones replace the stored ones** (the summary has not been
+  written yet); `rs init` now blanks `resources` only when it names `--input`,
+  so that update can't wipe them. The web UI has all three on both tabs; the
+  font list follows the chosen language.
+
 The 2026-09-08 rework (after a real 39-page output) still stands underneath:
 
 - **Keyframes are an appendix, not illustrations.** `PDF_FRAMES=contact`
@@ -1325,10 +2388,10 @@ The 2026-09-08 rework (after a real 39-page output) still stands underneath:
   own `resources.py` shells out to `pdftotext`, a silent 40% loss was not an
   option. The cost is a couple of blank-looking pages at the back.
   `PDF_TRANSCRIPT=appendix` prints it as Appendix C.
-- **Body text is 8pt, and every other size is an `em`.** `PDF_FONT_SIZE`
-  therefore rescales headings, tables, captions and code together instead of
-  leaving them stranded at their old point sizes. **A Thai face must stay in
-  any custom stack** — Computer Modern has no Thai glyphs, and a Thai lecture
+- **Every size is an `em` of the body.** `PDF_FONT_SIZE` therefore rescales
+  headings, tables, captions and code together. (8pt until 2026-09-29, 9.5pt
+  since — see the design section below.) **A Thai face must stay in any
+  custom stack** — Computer Modern has no Thai glyphs, and a Thai lecture
   then renders as tofu.
 
 The older decisions still hold:
@@ -1458,13 +2521,122 @@ design rule here.
 `is_blank()` lives here too, and is the same idea one step blunter: a frame
 whose downscaled grayscale copy is within a few levels of one shade carries no
 picture, so it never reaches the PDF. Recordings are full of solid-black
-frames — a screen share stopping, a slide mid-fade — and the scene-change pass
-collects them preferentially, since black-to-content is the biggest scene
-change in the video.
+frames — a screen share stopping, a slide mid-fade — and the old scene-change
+pass collected them preferentially, since black-to-content is the biggest
+scene change in the video. extract_frames.py now never saves one.
 
 Analysis runs on a 200px-wide grayscale copy, so cost is a few milliseconds per
 frame regardless of source resolution. Pillow is optional: without it frames
 are copied through uncropped with one warning, and nothing is blank.
+
+## Settled 2026-11-02: Drive upload, run history, the drama prompt, the combine switch
+
+Four requests from the operator, settled in three rounds of questions.
+
+### Google Drive upload (`lib/gdrive.py`, the `upload` stage)
+
+- **OAuth "Desktop app" client, signed in as the bot account**
+  (`GDRIVE_CLIENT_ID` / `GDRIVE_CLIENT_SECRET` in `.env`; `lib/gdrive.py
+  login`). The operator chose it over rclone, a service account (owns what
+  it uploads, sees only folders shared with it) and their personal account.
+  Loopback redirect + PKCE + `login_hint=BOT_GOOGLE_ACCOUNT`; the consent
+  page opens in the bot's own browser profile by a **direct launch** (same
+  rule as first_time_login.sh — never a driven browser), or the URL is
+  printed. A login as any other account is refused and not saved. Refresh
+  token in `$MEETING_BOT_ROOT/state/gdrive_token.json`, mode 600. Scope:
+  full `drive` — `drive.file` cannot list folders shared with the bot, which
+  the folder browser needs. Login is CLI-only on the PC: Google requires a
+  loopback redirect for desktop clients, so it cannot be done from a phone.
+- **Own stage, replace in place** (the operator's choices): `upload` runs
+  after summarize (and after the sweeps) in `run_one.sh` `maybe_upload`,
+  for single and combine runs; a failure fails only `upload` (summarize
+  stays done; run_one exits 1 with "only the Drive upload failed") and a
+  resume retries just it. A same-named file in the folder gets a new
+  revision (`PATCH` upload), same link. Resumable uploads only. PDF only.
+  `--resume-all` does NOT pick up a failed upload (its loop keys on
+  summarize); Resume / `--run-id` does.
+- **Name**: `--drive-name`, else the summary's first `# ` heading, else the
+  run name; `.pdf` appended, `/` replaced. **Folder**: `--drive-folder`
+  takes an id or a pasted folder link (`gdrive.parse_folder_id`).
+  `--drive-folder-name` is display only (the browser's path).
+- **State**: `drive_folder`, `drive_folder_name`, `drive_name` at top level;
+  `stages.upload.{drive_file_id, drive_link, drive_file_name,
+  drive_replaced}` via `annotate`. Given on any resume (auto-resume,
+  `--run-id`, `--resume-last`, the combine run), Drive settings replace the
+  stored ones and **reset `upload`**, so a finished run's PDF is sent again
+  — that is how the web UI's "Send PDF to Drive…" works (resume with the
+  folder; summarize is skipped as done). `--no-drive` clears the folder.
+  With `--combine` the Drive settings go to the combine run only.
+- **Checked offline in pipeline.sh** before anything is paid for: the folder
+  parses, `gdrive.py status` says configured + logged in + the right
+  account, and a PDF will exist (not `SUMMARY_WRITE_PDF=0`, not
+  `--no-combine-pdf`). Whether the folder exists and is writable is the
+  folder browser's job, or the stage's error.
+- **Web UI**: a switch on both tabs, then a folder browser
+  (`/api/drive/folders?parent=root|shared|drives|<id>`; crumbs; "view only"
+  folders can be entered but not chosen) and a name box; the last folder
+  is remembered in localStorage. Start stays locked while the switch is on
+  without a folder. The server runs gdrive.py as a child with
+  `current_config()` (so an `.env` edit applies without a restart).
+- Test seams: `GDRIVE_AUTH_URL`, `GDRIVE_TOKEN_URL`, `GDRIVE_API_URL`,
+  `GDRIVE_UPLOAD_URL`, `GDRIVE_TOKEN_FILE`; `lib/test_gdrive.py` drives a
+  fake `requests`; `test_pipeline_e2e.sh` replaces gdrive.py (except
+  `parse`) with a stub. **Not verified against the real Drive API** — no
+  OAuth client existed in the session that built it.
+
+### The run history (`lib/runadmin.py`)
+
+- **Clear = bookkeeping only** (the operator's choice): `runs/<id>/` and
+  `FRAMES_DIR/<id>` (nothing can reach those frames once the run is gone).
+  Recordings, transcripts, summaries and PDFs are never touched. Refused for
+  a run being processed (live `run.lock` owner) and for a member of a
+  combined set whose combine run still exists. A combine run may take its
+  members (`--with-members`; the UI's default); cleared alone, it leaves
+  them pointing at the gone run — deliberately: `--resume-all` keeps
+  skipping them instead of billing individual summaries, and re-running the
+  same `--combine` makes a new combine run over them.
+- **Cache = frames, chunks, media, and global tmp** (all four chosen). Each
+  regenerable; frames / fetch_video / clip are marked `cleaned` exactly like
+  the post-summary sweep, so a finished run stays finished. `media` never
+  applies to a meeting (its recording is not in the run dir anyway). `tmp`
+  is refused while any run is processed (prompt files are in use).
+- **Categories = automatic facets + the operator's tags**: status
+  (`statusKey` in the page), type (input_type), style (canonical prompt),
+  and `tags` (state.json; `--tag` repeatable / comma-split;
+  `runstate.normalize_tags`: trimmed, case-insensitively unique, ≤ 20 × 40
+  chars). Filtering is client side over `/api/runs?limit=400`.
+- API: `/api/runs/<id>/{sizes,clear,cache,tags}`, `/api/runs/bulk`
+  (`clear|cache|tags`; bulk tags ADD), `/api/cache`, `/api/cache/tmp`.
+  runadmin is imported in-process (stdlib only); FRAMES_DIR comes from
+  `current_config()`.
+
+### The `drama` prompt (Thai drama / lakorn episodes)
+
+A sixth prompt, asked for by the operator. Their choices: clickable
+`[mm:ss]` timestamps, characters & relationships, scene-by-scene recap with
+quotes, a spoiler-free opening; and it follows `SUMMARY_LANGUAGE` (quotes
+stay Thai, translated when the recap is English). So it joins `reality` in
+`TIMED_TRANSCRIPT_PROMPTS` (timed transcript, `link_timestamps`) and
+`WRAPPED_PROMPT_PREFIXES`, and has its own `_merge-drama.md`. Its specifics:
+names from credits/on-screen text, then forms of address (a bare
+kinship word is a relationship, not a name), then a `--resources` cast
+list, never guessed; the Characters table describes relationships as they
+stand at the START (no spoilers); revelations go where they happen and in
+`## What changed` (always written); the opening recap and the closing
+preview are not the episode's events. PDF kind label "Drama episode recap".
+
+### `--combine` is a switch
+
+The web UI's field became a toggle; the documents go to the default paths
+named for the combine run id (the operator's choice), like every run's
+artifacts, so resuming the set lands on the same files. In `pipeline.sh`
+`--combine`'s value is optional: **only a next argument ending in `.md`
+(`.markdown`) is taken as the path** — anything else (an input, an option,
+nothing) means `COMBINE_DEFAULT=1`. The run dir is resolved first, then
+`COMBINE_FILE` / `COMBINE_PDF` are derived from it (`@default` is the
+placeholder in between). The dry run prints
+`combine<TAB>SUMMARIES_DIR/<combine run id>.md`. `/trigger` still accepts a
+`.md` string in `combine` for old shortcuts; `true` means the switch.
 
 ## Cross-session queueing (`lib/slotqueue.py`)
 
@@ -1501,26 +2673,78 @@ files under `$MEETING_BOT_ROOT/queue/`.
 Decisions with a specific reason behind them. If you want to change one, stop
 and confirm with the user first — they're deliberate trade-offs, not laziness.
 
-- **Playwright uses `channel="chrome"`**, NOT the bundled Chromium. The bundled
-  build gets Google's "This browser or app may not be secure" block on sign-in.
-- **Login uses a direct `google-chrome-stable` launch, not Playwright.** Even
-  with `channel="chrome"`, Playwright injects automation flags (DevTools
-  Protocol, `navigator.webdriver=true`) that Google detects. Do not route the
-  login through Playwright.
+- **Firefox ESR is the default browser, Chrome the kept fallback.** The
+  operator chose "switchable, Firefox default" over replacing Chrome
+  (2026-09-29). Don't delete the Chrome path; don't make Chrome the default
+  again without asking.
+- **Firefox is driven through Selenium + geckodriver and `browser.FirefoxPage`,
+  not Playwright** — Playwright cannot drive the stock ESR binary. capture.py
+  stays written against the Playwright page API; extend the adapter rather
+  than forking the Meet/Zoom logic per browser.
+- **Firefox gets its profile as `-profile <dir>`**, never `Options.profile`
+  (which copies it and loses every sign-in).
+- **The PC's real camera and microphone never reach the browser.** Camera
+  refused / fake black device; microphone = the run's silent `<sink>_mic`
+  monitor (`PULSE_SOURCE`) or a silent fake file. Dropping this on a PC
+  broadcasts the operator's room when a mute click misses.
+- **`GDK_BACKEND=x11` and no `WAYLAND_DISPLAY` wherever the browser goes to
+  Xvfb.** On a Wayland session the browser otherwise fails to open the
+  display, or opens on the operator's screen.
+- **Playwright uses `channel="chrome"`** (on the Chrome path), NOT the bundled
+  Chromium. The bundled build gets Google's "This browser or app may not be
+  secure" block on sign-in.
+- **Login uses a direct launch of the browser binary, never Selenium or
+  Playwright.** Both inject automation flags (`navigator.webdriver=true`) that
+  Google's sign-in detects. `first_time_login.sh` also moves geckodriver's
+  `user.js` aside first.
 - **Chrome must be `google-chrome-stable`, not Debian's `chromium`.** The
-  branded build is what gets through the sign-in flow. This is the requirement
-  the whole Alpine-container era existed to satisfy; don't trade it away now
-  that it's cheap to meet.
-- **Chrome runs with `--no-sandbox`.** Required because everything runs as root.
-  Sandbox + root = crash on launch.
+  branded build is what gets through the sign-in flow.
+- **`--no-sandbox` only as root.** The PC runs as the operator; Chrome keeps
+  its sandbox. `browser._open_chrome` adds the flag when `geteuid() == 0`.
+- **The bot account is `BOT_GOOGLE_ACCOUNT`, never a literal.** Refuse a Meet
+  from a profile that holds a different account or none; never treat an
+  unreadable answer as "signed out"; keep `authuser=` on Meet URLs.
+- **Everything runs as the operator's user.** No root requirement outside
+  `setup.sh --system`; the user step refuses root (it would leave root-owned
+  files in `~/.local` and `.venv`).
+- **The venv is `.venv` in the repo, built by uv.** Removable by deleting it —
+  the operator's stated reason for uv.
+- **A meeting input detaches before any state is written**, and the web UI /
+  pm2 resume job run with `MEETING_BOT_FOREGROUND=1`. Detaching after
+  `rs init`, or twice, makes duplicate runs (two calls, for meet.new).
+- **pm2 never runs `pipeline.sh` itself for the resume job** —
+  `web/resume.sh` detaches it. cron_restart kills whatever is still running.
+- **The web UI's children get no `.env` key in their environment**
+  (`trigger_server.child_env`), and the pm2 entry scripts source with
+  `MEETING_BOT_ENV_FRESH=1`. Passing `os.environ` through again makes every
+  run use `.env` as it was when the UI started, silently.
+- **pm2 never starts anything at boot.** No `pm2 startup`, no `pm2 save` in
+  any script. The operator asked for the web UI to be off by default.
+- **The bot's mic and camera stay blocked at the browser**, and mute_av
+  never clicks an "already off" label. See "What the recording shows".
+- **Silence is measured by duration, not peak**, before any AssemblyAI upload.
+- **The bot's audio client is never called "Firefox"** (PULSE_PROP_OVERRIDE
+  in record_screen.sh), and lib/pinaudio.py keeps it on the recording sink.
+- **Stop on a run that is not recording terminates its process tree and
+  marks it `stopped`; `--resume-all` skips it until it is resumed by hand.**
+  The sentinel alone stops nothing past the recording.
+- **ffmpeg gets exactly one SIGINT, and is never SIGKILLed.** A second one
+  while it closes the file leaves an unplayable MP4.
+- **No awk (mawk) in a pipe that must be live.** It holds lines in its
+  input buffer; the meeting link never reached the web UI. Use a bash
+  `while read` loop.
+- **Display numbers are claimed with our own claim file, not Xvfb's lock.**
+  A non-root Xvfb ignores `-nolock` and refuses a lock that names a live pid.
 - **`--window-position=0,0` stays in `CHROME_ARGS`.** Without it Chrome places
   its kiosk window at (10,10) and every recording carries a 10px black band
   down the left and top edges. Found by `verify_e2e.sh --browser-smoke`, which
   measures the recorded frame rather than trusting the reported window size —
   a 1px band at the right and bottom is Chrome's viewport rounding and is fine.
-- **`CHROME_ARGS` in `capture.py` is the single source of the command line**,
-  imported by `screen/browser_smoke.py`. A flag that breaks recording has to
-  break the smoke test too, or the smoke test is testing a different browser.
+- **`browser.open_page()` is the single launch** (`CHROME_ARGS` /
+  `FIREFOX_PREFS` in `screen/browser.py`, `CHROME_ARGS` re-exported by
+  capture.py), used by capture.py and `screen/browser_smoke.py`. A flag that
+  breaks recording has to break the smoke test too, or the smoke test is
+  testing a different browser.
 - **Display numbers and sink names are allocated per run, never hardcoded.**
   The container boundary that made `:99` safe is gone. See the isolation
   section above, including why `pactl set-default-sink` must not be used.
@@ -1542,9 +2766,23 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   ffmpeg `SIGINT` so the MP4 stays playable.
 - **H.264 is `libx264 -preset ultrafast -crf 28`.** Keeps CPU low on a 4-vCPU
   VM with no GPU; visually fine for talking heads and slides.
-- **The frame-sampling combo is scene-change + periodic.** Scene-change catches
-  slide transitions and shared-video cuts; periodic guarantees a frame every N
-  seconds on a static slide. Don't drop the periodic pass.
+- **An OpenRouter answer in scripts nobody asked for is rejected**
+  (`language.foreign_runs`), never printed: the PDF has no glyphs for them.
+  The input's own scripts are allowed, so a Chinese lecture can quote Chinese.
+- **The lecture prompt is a cheat sheet and the merge consolidates.** The
+  operator chose it 2026-10-16 after a 38-page combined sheet; don't bring
+  back "preserve the level of detail" in `_merge.md`.
+- **No word in a non-Latin script reaches mathtext.** `mathrender` sets it
+  as text; mathtext draws a dummy box per letter.
+- **Frames are taken on change, from one decode — not on a clock.** The
+  operator replaced the scene-change + periodic passes on 2026-09-30. Keep:
+  the change test = the model dedupe's hash and distance (one constant,
+  `SAME_SLIDE_MAX_DISTANCE`); save on settle, never mid-transition; the
+  `motion` cap so a played video is not invisible; the 5-minute safety net;
+  blanks never saved. Don't bring back a fixed-period pass without asking.
+- **framecrop's numpy paths must stay result-identical to the Python loops**
+  (`FrameAnalysisPathsTest`). A crop or hash that moves changes the PDF, the
+  dedupe and the frame detector at once.
 - **`--disable-features=ScreenCapture` is intentional** — the bot has no reason
   to share its screen. Layers 2 and 3 in `capture.py` (dialog killer, "Stop
   presenting" monitor) are the catch-nets if Chrome renames the flag.
@@ -1559,8 +2797,10 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **Google Meet pre-join uses a Tab-scan, not fixed Tab counts.** The pre-join
   DOM reorders frequently; identifying buttons by accessible name is the only
   durable approach.
-- **YouTube URLs auto-route to youtube-transcript.io**, not AssemblyAI. We
-  already have free captions there and they return in seconds.
+- **YouTube URLs use YouTube's own captions — yt-dlp first,
+  youtube-transcript.io as the fallback** — not AssemblyAI. Don't put the API
+  back in front: it costs a credit per video for the same captions and its
+  language labels are wrong (Thai ASR labelled `en`).
 - **Empty YouTube transcripts fail loudly**, not silently. Every key hits the
   same upstream captions, so retrying won't help. Placeholder-only text (e.g.
   `[เสียงพากย์ไทย]`) is written through so the operator can see it in the
@@ -1580,8 +2820,8 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   YouTube exposes no muxed format at all on many videos and `best[ext=mp4]/best`
   alone fails with "Requested format is not available". Keep any future fix
   runtime-agnostic rather than re-enabling the merge.
-  The same string appears in `lib/run_one.sh` and `summarize/summarize.py` —
-  change both.
+  The string lives once, in `lib/ytdownload.py` (`FORMAT`), which both
+  `lib/run_one.sh` and `summarize/summarize.py` use.
 - **Kaltura is reached through `lib/kaltura.py`, never yt-dlp.** Its extractor
   sends no `Referer` and 404s on exactly the entries this project exists for.
 - **Every Kaltura request carries a `Referer`.** Dropping it turns a working
@@ -1685,7 +2925,7 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **`SUMMARY_MAX_TOKENS` is not a Claude lever, and must not be wired to
   one.** There is no output cap on the CLI, and output is not what spends
   the window. The levers are `SUMMARY_CHUNK_CHARS` (whether there is a merge),
-  `CLAUDE_CLI_MERGE_MODEL`, `CLAUDE_CLI_MAX_FRAMES`, `FRAME_PERIOD_SECONDS`,
+  `CLAUDE_CLI_MERGE_MODEL`, `CLAUDE_CLI_MAX_FRAMES`, `FRAME_MOTION_SECONDS`,
   `FRAME_MAX_DIMENSION`, `SUMMARY_EFFORT` and `CLAUDE_CLI_MODEL`.
 - **`ClaudeCliRateLimited` is `retryable = False` and the chain re-raises
   it.** Retrying it burns the backoff schedule; advancing hands the summary to
@@ -1698,9 +2938,17 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   same wall every fifteen minutes.
 - **`runstate.start` clears `rate_limited` and `waiting_until`.** Otherwise a
   run that resumed and succeeded still looks paused to the next `--resume-all`.
+- **Both backends filter frames the same way** (blanks/repeats, cap,
+  downscaled copy). A backend that sends the raw manifest hits Gemini's
+  per-minute token quota on any long video.
+- **Gemini quota is per image, not per pixel.** Don't "optimise" frame
+  size or JPEG quality for Gemini tokens; `GEMINI_MEDIA_RESOLUTION` and
+  `SUMMARY_CHUNK_MAX_FRAMES` are the levers.
 - **`CLAUDE_CLI_MAX_FRAMES` thins what is offered, never renumbers.** The
   numbers come from `assign_numbers()` over the whole manifest; a thinned
   list that renumbered would recreate the per-chunk numbering bug above.
+- **Every `genai.Client` gets an HTTP timeout.** Without one a request
+  Gemini never answers hangs the run silently, forever.
 - **`BackendUnavailable.retryable = False` stays.** Without it a signed-out CLI
   burns the whole retry schedule before falling back to Gemini.
 - **No `thinking.budget_tokens`, ever** — and now no CLI spelling for one
@@ -1716,6 +2964,28 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   limit**, and is white text in normal flow rather than `display: none`.
   Either mistake — one big block, or a display rule that emits nothing —
   turns "the transcript travels with the PDF" into a silent half-truth.
+- **The PDF look is DESIGN.md.** Change the spec and `_css()` together;
+  don't restyle one without the other.
+- **Callouts are extracted before `mathrender.extract`**, and maths symbols
+  are wrapped before `mathrender.restore`. Either order reversed breaks
+  formulas in boxes or corrupts data: URIs.
+- **Body faces are size-matched on x-height; `PDF_FONT_SIZE` is Computer
+  Modern's size.** Setting every face to the same point size is exactly what
+  the operator asked not to have.
+- **Computer Modern is never offered for Thai.** No Thai glyphs.
+- **No prompt asks for timestamps or frame citations** — except the
+  timestamps of `reality` and `drama` (`TIMED_TRANSCRIPT_PROMPTS`), the
+  operator's explicit exceptions of 2026-09-30 and 2026-11-02; no prompt
+  cites frames. One file per prompt for every backend; don't add a seventh
+  without asking. The old names
+  stay as aliases in `promptnames.py` — unfinished runs and `.env` files
+  carry them.
+- **A timed prompt's timestamps come from the transcript's marks, and the
+  links from `document.link_timestamps`.** Never ask the model for URLs (it
+  cannot know the clip offset, and a wrong link looks right), and never
+  put the marks in the document's embedded transcript.
+- **Per-run instructions go after the static end marker**, never inside the
+  static half.
 - **Keep a Thai face in `PDF_FONT_FAMILY`.** Computer Modern has no Thai
   glyphs.
 - **Don't set `PDF_FONT_FAMILY` in `.env.example`.** Set, it overrides the
@@ -1794,30 +3064,79 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **Alpine support was dropped in the Debian 13 port.** `setup.sh` is apt-only
   and fails fast elsewhere with a pointer to the `alpinelinux` branch. Don't
   reintroduce dual-target detection without asking.
-- **Don't reintroduce Docker.** The container existed only to give Chrome a
-  glibc filesystem. On Debian that is free, and the container cost a daemon, an
-  image build, bind mounts, and a second copy of ffmpeg.
+- **This branch is native; Docker lives on the `docker` branch.** The PC port
+  deliberately took the docker branch's features and not its packaging. If the
+  two are ever merged, the docker branch's own rules (one container, the
+  entrypoint's PID cleanup) come with it.
+- **Every value-taking `pipeline.sh` option goes through `need_value`.**
+  Without it a trailing option hangs the script silently.
+- **The web UI validates with `pipeline.sh --dry-run`, not its own parser.**
+  Its per-line ✓/✗ come from the dry run's `ok`/`bad`/`badarg`/`extra`
+  lines; the page's own hints check shapes, never what an input is. An
+  `extra` line is a failure in the form (a typo'd path would become the
+  run's name).
+- **The Drive upload is its own stage and never fails the summary.** The
+  PDF on disk is the deliverable; `upload` failing leaves summarize done.
+  Drive settings given on a resume reset `upload`. A same-named file is
+  replaced (new revision), never duplicated.
+- **Drive signs in as `BOT_GOOGLE_ACCOUNT` only**, through a direct browser
+  launch, never a driven one; a login for another account is not saved.
+- **Clearing a run never touches the deliverables** (recording, transcript,
+  summary, PDF) — only `runs/<id>/` and its frames. Never clear or sweep a
+  run whose `run.lock` owner is alive; never clear a member of a live set.
+- **`--combine`'s path is optional; only an `.md` next argument is one.**
+  Don't make it a required value again (the web UI sends it bare).
+- **A meet.new run is never auto-resumed**, and a hosted call is never ended
+  on an unreadable participant count.
+- **Captions are never taken from a YouTube machine translation.** Spoken
+  language first; another language only as the announced last resort.
+- **Of several `-orig` tracks, the original audio's wins** — never the
+  alphabetically first, and never the requested language's (transcribe.sh
+  always requests one). An auto-dubbed video has one per dub.
+- **Voice only means no frames stage, and summarize.py gets `--no-frames`.**
+  Dropping the flag while skipping the stage makes summarize.py extract (or,
+  for YouTube, download) the frames itself.
+- **An audio-only recording is always voice only**, and its medium is fixed
+  at run creation (the recording's file name depends on it).
+- **Course-reference metadata stays in the dynamic half** of the prompt, as
+  attributes — never substituted into the static instructions.
+- **A Discord spool is deleted only after the mix probed correctly**, and
+  each `.pcm` is written before its index line. The call is over; the spool
+  is the recording until the `.m4a` is proven.
+- **The Discord receive stack never enters the project `.venv`** until the
+  spike has chosen it — the Python candidate is a fork that pins its own
+  discord.py. Spikes keep their own venv / node_modules.
 
 ## Tests
 
-All of these run without API keys, network, or `/opt`, against temp directories
+Run them with the project venv (`.venv/bin/python3 <suite>`, and
+`MEETING_BOT_VENV=$PWD/.venv bash lib/test_*_e2e.sh`). All of these run
+without API keys or network, against temp directories
 — including one whose path contains a space, so quoting regressions fail loudly.
 `verify_e2e.sh` is the exception: it is the live checklist.
 
 | File | Covers | Count |
 |---|---|---|
-| `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI, `annotate` and the pause fields | 19 |
+| `lib/test_gdrive.py` | folder ids from links, PDF names, query escaping, gmail comparison, status / token file mode, not-logged-in and a revoked login, the consent URL, upload create vs replace (resumable, no parents on a revision), folder listing (pages, Shared with me), a file is not a folder, CLI errors | 13 |
+| `lib/test_runstate.py` | state transitions, stale artifacts, concurrent writes, CLI, `annotate` and the pause fields, `stop`/`unstop` | 20 |
 | `lib/test_slotqueue.py` | FIFO order, dead-holder reclaim, timeout, CLI | 23 |
 | `lib/test_keyring.py` | numbered slots, gaps, duplicates, cursor persistence | 22 |
-| `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets | 27 |
+| `lib/test_resources.py` | spec parsing, text extraction, GitHub fetch, budgets, frontmatter, binary files | 36 |
 | `lib/test_kaltura.py` | iframe/URL parsing, the Referer, the KS, caption selection, download, retries | 51 |
 | `lib/test_clip.py` | window parsing, the label round-trip, the ffmpeg invocation, caption windowing | 33 |
-| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field) | 182 |
-| `summarize/test_pdf_units.py` | crop geometry, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), real PDF render | 82 |
+| `lib/test_ytdownload.py` | the YouTube download retry: transient vs permanent errors (a failed challenge solver beats "not available"), a 403 then served, doubling waits, the attempt cap, the command never merges, no pm2 Node IPC variables passed on | 11 |
+| `lib/test_discord_spool.py` | Discord spool placement from synthetic packet timings (arrival only; RTP: bunching, loss, wraparound, a pause, a resync), crash tolerance, the int32 mix and clipping, real ffmpeg (words where spoken, speaker tracks, the spool kept on failure) | 22 |
+| `summarize/test_summarize_units.py` | the Gemini model chain (keys first, 429 without backoff, 404 skips the model), retry classification/backoff, chunking, segment granularity, map-reduce, global frame numbering, document, the multi-video wrapper and per-video chunking for `--combine`, the claude-cli command line + envelope parsing (plain and stream-json), inline image blocks vs the Read path, the merge role, the cacheable static prompt and the label/resources order, frame crop + downscale, blank/duplicate dropping and the texture hash, the usage ledger, the hit-window wait/pause and the chain not advancing, frame thinning, the model's title heading the document, the output language (default, aliases, the rule in every template and the merge, the cacheable half, the provenance field), the `<course_reference>` block, the six prompts (old names resolve, no timestamps outside `reality`/`drama`, the callout vocabulary), the drama prompt (timed, wrapped, its asks, its merge, links), `--instructions` placement, the no-frames note, the reality prompt (timed lines and their chunking, `[mm:ss]` → YouTube links with the clip offset, `[Video N, …]`, its own merge, end to end through `main()`), the Gemini request timeout, Gemini's frame filtering, media resolution and own cap, the per-chunk frame cap, the OpenRouter backend (payload, key/model walk, the per-account daily cap, an error inside a 200, a truncated answer retried once then the next model, the chunk cap, the rejected-answer dump, the real model of a router), the chunk flow (the merge's instructions, every model named, finished chunks reused and re-keyed on a model change), an off-script answer rejected (and a few foreign words or the input's own script let through) | 253 |
+| `summarize/test_pdf_units.py` | crop geometry, framecrop on decoded images / numpy vs Python identical / the shared downscale, citation rewriting and fading, blank-frame detection, LaTeX extraction/fallback, environment composition (cases/matrices/aligned, nesting, one glyph table), display fractions, nested-list re-indent, the legacy header, the summary-only defaults, the hidden transcript on request, part-tagged manifests and captions for `--combine`, the per-language body face (provenance over env, `PDF_FONT_FAMILY` override, the CSS), the per-run font (lists, aliases, defaults, precedence, x-height matching, CLI check), the design markup (callouts, code window, maths symbols, link lines in the title block, colophon), loose callout markers (`### [!KIND]`, a bare `[!KIND]`), real PDF render, Thai words inside a formula set as text (or the whole formula as text when they can't be cut out) | 113 |
 | `transcribe/test_yt_transcript_client.py` | key rotation, retry, and the `tracks[]` response shape | 16 |
-| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`) | 314 |
-| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps | 119 |
-| `verify_e2e.sh --browser-smoke` | real Chrome under Xvfb, recorded and measured for black edges | 6 |
+| `transcribe/test_yt_autocaptions.py` | yt-dlp captions: track choice (never a translation; `auto` prefers an upload in the spoken language), json3, the CLI against a stub yt-dlp, an auto-dubbed video's original audio over the dub | 15 |
+| `screen/test_extract_frames.py` | frames on change: settle, a transient change, blanks, the motion cap, the safety net, the last sample, the shared distance; the PPM reader; real ffmpeg (black lead-in skipped, audio-only empty, retired settings named) | 19 |
+| `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
+| `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
+| `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source, an `.env` edit reaching the next run and the form without a restart, the `.env` parser, no pm2 Node IPC variables in a child, the combine switch / tags / Drive arguments, run history (sizes, tags, cache removal marking stages `cleaned`, clear; a busy run and a live set's member refused; bulk clear with members), the tmp cache, Drive status, a resume naming a Drive folder | 20 |
+| `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line), Stop on a summarizing run (`kill_meeting.sh --run-id` terminates it, `STOPPED`, `--resume-all` skips it, `--run-id` finishes it and clears the mark), a YouTube download refused with a 403 and re-run (served, given up, a non-transient failure not retried), `--combine` without a path (default places, resumed onto the same files, last on the line in a dry run), the Drive upload (folder id from a link, the title as the name, the link stored, not repeated, renamed on `--run-id` without re-summarizing, a failure failing only `upload` and retried, refusals, only the combined PDF), tags (stored, split, on members too) | 520 |
+| `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, YouTube captions through a stub yt-dlp first (the API never asked when it succeeds), youtube-transcript.io when yt-dlp fails or finds no track, the other-language-labelled track as last resort, `YT_AUTOCAPTIONS=0`, both down = exit 1, `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 141 |
+| `verify_e2e.sh --browser-smoke` | the real browser (Firefox ESR or Chrome) under Xvfb, recorded and measured for black edges | 6 |
 
 `test_pipeline_e2e.sh` runs the real `pipeline.sh` and `run_one.sh` and stubs
 only the four expensive stages, behind the same argument/output contract. It has
@@ -1866,17 +3185,17 @@ invocation, assert it here. Note the wait test really sleeps: the stub's
 reset is 2s away and the margin is 60s, so that block takes about a minute.
 `KEEP_TESTROOT=1` keeps the test root for inspection.
 
-One pre-existing flaky failure on the author's desktop is worth knowing so
-it is not mistaken for a regression: "language not sent" in the transcribe
-section. (The earlier "no downscaled frame copies" failure went away with a
-scratch venv built from `requirements.txt` — `/opt/meeting-bot-venv` on the
-desktop is an empty 3.14 venv, so run the shell suites with
-`MEETING_BOT_VENV=<a venv built with uv from requirements.txt>`.) The media
+One flaky failure seen on the author's desktop in the past is worth knowing
+so it is not mistaken for a regression: "language not sent" in the
+transcribe section (it did not reproduce on 2026-09-29: 125/125 with the
+project `.venv`). The media
 test's synthetic slides are flat colour, so the duplicate pass collapses all
 three to one image block; that is the fixture, not a bug — real slides carry
 text, which is what the texture hash keys on.
 
-**What no test here covers:** Chrome actually joining a live Meet/Zoom call, a
+**What no test here covers:** the browser actually joining a live Meet/Zoom
+call (Firefox has reached Meet's pre-join page and its refusal page, not a
+call), a
 real Kaltura tenant's access-control (`./verify_e2e.sh --kaltura` is the live
 check, and needs no key), and
 real AssemblyAI/Claude/Gemini/youtube-transcript.io round-trips — including
@@ -1890,7 +3209,8 @@ own flags, which is everything about stage 1 except the call itself.
 
 ```
 .
-├── README.md                     <- all user-facing docs (the only other .md)
+├── README.md                     <- all user-facing docs
+├── DESIGN.md                     <- the summary PDF's design spec; pdf.py implements it
 ├── CLAUDE.md                     <- this file
 ├── .env.example                  <- names and defaults only; prose lives in README
 ├── requirements.in               <- edit this
@@ -1899,15 +3219,20 @@ own flags, which is everything about stage 1 except the call itself.
 ├── requirements-browser.txt      <- generated
 ├── fonts/                        <- vendored Bai Jamjuree + Sarabun (OFL); setup.sh installs them
 ├── source_env.sh
-├── setup.sh                      <- Debian/apt, installs Chrome + the venv
-├── first_time_login.sh           <- noVNC login, native Chrome
+├── setup.sh                      <- `sudo … --system` (apt) + the user step (uv .venv, geckodriver, pm2, .env)
+├── first_time_login.sh           <- desktop-window login as BOT_GOOGLE_ACCOUNT (or --novnc), then checks it
 ├── kill_meeting.sh               <- per-run or global, pid-file based
 ├── pipeline.sh                   <- multi-input orchestrator
 ├── verify_e2e.sh                 <- live checks: preflight + mp4/YouTube/Kaltura/Meet/Zoom
-├── trigger_server.py
-├── meeting-bot-trigger.service   <- systemd unit (setup.sh --with-trigger)
-├── meeting-bot-resume.service    <- `pipeline.sh --resume-all` for paused runs
-├── meeting-bot-resume.timer      <-   ...every 15 min (setup.sh --with-resume-timer)
+├── benchmark.sh                  <- CPU/memory per local stage (synthetic media); --browser, --watch-run
+├── trigger_server.py             <- web UI + /trigger + /api/* (stdlib only)
+├── ecosystem.config.js           <- pm2: meeting-bot-web + meeting-bot-resume (every 15 min)
+├── webui.sh                      <- ./webui.sh on|off|restart|status|url|logs (nothing at boot)
+├── test_trigger_server.py
+├── web/
+│   ├── index.html                <- the UI page (no external scripts)
+│   ├── serve.sh                  <- pm2 entry: loads .env, runs trigger_server.py
+│   └── resume.sh                 <- pm2 entry: starts --resume-all detached, exits
 ├── lib/
 │   ├── runstate.py               <- run state + locking + CLI
 │   ├── slotqueue.py              <- machine-wide component queue
@@ -1917,7 +3242,13 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── resources.py              <- slides/notes from GitHub or a folder
 │   ├── kaltura.py                <- Kaltura embeds: parse, media URL, captions
 │   ├── clip.py                   <- --clip: window parsing + the ffmpeg cut
+│   ├── ytdownload.py             <- the YouTube download (yt-dlp), re-run on a transient 403/429/5xx
 │   ├── combine.py                <- --combine: parts.json from the member runs, the run key
+│   ├── gdrive.py                 <- Google Drive: the bot account's OAuth login, folders, the PDF upload
+│   ├── runadmin.py               <- run history: clear, cache removal, tags (stdlib; the web UI imports it)
+│   ├── test_gdrive.py
+│   ├── discord_spool.py          <- Discord recordings: per-speaker spool, timeline placement, the .m4a mix
+│   ├── test_discord_spool.py
 │   ├── run_one.sh                <- the per-run stage DAG
 │   ├── fake_api_server.py        <- stub AssemblyAI/YouTube servers
 │   ├── fake_claude_cli.py        <- stub `claude` binary for the media test
@@ -1929,16 +3260,23 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── test_clip.py
 │   ├── test_pipeline_e2e.sh
 │   └── test_media_e2e.sh
+├── spike/discord/                <- THROWAWAY: py/ and node/ spike bots (run.sh each), until the library is chosen
 ├── screen/
 │   ├── record_screen.sh          <- stage 1, native (no container)
-│   ├── capture.py                <- Playwright join driver; owns CHROME_ARGS
+│   ├── browser.py                <- MEETING_BROWSER, profiles, launch, FirefoxPage adapter, the account check
+│   ├── capture.py                <- join/host driver (Playwright page API)
 │   ├── browser_smoke.py          <- the same browser, without a meeting
-│   └── extract_frames.py
+│   ├── test_browser.py
+│   ├── test_capture_host.py
+│   ├── test_extract_frames.py
+│   └── extract_frames.py         <- one decode; a frame when the picture changes
 ├── transcribe/
 │   ├── transcribe.sh
 │   ├── assemblyai_client.py
 │   ├── yt_transcript_client.py
-│   └── test_yt_transcript_client.py
+│   ├── yt_autocaptions.py        <- YouTube's own captions via yt-dlp (first choice)
+│   ├── test_yt_transcript_client.py
+│   └── test_yt_autocaptions.py
 └── summarize/
     ├── summarize.py
     ├── llm_client.py
@@ -1947,19 +3285,184 @@ own flags, which is everything about stage 1 except the call itself.
     ├── mapreduce.py
     ├── document.py
     ├── language.py               <- SUMMARY_LANGUAGE: the {language_rule} every prompt carries
-    ├── pdf.py                    <- markdown -> PDF
+    ├── fontchoice.py             <- per-language PDF fonts, defaults, x-height size matching (+ CLI check)
+    ├── promptnames.py            <- the six prompts, the old names' aliases, which read timed lines (stdlib only)
+    ├── pdf.py                    <- markdown -> PDF (DESIGN.md)
     ├── framecrop.py              <- slide-region detection, blank frames
     ├── mathrender.py             <- LaTeX -> Computer Modern SVG
     ├── test_summarize_units.py
     ├── test_pdf_units.py
     └── prompts/
-        ├── summarize.md          <- default (see the load_prompt_template note)
-        ├── summarize-v2.md       <- XML-tagged, worked example, cacheable prefix
-        ├── lecture-{claude,gemini}.md
-        ├── tutorial-{claude,gemini}.md
-        ├── meeting-{claude,gemini}.md
-        └── _merge.md             <- internal; leading _ keeps it off the menu
+        ├── video.md              <- the default: talks, news, interviews
+        ├── meeting.md
+        ├── lecture.md            <- study sheet + the course-reference rules
+        ├── tutorial.md
+        ├── reality.md            <- reality-show episode recap: [mm:ss], quotes, results last
+        ├── _merge.md             <- internal; leading _ keeps it off the menu
+        ├── drama.md              <- Thai drama (lakorn) episode recap: characters, [mm:ss], Thai quotes, what changed
+        ├── _merge-reality.md     <- the reality prompt's own merge
+        └── _merge-drama.md       <- the drama prompt's own merge
 ```
+
+## The web UI (`trigger_server.py`, `web/index.html`)
+
+Settled 2026-09-27: **a page served by the existing trigger server** — stdlib
+`http.server`, no framework, no new dependency, same bearer token — reachable
+on **localhost or the Tailscale address only** (`MEETING_BOT_BIND`, see
+"Running on a PC"). Run by pm2 (`./webui.sh on`), never at boot. The page itself is unauthenticated (it holds no
+data); every `/api/*` call and `/trigger` carries the token, which the page
+keeps in `localStorage`.
+
+- `build_args(body)` turns a JSON body into `pipeline.sh` arguments, and is
+  shared by `/trigger` and `/api/check`, so what was checked is what runs.
+  `/api/check` is `pipeline.sh --dry-run` with those arguments. **Start** is
+  only enabled for the exact form state that last passed a check.
+- The "New Google Meet" tab triggers `{"new_meet": true}` and polls that
+  trigger's log (`/api/log`) for the `New Google Meet: <link>` line
+  `capture.py` prints — the log is the one place the link appears before any
+  run id is known to the page. It also reads `Run: <id>` from the same log for
+  the **End & stop recording** button (`/api/runs/<id>/stop` →
+  `kill_meeting.sh --run-id`, which leaves through the UI as always).
+- Run ids and log names are matched against strict regexes before they touch
+  a path; nothing from a request reaches the filesystem otherwise.
+- A meeting started from the command line detaches with its own
+  `pipeline_*.log` in the same `logs/` directory; `LOG_NAME_RE` accepts both
+  `trigger_*` and `pipeline_*`, so the UI can show either.
+- `launch()` passes `MEETING_BOT_FOREGROUND=1`: the UI's child is already
+  detached and logged, and pipeline.sh must not detach a second time.
+- Both tabs carry the **Summary** fieldset (2026-09-29): style, "written
+  in" (th/en), PDF font (repopulated from `/api/options` `fonts[lang]` when
+  the language changes), and **Extra instructions**. `build_args` maps them
+  to `--summary-language`, `--pdf-font`, `--instructions` (one argv item,
+  never a shell). Since 2026-09-30 also **Save recording** / **Summarize
+  from** (`record_media`, `summary_source`; preselected from `.env` via
+  `/api/options` `default_record_media` / `default_summary_source`), with
+  audio disabling the source select at "voice". The default prompt shown is `canonical_prompt_name` of
+  `SUMMARY_PROMPT`, so an old name in `.env` still preselects.
+- `/trigger`'s original body contract is unchanged (phone shortcuts keep
+  working); `new_meet`, `clip`, `no_combine_pdf` and `playlist` were added.
+
+### The page's design (2026-09-30)
+
+The operator asked for "clearly toggle and input settings, with clear
+warnings and tick symbols", DESIGN.md as the reference, and chose in a round
+of questions:
+
+- **Segmented button groups for 2-3-way choices** (written in, save
+  recording, summarize from, spoken language) with a ✓ on the chosen one and
+  🔒 when locked (audio only locks "Summarize from" at voice); **switches for
+  on/off** (playlists, Markdown only, start over) with an ON/OFF word;
+  dropdowns only for the long lists (style, with a one-line description of
+  each; PDF font).
+- **Live hints plus an automatic check.** Every field has a one-line
+  ✓/⚠/✗/ℹ feedback slot (`fb-<id>`) filled as you type — *format only*
+  (clip shape, jobs, a name with several inputs, a non-.md combine path,
+  start over, playlists). ~900 ms after the last change `/api/check` runs
+  the dry run, and **each input line gets ✓ (kind, new/resume, window) or
+  ✗ (the pipeline's reason)**. A sequence number drops stale answers.
+  Mapping lines to the plan (`mapPlan`): `badarg`/`extra` entries by the
+  exact line, the rest in order; if the counts disagree (playlist
+  expansion) the plan is listed as it came. A refusal before any input was
+  looked at (bad `--clip`, font, jobs) marks the lines "not checked" and
+  shows the pipeline's words. Start reads "Start N runs" and unlocks only
+  for the exact form state that passed; warnings are repeated beside it.
+- **DESIGN.md's palette and callouts**: navy top bar and numbered section
+  banners, the five callout colours as the page's states (ok, info/running,
+  warn, bad with the red frame, note). Dark mode kept (the page follows the
+  system; tokens redefined under `prefers-color-scheme` and
+  `[data-theme=dark]`). Body face Bai Jamjuree → Sarabun → system, code
+  JetBrains Mono, as installed; a phone falls back to its own.
+- **Runs**: cards with a status badge and **labelled stage pills**; a stage
+  that never runs for that input (record on non-meetings, download on a
+  meeting or a voice-only YouTube run, clip without a window, frames on
+  voice only, summarize on a combine member) is hidden while pending
+  (`expected()`; `run_summary` now carries `summary_source` and
+  `combined_into` for it). The detail lists settings, output paths with
+  Copy, and logs whose open/closed state survives the 10 s refresh.
+- **Inline confirmation bars** (`confirmInline`) replace `confirm()` for
+  Stop and End & stop recording; the refresh does not rebuild a detail that
+  is waiting on one.
+- The last tab is remembered in `localStorage` (a convenience; the page
+  works without it).
+
+## A Discord voice source (in progress, 2026-09-30)
+
+Researched 2026-09-23; the operator asked to build it on 2026-09-30 and
+settled it in three rounds of questions, **replacing** parts of the 09-23
+plan (no email, no `/record`, no nickname change). Done means: in a voice
+meeting, someone types a command in chat; the bot records the audio, makes
+the PDF, posts it **into the voice channel's chat and into the requester's
+DMs**.
+
+- **Commands**: `/record-and-summarize` (optional style / summary language /
+  instructions; `.env` defaults otherwise) and `/stop`. `/record` and
+  `/summarize` were dropped. Slash commands, so no privileged intent.
+- **Anywhere, following the requester**: typed in any channel of the server,
+  the bot joins the voice channel the requester is in (refuses if they are
+  not in voice) and delivers into that voice channel's chat.
+- **Who**: anyone in the voice channel starts; only the requester or a member
+  with Manage Server stops. **Any server that invites the bot** may use it
+  (the operator declined an allowlist, knowing it spends their quota).
+- **Stops on** `/stop`, 30 s after the channel empties, `MAX_MEETING_MINUTES`.
+- **Notice**: one "🔴 Recording started by @user" chat message; no rename.
+- **Deliverables**: the PDF only, to the voice chat and the requester's DM.
+  The recording and transcript stay on the PC. Defaults I chose and told the
+  operator: a failure or a pause is reported in both places; closed DMs are
+  reported in the channel.
+- **Audio**: one mixed `.m4a` (AAC 128k, like an audio-only Meet) in
+  `RECORDINGS_DIR`, never swept. **Speakers**: one mixed track now ("option
+  2"), "but be prepared to upgrade" to names — so `<name>.speakers/` keeps one
+  speech-only mono track per speaker plus `speakers.json` mapping it back to
+  the meeting clock. Transcribing those instead of the mix is the upgrade.
+- **Runs**: a third pm2 app, on/off with `./webui.sh on|off`; runs show in
+  the web UI like any other.
+- Audio only is a hard wall (bots receive no Go Live/camera video; a
+  user-account self-bot violates the ToS). `--resources` covers slides.
+
+**DAVE decides the library, and it is not decided yet.** Since 2026-03-02
+every Discord voice call is end-to-end encrypted and a bot must *decrypt*
+received frames. Checked 2026-09-30: py-cord 2.8.0 does DAVE for sending
+only (its docs warn recording may not work); upstream
+`discord-ext-voice-recv` 0.5.2 decodes ciphertext; **zacker150's fork**
+(commit `dcf543a`, pins its own discord.py fork `44287eb`, needs `davey` and
+system `libopus`) decrypts, with RTP timestamps, a jitter buffer and PLC/FEC;
+**`@discordjs/voice` 0.19.2** (official) decrypts in `parsePacket` via
+`@snazzah/davey`, but pushes bare Opus payloads (no RTP timestamp, no jitter
+buffer, no concealment) and needs Node ≥ 22.12 (Debian 13 has 20). The
+operator chose **a live spike of both, then decide**: `spike/discord/py/`
+and `spike/discord/node/` (throwaway deps, gitignored, `run.sh` each;
+steps in README "Discord voice bot"). Both write the same spool and mix
+through `lib/discord_spool.py`, so the only variable is the library. Needs
+the operator's Developer Portal app and a second speaker.
+
+What is built (library-independent):
+
+- **`lib/discord_spool.py`** — the recording format and the mixer. Per
+  speaker an append-only s16le 48k stereo `.pcm` (silence left out) and a
+  JSONL `.idx` of `{t, off, n}`; `session.json`, `users.json`. Placement: a
+  packet continues its speaker's burst unless they were quiet > `GAP_MS`
+  (200); with an RTP timestamp it is placed by RTP inside the burst (a lost
+  packet leaves a gap of its length, a pause on a running RTP clock starts a
+  new burst instead of storing zeros) and an RTP clock > `RESYNC_MS` (1000)
+  off the wall clock is ignored. `.pcm` is flushed before its index line, so
+  a crash loses ≤ 1 s and never leaves an index past the data. The mix sums
+  in int32 per 10 s block (memory is one block) and clips once; the outputs
+  are probed for length before the `.part.m4a` is renamed, and the spool is
+  deleted only after that (`--remove-spool`). numpy is required here.
+- **`spike/discord/node/spool_writer.mjs`** — the JS twin (arrival-only);
+  its spool was mixed by the Python module in a scratch check (tones where
+  written, −91 dB between).
+- **`pipeline.sh --source-url URL`** — one local-file input only, `https://`
+  only, stored as `source_url` (`rs init --source-url`, replaced on a resume
+  like the summary settings); `run_one.sh` cites it as `SOURCE_URL`, and
+  `document.MEETING_URL_RE` now matches `discord.com/channels/…`, so the
+  document says `Meeting Link:`. The hand-off will be
+  `pipeline.sh <mix>.m4a --source-url https://discord.com/channels/<g>/<c>
+  --voice-only --prompt meeting …`, with `MEETING_BOT_FOREGROUND=1`.
+
+Next, after the spike: the bot itself (library per the spike), the pm2 app,
+delivery (read `stages.summarize.artifacts.pdf` from the run's state), and
+a web-UI label for Discord runs.
 
 ## Things future Claude might want to add
 

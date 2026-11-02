@@ -106,6 +106,17 @@ _DELIM_SPELLINGS = {
 _TEXT_COMMANDS = ("\\text", "\\mathrm", "\\mathbf", "\\mathit", "\\mathsf",
                   "\\mathtt", "\\operatorname", "\\textbf", "\\textit")
 
+# Characters Computer Modern has no glyph for — Thai, CJK, Arabic, Cyrillic
+# … — which mathtext draws as a dummy box each ("Font 'rm' does not have a
+# glyph"). Latin, Greek, punctuation, arrows, operators, letterlike symbols
+# and the mathematical alphanumerics are what maths needs, and CM has them.
+_NO_CM_GLYPH_RE = re.compile(
+    "[^\x00-\u024f\u0370-\u03ff\u2000-\u2bff\U0001d400-\U0001d7ff]")
+# A text group the model filled with words in another script, e.g.
+# `0.08 \text{ หรือ } 8\%`: that part is set as text, the rest as maths.
+_WORDS_GROUP_RE = re.compile(
+    r"\\(?:text|textrm|textbf|textit|mathrm|mbox|operatorname)\s*\{([^{}]*)\}")
+
 _engine_cache = "unset"
 
 
@@ -288,7 +299,41 @@ def _img_html(svg, width, height, depth, alt, display):
             f'vertical-align:{-depth:.2f}pt" />')
 
 
+def _word_pieces(row):
+    """Cut a row whose `\\text{…}` groups hold letters CM cannot draw into
+    [(is_words, s)], the words as plain text and the rest as maths; None
+    when the cut cannot be made cleanly (such letters outside a text group,
+    or a group that is an argument — `\\frac{\\text{กำไร}}{…}`, `x_\\text{…}`).
+    """
+    pieces, pos = [], 0
+    for m in _WORDS_GROUP_RE.finditer(row):
+        if not _NO_CM_GLYPH_RE.search(m.group(1)):
+            continue
+        pieces.append((False, row[pos:m.start()]))
+        pieces.append((True, m.group(1)))
+        pos = m.end()
+    pieces.append((False, row[pos:]))
+    for is_words, s in pieces:
+        if is_words:
+            continue
+        if _NO_CM_GLYPH_RE.search(s) or s.count("{") != s.count("}") \
+                or s.rstrip().endswith(("_", "^", "{")) \
+                or s.lstrip().startswith(("_", "^", "}")):
+            return None
+    return [(w, s) for w, s in pieces if w or s.strip()]
+
+
 def _row_html(row, engine, size_pt, color, display):
+    if _NO_CM_GLYPH_RE.search(row):
+        # Words in another script inside the maths: set them as text in the
+        # body face rather than as a row of dummy boxes.
+        pieces = _word_pieces(row)
+        if pieces is None:
+            return _fallback_html(row)
+        return "".join(
+            f'<span class="math-words">{_html.escape(s)}</span>' if is_words
+            else _row_html(s.strip(), engine, size_pt, color, display)
+            for is_words, s in pieces)
     if engine is not None:
         if BEGIN_RE.search(row):
             # An environment: composed out of mathtext pieces, see _layout.
@@ -797,7 +842,10 @@ def _fallback_html(tex):
     escaped = _html.escape(_flatten(text))
     escaped = re.sub(r"_\{([^{}]*)\}", r"<sub>\1</sub>", escaped)
     escaped = re.sub(r"\^\{([^{}]*)\}", r"<sup>\1</sup>", escaped)
-    escaped = re.sub(r"_(\w)", r"<sub>\1</sub>", escaped)
-    escaped = re.sub(r"\^(\w)", r"<sup>\1</sup>", escaped)
+    # One letter — or a whole word in a script CM lacks (`x_ไทย`), whose
+    # vowel marks would otherwise be cut from their consonant.
+    one = rf"((?:(?![\s{{}}^_]){_NO_CM_GLYPH_RE.pattern})+|\w)"
+    escaped = re.sub("_" + one, r"<sub>\1</sub>", escaped)
+    escaped = re.sub(r"\^" + one, r"<sup>\1</sup>", escaped)
     escaped = escaped.replace("{", "").replace("}", "")
     return f'<span class="math-fallback">{escaped}</span>'

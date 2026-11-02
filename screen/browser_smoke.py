@@ -3,13 +3,15 @@
 Launch the recorder's browser without a meeting, and hold it open.
 
 Everything about stage 1 except the meeting itself can be checked this way:
-that real Google Chrome starts under Xvfb, that Playwright drives it with
-`channel="chrome"`, that the persistent profile opens, that the kiosk window
-fills the display so ffmpeg's x11grab has no black edges, and that audio played
-by the page lands in this run's PulseAudio sink.
+that the configured browser (MEETING_BROWSER: Firefox ESR through Selenium, or
+real Google Chrome through Playwright with `channel="chrome"`) starts under
+Xvfb, that the persistent profile opens, that the kiosk window fills the
+display so ffmpeg's x11grab has no black edges, and that audio played by the
+page lands in this run's PulseAudio sink.
 
-It deliberately imports CHROME_ARGS and PROFILE_DIR from capture.py rather than
-repeating them: a flag that breaks recording should break this too.
+It deliberately launches through browser.open_page(), the same call
+capture.py uses, rather than repeating the command line: a flag that breaks
+recording should break this too.
 
     python3 screen/browser_smoke.py [--seconds 5] [--url URL]
 
@@ -26,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from capture import CHROME_ARGS, PROFILE_DIR  # noqa: E402
+import browser  # noqa: E402
 
 # A page with something worth capturing: a large light panel (so the slide
 # crop has a target), a caption, and a tone. Data URL, so no network and no
@@ -53,40 +55,21 @@ def main():
     ap.add_argument("--screenshot", help="also save a PNG of the page here")
     args = ap.parse_args()
 
-    from playwright.sync_api import sync_playwright
-
-    profile = Path(PROFILE_DIR)
-    profile.mkdir(parents=True, exist_ok=True)
-    # Same stale-lock cleanup as capture.py: a killed run leaves a
-    # SingletonLock that makes the next Chrome refuse to start.
-    for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-        path = profile / lock
-        if path.exists() or path.is_symlink():
-            path.unlink()
-
-    print(f"==> Launching Chrome (profile: {profile})")
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            str(profile),
-            headless=False,
-            channel="chrome",
-            args=CHROME_ARGS,
-            permissions=["camera", "microphone"],
-            no_viewport=True,
-            locale="th-TH",
-        )
-        page = context.new_page()
+    kind = browser.browser_kind()
+    print(f"==> Launching {kind} (profile: {browser.profile_dir(kind)})")
+    with browser.open_page(headless=False, kind=kind) as page:
         page.goto(args.url)
         page.wait_for_timeout(1000)
 
         size = page.evaluate("() => [window.innerWidth, window.innerHeight]")
-        print(f"==> Chrome is up. Window is {size[0]}x{size[1]}")
+        print(f"==> {kind} is up. Window is {size[0]}x{size[1]}")
+        wd = page.evaluate("() => navigator.webdriver === true")
+        print(f"==> navigator.webdriver: {wd}")
         if args.screenshot:
             page.screenshot(path=args.screenshot)
             print(f"==> Screenshot: {args.screenshot}")
 
         time.sleep(args.seconds)
-        context.close()
     print("==> Done.")
     return 0
 

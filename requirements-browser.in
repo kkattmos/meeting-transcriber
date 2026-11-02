@@ -6,3 +6,7 @@
 # land on the same versions in both files. See requirements.in for the command.
 
 playwright
+# Firefox ESR (MEETING_BROWSER=firefox-esr, the default). Playwright can only
+# drive its own patched Firefox build, never the stock ESR package, so the
+# Firefox path goes through Selenium + geckodriver (Marionette) instead.
+selenium

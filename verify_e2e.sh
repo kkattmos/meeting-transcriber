@@ -5,16 +5,17 @@
 # cover everything that can be checked without money or a meeting. Four things
 # they cannot cover, because they need the real world:
 #
-#   * Chrome actually joining a live Google Meet / Zoom call
+#   * the browser (Firefox ESR, or Chrome) actually joining a live Meet / Zoom call
 #   * real AssemblyAI / Anthropic / Gemini / youtube-transcript.io round trips
 #   * Xvfb + PulseAudio + ffmpeg x11grab on this actual hardware
-#   * the persistent Chrome profile still holding a valid Google/Zoom login
+#   * the persistent browser profile still holding a valid login, as
+#     BOT_GOOGLE_ACCOUNT
 #
 # This script is those checks. Run the preflight any time; run the recording
 # checks when you have a call you can point the bot at.
 #
 #   ./verify_e2e.sh --preflight                     no API calls, no spend
-#   ./verify_e2e.sh --browser-smoke                 real Chrome on Xvfb, recorded,
+#   ./verify_e2e.sh --browser-smoke                 the real browser on Xvfb, recorded,
 #                                                   but no meeting and no spend
 #   ./verify_e2e.sh --mp4 /path/to/recording.mp4    real transcribe + summarize
 #   ./verify_e2e.sh --youtube "<url>"               real captions + summarize
@@ -39,7 +40,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/paths.sh"
 
 export VERIFY_REPO="$SCRIPT_DIR"
-PY="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}/bin/python3"
+PY="${MEETING_BOT_VENV:-$LOADER_DIR/.venv}/bin/python3"
 [ -x "$PY" ] || PY="python3"
 
 PASS=0; FAIL=0; WARN=0
@@ -155,16 +156,31 @@ echo "--- host"
   || warn "this is ${PRETTY_NAME:-an unknown distro}, not Debian"
 
 echo "--- programs"
-for cmd in ffmpeg ffprobe Xvfb x11vnc websockify pactl pulseaudio yt-dlp \
-           google-chrome-stable git pdftotext pdftoppm; do
-  command -v "$cmd" >/dev/null 2>&1 && ok "$cmd" || bad "$cmd is missing (run ./setup.sh)"
+# pactl, not the pulseaudio daemon: on a desktop PipeWire answers it.
+for cmd in ffmpeg ffprobe Xvfb x11vnc websockify pactl yt-dlp git pdftotext pdftoppm; do
+  command -v "$cmd" >/dev/null 2>&1 && ok "$cmd" \
+    || bad "$cmd is missing (sudo ./setup.sh --system, then ./setup.sh)"
 done
+BROWSER_KIND="$("$PY" "$SCRIPT_DIR/screen/browser.py" info | awk '/^browser:/ {print $2}')"
+"$PY" "$SCRIPT_DIR/screen/browser.py" info | sed 's/^/  /'
+if [ "$BROWSER_KIND" = "chrome" ]; then
+  command -v google-chrome-stable >/dev/null 2>&1 && ok "google-chrome-stable" \
+    || bad "google-chrome-stable is missing (sudo ./setup.sh --system --with-chrome)"
+else
+  "$PY" "$SCRIPT_DIR/screen/browser.py" info | grep -q '^binary:  /' && ok "firefox-esr" \
+    || bad "firefox-esr is missing (sudo ./setup.sh --system)"
+  command -v geckodriver >/dev/null 2>&1 && ok "geckodriver" \
+    || warn "no geckodriver on PATH — Selenium Manager will try to download one (./setup.sh installs it)"
+fi
+command -v pm2 >/dev/null 2>&1 && ok "pm2 (web UI: ./webui.sh on)" \
+  || warn "no pm2 — the web UI can't be switched on (./setup.sh installs it)"
 command -v soffice >/dev/null 2>&1 || command -v libreoffice >/dev/null 2>&1 \
   && ok "libreoffice (optional: .pptx slide images)" \
   || warn "no libreoffice — .pptx resources contribute text but no slide images"
 
 echo "--- python packages"
-for mod in google.genai assemblyai requests playwright weasyprint markdown PIL; do
+DRIVER_MOD=selenium; [ "$BROWSER_KIND" = "chrome" ] && DRIVER_MOD=playwright
+for mod in google.genai assemblyai requests "$DRIVER_MOD" weasyprint markdown PIL; do
   "$PY" -c "import $mod" 2>/dev/null && ok "$mod" || bad "$mod not importable by $PY"
 done
 
@@ -212,6 +228,12 @@ fi
 if [ -z "$CLAUDE_BIN" ] && [ -x "$HOME/.local/bin/claude" ]; then
   CLAUDE_BIN="$HOME/.local/bin/claude"
 fi
+# A CLAUDE_CLI_BIN naming a file that isn't there is the same as none — the
+# summarizer would fall through to Gemini exactly as if it were unset.
+if [ -n "$CLAUDE_BIN" ] && [ ! -x "$CLAUDE_BIN" ]; then
+  bad "CLAUDE_CLI_BIN=$CLAUDE_BIN does not exist or is not executable"
+  CLAUDE_BIN=""
+fi
 if [ -z "$CLAUDE_BIN" ]; then
   bad "claude CLI not found — install it with: curl -fsSL https://claude.ai/install.sh | bash"
   warn "  (without it the chain falls back to Gemini for every summary)"
@@ -226,20 +248,28 @@ else
   fi
 fi
 
-echo "--- Chrome + the persistent login profile"
-CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-$MEETING_BOT_ROOT/chrome-profile}"
-if command -v google-chrome-stable >/dev/null 2>&1; then
-  ok "chrome $(google-chrome-stable --version 2>/dev/null | awk '{print $3}')"
-fi
-if [ -f "$CHROME_PROFILE_DIR/Default/Cookies" ]; then
-  age_days=$(( ( $(date +%s) - $(stat -c %Y "$CHROME_PROFILE_DIR/Default/Cookies") ) / 86400 ))
+echo "--- the browser's persistent login profile"
+PROFILE_DIR="$("$PY" "$SCRIPT_DIR/screen/browser.py" info | sed -n 's/^profile: //p')"
+case "$BROWSER_KIND" in
+  chrome)  COOKIES="$PROFILE_DIR/Default/Cookies" ;;
+  *)       COOKIES="$PROFILE_DIR/cookies.sqlite" ;;
+esac
+if [ -f "$COOKIES" ]; then
+  age_days=$(( ( $(date +%s) - $(stat -c %Y "$COOKIES") ) / 86400 ))
   ok "login profile exists (cookies last written ${age_days}d ago)"
   [ "$age_days" -gt 25 ] && warn "the Google session may have expired — ./first_time_login.sh"
+  if [ -n "${BOT_GOOGLE_ACCOUNT:-}" ]; then
+    # Opens the profile headless — skipped while a recording holds it.
+    if "$PY" "$SCRIPT_DIR/screen/browser.py" check-account 2>&1 | sed 's/^/  /'; then
+      ok "the profile is signed in as BOT_GOOGLE_ACCOUNT (or it could not be read)"
+    else
+      bad "the profile is not signed in as $BOT_GOOGLE_ACCOUNT — ./first_time_login.sh"
+    fi
+  else
+    warn "BOT_GOOGLE_ACCOUNT is not set — the recorder won't check the account"
+  fi
 else
-  bad "no login profile at $CHROME_PROFILE_DIR — run ./first_time_login.sh"
-fi
-if [ -e "$CHROME_PROFILE_DIR/SingletonLock" ]; then
-  warn "a stale Chrome SingletonLock is present (it is removed automatically at launch)"
+  bad "no login profile at $PROFILE_DIR — run ./first_time_login.sh"
 fi
 
 echo "--- the display + audio + capture chain (a real 2-second recording)"
@@ -279,7 +309,7 @@ fi
 if [ "$DO_BROWSER" -eq 1 ]; then
 echo ""
 echo "=================================================================="
-echo "Browser smoke — real Chrome, recorded, without a meeting"
+echo "Browser smoke — the real browser, recorded, without a meeting"
 echo "=================================================================="
 # Everything stage 1 does except joining a call: Chrome under Xvfb through
 # Playwright with the recorder's own flags, its audio in this run's sink, and
@@ -292,10 +322,12 @@ SMOKE_MP4="$SMOKE_DIR/browser.mp4"
 SMOKE_PNG="$SMOKE_DIR/browser.png"
 GEOM="${RECORD_GEOMETRY:-1920x1080}"
 
-if ! command -v google-chrome-stable >/dev/null 2>&1; then
-  bad "browser: google-chrome-stable is not installed"
-elif ! "$PY" -c "import playwright" 2>/dev/null; then
-  bad "browser: playwright is not installed in $PY"
+SMOKE_KIND="$("$PY" "$SCRIPT_DIR/screen/browser.py" info | awk '/^browser:/ {print $2}')"
+SMOKE_MOD=selenium; [ "$SMOKE_KIND" = "chrome" ] && SMOKE_MOD=playwright
+if ! "$PY" "$SCRIPT_DIR/screen/browser.py" info | grep -q '^binary:  /'; then
+  bad "browser: $SMOKE_KIND is not installed"
+elif ! "$PY" -c "import $SMOKE_MOD" 2>/dev/null; then
+  bad "browser: $SMOKE_MOD is not installed in $PY"
 else
   DISPLAY_NUM="$(xsession_pick_display)" || DISPLAY_NUM=""
   if [ -z "$DISPLAY_NUM" ]; then
@@ -311,21 +343,25 @@ else
     if xsession_start_xvfb "$DISPLAY_NUM" "$GEOM" && xsession_audio_start "$SINK"; then
       export DISPLAY=":$DISPLAY_NUM"
       export PULSE_SINK="$SINK"
+      # The window belongs on the Xvfb head, not on this desktop (see
+      # record_screen.sh: the same three lines, for the same reason).
+      unset WAYLAND_DISPLAY XDG_SESSION_TYPE
+      export GDK_BACKEND=x11 MOZ_ENABLE_WAYLAND=0
       ffmpeg -y -loglevel error -f x11grab -video_size "$GEOM" -framerate 10 \
         -i ":$DISPLAY_NUM" -f pulse -i "${SINK}.monitor" \
         -c:v libx264 -preset ultrafast -crf 28 -c:a aac -pix_fmt yuv420p \
-        -t 8 "$SMOKE_MP4" >/dev/null 2>&1 &
+        -t 14 "$SMOKE_MP4" >/dev/null 2>&1 &
       SMOKE_FFMPEG=$!
 
-      if "$PY" "$SCRIPT_DIR/screen/browser_smoke.py" --seconds 5 \
+      if "$PY" "$SCRIPT_DIR/screen/browser_smoke.py" --seconds 10 \
            --screenshot "$SMOKE_PNG" > "$SMOKE_DIR/smoke.log" 2>&1; then
-        ok "browser: Chrome launched via Playwright with the recorder's flags"
+        ok "browser: $SMOKE_KIND launched through browser.open_page (the recorder's launch)"
         WIN="$(grep -o 'Window is [0-9]*x[0-9]*' "$SMOKE_DIR/smoke.log" | awk '{print $3}')"
         echo "  viewport: ${WIN:-unknown} (head is $GEOM; 1px under is normal)"
         [ -s "$SMOKE_PNG" ] && ok "browser: page screenshot captured" \
           || warn "browser: no screenshot written"
       else
-        bad "browser: Chrome failed to launch — see $SMOKE_DIR/smoke.log"
+        bad "browser: $SMOKE_KIND failed to launch — see $SMOKE_DIR/smoke.log"
         sed 's/^/    /' "$SMOKE_DIR/smoke.log" | tail -n 15
       fi
 
@@ -343,13 +379,15 @@ else
         if [ "$(stat -c %s "$SMOKE_MP4")" -gt 20000 ]; then
           ok "browser: the capture has real picture content in it"
         else
-          bad "browser: the capture is suspiciously small — Chrome may not have rendered"
+          bad "browser: the capture is suspiciously small — the browser may not have rendered"
         fi
         # The check that actually matters: measure the recorded frame for the
         # black bands a mispositioned or mis-sized window leaves behind. This
         # is how the missing --window-position=0,0 was found; comparing window
-        # sizes would not have caught it.
-        ffmpeg -y -loglevel error -ss 3 -i "$SMOKE_MP4" -frames:v 1 \
+        # sizes would not have caught it. Sampled near the END of the capture:
+        # Firefox through geckodriver takes ~4s to map its window, and a frame
+        # from before that is the bare root window — all "black band".
+        ffmpeg -y -loglevel error -sseof -2 -i "$SMOKE_MP4" -frames:v 1 \
           "$SMOKE_DIR/frame.png" 2>/dev/null
         if [ -s "$SMOKE_DIR/frame.png" ] && "$PY" -c "import PIL" 2>/dev/null; then
           BANDS="$("$PY" - "$SMOKE_DIR/frame.png" <<'PYEOF'
@@ -454,13 +492,14 @@ record_meeting() {
   local label="$1" url="$2"
   echo ""
   echo "=================================================================="
-  echo "$label — real Chrome joining a live call for ${MINUTES} minute(s)"
+  echo "$label — the real browser joining a live call for ${MINUTES} minute(s)"
   echo "=================================================================="
   echo "  input: $url"
   echo "  Admit the bot if the call has a waiting room; it leaves on its own"
   echo "  after ${MINUTES} minute(s) via the normal kill path."
 
-  bash "$SCRIPT_DIR/pipeline.sh" "$url" --name "verify_${label}" > \
+  # --foreground: this check waits on the pipeline itself.
+  bash "$SCRIPT_DIR/pipeline.sh" "$url" --name "verify_${label}" --foreground > \
     "$MEETING_BOT_ROOT/verify_${label}.log" 2>&1 &
   local pipeline_pid=$!
 

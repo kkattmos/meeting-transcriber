@@ -1,7 +1,7 @@
 # See meeting-bot-resume.service. Every 15 minutes, and 5 minutes after boot
 # so a run interrupted by a reboot mid-wait comes back on its own.
 [Unit]
-Description=Meeting bot: periodically resume paused runs
+Description=Meeting bot: periodically resume unfinished runs
 
 [Timer]
 OnBootSec=5min

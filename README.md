@@ -1,13 +1,17 @@
 # meeting-transcriber
 
-A meeting/lecture bot for a Proxmox box running **Debian 13 (trixie)**. It joins
-a Google Meet or Zoom call in a real signed-in Chrome, records the screen and
-audio to MP4, transcribes it, and writes an AI summary — as Markdown **and as a
-PDF with the slides from the video inlined** — combining the transcript with
-keyframes pulled from the recording. It also works on YouTube links, on Kaltura
-lecture-capture embeds (paste the `<iframe>` from your LMS), and on video
-files you already have, and it can read the lecturer's own slides from a GitHub
-repo or a folder and use them as reference material.
+A meeting/lecture bot that runs on a **Debian 13 (trixie) server VM on
+Proxmox**, as root, with its state under `/opt/meeting-bot`. It joins a
+Google Meet or Zoom call — or creates a new Google Meet and hosts it — in a
+signed-in **Google Chrome** (Firefox ESR is selectable), on a hidden display,
+records the screen and audio to MP4 **in the background**, transcribes it,
+and writes an AI summary — as Markdown **and as a PDF** — combining the
+transcript with keyframes pulled from the recording. It also works on YouTube
+links, on Kaltura lecture-capture embeds (paste the `<iframe>` from your LMS),
+and on video files you already have, and it can read the lecturer's own
+slides from a GitHub repo or a folder and use them as reference material. A
+small web UI, run by systemd, does all of that from a browser — including
+the run history, and an optional copy of every PDF in Google Drive.
 
 The three stages are independent — each has its own entry script and runs
 without the others — and `pipeline.sh` chains them.
@@ -15,22 +19,29 @@ without the others — and `pipeline.sh` chains them.
 - **Everything you run day to day is in [Commands](#commands).**
 - Architectural decisions and the reasons behind them live in `CLAUDE.md`.
 
-> **Coming from the Alpine version?** That tree is preserved on the
-> `alpinelinux` branch. This branch runs everything natively on Debian: no
-> Docker, no container image, no bind mounts. See
-> [What changed on Debian 13](#what-changed-on-debian-13).
+> **Other versions.** This is the `debian13-in-proxmox` branch: the server
+> deployment. The same code as a desktop install (your own user, Firefox ESR,
+> pm2) is on `debian13`, which is where features are developed first; the
+> one-container Docker build is on `docker`; the Alpine host + Debian recorder
+> container is on `main`; an Ubuntu VM build is on `deprecated_proxmox_ubuntu`;
+> native Windows is on `windows`.
 
 ---
 
 ## Table of contents
 
 - [How it works](#how-it-works)
-- [What changed on Debian 13](#what-changed-on-debian-13)
+- [Running on a Proxmox VM](#running-on-a-proxmox-vm)
 - [Install](#install)
-- [First-time login (you can't see a window)](#first-time-login-you-cant-see-a-window)
+- [First-time login](#first-time-login)
+- [Web UI](#web-ui)
 - [Commands](#commands)
+- [Hosting a new Google Meet](#hosting-a-new-google-meet)
+- [Discord voice bot](#discord-voice-bot) (in progress)
 - [Summarizing part of a video](#summarizing-part-of-a-video)
 - [Slides and reference material](#slides-and-reference-material)
+- [Google Drive upload](#google-drive-upload)
+- [Clearing the run history](#clearing-the-run-history)
 - [Resuming a failed run](#resuming-a-failed-run)
 - [Parallelism](#parallelism)
 - [Output format](#output-format)
@@ -52,10 +63,10 @@ flowchart LR
         MP4[".mp4 on disk"]
     end
 
-    REC["record<br/>(Chrome + Xvfb + PulseAudio + ffmpeg)"]
+    REC["record<br/>(Firefox ESR + Xvfb + PipeWire/Pulse + ffmpeg)"]
     FETCH["fetch_video<br/>(yt-dlp / Kaltura API)"]
-    TR["transcribe<br/>(AssemblyAI / youtube-transcript.io / Kaltura captions)"]
-    FR["frames<br/>(ffmpeg scene-change + periodic)"]
+    TR["transcribe<br/>(AssemblyAI / YouTube captions / Kaltura captions)"]
+    FR["frames<br/>(one ffmpeg decode, saved on change)"]
     RES["resources<br/>(GitHub repo / folder)"]
     SUM["summarize<br/>(claude CLI, falling back to Gemini)"]
     OUTMD([summaries/&lt;run_id&gt;.md])
@@ -88,15 +99,15 @@ downloaded file and `fetch_video` runs first, ahead of both branches.
 
 | Stage | Does | Needs |
 |---|---|---|
-| `record` | Joins the call, records screen + audio to MP4 | Chrome, Xvfb, PulseAudio, a signed-in profile |
+| `record` | Joins (or creates) the call, records screen + audio to MP4, in the background | Firefox ESR (or Chrome), Xvfb, `pactl`, a profile signed in as `BOT_GOOGLE_ACCOUNT` |
 | `fetch_video` | Downloads a YouTube video (for frames only) or a Kaltura entry (for frames *and* audio) | yt-dlp / nothing (Kaltura needs no key) |
-| `transcribe` | Local file → AssemblyAI; YouTube → youtube-transcript.io captions; Kaltura → its own captions if it has any, else AssemblyAI | `ASSEMBLYAI_API_KEY_1..3` / `YT_TRANSCRIPT_KEY_1..10` |
-| `frames` | Scene-change + periodic keyframes → `manifest.json` | ffmpeg |
+| `transcribe` | Local file → AssemblyAI; YouTube → YouTube's own captions (yt-dlp), else youtube-transcript.io; Kaltura → its own captions if it has any, else AssemblyAI | `ASSEMBLYAI_API_KEY_1..3` / `YT_TRANSCRIPT_KEY_1..10` (optional for YouTube) |
+| `frames` | A keyframe each time the slide changes → `manifest.json` | ffmpeg + Pillow |
 | `summarize` | Transcript + frames (+ slides) → Markdown + PDF | the `claude` CLI signed into your Claude subscription / `GEMINI_API_KEY_1..3` |
 
 Where the outputs go is **configured, not assumed** — the five directories are
-independent variables, so summaries can sit on a NAS while recordings stay on
-the big local disk:
+independent variables, so summaries can sit in a synced library (SeaDrive, a
+NAS) while frames stay on the local disk:
 
 ```
 $RECORDINGS_DIR/<run_id>.mp4            screen + audio
@@ -105,101 +116,81 @@ $FRAMES_DIR/<run_id>/                   keyframes + manifest.json
 $SUMMARIES_DIR/<run_id>.md              the deliverable
 $PDF_DIR/<run_id>.pdf                   the readable deliverable
 
-$MEETING_BOT_ROOT/                      the pipeline's own bookkeeping
+$MEETING_BOT_ROOT/                      the pipeline's own bookkeeping (~/.local/share/meeting-bot)
 ├── runs/<run_id>/                       state.json, logs/, kill, admitted, record.pid,
 │                                        and the YouTube/Kaltura download while the run
 │                                        is in progress (deleted once it is summarized)
+├── logs/                                a background meeting's pipeline_*.log, web UI trigger_*.log
 ├── state/keycursor.json                 API-key rotation cursor
 ├── tmp/                                 claude CLI scratch cwd + cached system prompts
 ├── resources/                           cached slide repos + rendered slides
-└── chrome-profile/                      persistent Google/Zoom login
+├── firefox-profile/                     persistent Google/Zoom login (MEETING_BROWSER=firefox-esr)
+└── chrome-profile/                      the same, for MEETING_BROWSER=chrome
 ```
 
 ---
 
-## What changed on Debian 13
+## Running on a Proxmox VM
 
-The Alpine build could not run Chrome: Alpine is musl, Google ships no musl
-build, and Playwright doesn't support Alpine for its bundled browsers. So the
-browser half lived in a Debian container on an Alpine host. Debian 13 is glibc,
-so **that split is gone** and everything runs natively.
+This branch is the server deployment of the code on `debian13` — the
+features are identical; only how it is installed and run differs:
 
-| | `alpinelinux` branch | this branch |
+| | This VM (`debian13-in-proxmox`) | Desktop PC (`debian13`) |
 |---|---|---|
-| Host | Alpine (musl) | Debian 13 (glibc) |
-| Browser stages | Debian container via Docker | Native |
-| Docker | Required | Not used at all |
-| Per-run isolation | Container namespaces (`:99`, `meeting_sink` hardcoded) | Display + PulseAudio sink allocated per run (`lib/xsession.sh`) |
-| Init system | OpenRC (no systemd) | systemd — `setup.sh --with-trigger` installs the trigger unit, `--with-resume-timer` the resume timer |
-| Summarizer | Gemini first, API key | **Claude first, on your subscription** via the `claude` CLI; Gemini as fallback |
-| Keys | One each; YouTube tokens in a JSON file | **Numbered slots in `.env`**, round-robin (3 Gemini, 3 AssemblyAI, 10 YouTube) |
-| Output | Markdown, fixed layout under `/opt/meeting-bot` | Markdown **+ PDF**, five independently configured directories |
-| Slides | — | `--resources` pulls a GitHub repo or folder into the prompt and the PDF |
+| User | **root** | your own account |
+| Bot state | **`/opt/meeting-bot`** | `~/.local/share/meeting-bot` |
+| Python | **`/opt/meeting-bot-venv`**, built by uv | `.venv` in the repo |
+| Browser | **google-chrome-stable** via Playwright; Firefox ESR selectable (`--with-firefox`) | Firefox ESR; Chrome selectable |
+| Audio | the **PulseAudio daemon**, started on demand | the desktop's PipeWire |
+| Sign-in | **noVNC** (`./first_time_login.sh --novnc`) | a window on the desktop |
+| Services | **systemd**: `meeting-bot-trigger.service` + `meeting-bot-resume.timer`, on at boot once enabled | pm2, off at boot |
 
-Two consequences worth knowing:
-
-- **Per-run isolation is now explicit.** `lib/xsession.sh` claims a free
-  display number by creating `/tmp/.X<n>-lock` with `O_EXCL` (so two runs
-  starting in the same second can't pick the same one) and loads a null sink
-  named after the run. Chrome is pointed at that sink with `PULSE_SINK` — the
-  default sink is *never* changed, because that is global state and flipping it
-  would move another meeting's audio into this recording.
-- **Recording is no longer isolated by a container.** Two concurrent recordings
-  are still fine, but they share one PulseAudio daemon and one X server.
+Per-run isolation is the same: `lib/xsession.sh` claims a free display number
+for each recording and loads a PulseAudio null sink named after the run, and
+the browser is pointed at that sink with `PULSE_SINK`.
 
 ---
 
 ## Install
 
-Target: Debian 13 (trixie) on Proxmox (LXC container or KVM VM), 4 vCPU / 8 GB.
+Target: Debian 13 (trixie), as root, on a Proxmox LXC container or KVM VM
+(4 vCPU / 8GB is enough for one recording at a time — see `CLAUDE.md` for the
+measured capacity).
 
 ```bash
-sudo -H ./setup.sh
+sudo -H ./setup.sh --with-trigger --with-resume-timer
 ```
 
-That installs the system packages (ffmpeg, Xvfb, PulseAudio, x11vnc/noVNC,
-poppler, Pango for the PDF renderer, Thai fonts — plus the vendored Bai
-Jamjuree and Sarabun from `fonts/`), real `google-chrome-stable`
-from Google's repository, the Python venv at `/opt/meeting-bot-venv`, yt-dlp,
-and the working directories.
+One step, as root. It installs the apt packages — ffmpeg, Xvfb, PulseAudio,
+x11vnc/noVNC, poppler, Pango for the PDF renderer, Thai fonts and the Thai
+locale — real **google-chrome-stable** from Google's repository, **uv** and
+the hash-pinned venv at `/opt/meeting-bot-venv`, **yt-dlp** and **deno** (its
+JavaScript runtime for YouTube) in `/usr/local/bin`, the vendored Bai Jamjuree
+and Sarabun fonts, and a `.env` from `.env.example` with a fresh
+`MEETING_BOT_TOKEN`. `--with-trigger` installs and starts the web UI as a
+systemd service, `--with-resume-timer` the 15-minute resume timer; both start
+at boot. Other flags: `--no-chrome` (a box that only transcribes and
+summarizes), `--with-firefox` (Firefox ESR + geckodriver, for
+`MEETING_BROWSER=firefox-esr`), `--with-libreoffice` (render `.pptx` slides
+into the PDF, ~700MB).
 
 **Python dependencies are pinned.** `requirements.txt` (and
-`requirements-browser.txt`, which is skipped by `--no-chrome`) hold every
-package and transitive dependency at an exact version with a SHA-256 hash. Both
-are generated from the `requirements.in` files beside them. This is what stops
-two boxes built months apart from getting different SDK versions — the failure
-mode there is an SDK that quietly changes its request surface and turns a
-working install into a 400 on every summary.
-
-**uv is optional but worth installing** — same pinned result, ~40x faster
-(measured on this target: 4s versus 2m43s):
+`requirements-browser.txt`) hold every package and transitive dependency at an
+exact version with a SHA-256 hash, generated from the `requirements.in` files
+beside them. To change a dependency, edit the `.in` file, then:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-`setup.sh` uses it automatically when it's on `PATH` and falls back to pip
-otherwise; both verify the lockfile's hashes, so the venv is identical either
-way. uv is not in Debian's archive, which is why it stays optional.
-
-To change a dependency, edit `requirements.in`, then regenerate (needs uv):
-
-```bash
-uv pip compile --generate-hashes requirements.in -o requirements.txt
+uv pip compile --generate-hashes --python-version 3.13 --python-platform x86_64-unknown-linux-gnu requirements.in -o requirements.txt
 ```
 
 ```bash
-uv pip compile --generate-hashes -c requirements.txt requirements-browser.in -o requirements-browser.txt
+uv pip compile --generate-hashes --python-version 3.13 --python-platform x86_64-unknown-linux-gnu -c requirements.txt requirements-browser.in -o requirements-browser.txt
 ```
 
-Useful flags:
-
-```bash
-sudo -H ./setup.sh --no-chrome          # transcribe/summarize box only
-sudo -H ./setup.sh --with-libreoffice   # so .pptx slides can be rendered into the PDF (~700MB)
-sudo -H ./setup.sh --with-trigger       # install + enable the systemd trigger service
-sudo -H ./setup.sh --with-resume-timer  # every 15 min, resume runs paused on the Claude usage window
-```
+Wherever the rest of this README says `.venv/bin/python3`, use
+`/opt/meeting-bot-venv/bin/python3`; wherever it says `~/.local/bin/claude`,
+use `/root/.local/bin/claude`; and `./first_time_login.sh` needs `--novnc`
+(the VM has no screen).
 
 ### Sign the summarizer in
 
@@ -212,90 +203,205 @@ curl -fsSL https://claude.ai/install.sh | bash
 ```
 
 ```bash
-claude auth login
+~/.local/bin/claude auth login
 ```
 
-`claude auth login` opens a browser flow. On this box there is no browser you
-can see, so either run it through the same noVNC session
-[`first_time_login.sh`](#first-time-login-you-cant-see-a-window) sets up, or
-generate a long-lived token on a machine you *can* see and paste it in:
+`.env.example` already points `CLAUDE_CLI_BIN` at `~/.local/bin/claude`, where
+that installer puts it — set explicitly because pm2 and background runs don't
+always inherit your shell's `PATH`. (The Claude desktop app's bundled CLI is
+not the same install and is not signed in on its own.) Check it any time with:
 
 ```bash
-claude setup-token
+~/.local/bin/claude auth status
 ```
 
-`setup.sh` does not install the CLI: it comes from Anthropic's own installer
-rather than apt, and it is per-user state (the login lives in `~/.claude`),
-so it is not part of a root system bootstrap. Check it any time with:
-
-```bash
-claude auth status
-```
-
-If the CLI is missing or signed out, the summarize stage says so and falls
-through to Gemini rather than failing the run — but the summaries you get are
-Gemini's, so it is worth checking. `./verify_e2e.sh --preflight` reports it.
+If the CLI is missing or signed out, the summarize stage falls through to
+Gemini (if you have Gemini keys) — the provenance header of every document says
+which model wrote it. `./verify_e2e.sh --preflight` reports it too.
 
 Then configure:
 
 ```bash
-cp .env.example .env && chmod 600 .env
 $EDITOR .env
 ```
 
-Fill in the API keys (Gemini, AssemblyAI, youtube-transcript.io — Claude
-needs none) and the five output directories. Check them with:
+Set **`BOT_GOOGLE_ACCOUNT`** (the Google address the bot signs in as), the API
+keys (Gemini, AssemblyAI, youtube-transcript.io — Claude needs none) and the
+five output directories. `~/` at the start of a value means your home
+directory. Check them with:
 
 ```bash
-/opt/meeting-bot-venv/bin/python3 lib/paths.py show
-/opt/meeting-bot-venv/bin/python3 lib/keyring.py status    # counts keys, never prints them
-./verify_e2e.sh --preflight                                # everything, including a real 2s capture
+.venv/bin/python3 lib/paths.py show
+.venv/bin/python3 lib/keyring.py status    # counts keys, never prints them
+./verify_e2e.sh --preflight                # everything, including a real 2s capture
 ```
-
-> **Running in an LXC container?** No nesting flag is needed any more (that was
-> for Docker). The container does need `/dev/shm` of a sane size for Chrome —
-> the default 64MB is enough here because Chrome runs with
-> `--disable-dev-shm-usage`.
 
 ---
 
-## First-time login (you can't see a window)
+## First-time login
 
-Run this once, and again whenever your Google or Zoom session expires. It opens
-a real Chrome on a headless display using the same persistent profile the
-recorder reuses, and exposes it to **you** over noVNC.
+Run this once, and again whenever the bot's Google or Zoom session expires:
 
 ```bash
 ./first_time_login.sh
 ```
 
-It prints an `ssh -L ...` command to run on your own machine, then you open
-`http://localhost:6080/vnc.html` and sign in. Nothing is exposed to the network.
+It opens the bot's own browser — a separate Firefox ESR instance on the bot's
+profile, not your everyday Firefox — as a window on your desktop, on Google's
+sign-in page with **`BOT_GOOGLE_ACCOUNT` already filled in**. Sign in as that
+account only (sign out of any other that appears), then open `zoom.us` in the
+same window and sign in there too if you record Zoom calls. Close the window
+when you're done.
 
-Other ways in:
+When the window closes, the script checks which Google accounts the profile
+holds and exits 1 unless `BOT_GOOGLE_ACCOUNT` is among them. The recorder makes
+the same check before every Google Meet — a profile signed in as anyone else
+(or signed out) is refused with a `wrong_account.png` in the run — and it
+opens the meeting with `authuser=<BOT_GOOGLE_ACCOUNT>`, so Meet uses that
+account even if the profile holds another. Check it any time with:
 
 ```bash
-./first_time_login.sh --tailscale      # bind to this host's tailnet IP instead
+./first_time_login.sh --check
+```
+
+From another machine, or on a box with no desktop, the old noVNC path is still
+there:
+
+```bash
+./first_time_login.sh --novnc          # headless Xvfb + noVNC on localhost:6080
+./first_time_login.sh --tailscale      # noVNC on this host's tailnet IP
 ./first_time_login.sh --bind 0.0.0.0   # every interface (see the warning it prints)
-./first_time_login.sh --screenshot     # also dump the display to a PNG every 10s
+./first_time_login.sh --screenshot     # (noVNC) also dump the display to a PNG every 10s
 ./first_time_login.sh --url https://zoom.us/signin
 ```
 
-`--screenshot` is the fallback for when noVNC can't reach at all: it writes
-`$MEETING_BOT_ROOT/login-screenshots/latest.png`, which you can `scp` down to
-see what's actually on screen.
-
-Sign into Google, then open `zoom.us` in the same window and sign in there too.
-Both land in the shared profile at `$CHROME_PROFILE_DIR`. Press `Ctrl+C` when
-done.
-
-> The VNC session has no password and fronts a browser holding your Google
+> The VNC session has no password and fronts a browser holding the bot's Google
 > session. The default localhost binding is the safe one; only use `--bind` on a
 > network you trust, and stop the script as soon as you're signed in.
 
-Chrome is launched **directly** here, not through Playwright: even with
-`channel="chrome"`, Playwright sets automation flags that Google's sign-in flow
-rejects with "This browser or app may not be secure".
+The browser is launched **directly** here, never through Selenium or
+Playwright: a driven browser sets `navigator.webdriver`, and Google's sign-in
+flow rejects that with "This browser or app may not be secure". (The recorder
+*is* driven, and Firefox ESR 140 still exposes `navigator.webdriver` there —
+joining a Meet with an already-signed-in profile is a different check from
+signing in, but it is the first suspect if Meet ever starts refusing the bot;
+`MEETING_BROWSER=chrome` is the fallback.)
+
+---
+
+## Web UI
+
+> **On this VM** the web UI is a systemd service (`meeting-bot-trigger.service`)
+> and the resume loop a systemd timer (`meeting-bot-resume.timer`).
+> `./webui.sh on|off|restart|status|url|logs` works as described below, as
+> root; `on` also enables both at boot, `off` disables them. Wherever this
+> section says pm2, read systemd.
+
+Off until you switch it on, and off again after a reboot — pm2 runs it, but
+nothing registers it to start at boot:
+
+```bash
+./webui.sh on       # start the web UI and the 15-minute resume loop
+```
+
+```bash
+./webui.sh off      # stop both
+```
+
+```bash
+./webui.sh restart  # after changing MEETING_BOT_TOKEN/PORT/BIND; other .env edits apply to the next run
+```
+
+`./webui.sh on` prints the address(es) to open with the token already in them
+(`http://localhost:8765/#token=…` — the part after `#` never reaches the
+server or any log; the page keeps it in that browser). It listens on
+`MEETING_BOT_BIND` = `127.0.0.1,tailscale` by default: this machine, plus this
+PC's Tailscale address for your phone (skipped with a warning if Tailscale is
+down). `./webui.sh status`, `./webui.sh url` and `./webui.sh logs` do what
+they say.
+
+The second pm2 process, `meeting-bot-resume`, starts `pipeline.sh --resume-all`
+every 15 minutes — the backstop that finishes a summary paused on the Claude
+usage window once it resets, or one interrupted by a shutdown. Each resume
+runs detached from pm2 (`web/resume.sh`) and logs to
+`~/.local/share/meeting-bot/logs/resume.log`, so a long summary is not cut off
+at the next tick, and `./webui.sh off` does not stop one already under way.
+To stop one, signal its process group (it is resumable afterwards):
+`kill -TERM -- -$(ps -o pgid= -p $(cat ~/.local/share/meeting-bot/runs/<id>/run.lock/pid))`.
+
+The page follows the look of the summary PDF (DESIGN.md: navy section
+banners, green/amber/red boxes) in a light or dark theme, whichever your
+system uses. Two-or-three-way choices are button groups with a ✓ on the chosen
+one, on/off options are switches, and every field says ✓ / ⚠ / ✗ under itself
+as you type.
+
+- **New Google Meet** — one button: the bot creates a meeting, shows you the
+  link to share (with **Join** and **Copy link**), admits everyone, records,
+  and summarizes. **End & stop recording** ends it early, after a red
+  confirmation bar. See [Hosting a new Google Meet](#hosting-a-new-google-meet).
+- **Record / summarize** — the pipeline's options as a form: inputs one per
+  line (with `#t=` windows), spoken language, clip, tags, reference
+  material, and switches for **Combine into one document** (written to the
+  usual summaries and PDF folders, named for the combine run),
+  **Combined: Markdown only**, playlists and start over. About a second after you stop typing the page runs
+  `pipeline.sh --dry-run` with exactly those options — the real parser, so a
+  typo is caught before anything is downloaded or billed — and marks **every
+  input line** ✓ (its kind, new run or which run it resumes, its window) or ✗
+  with the reason. Warnings (a name that will be ignored, **Start over**
+  re-running paid stages, playlists expanding) are listed above the button.
+  **Start N runs** only unlocks once the current form has passed a check;
+  when the runs end the page says how many finished, failed or paused.
+- **Summary**, on both tabs: the style (`video`, `meeting`, `lecture`,
+  `tutorial`, `reality`, `drama`), the language it is written in (Thai or English), the PDF
+  font (only the ones that language offers; defaults from `PDF_FONT_TH` /
+  `PDF_FONT_EN`), and a free-text **Extra instructions** box for this run
+  ("focus on the exam hints", "list every decision with its owner"). Also
+  **Save recording** (video, or audio only — meetings) and **Summarize from**
+  (frames and voice, or voice only); audio only forces voice only. See
+  [Voice only and audio-only recordings](#voice-only-and-audio-only-recordings).
+- **Send the PDF to Google Drive**, on both tabs: a switch, then a folder
+  browser over the bot account's Drive (My Drive, Shared with me, shared
+  drives) and a file-name box (empty = the summary's title). See
+  [Google Drive upload](#google-drive-upload).
+- **Runs** — the run history. Every run with a status badge (recording,
+  running, paused, failed, done, in a combined set), its tags, ☁ when its PDF
+  is in Drive, and its stages as labelled pills (`✓ transcribe`,
+  `✗ summarize`, `✓ drive` … — stages that never run for that kind of input
+  are left out), live meeting audio, the created meeting's link and **Join**.
+  - **Categories**: filter chips by status, type (meeting, YouTube, Kaltura,
+    file, combined), style and your own **tags** (OR within a group, AND
+    across groups; each chip shows how many runs it would show), plus a
+    search box over the id, input, name and tags.
+  - Open a run for its settings, the summary and PDF paths (with **Copy
+    path**), the Drive link, the tail of each stage log, **Resume** /
+    **Stop**, a **Tags** editor, **Send PDF to Drive…** (for a finished run,
+    or to send it again elsewhere — only the upload runs), its **Cache** —
+    frames, the chunk cache and the download, each with its size, removable
+    — and **Clear from history**.
+  - **☐ Select** turns on checkboxes for bulk **+ Tag**, **Remove cache…**
+    and **Clear from history…**; **🧹 Temp files** empties
+    `$MEETING_BOT_ROOT/tmp`. Every destructive action asks in a red bar
+    first. See [Clearing the run history](#clearing-the-run-history).
+
+The same server takes scripted requests (a phone shortcut, say):
+
+```bash
+curl -X POST http://localhost:8765/trigger \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"url": "https://meet.google.com/abc-defg-hij", "name": "Client Call",
+       "resources": "https://github.com/me/course@week4"}'
+```
+
+```bash
+curl -X POST http://localhost:8765/trigger \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"new_meet": true, "name": "Project sync"}'
+```
+
+Both return `202` at once and run `pipeline.sh` in the background, logging to
+`$MEETING_BOT_ROOT/logs/trigger_<timestamp>.log`. The endpoints are listed at
+the top of `trigger_server.py`. A meeting started from the command line shows
+up in **Runs** too, and its `pipeline_*.log` is readable there.
 
 ---
 
@@ -306,9 +412,27 @@ rejects with "This browser or app may not be secure".
 ```bash
 ./pipeline.sh "https://meet.google.com/abc-defg-hij" --name "Weekly Standup"
 ./pipeline.sh "https://zoom.us/j/1234567890" --name "Client Call"
+./pipeline.sh --new-meet --name "Project sync"      # the bot creates the meeting
 ./pipeline.sh "https://www.youtube.com/watch?v=5GAfjAjLKYk"
-./pipeline.sh /srv/recordings/existing.mp4
+./pipeline.sh ~/Videos/existing.mp4
 ```
+
+**A meeting runs in the background.** Anything that records (a Meet or Zoom
+link, `--new-meet`) detaches into its own session and the command returns at
+once:
+
+```
+==> Recording in the background (pid 41233). Closing this terminal won't stop it.
+    Log:    tail -f '~/.local/share/meeting-bot/logs/pipeline_20260929_140501_41230.log'
+    Run:    Weekly_Standup_20260929_140501
+    Status: ./pipeline.sh --list    (or ./pipeline.sh --status <run id>)
+    Stop:   ./kill_meeting.sh --run-id <run id>   (leaves the call cleanly)
+```
+
+The whole run — recording, then transcription and the summary — carries on in
+the background; the browser is on a hidden display, so nothing appears on your
+screen. `--foreground` (or `MEETING_BOT_FOREGROUND=1`) keeps the old attached
+behaviour. YouTube, Kaltura and local files still run in the foreground.
 
 A Kaltura lecture can be given either way — paste the whole `<iframe>` your LMS
 shows you, or just its `src`. Quote it: the tag contains spaces.
@@ -353,7 +477,17 @@ Summarize several videos **as one lecture** — one document, one study guide,
 the model reads every transcript:
 
 ```bash
-./pipeline.sh --from-file chapter3_links.txt --prompt lecture-claude \
+./pipeline.sh --from-file chapter3_links.txt --prompt lecture --combine
+```
+
+With no path, the document goes where every run's does —
+`SUMMARIES_DIR/<combine run id>.md` and `PDF_DIR/<combine run id>.pdf` (the
+web UI's **Combine** switch does exactly this). To name it yourself, give a
+path ending in `.md` (only a next argument ending in `.md` is taken as the
+path):
+
+```bash
+./pipeline.sh --from-file chapter3_links.txt --prompt lecture \
   --combine ~/courses/2_Transcripts/chapter3.md
 ```
 
@@ -411,22 +545,40 @@ keeps the frames too).
 | `--name N` | Meeting name (single input only; otherwise derived) |
 | `--display-name D` | Name the bot shows in the meeting (default `Meeting Bot`) |
 | `--language L` | `th` (default), `en`, `auto`, or any AssemblyAI code |
-| `--prompt P` | A file in `summarize/prompts/`, e.g. `--prompt lecture-claude` |
+| `--prompt P` | The summary style: `video` (default), `meeting`, `lecture`, `tutorial`, `reality` or `drama` — see [Summary styles](#summary-styles) |
+| `--summary-language L` | The language the summary is **written** in: `th` or `en` (default `SUMMARY_LANGUAGE`) |
+| `--pdf-font F` | The PDF's body font: `"Bai Jamjuree"` or `Sarabun` for Thai; `"CMU Serif"` (Computer Modern), `Sarabun` or `"Bai Jamjuree"` for English (default `PDF_FONT_TH` / `PDF_FONT_EN`) |
+| `--instructions T` | Extra instructions for the summarizer, this run only — e.g. `"Focus on what will be on the midterm"` |
+| `--summary-source S` | `both` (default: transcript + frames) or `voice` (transcript only: no frames stage). `--voice-only` is the short form. Default `SUMMARY_SOURCE` |
+| `--record-media M` | Meetings: `video` (default, an MP4) or `audio` (an `.m4a`, summary from the voice). `--audio-only` is the short form. Default `RECORD_MEDIA` |
+| `--source-url URL` | One local file only: the `https://` link of the call it was recorded from, cited by the summary in place of the file's path (the Discord bot passes its voice channel's link) |
 | `--clip W` | Summarize only part of the video, e.g. `--clip 00:05:00-01:30:00` (see below) |
 | `<input>#t=W` | Not a flag: a per-input window, overriding `--clip` for that input |
 | `--resources SPEC` | Slides / notes for this session; repeatable (see below) |
 | `--jobs N` | Inputs processed at once (default 2) |
 | `--from-file F` | Read inputs from a file, one per line |
 | `--playlist` | Expand YouTube playlist URLs |
-| `--combine F` | Summarize all the inputs together, as one document (no per-input summaries) |
-| `--combine-pdf F` | Where the combined PDF goes (default: `--combine`'s path with `.pdf`) |
+| `--combine [F.md]` | Summarize all the inputs together, as one document (no per-input summaries); without a path, into `SUMMARIES_DIR` / `PDF_DIR` named for the combine run |
+| `--combine-pdf F` | Where the combined PDF goes (default: `--combine`'s path with `.pdf`, or `PDF_DIR`) |
 | `--no-combine-pdf` | Write only the combined markdown |
+| `--drive-folder F` | Also put the PDF into this Google Drive folder (id or link) of the bot account — see [Google Drive upload](#google-drive-upload) |
+| `--drive-name N` | The file's name in Drive (`.pdf` added; default: the summary's title) |
+| `--no-drive` | Turn a run's stored Drive upload off |
+| `--tag T` | A label for the run history; repeatable or comma-separated |
+| `--new-meet` | Create a new Google Meet, host it and record it (also: `meet.new` as an input) — see [Hosting a new Google Meet](#hosting-a-new-google-meet) |
+| `--foreground` | Don't detach a meeting into the background (see above) |
+| `--dry-run` | Check every input, window and reference file, print what would run, start nothing. Every unusable input is reported (not just the first), and the exit is 1 if there was one |
 | `--force` | Ignore prior state, start clean |
 | `--run-id ID` / `--resume-last` / `--resume-all` | Resume (see below) |
 | `--list` / `--status ID` | Inspect runs |
 
 The legacy positional form still works when unambiguous:
 `./pipeline.sh <input> [name] [display_name] [language] [prompt]`.
+
+An option that needs a value and doesn't get one (`... --jobs` as the last
+argument, or `--name --jobs 1`) is an error naming the option. It used to
+make `pipeline.sh` loop forever without printing anything. (`--combine` no
+longer needs one.)
 
 ### Individual stages
 
@@ -443,7 +595,7 @@ python3 lib/kaltura.py info "<iframe or src url>"
 python3 lib/kaltura.py download "<iframe or src url>" /tmp/lecture.mp4
 
 # 3 — summarize only
-/opt/meeting-bot-venv/bin/python3 ./summarize/summarize.py \
+.venv/bin/python3 ./summarize/summarize.py \
     <video_or_youtube_url> <transcript.txt> [out.md] \
     [--prompt NAME] [--frames-manifest PATH] [--resources SPEC] \
     [--pdf-out PATH] [--no-pdf] [--no-markdown] [--source-url URL] [--title TEXT]
@@ -452,7 +604,7 @@ python3 lib/kaltura.py download "<iframe or src url>" /tmp/lecture.mp4
 python3 screen/extract_frames.py <video> <out_dir> ["name"]
 
 # PDF only, from a summary you already have
-/opt/meeting-bot-venv/bin/python3 summarize/pdf.py summary.md out.pdf \
+.venv/bin/python3 summarize/pdf.py summary.md out.pdf \
     --frames-manifest "$FRAMES_DIR/<run_id>/manifest.json"
 ```
 
@@ -464,31 +616,135 @@ python3 screen/extract_frames.py <video> <out_dir> ["name"]
 ./kill_meeting.sh --list           # show what's running, kill nothing
 ```
 
+On a run that is past its recording (transcribing, summarizing — or any
+YouTube/Kaltura/local-file run), `--run-id` — and the web UI's **Stop** —
+terminates that run's processes instead. Finished stages are kept, the run is
+marked stopped, and the 15-minute `--resume-all` leaves it alone; resume it
+with **Resume** or `./pipeline.sh --run-id <id>`. Stopping a meeting while it
+records still lets transcribe and summarize run; press Stop again to stop
+those.
+
 `Ctrl+\` in the recording terminal does the same thing. Either way the bot
 clicks **Leave** in the meeting UI so other participants see it go, rather than
 having the browser killed under it. Only if a recorder is still alive after the
 grace period (25s) does `kill_meeting.sh` escalate to signals, and even then
 ffmpeg gets `SIGINT` first so the MP4 is finalised and playable.
 
-### Remote trigger (start a run from your phone over Tailscale)
-
-Debian has systemd, so the bundled unit is usable directly:
+## Hosting a new Google Meet
 
 ```bash
-sudo -H ./setup.sh --with-trigger
-echo "MEETING_BOT_TOKEN=$(openssl rand -hex 24)" | sudo tee -a /etc/meeting-bot.env
-sudo systemctl restart meeting-bot-trigger
+./pipeline.sh --new-meet --name "Project sync"
+```
+
+(or the **New Google Meet** button in the web UI). The bot opens `meet.new` in
+its signed-in browser profile, so **the meeting belongs to
+`BOT_GOOGLE_ACCOUNT`** (it opens `meet.google.com/new?authuser=…` when that is
+set). Then:
+
+1. **The link is announced the moment it exists** — printed as
+   `New Google Meet: https://meet.google.com/xxx-xxxx-xxx`, written to
+   `runs/<run_id>/meet_url`, stored in the run (`--status` shows it) and shown
+   in the web UI with a copy button. Share it however you like.
+2. **Everyone who asks to join is admitted**, checked every 3 seconds.
+3. **Recording starts at once** — the bot is the host, so there is no waiting
+   room for it.
+4. **It waits `NEW_MEET_WAIT_MINUTES` (15) for the first participant.** An
+   empty call it just created is not a meeting that ended, so the idle rules
+   don't apply until someone has joined; if nobody comes, it ends the call.
+5. **Once people have joined, it ends the call for everyone when they've all
+   left** — about 30 seconds after the last one goes. A 1:1 (you and the bot)
+   is a real meeting here, not an idle test call. `MAX_MEETING_MINUTES` and
+   **End & stop recording** / `./kill_meeting.sh --run-id <id>` still work.
+6. Transcription and the summary follow as for any meeting; the summary cites
+   the real `meet.google.com` link.
+
+Every `--new-meet` is a new call: it is never auto-resumed into an earlier run
+(re-running the command creates another meeting). A run whose *recording*
+finished but whose summary failed resumes with `--run-id` as usual.
+
+If the profile isn't signed in as `BOT_GOOGLE_ACCOUNT`, the run fails in
+seconds and says so — run `first_time_login.sh`.
+
+> **Verify on a live call before relying on it.** The admit and "end the call
+> for everyone" buttons are found by their labels, in English and Thai (the
+> bot's browser runs in `th-TH`); the Thai admit labels in particular have not
+> yet been checked against a real call. If knockers are left waiting, the
+> labels in `HOST_ADMIT_LABELS` in `screen/capture.py` are the place to look.
+
+---
+
+## Discord voice bot
+
+> **In progress — not usable yet.** What exists: the recording format and
+> mixer (`lib/discord_spool.py`), the pipeline hand-off (`--source-url`), and
+> two spike bots to decide which Discord library the real bot is built on.
+> The bot itself comes after the spike.
+
+What it will do: in a Discord server, anyone in a voice channel types
+`/record-and-summarize` (optional style, language and instructions). The bot
+joins that voice channel, posts "🔴 Recording started by @you" in its chat,
+records until `/stop` (the requester or someone with Manage Server), 30 s
+after the channel empties, or `MAX_MEETING_MINUTES`. Then it transcribes
+and summarizes, and posts the **PDF into the voice channel's chat and into
+the requester's DMs**. The recording (`.m4a`) stays on this PC in
+`RECORDINGS_DIR`, with one speech-only track per speaker beside it
+(`<name>.speakers/`) for a later upgrade to named speakers. The bot runs as a
+third pm2 app, on and off with `./webui.sh on|off`, and its runs appear in
+the web UI.
+
+Why a spike first: since 2 March 2026 every Discord voice call is end-to-end
+encrypted (DAVE), and a recording bot has to *decrypt* what it receives. Two
+libraries do, differently:
+
+| | Python: discord.py fork + `discord-ext-voice-recv` | Node: discord.js + `@discordjs/voice` 0.19 |
+|---|---|---|
+| Who maintains it | a fork of a fork (zacker150), pinned to a commit | the discord.js team |
+| Timing | RTP timestamps, jitter buffer, lost-packet concealment | arrival time only |
+| Needs | `libopus0` (installed here) | Node ≥ 22.12 (Debian 13 has 20) |
+
+### Setting up the Discord application (once)
+
+1. <https://discord.com/developers/applications> → **New Application**, name
+   it (e.g. "Meeting Bot"). Note the **Application ID** on *General
+   Information*.
+2. **Bot** → **Reset Token** → copy it into `.env` as `DISCORD_BOT_TOKEN=`.
+   Leave every *Privileged Gateway Intent* off — slash commands need none.
+3. Invite it to your test server with this URL (put your Application ID in):
+   `https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot+applications.commands&permissions=1084416`.
+   It asks for View Channels, Send Messages, Attach Files and Connect.
+4. In Discord: *User Settings → Advanced → Developer Mode* on, then
+   right-click the server → **Copy Server ID** → `.env`:
+   `DISCORD_SPIKE_GUILD_ID=`. (The spike registers its commands on that one
+   server, where they appear at once.)
+5. Allow DMs from that server's members (*Privacy Settings* on the server),
+   or the DM half of the test fails. The bot says so in the channel when
+   that happens.
+
+### Running the spike
+
+You need a second person (or a second Discord account on another device) in
+the voice channel. Run each candidate in turn:
+
+```bash
+./spike/discord/py/run.sh
 ```
 
 ```bash
-curl -X POST http://<tailscale-host>:8765/trigger \
-  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-  -d '{"url": "https://meet.google.com/abc-defg-hij", "name": "Client Call",
-       "resources": "https://github.com/me/course@week4"}'
+./spike/discord/node/run.sh --fetch-node
 ```
 
-Returns `202` immediately and runs `pipeline.sh` in the background, logging to
-`$MEETING_BOT_ROOT/logs/trigger_<timestamp>.log`.
+(`--fetch-node` downloads Node 22 into `spike/discord/node/node-v22` the
+first time; nothing is installed system-wide.) In Discord, join a voice
+channel, type `/spike_join`, talk for two minutes — take turns, talk over
+each other once, and leave one long pause — then `/spike_stop`. The bot
+posts `report.json` and `mixed.m4a` into the voice channel's chat and your
+DMs; everything is also in `~/.local/share/meeting-bot/discord/spike/`.
+Listen for: every voice clear (not static or robotic), nobody's words
+shifted against the others', the pause still a pause. Ctrl+C stops the spike
+bot.
+
+Remove the spikes afterwards with `rm -rf spike/discord/py/.venv
+spike/discord/node/node_modules spike/discord/node/node-v22`.
 
 ---
 
@@ -612,11 +868,161 @@ What happens to it:
   against the same material the first attempt used.
 
 A GitHub source that can't be fetched degrades the summary and is reported —
-it doesn't fail the run. A *local* path that doesn't exist fails immediately,
-because that is always a typo, and finding out after paying for a summary is
-worse.
+it doesn't fail the run. A *local* path that doesn't exist fails immediately —
+in `pipeline.sh`, before anything is recorded or transcribed — because that is
+always a typo, and finding out after paying for a summary is worse. So does a
+**binary file with a text name** (a PDF saved as `notes.md`, a `.docx` renamed
+`.txt`): *"this looks like a binary document; convert it to Markdown first."*
+A real `.pdf` is fine; it is read with `pdftotext`. `--from-file` gets the same
+check, since a PDF read as a list of links is a list of garbage inputs.
+
+Every `--resources` applies to every run in the invocation, and the size of
+the text actually sent is printed once per summarize (it goes with every
+chunk, so a large reference is a large part of every request).
+
+### A textbook excerpt with citations
+
+For a course with a textbook, give the reference a small header and use the
+`lecture` prompt. Nothing in the code is course-specific: the same two steps
+work for any subject.
+
+1. Turn the chapters you need into Markdown, e.g.:
+
+   ```bash
+   pdftotext -layout -f 25 -l 110 kurose.pdf kurose-ch1-3.md
+   ```
+
+   Trim it to what the lectures cover — `RESOURCE_MAX_CHARS` (40,000) is the
+   cap, and a focused excerpt beats a truncated book.
+
+2. Put frontmatter at the top:
+
+   ```yaml
+   ---
+   course: Computer Networks I
+   source: "Kurose & Ross, Computer Networking: A Top-Down Approach (7th ed.)"
+   citation_label: Kurose      # the notes cite "(Kurose §2.4)"
+   coverage: "Chapters 1-3 only"
+   ---
+   ```
+
+   `course` and `source` are expected (a missing `course` falls back to the
+   file name, with a warning); `citation_label` defaults to `course`;
+   `coverage` is optional; unknown keys are ignored. Malformed lines are
+   reported and skipped — never fatal.
+
+3. Run with it:
+
+   ```bash
+   ./pipeline.sh ~/Videos/Week03.mp4 \
+       --resources ~/notes/kurose-ch1-3.md --prompt lecture
+   ```
+
+The file's text reaches the model inside
+`<course_reference course="…" source="…" citation_label="…" coverage="…" lecture_language="th">`,
+and the `lecture` prompt's six course-reference rules (which it ignores when
+there is no such block) tell it: the transcript decides what was taught; cite
+only headings that are actually in the excerpt, and say *"not in the provided
+Kurose excerpt"* rather than recall a section number; fix transcription garble
+the book disambiguates; put book-only additions in a `> [!NOTE] From Kurose`
+box; report
+lecturer/book contradictions as contradictions; and give the lecturer's spoken
+term in parentheses on first mention when the lecture language differs.
+
+A Markdown file *without* frontmatter behaves exactly as before.
+
+**Caching:** the rules are in the prompt's static half — one system-prompt file
+for every course — and the reference sits at the top of the per-run half,
+before anything that changes between chunks. So every chunk after the first,
+and every lecture of the same course within the CLI's cache window, reads the
+reference from cache. `cache_read_input_tokens` in `--status`'s usage line is
+where that shows.
 
 ---
+
+## Google Drive upload
+
+The summary PDF can also go to a Google Drive folder — any folder the bot
+account (`BOT_GOOGLE_ACCOUNT`) can add files to, its own or one shared with
+it. It is its own stage, `upload`, after summarize: a failed upload leaves
+the summary done and only `upload` failed, and **Resume** (or
+`./pipeline.sh --run-id <id>`) retries just the upload. A file with the same
+name already in the folder is **replaced** — a new version of the same file,
+so its link stays the same. With `--combine`, only the combined PDF goes.
+
+**Set it up once:**
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create
+   (or pick) a project, enable the **Google Drive API**, and set up the
+   OAuth consent screen (External, Testing; add the bot account as a test
+   user).
+2. **Credentials → Create credentials → OAuth client ID → Desktop app.** Put
+   its id and secret in `.env`:
+
+   ```
+   GDRIVE_CLIENT_ID=….apps.googleusercontent.com
+   GDRIVE_CLIENT_SECRET=…
+   ```
+
+3. On the PC (the sign-in page redirects to `127.0.0.1`, so it has to open
+   there), sign in as the bot account and allow Drive access:
+
+   ```bash
+   .venv/bin/python lib/gdrive.py login
+   ```
+
+   It opens the consent page in the bot's own browser profile, already
+   signed in as the bot (or prints the link, if that profile is busy with a
+   recording, or with `--no-browser`). It refuses to save a login for any
+   other account. The refresh token is kept in
+   `~/.local/share/meeting-bot/state/gdrive_token.json` (mode 600).
+   `lib/gdrive.py status` says whether it is set up; `lib/gdrive.py logout`
+   forgets it. The scope is full Drive access, which the folder browser
+   needs to list folders shared with the bot.
+
+**Use it:** in the web UI, switch on **Send the PDF to Google Drive**, pick
+the folder in the browser and, optionally, a file name. On the command line:
+
+```bash
+./pipeline.sh "https://youtu.be/…" --drive-folder "https://drive.google.com/drive/folders/1AbC…" \
+  --drive-name "Signals — Week 1"
+```
+
+`--drive-folder` takes a folder id or a link pasted from Drive. Without
+`--drive-name` the file is named after the summary's own title. To send a
+run that has already finished (or to send it again, elsewhere or under
+another name), give the Drive options to its `--run-id`, or use **Send PDF
+to Drive…** in its detail: only the upload runs. `--no-drive` turns a
+stored upload off. The link is stored in the run and shown in the web UI.
+
+## Clearing the run history
+
+Runs pile up in `~/.local/share/meeting-bot/runs/`. From the web UI's
+**Runs** tab (or `lib/runadmin.py` with `.env` loaded):
+
+- **Clear from history** removes the run's bookkeeping — its `runs/<id>/`
+  folder (state, logs, the chunk cache, any download) and its frames — so it
+  disappears from the list. **The recording, transcript, summary and PDF are
+  never touched**; they stay in their output folders. A combined run can
+  take its member runs with it; a member of a combined set that still exists
+  cannot be cleared on its own (the set reads its transcript). A run being
+  processed is refused.
+- **Remove cache**, per run or in bulk, any of: **frames**
+  (`FRAMES_DIR/<id>`), the **chunk cache** (finished chunk summaries a
+  resume reuses) and the **download** (a YouTube/Kaltura video in the run
+  folder). All are made again if a resume needs them; a finished run stays
+  finished.
+- **🧹 Temp files** empties `$MEETING_BOT_ROOT/tmp` — rejected model
+  answers, cached prompt files, the CLI's scratch folder — all recreated on
+  demand; refused while any run is being processed.
+- **Tags** — your own labels, from the form (`--tag`), the run's detail, or
+  in bulk; the Runs tab filters on them alongside status, type and style.
+
+```bash
+set -a; . ./.env; set +a
+.venv/bin/python lib/runadmin.py cache --run-id yt_abc_20261101_100000 --what frames,chunks,media
+.venv/bin/python lib/runadmin.py clear --run-id combine_3x_… --with-members
+```
 
 ## Resuming a failed run
 
@@ -701,6 +1107,36 @@ CPU-hungry part. Chunk concurrency is kept low on purpose — every chunk carrie
 images, and firing a dozen multi-megabyte requests is a good way to earn the
 429s you then have to sit out.
 
+### What costs CPU, and measuring it (`benchmark.sh`)
+
+`./benchmark.sh` runs synthetic media through every local stage with the
+settings the pipeline really uses, and prints wall time, CPU time and peak
+memory per stage, plus CPU-minutes per hour of media. It touches no run
+state and calls no API. `--browser` adds Firefox ESR on a hidden display
+playing a full-screen video, as a stand-in for the browser rendering a call.
+`--watch-run <run_id>` samples a recording in progress instead: CPU and
+memory of its browser, ffmpeg, Xvfb and helpers.
+
+```bash
+./benchmark.sh --browser
+```
+
+Measured on the reference PC (Core 7 150U, 12 threads), 2026-09-29:
+
+| Stage | CPU per hour of media | Can it be turned off? |
+|---|---|---|
+| Recording: browser rendering the call | ≥ 60 CPU-min (≥ 1 core, the whole meeting) | Only by not recording. `MEETING_BROWSER` picks the browser |
+| Recording: x264 encode | 20 (slides) to 56 (full-screen camera) CPU-min | No. `RECORD_FRAMERATE` scales it |
+| `--clip` with `CLIP_REENCODE=1` | ~29 CPU-min | Yes, off by default (stream copy is ~0) |
+| Frame extraction (one decode + change check) | ~5-8 CPU-min (three real Meet recordings, 2026-09-30; the old two-pass extractor took 12-19 on the same files) | No. `FRAME_CHECK_SECONDS` scales the check; `FRAME_DECODE_THREADS=0` trades ~50% more CPU for a faster decode |
+| Frame prep for the model | 0.2-0.3 CPU-s per frame | `CLAUDE_CLI_FRAME_VISION=0` skips it |
+| PDF render | ~10 CPU-s per document (half of it maths) | `--no-pdf` / `SUMMARY_WRITE_PDF=0`; `PDF_MATH=0` |
+| Silence check before upload | ~0.5 CPU-min | No, it is what stops paying for silence |
+
+The summary itself costs the Claude subscription, not local CPU: see
+[The usage window](#summarization) and each run's `state.json`
+`stages.summarize.usage`.
+
 ### Queueing across separate sessions
 
 `--jobs` only limits concurrency *inside one* `./pipeline.sh` invocation. Run
@@ -749,9 +1185,97 @@ queue can't wedge permanently and needs no cleanup daemon.
 
 ## Output format
 
+### Summary styles
+
+There are six prompts, one per kind of recording, shared by the Claude and
+the Gemini backends (`summarize/prompts/`):
+
+| `--prompt` | For | What it writes |
+|---|---|---|
+| `video` (default) | talks, news, interviews, documentaries | key points, then the video's topics in order, speakers attributed |
+| `meeting` | calls | decisions, an action-item table (task, owner, due, priority), the discussion by topic, open questions |
+| `lecture` | classes | a cheat sheet (about 300 words per hour, at most 1,200 per call): what the instructor flagged, then terse numbered sections — key formulas, decision rules, pitfalls, an example only where needed; cites a `--resources` textbook excerpt when it has frontmatter |
+| `tutorial` | walkthroughs, coding videos | prerequisites and takeaways, then the steps with every command and code block verbatim, and a quick-reference table |
+| `reality` | competition reality-show episodes (The Face, Drag Race, MasterChef, …) | an episode recap: the teams, then the episode's segments in order with `[mm:ss]` timestamps and quotes from the mentors, judges and contestants, a highlights table, and last the results — the winner, who was up for elimination, who was eliminated |
+| `drama` | Thai drama (ละคร) episodes — lakorn, BL/GL series, period dramas | a spoiler-free opening, a characters-and-relationships table (as things stand at the start), the episode scene by scene with `[mm:ss]` timestamps and quotes in Thai, a highlights table, then **what changed** by the end (relationships, secrets, who knows what) and the cliffhanger, and the next-episode preview if there is one |
+
+None of them but `reality` and `drama` writes timestamps, and none cites frames: the
+notes stand on their own. All six mark their key points with callout boxes that the PDF styles
+(see [DESIGN.md](DESIGN.md)). The names from before the merge
+(`lecture-claude`, `lecture-gemini`, `lecture-reference`, `meeting-claude`,
+`tutorial-gemini`, `summarize`, …) still work and resolve to the new file, so
+an older `.env` or a resumed run keeps working.
+
+**Reality-show recaps** (`--prompt reality`). The one style that cites
+times: the model reads the transcript with a `[mm:ss]` mark every ~10
+seconds (built from the `.srt`, so it costs ~7% more input; the document's
+own transcript stays plain), and copies the mark where each moment begins.
+On a YouTube source the code then turns every mark into a link to that
+second of the video — with `--clip`, the clip's start is added to the link,
+while the text keeps the clip-relative time. Kaltura and recordings keep the
+marks as plain text. The transcript names no one, so quotes are credited
+from the on-screen name captions in the frames, then names said aloud; an
+unidentified speaker is described by role and team, never guessed. The
+results come last, in a red box: challenge winner, prize, nominees,
+eliminated, saved. A long episode is chunked and merged with its own merge
+prompt (`_merge-reality.md`), which keeps every timestamp and quote and puts
+the results at the end. Without an `.srt` beside the transcript there are
+no timestamps, with a warning in the log.
+
+**Thai drama recaps** (`--prompt drama`). Timed and linked exactly like
+`reality`, with its own merge prompt (`_merge-drama.md`). Names come from
+the opening credits and on-screen text, then from how characters address
+each other (nicknames, titles, kinship words — a bare พี่ or แม่ is kept as
+the relationship it states, not taken for a name), then a cast list in
+`--resources` if you give one; never guessed. Nothing is revealed in the
+opening paragraph or the characters table; revelations appear where they
+happen, and again under **What changed**. The recap at the start of an
+episode and the preview at its end are not treated as the episode's events.
+It follows `SUMMARY_LANGUAGE` like every prompt; quotes stay in Thai, with a
+translation when the recap is in English.
+
+**Per-run settings.** `--summary-language`, `--pdf-font` and `--instructions`
+(and the matching fields on both tabs of the web UI) are stored with the run,
+so a resume summarizes the same way; given again on a resume, they replace
+the stored ones. `--instructions` is free text for the summarizer: it goes in
+after the prompt's cached half, and takes precedence over the default
+structure.
+
+### Voice only and audio-only recordings
+
+When a call is only voices and cameras, the frames cost CPU and summary
+tokens for faces. Two per-run choices, on the command line, in `.env`, and
+on both tabs of the web UI:
+
+- **Summarize from: voice only** (`--voice-only`, `SUMMARY_SOURCE=voice`) —
+  no frames stage at all, nothing on screen offered to the model, no
+  pictures in the PDF. The prompt is told there are no frames.
+- **Save recording: audio only** (`--audio-only`, `RECORD_MEDIA=audio`) — a
+  meeting is recorded as an `.m4a` (AAC 128k, the same audio the MP4
+  carries, ~58 MB/hour) instead of a screen recording, and the bot's hidden
+  browser renders at `RECORD_AUDIO_GEOMETRY` (960x540). No picture means no
+  frames, so it is always voice only; `--audio-only --summary-source both`
+  is refused for a meeting.
+
+What each one does per source:
+
+| Source | Voice only | Audio only |
+|---|---|---|
+| Meet / Zoom link, `--new-meet` | Video still recorded; no frames cut from it | `.m4a`, no x264 encode (measured 1.12 → 0.43 cores with the bot alone in a call), smaller browser; voice only |
+| YouTube | Not even downloaded (the download only ever fed the frames) | — |
+| Kaltura | Still downloaded when AssemblyAI needs the media (no captions); no frames | — |
+| Local file | No frames | — |
+| `--combine` | One transcript-only summary; the members cut no frames | — |
+
+Both are stored with the run. `--summary-source` given again on a resume
+replaces the stored choice (a voice-only run resumed with `--summary-source
+both` extracts its frames then); the recording medium is fixed when the run
+is created. An audio file given as an input needs neither: its empty frame
+manifest is summarized from the transcript alone.
+
 ### Markdown
 
-Summaries from `lecture-*` and `tutorial-*` prompts are wrapped in a
+Summaries from the `lecture`, `tutorial`, `video` and `reality` prompts are wrapped in a
 course-note document, shaped to drop straight into a chapter file:
 
 ```markdown
@@ -759,9 +1283,10 @@ course-note document, shaped to drop straight into a chapter file:
      source: https://www.youtube.com/watch?v=5GAfjAjLKYk
      source_type: youtube
      model: claude-cli/opus
-     prompt: lecture-claude.md
+     prompt: lecture.md
      run_id: yt_5GAfjAjLKYk_20260904_120000
      language: th
+     font: Bai Jamjuree
      generated: 2026-09-04
 -->
 
@@ -794,14 +1319,31 @@ Youtube Link: `https://www.youtube.com/watch?v=5GAfjAjLKYk`
   video's transcript in input order, and one model-written body. See the
   `--combine` section above for how timestamps and frame numbers work there.
 
-`meeting-*` prompts keep the plain executive-summary format — no wrapper.
-
-Available prompts: `ls summarize/prompts/`. Pick one with `--prompt <name>`
-(no `.md` needed). `_merge.md` is internal and not selectable.
+The `meeting` prompt keeps the plain executive-summary format — no wrapper.
+`_merge.md` is internal and not selectable.
 
 ### PDF
 
-The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint:
+The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint. Its
+look is specified in [DESIGN.md](DESIGN.md), after the operator's exercise
+sheet: a title with a grey subtitle and source line, navy section banners,
+colour-coded callout boxes (green key concepts, blue examples, amber
+mistakes, red must-remember, grey notes), tinted table headers, and code in
+a dark editor window.
+
+- **Callout boxes.** The prompts write `> [!CONCEPT] Title` blockquotes
+  (also `[!EXAMPLE]`, `[!WARNING]`, `[!IMPORTANT]`, `[!NOTE]`); the export
+  turns them into the coloured boxes. In any other Markdown reader they are
+  ordinary quotes, and GitHub and Obsidian show NOTE, WARNING and IMPORTANT
+  as their own alerts.
+- **Code is JetBrains Mono on a dark panel**, with a window bar naming the
+  language and Pygments `one-dark` syntax colours. Inline `code` is a dark
+  chip in the same face. `fonts-jetbrains-mono` is installed by `setup.sh
+  --system`; a JetBrainsMono Nerd Font already in `~/.local/share/fonts` is
+  used as well.
+- **Maths is always Computer Modern**, including symbols the model typed
+  straight into the prose (ω, ≤, ⇒, ∑, ²), which are picked out and set in
+  CMU Serif.
 
 - **LaTeX is typeset, in Computer Modern.** The model writes maths as `$L/R$`
   and `$$...$$`; markdown readers render that, and a PDF renderer with no
@@ -820,12 +1362,11 @@ The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint:
 - **Nested bullets nest.** The model indents sub-items by two spaces, which
   every markdown reader accepts and python-markdown flattens; the export
   re-indents them before conversion so a three-level outline stays one.
-- **Frame citations, where a prompt produces them, are faded.** The bundled
-  `lecture-*` and `tutorial-*` prompts no longer ask for `(Frame N @ …)`
-  citations or the closing visual-index table — the frames still inform the
-  notes, they are just not indexed. A document that does cite (an older run,
-  a custom prompt) keeps the citations at 30% opacity so the notes read as
-  notes.
+- **Frame citations, where a document has them, are faded.** None of the
+  four prompts asks for `(Frame N @ …)` citations, timestamps or a visual
+  index — the frames still inform the notes, they are just not indexed. A
+  document that does cite (an older run, a custom prompt) keeps the
+  citations at 30% opacity so the notes read as notes.
 - **The sheet is the summary alone.** No keyframe appendix, no reference
   slides, no transcript layer by default; the `.md` beside it still carries
   the transcript in its `<details>` block. Each comes back on request:
@@ -851,21 +1392,23 @@ The same summary is rendered to `$PDF_DIR/<run_id>.pdf` by WeasyPrint:
   so a single block would come back truncated with no warning; the cost is a
   couple of blank-looking pages at the back of a long lecture.
   `PDF_TRANSCRIPT=appendix` prints it as Appendix C instead.
-- **The body face follows the summary's language, at 8pt** (`PDF_FONT_SIZE`).
-  A Thai summary (`SUMMARY_LANGUAGE=th`, the default) is set in **Bai
-  Jamjuree**, with Sarabun behind it; an English one in **CMU Serif** —
-  Computer Modern, the face the maths is set in. The maths is Computer
-  Modern in both: mathtext typesets it and ships it as SVG, so the body face
-  never touches it. The language is read from the document's own
-  provenance comment first, so a Thai sheet re-rendered later on a box
-  switched to English keeps its face. `PDF_FONT_FAMILY` replaces the stack
-  for both languages; keep a Thai face in it or Thai renders as tofu boxes.
-  Every other size in the document is relative to `PDF_FONT_SIZE`, so
-  changing it rescales headings, tables and captions together. Bai Jamjuree
-  and Sarabun are not in Debian's archive; they are OFL Google Fonts vendored
-  under `fonts/` and installed by `setup.sh` into `/usr/local/share/fonts`
-  (`fonts-cmu` and Noto Serif Thai come from apt). Without them the stack
-  falls through to Noto Serif Thai.
+- **The body font is chosen per run, and every choice looks the same
+  size.** A Thai summary offers **Bai Jamjuree** (default, `PDF_FONT_TH`) or
+  **Sarabun**; an English one **CMU Serif** — Computer Modern, the face the
+  maths is set in (default, `PDF_FONT_EN`) — Sarabun or Bai Jamjuree.
+  Computer Modern has no Thai glyphs, so it is not offered for Thai. Pick one
+  with `--pdf-font` or in the web UI. `PDF_FONT_SIZE` (9.5) is the size *as
+  Computer Modern*; Sarabun and Bai Jamjuree are scaled to the same
+  x-height, so they come out at about 8.2pt and look just as big. The
+  language and font are read from the document's own provenance comment
+  first, so a sheet re-rendered later keeps its face. `PDF_FONT_FAMILY`
+  replaces the whole stack for both languages when no font was chosen for
+  the run (no size matching then); keep a Thai face in it or Thai renders as
+  tofu boxes. Every other size is relative to the body, so changing
+  `PDF_FONT_SIZE` rescales headings, tables and captions together. Bai
+  Jamjuree and Sarabun are not in Debian's archive; they are OFL Google
+  Fonts vendored under `fonts/` and installed by `setup.sh` (`fonts-cmu` and
+  Noto come from apt).
 
 A PDF that fails to render logs a warning and leaves the run successful — the
 Markdown is the artifact everything downstream depends on. Turn either output
@@ -891,7 +1434,7 @@ overrides work: `SUMMARY_EFFORT=max ./pipeline.sh ...`.
 | `FRAMES_DIR` | `<run_id>/` — keyframes and `manifest.json` |
 | `SUMMARIES_DIR` | `<run_id>.md` |
 | `PDF_DIR` | `<run_id>.pdf` |
-| `MEETING_BOT_ROOT` | The pipeline's own bookkeeping only: `runs/`, `state/`, `tmp/`, `resources/`, `chrome-profile/` |
+| `MEETING_BOT_ROOT` | The pipeline's own bookkeeping only (default `~/.local/share/meeting-bot`): `runs/`, `state/`, `tmp/`, `logs/`, `resources/`, the browser profiles |
 
 They are independent of each other and of `MEETING_BOT_ROOT` — point any of
 them anywhere, including a mount with spaces in the path. An unset one is a
@@ -899,8 +1442,15 @@ hard error naming the variable, rather than a silent default: with independent
 paths, a wrong default doesn't fail, it just puts your lecture summaries
 somewhere you'll never look.
 
-`CHROME_PROFILE_DIR` (default `$MEETING_BOT_ROOT/chrome-profile`) and
-`RESOURCE_CACHE_DIR` (default `$MEETING_BOT_ROOT/resources`) can also be moved.
+`FIREFOX_PROFILE_DIR` / `CHROME_PROFILE_DIR` (default `$MEETING_BOT_ROOT/firefox-profile`,
+`.../chrome-profile`) and `RESOURCE_CACHE_DIR` (default
+`$MEETING_BOT_ROOT/resources`) can also be moved.
+
+**On a synced library (SeaDrive here), check the mount, not just the path.** If
+the drive is not mounted when a run starts, the path is an ordinary empty
+directory, the run writes into it, and the files vanish from view when the
+mount comes back. `./verify_e2e.sh --preflight` shows where each directory
+points.
 
 ### API keys — numbered slots, rotated round-robin
 
@@ -922,7 +1472,7 @@ duplicates are skipped; a gap (`_1` and `_3` set, `_2` commented out) doesn't
 end the scan.
 
 ```bash
-/opt/meeting-bot-venv/bin/python3 lib/keyring.py status   # counts and the next slot
+.venv/bin/python3 lib/keyring.py status   # counts and the next slot
 ```
 
 > **Moved from the Alpine version:** youtube-transcript.io tokens used to live
@@ -945,19 +1495,31 @@ end the scan.
 | `SUMMARY_MERGE_EFFORT` | same as `SUMMARY_EFFORT` | Effort for that merge call |
 | `CLAUDE_CLI_STATIC_PROMPT` | 1 | Pass the prompt's unchanging half as a system prompt file, so the prefix is cache-eligible. `0` sends it inline (for a `claude` too old to know the flags) |
 | `SUMMARY_EFFORT` | `high` | `low`, `medium`, `high`, `xhigh`, `max` |
-| `CLAUDE_CLI_MAX_FRAMES` | 0 | Most frames the model is *offered* per call (`0` = all of the chunk's), counted after the blank/duplicate pass. Scene changes kept first, periodic frames thinned evenly. The PDF still has every frame |
+| `CLAUDE_CLI_MAX_FRAMES` | 0 | Most frames the model is *offered* per call (`0` = all of the chunk's), counted after the blank/duplicate pass. Scene changes kept first, periodic frames thinned evenly. Applies to the `gemini` backend too (as do the blank/duplicate pass and `FRAME_MAX_DIMENSION`) — on the Gemini free tier, leaving it at `0` lets one long video exceed the 250k-input-tokens-per-minute quota. The PDF still has every frame |
 | `CLAUDE_CLI_MAX_WAIT_SECONDS` | 21600 | How long one call may sleep for the usage window to reset before the stage pauses (exit 75) |
 | `CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS` | 600 | Retry interval when the CLI reports a hit window without a reset time |
 | `GEMINI_API_KEY_1..3` | — | For the `gemini` fallback |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | A comma-separated list is a fallback chain: every key is tried on the first model, then the next model (`gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash` in `.env.example`). A rate-limited key moves on at once; an unknown model is skipped. Pin real versions, not `-latest` aliases |
-| `SUMMARY_PROMPT` | `summarize.md` | Prompt file; `--prompt` overrides |
+| `GEMINI_TIMEOUT_SECONDS` | 600 | How long one Gemini request may go without an answer before it is retried, then handed to the next key/model. Without it a request Gemini never answers hangs the run |
+| `GEMINI_MAX_FRAMES` | (unset) | Gemini's own frame cap, counted after the blank/repeat pass. Unset = `CLAUDE_CLI_MAX_FRAMES`; `0` = every distinct frame (then set `SUMMARY_CHUNK_MAX_FRAMES` so a long video is split across requests) |
+| `GEMINI_MEDIA_RESOLUTION` | (unset) | `low` / `medium` / `high`. The only thing that changes what an image costs Gemini: ~264 / 527 / 1100 tokens per image, whatever its pixel size (measured; unset prices like `high`). The free tier allows 250k input tokens per minute per model |
+| `OPENROUTER_API_KEY_1..3` | — | For the `openrouter` backend (openrouter.ai → Keys; free `:free` models need no card). Free limits are per **account**: 20 requests/min, 50/day, 1,000/day after a one-time $10 top-up — extra keys on one account add nothing |
+| `OPENROUTER_MODEL` | `dots-studio/dots-3-note-preview:free` | A comma-separated chain, walked like `GEMINI_MODEL`. Must accept images. Free variants are withdrawn without notice; a gone one is skipped |
+| `OPENROUTER_TIMEOUT_SECONDS` | 600 | One request's timeout, then retry / next key |
+| `OPENROUTER_MAX_FRAMES` | (unset) | OpenRouter's own frame cap after the blank/repeat pass. Unset = `CLAUDE_CLI_MAX_FRAMES`; `0` = all |
+| `OPENROUTER_MAX_TOKENS` | 32768 | Output cap for one chunk, so a runaway answer stops sooner. The merge is never capped. `0` = no cap |
+| `OPENROUTER_TRUNCATION_RETRIES` | 1 | A cut-off or off-script answer is retried this many times on the same model before the next model / backend. Rejected answers are kept in `$MEETING_BOT_ROOT/tmp/rejected-answers/` |
+| `OPENROUTER_MAX_FOREIGN_RUNS` | 2 | An answer with more runs than this of a script that is neither the summary language's nor the transcript's (Chinese or Arabic inside Thai words, say) is rejected like a cut-off one. `0` = reject any |
+| `SUMMARY_CHUNK_CACHE` | 1 | Keep each finished chunk summary in `runs/<id>/chunks/` and reuse it on a resume. `0` = always summarize every chunk again |
+| `SUMMARY_PROMPT` | `video` | `video`, `meeting`, `lecture`, `tutorial`, `reality` or `drama` (`lecture` in `.env.example`); `--prompt` overrides. Older names still resolve |
+| `SUMMARY_INSTRUCTIONS` | — | Extra instructions for every summary; `--instructions` (or the web UI's field) overrides it per run |
 | `SUMMARY_MAX_TOKENS` | 16000 | **Gemini only.** The Claude CLI has no output cap, and output is not what spends a subscription window anyway — see below |
-| `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture-*`/`tutorial-*` output; `always`/`never` override |
-| `SUMMARY_LANGUAGE` | `th` | The language the summary is *written* in: `th` or `en`. Independent of `ASSEMBLYAI_LANGUAGE`, which is the language the audio is in — see below |
+| `SUMMARY_DOC_FORMAT` | `auto` | `auto` wraps `lecture`/`tutorial`/`video`/`reality`/`drama` output; `always`/`never` override |
+| `SUMMARY_LANGUAGE` | `th` | The language the summary is *written* in: `th` or `en`; `--summary-language` overrides it per run. Independent of `ASSEMBLYAI_LANGUAGE`, which is the language the audio is in — see below |
 
 **Output language.** `SUMMARY_LANGUAGE` decides what every prompt tells the
 model to write in — `th` (the default) or `en`. Every shipped template
-(`lecture-*`, `tutorial-*`, `meeting-*` and the merge prompt) carries a
+(`video`, `meeting`, `lecture`, `tutorial`, `reality`, `drama` and the merge prompts) carries a
 `{language_rule}` placeholder that is filled from this setting before the
 prompt is sent, on both the Claude and the Gemini backends. In Thai the
 model is asked for ordinary Thai academic prose with each technical term's
@@ -1010,12 +1572,12 @@ system prompt too. Everything that varies — the chunk label, your slides, the
 transcript, the frame paths — stays on stdin. On a long lecture split into
 several chunks, every chunk after the first reuses the same cached prefix.
 
-`prompts/lecture-claude.md` (the default in `.env.example`) and
-`prompts/summarize-v2.md` both carry the fences — for `lecture-claude` that is
-5,473 cached characters against 346 sent per call. Any other prompt file has no
-markers, is sent exactly as before, and gets no caching benefit; copy the
-fences into your own prompt if you want it. `CLAUDE_CLI_STATIC_PROMPT=0` turns
-it off entirely.
+All four shipped prompts carry the fences, so the instructions (role, output
+format, callout vocabulary, rules) are cached and only the transcript, the
+frames, your slides and any `--instructions` are sent per call. A prompt file
+of your own without markers is sent exactly as written and gets no caching
+benefit; copy the fences into it if you want it. `CLAUDE_CLI_STATIC_PROMPT=0`
+turns it off entirely.
 
 **Frames are sent inline, in one turn.** `--input-format stream-json` lets
 the user message carry base64 image blocks, the same shape the Messages API
@@ -1030,8 +1592,8 @@ lighter still, but the model then cites frames it has never seen, so the
 pictures in the PDF may not match what the text says about them.
 
 **Before they are sent, frames are filtered, cropped and shrunk.** Blank
-frames (a screen share stopping, a slide mid-fade — the scene-change pass is
-drawn to these) and consecutive frames of an unchanged slide are dropped
+frames (a screen share stopping, a slide mid-fade — extraction already skips
+these, but older runs have them) and consecutive frames of an unchanged slide are dropped
 (`CLAUDE_CLI_FRAME_DEDUPE`; a texture hash of the slide region, so a moved
 cursor or a changed participant tile still counts as the same slide, while a
 changed title does not). What remains is capped by `CLAUDE_CLI_MAX_FRAMES`,
@@ -1072,10 +1634,10 @@ prints it. **That number is how you size a lecture to your plan**: run one,
 read `+N% this stage`, and you know how many fit in a window.
 
 `.env.example` ships Pro-sized values — `CLAUDE_CLI_MAX_FRAMES=20`,
-`FRAME_PERIOD_SECONDS=60`, `SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`,
+`SUMMARY_EFFORT=medium`, `SUMMARY_MAX_PARALLEL=1`,
 `SUMMARY_CHUNK_CHARS=60000`, `CLAUDE_CLI_MERGE_MODEL=sonnet`,
 `SUMMARY_MERGE_EFFORT=low` — which differ from the code's own defaults (0,
-30, `high`, 3, 24000, and the chunk model/effort) on purpose: an unset
+`high`, 3, 24000, and the chunk model/effort) on purpose: an unset
 variable behaves as it always did, a fresh `.env` fits a lecture into a
 window. Loosen them once the meter says you have room.
 
@@ -1092,10 +1654,11 @@ is not where the window goes. What spends it, in order:
    of noisy ASR happens — stay on `CLAUDE_CLI_MODEL`.
 2. **Frames.** A whole 1920x1080 frame is ~1,844 tokens; cropped to the
    slide and fitted to 768px (`FRAME_MAX_DIMENSION`) it is ~200-450. The
-   blank/duplicate pass usually removes most of a static lecture's periodic
-   samples before any of that; `CLAUDE_CLI_MAX_FRAMES` caps what is left
-   (scene changes first, the rest spread evenly), and `FRAME_PERIOD_SECONDS`
-   sets the count at the source. `CLAUDE_CLI_FRAME_VISION=0` drops them
+   extractor saves a frame only when the slide changes, and the
+   blank/duplicate pass removes what still repeats; `CLAUDE_CLI_MAX_FRAMES`
+   caps what is left (slide changes first, the rest spread evenly), and
+   `FRAME_MOTION_SECONDS` sets how often a moving picture (a played video)
+   is sampled at the source. `CLAUDE_CLI_FRAME_VISION=0` drops them
    entirely, at the cost of citations to pictures the model never saw.
 3. **Effort.** `SUMMARY_EFFORT=high` buys thinking tokens on every chunk;
    `medium` is noticeably cheaper on the window and still fine for notes.
@@ -1136,10 +1699,12 @@ provenance header (`model: claude-cli/opus`).
 | `PDF_RESOURCES` | `none` | `none` or `appendix` (the `--resources` slides as Appendix B) |
 | `PDF_HIDDEN_CHUNK_CHARS` | 40000 | Characters of hidden transcript per page; above ~50k poppler stops extracting |
 | `PDF_PAGE_SIZE` | `A4` | Any WeasyPrint page size |
-| `PDF_FONT_FAMILY` | by language — `th`: `Bai Jamjuree, Sarabun, Noto Serif Thai, …`; `en`: `CMU Serif, Latin Modern Roman, Noto Serif Thai, …` | Set it to use one stack for both languages. Keep a Thai face in it |
-| `PDF_FONT_SIZE` | 8 | Body size in points; everything else scales with it |
+| `PDF_FONT_TH` | `Bai Jamjuree` | Default body font for Thai summaries: `Bai Jamjuree` or `Sarabun` |
+| `PDF_FONT_EN` | `CMU Serif` | Default body font for English summaries: `CMU Serif`, `Sarabun` or `Bai Jamjuree` |
+| `PDF_FONT_FAMILY` | — | A whole CSS font stack for both languages, used only when no font was chosen for the run; no size matching. Keep a Thai face in it |
+| `PDF_FONT_SIZE` | 9.5 | Body size in points, as Computer Modern — the other faces are scaled to look the same size. Everything else scales with it |
 | `PDF_MATH` | 1 | 0 leaves LaTeX as text instead of typesetting it |
-| `PDF_MATH_SCALE` | 1.0 | Maths size relative to the body text (Computer Modern both, so 1.0; a sans body wants ~1.15) |
+| `PDF_MATH_SCALE` | 1.0 | Maths size relative to `PDF_FONT_SIZE`; the body faces are already matched to Computer Modern, so 1.0 |
 | `PDF_MATH_FONTSET` | `cm` | matplotlib mathtext font set (`cm` is Computer Modern) |
 
 ### Reference material
@@ -1173,6 +1738,7 @@ immediately rather than burning the full retry schedule first.
 | Variable | Default | Meaning |
 |---|---|---|
 | `SUMMARY_CHUNK_CHARS` | 24000 | Above this, chunk + merge. `0` disables. `.env.example` ships 60000: fewer seams, and no merge call at all for most lectures |
+| `SUMMARY_CHUNK_MAX_FRAMES` | 0 | Most frames one chunk may carry; a chunk with more is cut in time (at every Nth frame), and the cap alone starts chunking. `0` = no limit. Size it so frames × per-image tokens + the transcript stays well under 250k for the Gemini free tier — e.g. 350 at `low`, 180 at `medium` |
 | `SUMMARY_CHUNK_OVERLAP` | 800 | Context repeated across a boundary |
 | `SUMMARY_SEGMENT_MAX_SECONDS` | 120 | Transcript segments longer than this are split before chunking. `0` disables |
 | `SUMMARY_SEGMENT_MAX_CHARS` | 2000 | Same, by length |
@@ -1185,8 +1751,32 @@ immediately rather than burning the full retry schedule first.
 | `ASSEMBLYAI_API_KEY_1..3` | — | Required for local files |
 | `ASSEMBLYAI_LANGUAGE` | `th` | `en`, `auto`, or any AssemblyAI code |
 | `ASSEMBLYAI_MODEL` | SDK chain `universal-3-5-pro`, `universal-2` | Overrides the leading entry |
-| `YT_TRANSCRIPT_KEY_1..10` | — | Required for YouTube inputs |
+| `YT_TRANSCRIPT_KEY_1..10` | — | Optional: youtube-transcript.io, the fallback for YouTube captions |
+| `YT_AUTOCAPTIONS` | 1 | `0` skips yt-dlp for captions (youtube-transcript.io only) |
+| `YT_DOWNLOAD_ATTEMPTS` | 4 | attempts at the YouTube video download (for frames); a 403/429/5xx, timeout or dropped connection re-runs yt-dlp, an unavailable/private video fails at once |
+| `YT_DOWNLOAD_RETRY_SECONDS` | 30 | first wait between those attempts, doubled each time |
 | `TRANSCRIBE_BACKEND` | `assemblyai` | YouTube URLs always use captions regardless |
+
+**YouTube captions come from two places.** yt-dlp first (free, no key):
+an uploaded track in the requested language if there is one, otherwise
+YouTube's **automatic captions of the language actually spoken**; with
+`--language auto`, an uploaded track in the spoken language before the
+automatic one. Never one of YouTube's machine translations. For a playlist
+that mixes Thai and English lectures, use `--language auto` — with `th`, an
+English lecture that carries an uploaded Thai *translation* is transcribed
+from that translation.
+
+youtube-transcript.io is the fallback, for yt-dlp failing (a bot check, a
+429, a YouTube change) or finding no track. It costs a credit per video and
+returns the same YouTube captions, but its language labels are unreliable — a
+Thai lecture's automatic captions came back labelled `en` — so a track
+labelled in another language is used only as the last resort, with a
+warning. Without keys the fallback is simply skipped.
+
+yt-dlp needs a JavaScript runtime for YouTube; `setup.sh` installs **deno**
+(Debian's Node 20 is below yt-dlp's minimum). Without one, some videos come
+back "This video is not available". When YouTube breaks yt-dlp, `yt-dlp -U`
+(or re-running `./setup.sh`) is the fix.
 
 Kaltura entries need no key at all. When the entry carries a caption track in
 the requested language it is used and AssemblyAI is skipped; most
@@ -1215,13 +1805,26 @@ another key would fail identically.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SCENE_THRESHOLD` | 0.3 | ffmpeg scene-change score cutoff |
-| `FRAME_PERIOD_SECONDS` | 30 | Periodic safety-net sample; `0` disables |
+| `FRAME_CHECK_SECONDS` | 2 | How often the picture is looked at; a slide shown for less can be missed |
+| `FRAME_CHANGE_DISTANCE` | 16 | Texture-hash bits (of 4096, over the slide region) that make a new picture; the model-side duplicate pass uses the same number |
+| `FRAME_MOTION_SECONDS` | 30 | A picture that never settles (a played video, a full-screen camera) gets one frame per this |
+| `FRAME_SAFETY_SECONDS` | 300 | A frame anyway after this long without one; `0` disables |
+| `FRAME_DECODE_THREADS` | 1 | ffmpeg decoder threads; `0` = automatic (faster, ~50% more CPU) |
 | `FRAME_MAX_DIMENSION` | 768 | Long edge, in pixels, of the frame *copies* sent to the LLM, after the crop to the slide; `0` skips the downscale |
 | `CLIP_REENCODE` | 0 | `--clip` cuts by stream copy; `1` re-encodes for a frame-accurate start |
 
-Aggressive: `FRAME_PERIOD_SECONDS=10 SCENE_THRESHOLD=0.2`.
-Slides only: `FRAME_PERIOD_SECONDS=300 SCENE_THRESHOLD=0.6`.
+**A frame is saved when the picture changes, never on a clock.** One ffmpeg
+decode hands a sample every `FRAME_CHECK_SECONDS` to Python, which compares
+it with the last saved frame by a texture hash of the slide region — a moved
+cursor or the participant strip is not a change, a new title or new text is.
+A changed picture is saved once the next sample shows the same thing, so a
+slide mid-fade is never the one kept; a blank (one-colour) sample is never
+saved. A static slide is therefore one frame however long it stays up.
+`SCENE_THRESHOLD` and `FRAME_PERIOD_SECONDS` belonged to the previous
+two-pass extractor and are ignored (the log says so if they are set).
+
+More frames: `FRAME_CHECK_SECONDS=1 FRAME_MOTION_SECONDS=15`.
+Fewer: `FRAME_MOTION_SECONDS=120 FRAME_SAFETY_SECONDS=0`.
 
 **`CLIP_REENCODE` buys exactness with a full transcode.** The default stream
 copy takes seconds and starts at the keyframe at or before the requested time —
@@ -1245,40 +1848,105 @@ Needs Pillow — without it the originals are sent, with a warning. This
 changes how much each frame costs; the duplicate pass and
 `CLAUDE_CLI_MAX_FRAMES` change how many there are.
 
+### The bot's browser and account
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BOT_GOOGLE_ACCOUNT` | — | The only Google account the bot joins Meet as. Prefilled by `first_time_login.sh`, checked before every Meet, passed as `authuser=`. Unset: nothing is checked (a warning says so) |
+| `MEETING_BROWSER` | `firefox-esr` | `firefox-esr` (Selenium + geckodriver) or `chrome` (Playwright, `google-chrome-stable`) |
+| `FIREFOX_PROFILE_DIR` | `$MEETING_BOT_ROOT/firefox-profile` | Firefox's persistent login |
+| `CHROME_PROFILE_DIR` | `$MEETING_BOT_ROOT/chrome-profile` | Chrome's |
+| `FIREFOX_BIN` / `GECKODRIVER_BIN` / `CHROME_BIN` | from `PATH` | Override the binaries |
+
+Each browser has its own profile: switching `MEETING_BROWSER` means signing in
+again with `first_time_login.sh`.
+
+### Web UI
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MEETING_BOT_TOKEN` | generated by `setup.sh` | Shared secret for every `/api` call and `/trigger` |
+| `MEETING_BOT_BIND` | `127.0.0.1,tailscale` | Comma-separated listen addresses; `tailscale` = this PC's Tailscale IPv4 |
+| `MEETING_BOT_PORT` | 8765 | |
+| `MEETING_BOT_FOREGROUND` | 0 | `1` = never detach a meeting into the background (same as `--foreground`) |
+
+### Google Drive
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GDRIVE_CLIENT_ID` / `GDRIVE_CLIENT_SECRET` | — | The OAuth "Desktop app" client the bot account signs in through (`lib/gdrive.py login`); see [Google Drive upload](#google-drive-upload) |
+
+### Discord voice bot (in progress)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DISCORD_BOT_TOKEN` | — | The bot's token from the Developer Portal (*Bot → Reset Token*). A secret, like the API keys |
+| `DISCORD_SPIKE_GUILD_ID` | — | The spike only: the test server's ID, where `/spike_join` and `/spike_stop` are registered |
+
 ### Meeting behaviour
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `MAX_MEETING_MINUTES` | 240 | Hard wall-clock cap |
 | `IDLE_LEAVE_MINUTES` | 5 | Leave after this long alone (or with one other); `0` disables |
-| `RECORD_GEOMETRY` | `1920x1080` | Xvfb head, Chrome window and ffmpeg capture size — they must agree or the recording gets black edges |
+| `NEW_MEET_WAIT_MINUTES` | 15 | A meeting the bot created: how long to wait for the first participant before ending it |
+| `AUTO_LEAVE_SILENCE_SECONDS` | 120 | The idle and "most people left" rules only fire after the meeting audio has also been silent this long |
+| `AUDIO_SILENCE_WARN_SECONDS` | 120 | Warn in the log / web UI after this long without meeting audio |
+| `TRANSCRIBE_MIN_SOUND_SECONDS` | 30 | Less sound than this in a recording → not sent to AssemblyAI |
+| `KILL_FINALISE_SECONDS` | 120 | `kill_meeting.sh`: how long to wait for the MP4 to be finalised when forcing a stop |
+| `RECORD_GEOMETRY` | `1920x1080` | Xvfb head, browser window and ffmpeg capture size — they must agree or the recording gets black edges |
+| `RECORD_MEDIA` | `video` | `audio` records meetings as an `.m4a`; same as `--record-media` |
+| `RECORD_AUDIO_GEOMETRY` | `960x540` | The browser's display size for an audio-only recording |
+| `SUMMARY_SOURCE` | `both` | `voice` summarizes from the transcript alone; same as `--summary-source` |
 | `RECORD_FRAMERATE` | 15 | |
 | `MEETING_BOT_DISPLAY_NAME` | `Meeting Bot` | Same as `--display-name` |
 | `PIPELINE_JOBS` | 2 | Same as `--jobs` |
 
-The bot also leaves on the kill sentinel, when the page says the meeting ended,
-or when participants drop below 30% of their peak for two consecutive polls.
+When the bot leaves on its own (checked every 15 seconds):
+
+- **Everyone left** — only the bot remains on two polls (~30s): it leaves, or
+  ends the call for everyone if it created it.
+- **Nobody came** — a meeting it created with no one joining within
+  `NEW_MEET_WAIT_MINUTES`.
+- **It dropped out** — the call's controls are gone on two polls (Meet sent it
+  back to the lobby): the recording ends; `runs/<id>/left_call.png` shows why.
+- **Idle** — joining someone else's call, only the bot and one other person for
+  `IDLE_LEAVE_MINUTES` — **and** no meeting audio for
+  `AUTO_LEAVE_SILENCE_SECONDS`. A 1:1 where people talk is not idle.
+- **Most people left** — the count falls to 30% of its peak on two polls —
+  **and** the meeting has gone quiet. A lecturer still talking to the few who
+  stayed keeps the recording going.
+- The stop button / `./kill_meeting.sh`, and the `MAX_MEETING_MINUTES` cap.
 
 ---
 
 ## Tests
 
-Everything except `verify_e2e.sh` runs with no API keys, no network access and
-no `/opt` — against temporary directories, including one with a space in its
+Run them with the project venv (`.venv/bin/python3`, or
+`MEETING_BOT_VENV=$PWD/.venv bash lib/...` for the shell suites).
+Everything except `verify_e2e.sh` runs with no API keys and no network access
+— against temporary directories, including one with a space in its
 path so quoting mistakes surface.
 
 ```bash
 python3 lib/test_runstate.py                 # run state, resume, concurrency, the pause (19)
 python3 lib/test_slotqueue.py                # cross-session component queue (23)
 python3 lib/test_keyring.py                  # numbered keys + rotation cursor (22)
-python3 lib/test_resources.py                # resource specs, extraction, GitHub (27)
+python3 lib/test_resources.py                # resource specs, extraction, GitHub, frontmatter, binary files (36)
 python3 lib/test_kaltura.py                  # iframe/URL parsing, Referer, captions, retries (51)
+python3 lib/test_gdrive.py                   # Google Drive: folder links, names, the upload (create vs replace), folders (13)
 python3 lib/test_clip.py                     # --clip parsing, the cut, caption windowing (33)
-python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain (171)
-python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, PDF render (73)
+python3 lib/test_discord_spool.py            # Discord recordings: placing each speaker on one timeline, the mix, real ffmpeg (22)
+python3 summarize/test_summarize_units.py    # retry, chunking, map-reduce, frame numbering, document, claude-cli, the usage window, the Gemini model chain, the course reference, the output language, the six prompts (drama included), --instructions, no frames (253)
+python3 summarize/test_pdf_units.py          # frame cropping, citations, LaTeX, the design (callouts, code, maths symbols), font choice and size matching, PDF render (107)
 python3 transcribe/test_yt_transcript_client.py   # key rotation, retry, tracks[] (16)
-bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed (281)
-bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (119)
+python3 transcribe/test_yt_autocaptions.py   # yt-dlp captions: track choice, json3 (13)
+python3 screen/test_extract_frames.py        # frames on change: settle, motion cap, safety net, blanks, real ffmpeg (19)
+python3 screen/test_capture_host.py          # hosting a created Meet: when it ends, and when it must not (7)
+python3 screen/test_browser.py               # browser choice, fake devices, the bot-account check (16)
+python3 test_trigger_server.py               # the web UI API: argument mapping, auth, dry-run check, paths, summary settings, record/summary source, per-line check results, the combine switch, tags, Drive, the run history (20)
+bash lib/test_pipeline_e2e.sh                # full orchestration, stages stubbed, background meetings, summary settings, voice only / audio only, dry-run reports, --source-url, --combine without a path, the Drive upload stage, tags (520)
+bash lib/test_media_e2e.sh                   # real media, APIs stubbed at the socket (131)
 ```
 
 Two of those are worth understanding:
@@ -1302,25 +1970,26 @@ Two of those are worth understanding:
   instead of being retried, that the key cursor advances, and that the PDF comes
   out with cropped frames in it.
 
-Neither proves Chrome can join a live Meet call, that your real keys work, or
+Neither proves the browser can join a live Meet call, that your real keys work, or
 that your Claude subscription still has quota.
 That is what `verify_e2e.sh` is for:
 
 ```bash
 ./verify_e2e.sh --preflight                    # tools, packages, keys, profile,
                                                # and a real 2-second Xvfb+Pulse+ffmpeg capture
-./verify_e2e.sh --browser-smoke                # real Chrome on Xvfb, recorded — no meeting, no spend
+./verify_e2e.sh --browser-smoke                # the real browser on Xvfb, recorded — no meeting, no spend
 ./verify_e2e.sh --mp4 /path/to/recording.mp4   # real AssemblyAI + real summarizer
 ./verify_e2e.sh --youtube "<url>"              # real captions + real summarizer
 ./verify_e2e.sh --kaltura "<iframe or url>"    # real Kaltura download + summarizer
-./verify_e2e.sh --meet "<url>" --minutes 3     # real Chrome joins, records, leaves
+./verify_e2e.sh --meet "<url>" --minutes 3     # the real browser joins, records, leaves
 ./verify_e2e.sh --zoom "<url>" --minutes 3
 ```
 
 `--browser-smoke` is worth running after any change to the recording path: it
-launches Chrome through Playwright with the recorder's exact flags
-(`screen/browser_smoke.py` imports them from `capture.py`), records eight
-seconds of it, and then **measures the recorded frame for black bands**. That
+launches the configured browser through `browser.open_page()` — the
+recorder's own launch — records fourteen seconds of it, and then **measures a
+late recorded frame for black bands** (late, because Firefox through
+geckodriver takes a few seconds to map its window). That
 check is what caught Chrome placing its kiosk window at (10,10) — a 10-pixel
 black band down the left and top of every recording that comparing window sizes
 would have missed.
@@ -1336,35 +2005,60 @@ summary.
 ## Troubleshooting
 
 **`missing required program(s): ...`**
-`sudo -H ./setup.sh`. The browser stages run natively now, so Xvfb, PulseAudio,
-x11vnc and Chrome all have to be present on the host itself.
+`sudo ./setup.sh --system`, then `./setup.sh`. Xvfb, `pactl` and the browser
+all have to be present on the PC itself.
 
 **`no free X display between :90 and :119`**
-Stale locks from a crashed run: `ls -l /tmp/.X*-lock`, and remove the ones with
-no matching process.
+Stale claims from a crashed run: `ls -l /tmp/.meeting-bot-X*.claim /tmp/.X*-lock`.
+A claim or lock whose pid is gone is taken over automatically; remove any that
+aren't.
 
 **`PulseAudio did not start (pactl info fails)`**
-The daemon runs per-user and this runs as root. `pulseaudio -D
---exit-idle-time=-1` by hand will show the real error; in a locked-down LXC it
-usually needs `/dev/shm` and a writable `$HOME`.
+On the desktop PipeWire's pulse socket answers `pactl`; `pactl info` in your own
+terminal shows whether it is up. A background run started from a login shell
+with no `XDG_RUNTIME_DIR` can't find it — start it from your desktop session.
+
+**Firefox: `Error: cannot open display`, or its window appears on your screen**
+The browser picked Wayland over the hidden X display. `record_screen.sh` unsets
+`WAYLAND_DISPLAY` and exports `GDK_BACKEND=x11` for exactly this; if you launch
+`screen/capture.py` by hand, do the same.
+
+**`Cannot join: the browser profile is signed in as …, not …`**
+The profile holds a different Google account from `BOT_GOOGLE_ACCOUNT` (or none:
+"not signed into Google"). Run `./first_time_login.sh`, sign out of the other
+account, sign in as the bot. `runs/<run_id>/wrong_account.png` shows what the
+bot saw.
 
 **Google says "This browser or app may not be secure"**
-The login must go through `first_time_login.sh`, which launches Chrome directly.
-Playwright sets automation flags Google detects, even with `channel="chrome"`.
+The login must go through `first_time_login.sh`, which launches the browser
+directly. Selenium and Playwright both set automation flags Google detects.
+
+**Google Meet says "You can't join this video call"**
+Meet refuses guests while the organizer isn't in the call, and refuses accounts
+that weren't invited to a restricted meeting. Sign the bot in (`BOT_GOOGLE_ACCOUNT`)
+and invite that account, or be in the call to let it in.
 
 **The bot never gets admitted**
 Check `runs/<run_id>/join_failed.png` or `not_admitted.png`, and
 `runs/<run_id>/logs/record.log`.
 
 **The MP4 has video but no sound**
-The sink wasn't wired to the browser. Check that `PULSE_SINK` reached Chrome
+The sink wasn't wired to the browser. Check that `PULSE_SINK` reached the browser
 (`runs/<run_id>/record.pid` records the sink name) and that
 `pactl list short sinks` shows it. `./verify_e2e.sh --preflight` reproduces the
 whole chain in two seconds.
 
+**The meeting had sound, but the recording is silent**
+Check where the bot's browser is playing: `pactl list sink-inputs` should
+show `application.name = "Meeting Bot"` on the `meeting_<run id>` sink. The
+recorder pins it there every 10 seconds (`lib/pinaudio.py`). If your *own*
+browser's sound has gone somewhere odd after a recording, that is PipeWire
+restoring a routing it remembered for "Firefox": set it back in
+`pavucontrol` → Playback.
+
 **The recording has black bands down one edge**
-The Chrome window isn't filling the Xvfb head. `./verify_e2e.sh --browser-smoke`
-measures it. A band of 1px at the right and bottom is normal (Chrome's kiosk
+The browser window isn't filling the Xvfb head. `./verify_e2e.sh --browser-smoke`
+measures it. A band of 1px at the right and bottom is normal (the kiosk
 viewport is a pixel under the window); anything thicker means `RECORD_GEOMETRY`,
 `--window-size` and `--window-position` disagree.
 
@@ -1376,14 +2070,14 @@ didn't come up.
 The renderer is optional at runtime by design. The warning names what's
 missing — usually `weasyprint` or its Pango libraries. Install the system half
 with `sudo apt-get install libpango-1.0-0 libpangoft2-1.0-0`, then re-run
-`sudo -H ./setup.sh` to restore the Python half from the lockfile. (Installing
-individual packages by hand with `/opt/meeting-bot-venv/bin/pip install
-weasyprint` works too, but leaves the venv out of step with
-`requirements.txt`.)
+`./setup.sh` to restore the Python half from the lockfile (or `rm -rf .venv`
+first for a clean rebuild). Installing individual packages by hand with
+`.venv/bin/pip install weasyprint` works too, but leaves the venv out of step
+with `requirements.txt`.
 
 **The PDF prints raw LaTeX instead of formulas**
 matplotlib isn't installed in the venv, so `summarize/mathrender.py` fell back
-to plain text. Re-run `sudo -H ./setup.sh` to restore the venv from the
+to plain text. Re-run `./setup.sh` to restore the venv from the
 lockfile. If a *particular* expression is the only one showing as text, it is
 one mathtext can't parse (environments other than `aligned`-style ones,
 `\substack`, and similar) — the fallback is deliberate, and the formula is
@@ -1403,7 +2097,7 @@ python3 lib/kaltura.py info "<iframe or src url>"
 ```
 
 "exposes no playable source" is the other case: the entry is not playable
-without a logged-in LMS session. There is no fallback for that — the Chrome
+without a logged-in LMS session. There is no fallback for that — the browser
 profile is not involved on this path, so signing it in would not help, and
 browser-recording a private entry is not implemented. Download the file from
 the LMS yourself and feed the pipeline the local `.mp4`.
@@ -1419,8 +2113,8 @@ it. Check both — the first is easy to miss because an interactive shell can
 find `claude` when the pipeline cannot.
 
 *The binary isn't on the pipeline's PATH.* `claude` installs to
-`~/.local/bin`, which a minimal root `.profile` never adds to `PATH`, and a
-systemd unit or cron job gets an even barer environment. `_claude_cli_bin()`
+`~/.local/bin`, which pm2, cron and a background run don't necessarily have on
+`PATH`. `_claude_cli_bin()`
 then returns `None`, the backend raises `BackendUnavailable`, and the chain
 falls through to Gemini without anything looking broken. **Set
 `CLAUDE_CLI_BIN` to the absolute path in `.env`** rather than relying on
@@ -1431,8 +2125,7 @@ while the operator believed they were spending a Claude subscription.
 *Or the CLI isn't logged in.* `claude auth status` — if it says
 `"loggedIn": false`, run `claude auth login` (or `claude setup-token` on a
 headless box) *as the user the pipeline runs as*; the login lives in that
-user's `~/.claude`, so a login as yourself doesn't help a systemd unit running
-as root. `./verify_e2e.sh --preflight` checks this. The summarize log names the
+user's `~/.claude`. `./verify_e2e.sh --preflight` checks this. The summarize log names the
 reason on the `!! claude-cli unavailable:` line, and the finished document's
 provenance header records which backend actually answered.
 
@@ -1449,7 +2142,7 @@ had to give up (`PAUSED`, exit 75) is picked up by `./pipeline.sh --resume-all`
 once its recorded reset time has passed — automatically, if you installed
 `setup.sh --with-resume-timer`. To make the next lecture fit, read
 `stages.summarize.usage` in `--status` and turn down `CLAUDE_CLI_MAX_FRAMES`,
-`FRAME_PERIOD_SECONDS` or `SUMMARY_EFFORT` — see
+`FRAME_MOTION_SECONDS` or `SUMMARY_EFFORT` — see
 [the usage window](#the-usage-window). If you would rather have Gemini answer
 than wait, set `SUMMARY_FALLBACK_CHAIN=gemini`.
 
@@ -1463,5 +2156,6 @@ written through deliberately so you can see it in the `.txt`.
 `./pipeline.sh --run-id <run_id>` picks up from there.
 
 **Everything is slow on a long video**
-Frame extraction is CPU-bound. Raise `FRAME_PERIOD_SECONDS`, or lower `--jobs`
-so runs aren't competing for the same cores.
+Frame extraction is CPU-bound. `FRAME_DECODE_THREADS=0` finishes it sooner
+for more CPU; raise `FRAME_CHECK_SECONDS`, or lower `--jobs` so runs aren't
+competing for the same cores.

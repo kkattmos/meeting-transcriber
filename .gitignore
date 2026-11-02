@@ -40,3 +40,15 @@ runs/
 # shell junk that lands in the repo root (the repo IS $HOME)
 .bash_history-*.tmp
 .bashrc.bak-*
+
+# The uv-built project venv (setup.sh). Delete it to remove every Python dep.
+/.venv/
+
+# A copy of the Proxmox VM's .env, kept for its keys. Never commit it.
+/t.env
+
+# The Discord spikes' own throwaway dependencies (README "Discord voice bot").
+/spike/discord/py/.venv/
+/spike/discord/node/node_modules/
+/spike/discord/node/node-v22/
+/spike/discord/node/package-lock.json

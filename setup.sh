@@ -1,42 +1,43 @@
 #!/bin/bash
-# One-time setup for the meeting recording + transcription bot.
-# Target: Debian 13 (trixie) on Proxmox (LXC container or KVM VM), 4 vCPU / 8GB.
+# One-time setup for the meeting recording + transcription bot on a server VM:
+# Debian 13 (trixie) on Proxmox (LXC container or KVM VM), 4 vCPU / 8GB, run as root, state under /opt/meeting-bot, real Google
+# Chrome, systemd units.
 #
-# Everything runs natively on this host — there is no container split any more.
-# Debian is glibc, so Google's own google-chrome-stable package installs and
-# runs here; the Alpine branch needed a Debian container purely because Chrome
-# has no musl build. See CLAUDE.md.
+# This is the `debian13-in-proxmox` branch. The same code runs on a desktop PC as a
+# normal user with Firefox ESR and pm2 on the `debian13` branch; only the
+# deployment (this script, the units, .env.example's paths, webui.sh) differs.
+#
+#   sudo -H ./setup.sh [flags]
 #
 # Idempotent: re-running is safe and cheap. Flags:
-#   --no-chrome          skip Chrome + Playwright (stages 2 and 3 only box)
+#   --no-chrome          skip Chrome + the browser drivers (stages 2 and 3 only)
+#   --with-firefox       also install Firefox ESR + geckodriver
+#                        (MEETING_BROWSER=firefox-esr; Chrome stays the default)
 #   --with-libreoffice   also install LibreOffice, so .pptx slides passed via
 #                        --resources can be rendered into the PDF (~700MB)
-#   --with-trigger       install and enable the systemd trigger service
-#   --with-resume-timer  install a systemd timer that runs `pipeline.sh
-#                        --resume-all` every 15 min, so a run paused on the
-#                        Claude usage window finishes without anyone watching
-set -e
+#   --with-trigger       install and enable the web UI (meeting-bot-trigger.service)
+#   --with-resume-timer  install the 15-minute `pipeline.sh --resume-all` timer,
+#                        so a run paused on the Claude usage window finishes
+#                        without anyone watching
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_CHROME=1
+INSTALL_FIREFOX=0
 INSTALL_LIBREOFFICE=0
 INSTALL_TRIGGER=0
 INSTALL_RESUME_TIMER=0
+DISTRO_NAME="Debian 13"
 
 for arg in "$@"; do
   case "$arg" in
-    --no-chrome)        INSTALL_CHROME=0 ;;
-    --with-libreoffice) INSTALL_LIBREOFFICE=1 ;;
-    --with-trigger)     INSTALL_TRIGGER=1 ;;
+    --no-chrome)         INSTALL_CHROME=0 ;;
+    --with-firefox)      INSTALL_FIREFOX=1 ;;
+    --with-libreoffice)  INSTALL_LIBREOFFICE=1 ;;
+    --with-trigger)      INSTALL_TRIGGER=1 ;;
     --with-resume-timer) INSTALL_RESUME_TIMER=1 ;;
-    -h|--help)
-      sed -n '2,17p' "$0"
-      exit 0
-      ;;
-    *)
-      echo "Unknown flag: $arg (try --help)" >&2
-      exit 1
-      ;;
+    -h|--help)           sed -n '2,22p' "$0"; exit 0 ;;
+    *) echo "Unknown flag: $arg (try --help)" >&2; exit 1 ;;
   esac
 done
 
@@ -44,80 +45,53 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "This must be run as root — try: sudo -H $0" >&2
   exit 1
 fi
-
 if ! command -v apt-get >/dev/null 2>&1; then
-  echo "ERROR: apt-get not found. This setup script targets Debian 13." >&2
-  echo "  The Alpine variant lives on the 'alpinelinux' branch; see CLAUDE.md" >&2
-  echo "  for why the project moved back to a glibc host." >&2
+  echo "ERROR: apt-get not found. This setup script targets $DISTRO_NAME." >&2
   exit 1
 fi
-
 . /etc/os-release 2>/dev/null || true
-if [ "${ID:-}" != "debian" ] && [ "${ID_LIKE:-}" != "debian" ]; then
-  echo "WARNING: this looks like ${PRETTY_NAME:-an unknown distro}, not Debian."
-  echo "  Continuing anyway — the package names below are Debian's."
-fi
-
+case "${ID:-} ${ID_LIKE:-}" in
+  *debian*|*ubuntu*) ;;
+  *) echo "WARNING: this looks like ${PRETTY_NAME:-an unknown distro}, not $DISTRO_NAME."
+     echo "  Continuing anyway — the package names below are Debian's." ;;
+esac
 export DEBIAN_FRONTEND=noninteractive
-VENV="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}"
 
-# Read the operator's own directory choices if .env already exists, so setup
-# creates the directories they actually configured rather than the defaults.
-# shellcheck disable=SC1091
-. "$SCRIPT_DIR/source_env.sh" || true
-MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-/opt/meeting-bot}"
-RECORDINGS_DIR="${RECORDINGS_DIR:-$MEETING_BOT_ROOT/recordings}"
-TRANSCRIPTS_DIR="${TRANSCRIPTS_DIR:-$MEETING_BOT_ROOT/transcripts}"
-FRAMES_DIR="${FRAMES_DIR:-$MEETING_BOT_ROOT/frames}"
-SUMMARIES_DIR="${SUMMARIES_DIR:-$MEETING_BOT_ROOT/summaries}"
-PDF_DIR="${PDF_DIR:-$MEETING_BOT_ROOT/pdf}"
-CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-$MEETING_BOT_ROOT/chrome-profile}"
-RESOURCE_CACHE_DIR="${RESOURCE_CACHE_DIR:-$MEETING_BOT_ROOT/resources}"
+LOCAL_BIN=/usr/local/bin
+VENV="${MEETING_BOT_VENV:-/opt/meeting-bot-venv}"
 
 echo "==> Updating the package index"
 apt-get update -qq
 
-echo "==> Installing base tools"
-# ffmpeg           frame extraction (stage 3), audio demux (stage 2), x11grab
-# xvfb             the virtual display the browser renders into
-# x11vnc/novnc     the viewable-browser path used by first_time_login.sh
-# pulseaudio       per-run null sinks; ffmpeg records their .monitor source
-# poppler-utils    pdftotext/pdftoppm for --resources PDFs and slide images
-# libpango*        WeasyPrint's text shaping — without it the PDF export dies
-# fonts-*          Thai renders in both the browser (locale th-TH) and the PDF
+echo "==> Installing packages"
+# ffmpeg            recording (x11grab + pulse), frames, audio demux, clips
+# xvfb              the hidden display the recorder's browser renders into
+# x11vnc/novnc      first_time_login.sh --novnc (the VM has no screen)
+# pulseaudio        a server VM has no audio stack: lib/xsession.sh starts the
+#                   daemon on demand and loads one null sink per run
+# poppler-utils     pdftotext/pdftoppm for --resources PDFs and slide images
+# libpango*         WeasyPrint's text shaping — without it the PDF export dies
+# fonts-*           Thai in the browser (locale th-TH) and in the PDF
 apt-get install -y --no-install-recommends \
-  ca-certificates curl wget gnupg git \
+  ca-certificates curl wget gnupg git unzip \
   ffmpeg \
-  python3 python3-venv python3-dev \
-  build-essential pkg-config \
-  procps psmisc \
+  python3 python3-venv \
+  procps psmisc util-linux \
   tzdata locales \
   xvfb x11vnc novnc websockify \
   pulseaudio pulseaudio-utils \
-  wmctrl xdotool \
   poppler-utils \
-  libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b libffi-dev \
-  fonts-thai-tlwg fonts-liberation fonts-noto-core fonts-cmu
+  libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b \
+  fonts-thai-tlwg fonts-liberation fonts-noto-core fonts-cmu \
+  fontconfig
+# JetBrains Mono (the code face, DESIGN.md) is packaged on Debian 13; where it
+# is not, the PDF falls back to the next monospace face.
+apt-get install -y --no-install-recommends fonts-jetbrains-mono 2>/dev/null \
+  || echo "  fonts-jetbrains-mono not available here — code blocks use the fallback face."
 
-# fonts-cmu is CMU Serif — Computer Modern, the PDF's body face for English
-# summaries and the face mathtext sets the maths in (see summarize/pdf.py).
-# fonts-noto-core carries Noto Serif Thai, the last-resort Thai fallback.
-
-# Bai Jamjuree and Sarabun — the PDF's body faces for Thai summaries
-# (SUMMARY_LANGUAGE=th) — are not in Debian's archive. They are OFL Google
-# Fonts, vendored under fonts/ (four styles each, with their licences) so
-# this step needs no network. fontconfig picks them up from
-# /usr/local/share/fonts, which is where WeasyPrint looks too.
-echo "==> Installing the vendored Thai PDF fonts (Bai Jamjuree, Sarabun)"
-install -d /usr/local/share/fonts/meeting-bot
-install -m 0644 "$SCRIPT_DIR"/fonts/*/*.ttf /usr/local/share/fonts/meeting-bot/
-fc-cache -f >/dev/null
-
-# Thai locale: Chrome is driven with locale th-TH so Thai participant names
-# render instead of boxes. See CLAUDE.md — this is deliberate, not cosmetic.
 echo "==> Generating locales (en_US.UTF-8, th_TH.UTF-8)"
-sed -i 's/^# *\(en_US.UTF-8\|th_TH.UTF-8\)/\1/' /etc/locale.gen
-locale-gen >/dev/null
+sed -i 's/^# *\(en_US.UTF-8\|th_TH.UTF-8\)/\1/' /etc/locale.gen 2>/dev/null || true
+locale-gen >/dev/null 2>&1 || locale-gen en_US.UTF-8 th_TH.UTF-8 >/dev/null 2>&1 || true
 
 if [ "$INSTALL_LIBREOFFICE" -eq 1 ]; then
   echo "==> Installing LibreOffice Impress (for .pptx -> PDF -> slide images)"
@@ -125,15 +99,12 @@ if [ "$INSTALL_LIBREOFFICE" -eq 1 ]; then
 fi
 
 if [ "$INSTALL_CHROME" -eq 1 ]; then
-  echo "==> Installing real Google Chrome"
+  echo "==> Installing real Google Chrome (the default MEETING_BROWSER here)"
   # NOT chromium. Google's sign-in flow blocks unbranded Chromium builds with
-  # "This browser or app may not be secure", which is the entire reason this
-  # project insists on the branded package. See CLAUDE.md.
+  # "This browser or app may not be secure". See CLAUDE.md.
   if [ ! -f /usr/share/keyrings/google-chrome.gpg ]; then
-    wget -q -O /tmp/google-signing-key.pub \
-      https://dl.google.com/linux/linux_signing_key.pub
-    gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-      /tmp/google-signing-key.pub
+    wget -q -O /tmp/google-signing-key.pub https://dl.google.com/linux/linux_signing_key.pub
+    gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg /tmp/google-signing-key.pub
     rm -f /tmp/google-signing-key.pub
   fi
   echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
@@ -143,122 +114,136 @@ if [ "$INSTALL_CHROME" -eq 1 ]; then
   google-chrome-stable --version
 fi
 
-echo "==> Setting up the Python venv at $VENV"
-# `python3 -m venv`, not `uv venv`: this one always leaves a working pip inside,
-# which the troubleshooting steps in README lean on and which is the fallback
-# installer below. uv is used for *installing* when it's available.
-#
-# --system-site-packages is deliberately NOT used: we want a self-contained
-# venv so an apt upgrade of python3-* can't silently change SDK versions.
-if [ ! -x "$VENV/bin/python3" ]; then
-  python3 -m venv "$VENV"
+if [ "$INSTALL_FIREFOX" -eq 1 ]; then
+  echo "==> Installing Firefox ESR (MEETING_BROWSER=firefox-esr)"
+  apt-get install -y --no-install-recommends firefox-esr
 fi
 
-# Dependencies are pinned with hashes in requirements*.txt, generated from the
-# requirements*.in files beside them — see requirements.in for the regenerate
-# command. Pinning is the point: two boxes set up months apart otherwise get
-# whatever PyPI was serving that week, and an SDK that quietly changes its
-# request surface is exactly how a working install starts returning 400s.
-#
-# The browser file is separate so `--no-chrome` doesn't pull playwright's
-# bundled Node driver onto a box that will never open a browser.
-declare -a REQ_FILES=("$SCRIPT_DIR/requirements.txt")
-if [ "$INSTALL_CHROME" -eq 1 ]; then
-  REQ_FILES+=("$SCRIPT_DIR/requirements-browser.txt")
+echo "==> uv -> $LOCAL_BIN"
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$LOCAL_BIN" UV_NO_MODIFY_PATH=1 sh
 fi
-for req in "${REQ_FILES[@]}"; do
-  if [ ! -f "$req" ]; then
-    echo "ERROR: $req is missing." >&2
-    echo "  Regenerate it with:  uv pip compile --generate-hashes requirements.in -o requirements.txt" >&2
-    exit 1
+uv --version
+
+echo "==> Python venv at $VENV (uv)"
+# --seed keeps a pip inside for README's troubleshooting steps. The lockfiles
+# are compiled for Python 3.13: the system one where it is 3.13, otherwise a
+# uv-managed 3.13 is downloaded.
+if [ ! -x "$VENV/bin/python3" ]; then
+  uv venv --seed --python 3.13 "$VENV"
+fi
+REQS=(-r "$SCRIPT_DIR/requirements.txt")
+if [ "$INSTALL_CHROME" -eq 1 ] || [ "$INSTALL_FIREFOX" -eq 1 ]; then
+  REQS+=(-r "$SCRIPT_DIR/requirements-browser.txt")
+fi
+uv pip install --quiet --python "$VENV/bin/python3" "${REQS[@]}"
+if [ "$INSTALL_CHROME" -eq 1 ]; then
+  # The shared libraries Chrome needs. NOT `playwright install chromium`:
+  # capture.py drives the package above with channel="chrome".
+  "$VENV/bin/playwright" install-deps chromium >/dev/null 2>&1 || true
+fi
+
+if [ "$INSTALL_FIREFOX" -eq 1 ] && ! command -v geckodriver >/dev/null 2>&1; then
+  echo "==> geckodriver -> $LOCAL_BIN"
+  tag="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+         https://github.com/mozilla/geckodriver/releases/latest | sed 's#.*/tag/##')"
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/gd.tgz" \
+    "https://github.com/mozilla/geckodriver/releases/download/$tag/geckodriver-$tag-linux64.tar.gz"
+  tar -xzf "$tmp/gd.tgz" -C "$tmp"
+  install -m 0755 "$tmp/geckodriver" "$LOCAL_BIN/geckodriver"
+  rm -rf "$tmp"
+fi
+
+echo "==> yt-dlp -> $LOCAL_BIN"
+# From GitHub releases, not apt: YouTube breaks yt-dlp regularly and a stale
+# binary is the #1 cause of silent failures. Refreshed on every run of this.
+curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "$LOCAL_BIN/yt-dlp"
+chmod a+rx "$LOCAL_BIN/yt-dlp"
+"$LOCAL_BIN/yt-dlp" --version
+
+echo "==> deno (yt-dlp's JavaScript runtime) -> $LOCAL_BIN"
+# yt-dlp solves YouTube's JS challenges with an external runtime; without one
+# some videos are "not available". See CLAUDE.md, "yt-dlp needs deno".
+if ! command -v deno >/dev/null 2>&1; then
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/deno.zip" \
+    https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
+  python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract("deno", sys.argv[2])' \
+    "$tmp/deno.zip" "$tmp"
+  install -m 0755 "$tmp/deno" "$LOCAL_BIN/deno"
+  rm -rf "$tmp"
+fi
+deno --version | head -n 1
+
+echo "==> Vendored Thai PDF fonts (Bai Jamjuree, Sarabun) -> /usr/local/share/fonts/meeting-bot"
+install -d /usr/local/share/fonts/meeting-bot
+install -m 0644 "$SCRIPT_DIR"/fonts/*/*.ttf /usr/local/share/fonts/meeting-bot/
+fc-cache -f /usr/local/share/fonts/meeting-bot >/dev/null 2>&1 || true
+
+echo "==> .env"
+if [ ! -f "$SCRIPT_DIR/.env" ]; then
+  cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
+  chmod 600 "$SCRIPT_DIR/.env"
+  echo "  created from .env.example — fill in BOT_GOOGLE_ACCOUNT and your keys."
+fi
+if ! grep -qE '^MEETING_BOT_TOKEN=.+' "$SCRIPT_DIR/.env"; then
+  token="$("$VENV/bin/python3" -c 'import secrets; print(secrets.token_urlsafe(24))')"
+  if grep -qE '^MEETING_BOT_TOKEN=' "$SCRIPT_DIR/.env"; then
+    sed -i "s|^MEETING_BOT_TOKEN=.*|MEETING_BOT_TOKEN=$token|" "$SCRIPT_DIR/.env"
+  else
+    printf '\nMEETING_BOT_TOKEN=%s\n' "$token" >> "$SCRIPT_DIR/.env"
   fi
+  echo "  generated MEETING_BOT_TOKEN for the web UI."
+fi
+
+echo "==> Working directories"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/source_env.sh"
+mkdir -p "$MEETING_BOT_ROOT"/{runs,tmp,state,logs,resources}
+for var in RECORDINGS_DIR TRANSCRIPTS_DIR FRAMES_DIR SUMMARIES_DIR PDF_DIR; do
+  dir="${!var:-}"
+  [ -n "$dir" ] || { echo "  $var is not set in .env"; continue; }
+  mkdir -p "$dir" 2>/dev/null && echo "  $var = $dir" \
+    || echo "  WARNING: cannot create $var ($dir) — is the drive mounted?"
 done
 
-# uv installs the same pinned set roughly 40x faster (measured on this target:
-# 4s vs 2m43s cold). It is optional on purpose — it isn't in Debian's archive,
-# so a box without it must still be able to run setup.sh. Both paths verify the
-# hashes in the lockfile, so they produce byte-identical environments.
-if command -v uv >/dev/null 2>&1; then
-  echo "==> Installing Python dependencies with uv ($(uv --version))"
-  for req in "${REQ_FILES[@]}"; do
-    uv pip install --quiet --python "$VENV/bin/python3" -r "$req"
-  done
+install_unit() {  # <unit file in the repo>
+  local name; name="$(basename "$1")"
+  sed -e "s|@REPO_ROOT@|$SCRIPT_DIR|g" -e "s|@VENV@|$VENV|g" "$1" \
+    > "/etc/systemd/system/$name"
+  echo "  /etc/systemd/system/$name"
+}
+if [ "$INSTALL_TRIGGER" -eq 1 ] || [ "$INSTALL_RESUME_TIMER" -eq 1 ]; then
+  echo "==> systemd units"
+  [ "$INSTALL_TRIGGER" -eq 1 ] && install_unit "$SCRIPT_DIR/meeting-bot-trigger.service"
+  if [ "$INSTALL_RESUME_TIMER" -eq 1 ]; then
+    install_unit "$SCRIPT_DIR/meeting-bot-resume.service"
+    install_unit "$SCRIPT_DIR/meeting-bot-resume.timer"
+  fi
+  systemctl daemon-reload
+  [ "$INSTALL_TRIGGER" -eq 1 ] && systemctl enable --now meeting-bot-trigger.service
+  [ "$INSTALL_RESUME_TIMER" -eq 1 ] && systemctl enable --now meeting-bot-resume.timer
+fi
+
+echo "==> The claude CLI (the summarizer spends your Claude subscription)"
+CLI="${CLAUDE_CLI_BIN:-$(command -v claude || true)}"
+if [ -n "$CLI" ] && [ -x "$CLI" ]; then
+  echo "  $CLI ($("$CLI" --version 2>/dev/null | head -n 1))"
 else
-  echo "==> Installing Python dependencies with pip"
-  echo "    (install uv to make this step seconds instead of minutes:"
-  echo "     curl -LsSf https://astral.sh/uv/install.sh | sh)"
-  "$VENV/bin/pip" install --quiet --upgrade pip
-  for req in "${REQ_FILES[@]}"; do
-    # No --no-cache-dir: the lockfile's hashes are verified on every install,
-    # so a warm cache can't change what lands in the venv — it only makes a
-    # re-run faster.
-    "$VENV/bin/pip" install --quiet -r "$req"
-  done
-fi
-
-if [ "$INSTALL_CHROME" -eq 1 ]; then
-  echo "==> Installing Chrome's shared libraries for Playwright"
-  # `playwright install-deps chromium` pulls the shared libraries Chrome needs.
-  # We deliberately do NOT `playwright install chromium` (the bundled browser):
-  # capture.py uses channel="chrome" against the Google package above.
-  "$VENV/bin/playwright" install-deps chromium
-fi
-
-echo "==> Installing the latest yt-dlp"
-# From GitHub releases, not apt: YouTube breaks yt-dlp regularly and a stale
-# binary is the #1 cause of silent failures.
-curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-  -o /usr/local/bin/yt-dlp
-chmod a+rx /usr/local/bin/yt-dlp
-# A firewall that returns an HTML error page instead of the binary fails here
-# rather than three stages into a real run.
-/usr/local/bin/yt-dlp --version
-
-echo "==> Creating working directories"
-# The five media directories are configured independently in .env; the rest is
-# the pipeline's own bookkeeping under MEETING_BOT_ROOT.
-mkdir -p "$RECORDINGS_DIR" "$TRANSCRIPTS_DIR" "$FRAMES_DIR" \
-         "$SUMMARIES_DIR" "$PDF_DIR" "$RESOURCE_CACHE_DIR" \
-         "$MEETING_BOT_ROOT/runs" "$MEETING_BOT_ROOT/tmp" \
-         "$MEETING_BOT_ROOT/state" "$CHROME_PROFILE_DIR"
-
-if [ "$INSTALL_TRIGGER" -eq 1 ]; then
-  echo "==> Installing the systemd trigger service"
-  # Debian has systemd, so the unit that the Alpine branch kept purely for
-  # reference is usable again.
-  sed -e "s#@REPO_ROOT@#$SCRIPT_DIR#g" -e "s#@VENV@#$VENV#g" \
-    "$SCRIPT_DIR/meeting-bot-trigger.service" \
-    > /etc/systemd/system/meeting-bot-trigger.service
-  systemctl daemon-reload
-  systemctl enable --now meeting-bot-trigger.service
-  systemctl --no-pager status meeting-bot-trigger.service || true
-fi
-
-if [ "$INSTALL_RESUME_TIMER" -eq 1 ]; then
-  echo "==> Installing the resume timer"
-  # The backstop for a summarize stage that paused on the Claude usage
-  # window: the stage waits in-process first, but if that process is gone
-  # (reboot, killed terminal, the 6h wait cap) this is what finishes the run.
-  sed -e "s#@REPO_ROOT@#$SCRIPT_DIR#g" \
-    "$SCRIPT_DIR/meeting-bot-resume.service" \
-    > /etc/systemd/system/meeting-bot-resume.service
-  cp "$SCRIPT_DIR/meeting-bot-resume.timer" /etc/systemd/system/meeting-bot-resume.timer
-  systemctl daemon-reload
-  systemctl enable --now meeting-bot-resume.timer
-  systemctl --no-pager list-timers meeting-bot-resume.timer || true
+  echo "  not installed. Install it, sign in, and set CLAUDE_CLI_BIN in .env:"
+  echo "      curl -fsSL https://claude.ai/install.sh | bash"
+  echo "      /root/.local/bin/claude auth login"
 fi
 
 echo ""
 echo "==> Done."
 echo "Next steps:"
-echo "  1. cp .env.example .env && chmod 600 .env  — then fill in your API keys."
-echo "     (Anthropic key, Gemini keys 1-3, AssemblyAI keys 1-3,"
-echo "      youtube-transcript.io keys 1-10, and the five output directories.)"
-echo "  2. ./first_time_login.sh   — sign into Google/Zoom in the persistent"
-echo "     Chrome profile. It prints an SSH-tunnel command you run from your"
-echo "     own machine, since this box has no visible display."
-echo "  3. ./pipeline.sh <url-or-file>   — record, transcribe, summarize."
+echo "  1. Edit .env: BOT_GOOGLE_ACCOUNT, your API keys, and the five output directories."
+echo "  2. ./first_time_login.sh --novnc   — sign the bot's Chrome profile in, over noVNC."
+echo "  3. ./pipeline.sh <url-or-file>     — a Meet/Zoom link records in the background."
+echo "  4. ./webui.sh on                   — the web UI (systemd; --with-trigger also starts it at boot)."
 echo ""
 echo "Check the configuration with:"
 echo "  $VENV/bin/python3 lib/paths.py show"
-echo "  $VENV/bin/python3 lib/keyring.py status"
+echo "  ./verify_e2e.sh --preflight"

@@ -35,8 +35,27 @@ Two things come out of a bundle:
 
 Everything here is best-effort by design: a missing converter, an unreadable
 PDF or an unreachable repo degrades the summary, it does not fail the run. The
-one exception is a spec that names a local path that doesn't exist, which is
-almost always a typo and is reported as an error.
+exceptions are a spec that names a local path that doesn't exist, and a spec
+that names a text file (.md, .txt, ...) whose bytes are a PDF, a zip/OOXML
+document or anything with NULs in it — both are almost always a mistake, and
+are reported as errors.
+
+A Markdown file may open with YAML frontmatter describing the reference:
+
+    ---
+    course: Computer Networks I
+    source: "Kurose & Ross, Computer Networking (7th ed.)"
+    citation_label: Kurose      # the summary cites "(Kurose §2.4)"
+    coverage: "Chapters 1-3 only"
+    ---
+
+`course` and `source` are expected (a missing one is a warning; `course`
+falls back to the file name), the rest are optional, unknown keys are
+ignored. The frontmatter is stripped from the text and its fields become the
+attributes of a <course_reference> element around that file's text, which the
+lecture-reference prompt's citation rules are written against. Nothing about a
+file without frontmatter changes. Parsed by hand: flat `key: value` lines are
+all it needs, and pyyaml would be a dependency for that.
 """
 import hashlib
 import os
@@ -50,7 +69,7 @@ from pathlib import Path
 
 DEFAULT_MAX_CHARS = 40000
 DEFAULT_MAX_FILE_MB = 25
-DEFAULT_CACHE_DIR = "/opt/meeting-bot/resources"
+DEFAULT_CACHE_DIR = os.path.expanduser("~/.local/share/meeting-bot/resources")
 
 # Extensions we can pull text out of, cheapest first.
 TEXT_SUFFIXES = {
@@ -84,6 +103,9 @@ class ResourceFile:
     origin: str         # the spec it came from
     text: str = ""
     images: list = field(default_factory=list)
+    # Frontmatter fields (course, source, citation_label, coverage) when the
+    # file had frontmatter; None otherwise.
+    meta: dict = None
 
     @property
     def suffix(self):
@@ -106,11 +128,28 @@ class ResourceBundle:
             out.extend(f.images)
         return out
 
-    def text_block(self):
-        """The reference material as one prompt-ready string."""
+    def has_metadata(self):
+        return any(f.meta is not None for f in self.files)
+
+    def text_block(self, lecture_language=None):
+        """The reference material as one prompt-ready string.
+
+        A file with frontmatter is wrapped in <course_reference> with its
+        fields as attributes (plus the lecture's language, so bilingual rules
+        need no hardcoded language pair); any other file is exactly the
+        `### label` section it always was.
+        """
         chunks = []
         for f in self.files:
             if not f.text.strip():
+                continue
+            if f.meta is not None:
+                attrs = dict(f.meta)
+                if lecture_language:
+                    attrs["lecture_language"] = lecture_language
+                attr_text = " ".join(f'{k}="{_attr(v)}"' for k, v in attrs.items() if v)
+                chunks.append(f"<course_reference {attr_text}>\n"
+                              f"{f.text.strip()}\n</course_reference>")
                 continue
             chunks.append(f"### {f.label}\n\n{f.text.strip()}")
         body = "\n\n".join(chunks)
@@ -121,6 +160,68 @@ class ResourceBundle:
 
     def provenance(self):
         return "; ".join(self.sources)
+
+
+def _attr(value):
+    return (str(value).replace("&", "&amp;").replace('"', "&quot;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+FRONTMATTER_FIELDS = ("course", "source", "citation_label", "coverage")
+MARKDOWN_SUFFIXES = {".md", ".markdown"}
+
+
+def parse_frontmatter(text):
+    """Split YAML-ish frontmatter off a Markdown document.
+
+    Returns (meta, body, problems). meta is None when the text has no
+    frontmatter at all (then body is the text unchanged); otherwise a dict of
+    the known fields that were present. problems lists lines that could not be
+    read — reported, never fatal.
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return None, text, []
+    for end in range(1, len(lines)):
+        if lines[end].strip() in ("---", "..."):
+            break
+    else:
+        # An opening fence with no closing one is a horizontal rule, not
+        # frontmatter.
+        return None, text, []
+    meta, problems = {}, []
+    for raw in lines[1:end]:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition(":")
+        if not sep or not key.strip():
+            problems.append(line)
+            continue
+        value = value.strip()
+        if value[:1] in ('"', "'"):
+            close = value.find(value[0], 1)
+            value = value[1:close] if close > 0 else value[1:]
+        else:
+            value = re.sub(r"\s+#.*$", "", value).strip()
+        key = key.strip()
+        if key in FRONTMATTER_FIELDS:
+            meta[key] = value
+    return meta, "".join(lines[end + 1:]).lstrip("\n"), problems
+
+
+def looks_binary(path):
+    """True for a file whose bytes say it is not text, whatever its name."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8192)
+    except OSError:
+        return False
+    return (head.startswith(b"%PDF") or head.startswith(b"PK\x03\x04")
+            or b"\x00" in head)
+
+
+BINARY_MESSAGE = "this looks like a binary document; convert it to Markdown first."
 
 
 def max_chars():
@@ -442,9 +543,36 @@ def collect(specs, cache_root=None, want_images=None):
             except ValueError:
                 label = path.name
 
+            suffix = path.suffix.lower()
+            if (suffix in TEXT_SUFFIXES or suffix in CODE_SUFFIXES) and looks_binary(path):
+                if root.is_file():
+                    # Named directly: a PDF saved as notes.md, say. Fail now,
+                    # not after the model has been handed garbage.
+                    raise ValueError(f"{path}: {BINARY_MESSAGE}")
+                bundle.notes.append(f"{label}: skipped ({BINARY_MESSAGE})")
+                print(f"  !! {label}: skipped — {BINARY_MESSAGE}", file=sys.stderr)
+                continue
+
+            meta = None
             text = ""
             if used < budget:
                 text = extract_text(path).strip()
+                if suffix in MARKDOWN_SUFFIXES:
+                    meta, text, problems = parse_frontmatter(text)
+                    text = text.strip()
+                    for bad in problems:
+                        bundle.notes.append(f"{label}: unreadable frontmatter line: {bad}")
+                        print(f"  !! {label}: frontmatter line ignored: {bad}",
+                              file=sys.stderr)
+                    if meta is not None:
+                        if not meta.get("course"):
+                            meta["course"] = path.stem
+                            print(f"  !! {label}: frontmatter has no 'course' — "
+                                  f"using {path.stem!r}", file=sys.stderr)
+                        if not meta.get("source"):
+                            print(f"  !! {label}: frontmatter has no 'source'",
+                                  file=sys.stderr)
+                        meta.setdefault("citation_label", meta["course"])
                 if text:
                     remaining = budget - used
                     if len(text) > remaining:
@@ -457,7 +585,7 @@ def collect(specs, cache_root=None, want_images=None):
                 continue
             bundle.files.append(ResourceFile(path=path, label=label,
                                              origin=desc, text=text,
-                                             images=images))
+                                             images=images, meta=meta))
     return bundle
 
 
@@ -479,8 +607,52 @@ def parse_specs_arg(value):
     return parts
 
 
+def check_specs(specs):
+    """The cheap, offline checks pipeline.sh runs before anything is paid for.
+
+    Returns a list of error strings (fatal) and prints warnings. A GitHub spec
+    is only parsed — fetching it is the summarize stage's job.
+    """
+    errors = []
+    budget = max_chars()
+    for spec in specs:
+        try:
+            source = parse_spec(spec)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        if source["kind"] == "github":
+            continue
+        path = source["path"]
+        if path.is_file():
+            suffix = path.suffix.lower()
+            if (suffix in TEXT_SUFFIXES or suffix in CODE_SUFFIXES) and looks_binary(path):
+                errors.append(f"{path}: {BINARY_MESSAGE}")
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if suffix in TEXT_SUFFIXES and size > budget:
+                print(f"WARNING: --resources {path.name} is {size:,} bytes; only the "
+                      f"first {budget:,} characters (RESOURCE_MAX_CHARS) reach the "
+                      f"model, and they dominate every request.", file=sys.stderr)
+    return errors
+
+
 def _main(argv):
-    """CLI: `python3 lib/resources.py <spec> [...]` — show what we'd collect."""
+    """CLI: `python3 lib/resources.py <spec> [...]` — show what we'd collect.
+
+    `resources.py check <spec> [...]`: the offline pre-flight (exit 1 on an
+    error). `resources.py is-binary <file>`: exit 0 if the file is binary.
+    """
+    if len(argv) >= 2 and argv[1] == "check":
+        errors = check_specs(argv[2:])
+        for err in errors:
+            print(f"ERROR: --resources: {err}", file=sys.stderr)
+        return 1 if errors else 0
+    if len(argv) == 3 and argv[1] == "is-binary":
+        return 0 if looks_binary(argv[2]) else 1
     specs = argv[1:]
     if not specs:
         print("Usage: resources.py <github-url-or-path> [...]", file=sys.stderr)
@@ -494,6 +666,8 @@ def _main(argv):
     print(f"files:   {len(bundle.files)}   images: {len(bundle.images())}")
     for f in bundle.files:
         print(f"  {f.label:<50} text={len(f.text):>6}  images={len(f.images)}")
+        if f.meta is not None:
+            print(f"      frontmatter: {f.meta}")
     for note in bundle.notes:
         print(f"  note: {note}")
     return 0

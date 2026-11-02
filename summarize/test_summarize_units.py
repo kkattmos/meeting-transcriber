@@ -221,6 +221,42 @@ class ChunkingTest(unittest.TestCase):
         assigned = [f.timestamp_s for c in chunks for f in c.frames]
         self.assertIn(500.0, assigned)
 
+    def test_a_frame_heavy_chunk_is_cut_to_the_frame_cap(self):
+        # 10 minutes of talk, a frame every 2s (300), one chunk by size;
+        # SUMMARY_CHUNK_MAX_FRAMES=100 cuts it into pieces of about 100, and
+        # every frame still lands exactly once.
+        segments = [Segment(i * 10.0, i * 10.0 + 10.0, "w" * 10) for i in range(60)]
+        frames = self._frames(*[i * 2.0 for i in range(300)])
+        with mock.patch.dict(os.environ, {"SUMMARY_CHUNK_MAX_FRAMES": "100"}):
+            chunks = chunking.chunk_by_segments(segments, frames,
+                                                limit=100000, overlap=0)
+        self.assertEqual(len(chunks), 3)
+        self.assertTrue(all(len(c.frames) <= 100 for c in chunks))
+        assigned = sorted(f.timestamp_s for c in chunks for f in c.frames)
+        self.assertEqual(assigned, [i * 2.0 for i in range(300)])
+
+    def test_the_frame_cap_alone_starts_chunking(self):
+        # A short transcript with many frames: under SUMMARY_CHUNK_CHARS, so
+        # it would go in one call, but over the frame cap — and with size
+        # chunking switched off the cap still cuts, without one chunk per
+        # segment.
+        srt = self.tmp / "t.srt"
+        srt.write_text("".join(
+            f"{i + 1}\n00:{i // 6:02d}:{i % 6 * 10:02d},000 --> "
+            f"00:{(i + 1) // 6:02d}:{(i + 1) % 6 * 10:02d},000\nline {i}\n\n"
+            for i in range(60)))
+        part = chunking.Part(label="video 1", text="x",
+                             frames=self._frames(*[i * 2.0 for i in range(300)]),
+                             srt_path=str(srt))
+        for chars in ("100000", "0"):
+            with mock.patch.dict(os.environ, {"SUMMARY_CHUNK_CHARS": chars,
+                                              "SUMMARY_CHUNK_MAX_FRAMES": "100"}):
+                chunks = chunking.build_part_chunks([part])
+            self.assertEqual(len(chunks), 3, chars)
+        with mock.patch.dict(os.environ, {"SUMMARY_CHUNK_CHARS": "100000",
+                                          "SUMMARY_CHUNK_MAX_FRAMES": "0"}):
+            self.assertEqual(chunking.build_part_chunks([part]), [])
+
     def test_overlap_repeats_context_between_chunks(self):
         segments = [Segment(i * 5.0, i * 5.0 + 5.0, f"sentence{i} " * 10)
                     for i in range(12)]
@@ -312,11 +348,39 @@ class MapReduceTest(unittest.TestCase):
 
 
 class DocumentTest(unittest.TestCase):
-    def test_wrapper_applies_to_lecture_and_tutorial_only(self):
-        self.assertTrue(document.wants_wrapper("lecture-gemini"))
-        self.assertTrue(document.wants_wrapper("tutorial-claude.md"))
-        self.assertFalse(document.wants_wrapper("meeting-gemini"))
+    def test_wrapper_applies_to_lecture_tutorial_and_video(self):
+        self.assertTrue(document.wants_wrapper("lecture"))
+        self.assertTrue(document.wants_wrapper("tutorial.md"))
+        self.assertTrue(document.wants_wrapper("video"))
+        self.assertFalse(document.wants_wrapper("meeting"))
         self.assertFalse(document.wants_wrapper(None))
+        # Older names still decide the same way.
+        self.assertTrue(document.wants_wrapper("lecture-gemini"))
+        self.assertFalse(document.wants_wrapper("meeting-gemini"))
+
+    def test_a_meeting_link_is_labelled_as_one(self):
+        # The first live guest recording cited its Meet link as "Source File".
+        # A Discord voice channel: the bot's .m4a is a local file, passed
+        # with --source-url so the document cites the channel.
+        for url in ("https://meet.google.com/xbm-ryat-jch",
+                    "https://us02web.zoom.us/j/123456",
+                    "https://discord.com/channels/111111111111111111/222222222222222222"):
+            with self.subTest(url=url):
+                out = document.build_document(
+                    "# T\n\nbody", source=url, source_kind="local_file")
+                self.assertIn(f"Meeting Link: `{url}`", out)
+                self.assertNotIn("Source File", out)
+        out = document.build_document("# T\n\nbody", source="/rec/a.mp4",
+                                      source_kind="local_file")
+        self.assertIn("Source File: `/rec/a.mp4`", out)
+        self.assertTrue(document.looks_like_meeting("https://meet.google.com/abc-defg-hij"))
+        self.assertFalse(document.looks_like_meeting("https://youtu.be/x"))
+        self.assertFalse(document.looks_like_meeting("https://discord.com/invite/abc"))
+
+    def test_the_document_records_its_font(self):
+        out = document.build_document("# T\n\nbody", source="x.mp4",
+                                      source_kind="local_file", font="Sarabun")
+        self.assertIn("     font: Sarabun\n", out)
 
     def test_format_override(self):
         self.assertTrue(document.wants_wrapper("meeting-gemini", "always"))
@@ -1349,6 +1413,13 @@ class FrameNumberingTest(unittest.TestCase):
         _, text = llm_client._render(self.frames(5.0), "t", "{frame_manifest}")
         self.assertIn("[frame 1 @ 5.0s", text)
 
+    def test_no_frames_says_so_instead_of_an_empty_list(self):
+        # Voice only (--no-frames), or an audio file: every prompt says "look
+        # at the frames" under the list, so an empty list must be explained.
+        frames, text = llm_client._render([], "t", "Frames:\n{frame_manifest}")
+        self.assertEqual(frames, [])
+        self.assertIn(llm_client.NO_FRAMES_NOTE, text)
+
 
 # ---------------------------------------------------------------------------
 # The cache-stable prefix
@@ -1437,8 +1508,8 @@ class ShippedMarkedPromptsTest(unittest.TestCase):
 
     def test_the_expected_files_carry_the_markers(self):
         names = {path.name for path, _ in self._marked()}
-        self.assertIn("summarize-v2.md", names)
-        self.assertIn("lecture-claude.md", names)
+        self.assertEqual(names, {"lecture.md", "tutorial.md", "meeting.md",
+                                 "video.md", "reality.md", "drama.md"})
 
     def test_each_splits_cleanly(self):
         for path, text in self._marked():
@@ -1457,14 +1528,14 @@ class ShippedMarkedPromptsTest(unittest.TestCase):
         # lecture-claude.md used to lose it: load_prompt_template cut at the
         # first "# Input", which matched the "# Input Data" heading near the
         # top, so the prompt began with the orphaned word "Data".
-        text = (self.PROMPTS_DIR / "lecture-claude.md").read_text()
+        text = (self.PROMPTS_DIR / "lecture.md").read_text()
         static, _ = llm_client.split_static_prompt(text)
         self.assertTrue(static.startswith("You are an expert academic tutor"))
 
     def test_load_prompt_template_keeps_a_marked_file_whole(self):
         import summarize as summarize_main
         template = summarize_main.load_prompt_template(
-            self.PROMPTS_DIR / "lecture-claude.md")
+            self.PROMPTS_DIR / "lecture.md")
         self.assertIn("You are an expert academic tutor", template)
         self.assertIn("# Execution Rules", template)
         self.assertIn("{transcript}", template)
@@ -1837,6 +1908,92 @@ class DropUninformativeTest(unittest.TestCase):
         self.assertIn("[frame 1 @ 0.0s", text)
         self.assertIn("[frame 11 @ 300.0s", text)
 
+    def test_gemini_gets_the_same_filtering_as_the_cli(self):
+        # Blank and repeated frames out, then the cap, then cropped and
+        # downscaled copies — on 2026-10-06 Gemini was still sent every
+        # frame at full size, ~90MB for one 910-frame video, which alone
+        # spent the free tier's per-minute token quota.
+        frames = [self._frame(f"f{i}", i * 30, 1) for i in range(10)]
+        frames.append(self._frame("blank", 300, 0, blank=True))
+        frames.append(self._frame("new", 330, 2))
+        frames.append(self._frame("third", 360, 3))
+        frames = llm_client.assign_numbers(frames)
+        sent = []
+
+        class _Resp:
+            text = "BODY"
+
+        class _Models:
+            def generate_content(self, model, contents):
+                sent.append(contents)
+                return _Resp()
+
+        class Client:
+            def __init__(self, api_key, http_options=None):
+                self.models = _Models()
+
+        google = type(sys)("google")
+        genai = type(sys)("google.genai")
+        genai.Client = Client
+        google.genai = genai
+        env = {"MEETING_BOT_ROOT": self.tmp.name, "GEMINI_API_KEY_1": "k1",
+               "GEMINI_MODEL": "m", "CLAUDE_CLI_MAX_FRAMES": "2",
+               "FRAME_MAX_DIMENSION": "320", "PDF_FRAME_CROP": "none"}
+        before = {f.path: Path(f.path).stat().st_size for f in frames}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            llm_client.summarize_gemini(frames, "t", "{transcript}\n{frame_manifest}")
+        parts = sent[0][0]["parts"]
+        images = [p for p in parts if "inline_data" in p]
+        self.assertEqual(len(images), 2)          # 3 distinct slides, cap 2
+        self.assertNotIn("[frame 11 @", parts[0]["text"])   # the blank one
+        from PIL import Image
+        import io
+        for img in images:
+            self.assertLessEqual(max(Image.open(io.BytesIO(
+                img["inline_data"]["data"])).size), 320)
+        self.assertEqual(before, {f.path: Path(f.path).stat().st_size
+                                  for f in frames})   # originals untouched
+
+    def test_gemini_resolution_and_its_own_cap(self):
+        # GEMINI_MAX_FRAMES=0 sends every distinct frame even with the CLI's
+        # cap at 2, and GEMINI_MEDIA_RESOLUTION lands on every image part —
+        # it is the only thing that changes what an image costs Gemini.
+        frames = [self._frame("a", 0, 1), self._frame("b", 30, 2),
+                  self._frame("c", 60, 3)]
+        frames = llm_client.assign_numbers(frames)
+        sent = []
+
+        class _Resp:
+            text = "BODY"
+
+        class _Models:
+            def generate_content(self, model, contents):
+                sent.append(contents)
+                return _Resp()
+
+        class Client:
+            def __init__(self, api_key, http_options=None):
+                self.models = _Models()
+
+        google = type(sys)("google")
+        genai = type(sys)("google.genai")
+        genai.Client = Client
+        google.genai = genai
+        env = {"MEETING_BOT_ROOT": self.tmp.name, "GEMINI_API_KEY_1": "k1",
+               "GEMINI_MODEL": "m", "CLAUDE_CLI_MAX_FRAMES": "2",
+               "GEMINI_MAX_FRAMES": "0", "GEMINI_MEDIA_RESOLUTION": "low",
+               "PDF_FRAME_CROP": "none"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            llm_client.summarize_gemini(frames, "t", "{transcript}\n{frame_manifest}")
+        images = [p for p in sent[0][0]["parts"] if "inline_data" in p]
+        self.assertEqual(len(images), 3)
+        self.assertTrue(all(p["media_resolution"] == {"level": "MEDIA_RESOLUTION_LOW"}
+                            for p in images))
+        with mock.patch.dict(os.environ, {"GEMINI_MEDIA_RESOLUTION": "tiny"}):
+            self.assertEqual(llm_client._gemini_media_resolution(), "")
+
     def test_frame_hash_tells_slides_apart(self):
         import framecrop
         a = framecrop.frame_hash(self._frame("a", 0, 1).path)
@@ -1936,6 +2093,763 @@ class PromptOrderForCachingTest(unittest.TestCase):
         self.assertTrue(out.startswith("RULES"))
         self.assertGreater(out.index("Week 4"), out.index("{transcript}"))
 
+    def test_frontmatter_reference_is_tagged_and_keeps_its_braces_safe(self):
+        import summarize as summarize_main
+        import resources as botresources
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "kurose.md"
+            ref.write_text("---\ncourse: Networks\nsource: Kurose & Ross\n"
+                           "citation_label: Kurose\n---\n# 2.4 DNS\nuses {x}\n")
+            bundle = botresources.collect([str(ref)], cache_root=tmp, want_images=False)
+            template = f"{BEGIN}\nRULES\n{END}\n# Input\n{{transcript}}\n"
+            with mock.patch.dict(os.environ, {"MEETING_BOT_LANGUAGE": "th"}):
+                out = summarize_main.inject_resources(template, bundle)
+        static, dynamic = llm_client.split_static_prompt(out)
+        self.assertNotIn("Networks", static, "per-course metadata must stay dynamic")
+        self.assertIn('<course_reference course="Networks" source="Kurose &amp; Ross" '
+                      'citation_label="Kurose" lecture_language="th">', dynamic)
+        self.assertNotIn("---", dynamic.split("<course_reference")[1],
+                         "the frontmatter itself is stripped")
+        self.assertEqual(dynamic.format(transcript="T").count("uses {x}"), 1)
+
+    def test_a_reference_without_frontmatter_is_unchanged(self):
+        import summarize as summarize_main
+        import resources as botresources
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "notes.md"
+            ref.write_text("# Notes\nplain\n")
+            bundle = botresources.collect([str(ref)], cache_root=tmp, want_images=False)
+            with mock.patch.dict(os.environ, {"MEETING_BOT_LANGUAGE": "th"}):
+                out = summarize_main.inject_resources("RULES\n{transcript}", bundle)
+        self.assertNotIn("course_reference", out)
+        self.assertNotIn("lecture_language", out)
+        self.assertIn("### notes.md\n\n# Notes\nplain", out)
+
+    def test_lecture_reference_prompt_keeps_its_rules_static(self):
+        template = summarize_main_load("lecture-reference")
+        static, dynamic = llm_client.split_static_prompt(template)
+        self.assertIn("Cite only what is in the excerpt", static)
+        self.assertIn("{transcript}", dynamic)
+        self.assertNotIn("{", static.replace("{{", ""), "no format slots in the static half")
+
+
+class PromptSetTest(unittest.TestCase):
+    """The prompts (four on 2026-09-29, `reality` the fifth on 09-30): one
+    file per kind of recording, shared by every backend, none but the timed
+    ones asking for timestamps, none asking for frame citations, all
+    speaking the callout vocabulary the PDF styles (DESIGN.md)."""
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+
+    def test_exactly_six_selectable_prompts(self):
+        names = sorted(p.stem for p in self.PROMPTS_DIR.glob("*.md")
+                       if not p.stem.startswith("_"))
+        self.assertEqual(names, ["drama", "lecture", "meeting", "reality",
+                                 "tutorial", "video"])
+
+    def test_old_names_resolve_to_their_replacements(self):
+        for old, new in (("lecture-claude", "lecture"),
+                         ("lecture-gemini.md", "lecture"),
+                         ("lecture-reference", "lecture"),
+                         ("tutorial-gemini", "tutorial"),
+                         ("meeting-claude", "meeting"),
+                         ("summarize-v2", "meeting"), ("summarize", "meeting"),
+                         (None, "video"), ("", "video"), ("tutorial", "tutorial")):
+            with self.subTest(name=old):
+                self.assertEqual(self.sm.resolve_prompt_path(old).name,
+                                 f"{new}.md")
+
+    def test_an_unknown_prompt_lists_them(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.sm.resolve_prompt_path("nope")
+        self.assertIn("drama, lecture, meeting, reality, tutorial, video",
+                      str(cm.exception))
+
+    def test_no_prompt_asks_for_timestamps_or_frame_citations(self):
+        from promptnames import TIMED_TRANSCRIPT_PROMPTS
+        timed = {f"{n}.md" for n in TIMED_TRANSCRIPT_PROMPTS} | {
+            f"_merge-{n}.md" for n in TIMED_TRANSCRIPT_PROMPTS}
+        for path in sorted(self.PROMPTS_DIR.glob("*.md")):
+            if path.name in timed:
+                continue  # RealityPromptTest holds what those ask for
+            text = path.read_text()
+            with self.subTest(prompt=path.name):
+                for asks in ("Timestamp Format", "[mm:ss]`", "Visual Index",
+                             "Frame / Index", "Context Timestamp",
+                             "Preserve timestamp citations"):
+                    self.assertNotIn(asks, text)
+                if not path.name.startswith("_"):
+                    self.assertIn("never cite them", text)
+                    self.assertIn("no timestamps", text)
+
+    def test_every_prompt_speaks_the_callout_vocabulary(self):
+        for name in ("lecture", "tutorial", "meeting", "video", "reality",
+                     "drama"):
+            text = (self.PROMPTS_DIR / f"{name}.md").read_text()
+            with self.subTest(prompt=name):
+                for tag in ("[!CONCEPT]", "[!EXAMPLE]", "[!WARNING]",
+                            "[!IMPORTANT]", "[!NOTE]"):
+                    self.assertIn(tag, text)
+                static, _ = llm_client.split_static_prompt(text)
+                self.assertIn("[!CONCEPT]", static)
+
+    def test_the_lecture_prompt_carries_the_course_reference_rules(self):
+        static, _ = llm_client.split_static_prompt(
+            (self.PROMPTS_DIR / "lecture.md").read_text())
+        self.assertIn("Cite only what is in the excerpt", static)
+        self.assertIn("If there is none, ignore this section entirely", static)
+
+
+class RealityPromptTest(unittest.TestCase):
+    """The reality-show recap (2026-09-30): the one prompt that reads a timed
+    transcript and cites [mm:ss], which the code — not the model — links
+    into the video; quotes credited from on-screen name captions; the
+    results last."""
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def _srt(self, cues, name="ep.srt"):
+        """cues: [(start_s, end_s, text)] -> the .txt path beside an .srt."""
+        def ts(sec):
+            ms = int(round(sec * 1000))
+            h, rem = divmod(ms, 3600_000)
+            m, rem = divmod(rem, 60_000)
+            s_, ms = divmod(rem, 1000)
+            return f"{h:02d}:{m:02d}:{s_:02d},{ms:03d}"
+        blocks = [f"{i}\n{ts(a)} --> {ts(b)}\n{t}\n"
+                  for i, (a, b, t) in enumerate(cues, start=1)]
+        srt = self.dir / name
+        srt.write_text("\n".join(blocks))
+        txt = srt.with_suffix(".txt")
+        txt.write_text("\n".join(t for _, _, t in cues))
+        return txt
+
+    # --- which prompts read the timed transcript -------------------------
+
+    def test_only_reality_and_drama_read_timed_lines(self):
+        from promptnames import wants_timed_transcript
+        self.assertTrue(wants_timed_transcript("reality"))
+        self.assertTrue(wants_timed_transcript("reality.md"))
+        self.assertTrue(wants_timed_transcript("drama"))
+        for name in (None, "", "video", "lecture", "meeting", "tutorial",
+                     "lecture-claude", "summarize"):
+            with self.subTest(prompt=name):
+                self.assertFalse(wants_timed_transcript(name))
+
+    def test_it_is_wrapped_with_the_link_and_transcript(self):
+        self.assertTrue(document.wants_wrapper("reality"))
+
+    # --- what the prompt asks for ----------------------------------------
+
+    def test_the_prompt_asks_for_the_recap(self):
+        text = (self.PROMPTS_DIR / "reality.md").read_text()
+        static, dynamic = llm_client.split_static_prompt(text)
+        for asks in ("## Highlights", "## Results", "eliminated",
+                     "[!EXAMPLE]` box titled \"Quotes\"",
+                     "On-screen name captions", "never guess a name",
+                     "The Face", "`[mm:ss]`", "[Video N, mm:ss]",
+                     "If the transcript carries no marks, write no timestamps",
+                     "{language_rule}"):
+            with self.subTest(asks=asks):
+                self.assertIn(asks, static)
+        # Results last, and no spoiler in the opening.
+        self.assertIn("**End with the Results section.**", static)
+        self.assertIn("Do not reveal any result here", static)
+        self.assertLess(static.index("## Highlights"),
+                        static.index("`## Results`"))
+        # Frames are still never cited.
+        self.assertIn("never cite them", static)
+        for placeholder in ("{transcript}", "{frame_manifest}"):
+            self.assertIn(placeholder, dynamic)
+            self.assertNotIn(placeholder, static)
+
+    def test_the_template_formats(self):
+        # Every brace in the file is a placeholder: .format() must not choke.
+        template = self.sm.load_prompt_template(self.PROMPTS_DIR / "reality.md")
+        out = template.format(transcript="T", frame_manifest="F")
+        self.assertIn("[mm:ss]", out)
+
+    # --- the timed transcript --------------------------------------------
+
+    def test_lines_group_cues_and_open_with_their_time(self):
+        segs = [Segment(t, t + 3, f"c{t}") for t in range(0, 30, 3)]
+        lines = chunking.timed_transcript(segs).splitlines()
+        self.assertEqual(lines, ["[00:00] c0 c3 c6 c9",
+                                 "[00:12] c12 c15 c18 c21",
+                                 "[00:24] c24 c27"])
+
+    def test_past_the_hour_the_mark_carries_hours(self):
+        self.assertEqual(chunking.timestamp_label(3599), "[59:59]")
+        self.assertEqual(chunking.timestamp_label(3723.9), "[1:02:03]")
+
+    def test_a_long_asr_segment_is_cut_so_marks_stay_dense(self):
+        # AssemblyAI on Thai: one "sentence" for two minutes.
+        segs = [Segment(0, 120, "ก" * 1200)]
+        lines = chunking.timed_transcript(segs).splitlines()
+        self.assertEqual([ln.split("]")[0] + "]" for ln in lines],
+                         ["[00:00]", "[00:30]", "[01:00]", "[01:30]"])
+
+    def test_chunks_carry_the_marks_and_their_frames(self):
+        txt = self._srt([(t, t + 4, "x" * 50) for t in range(0, 400, 4)])
+        frames = [FrameMeta(timestamp_s=t, kind="motion", path=f"/f{t}.jpg")
+                  for t in (5, 395)]
+        timed = self.sm.model_transcript(txt.read_text(), str(txt), "reality")
+        with mock.patch.dict(os.environ, {"SUMMARY_CHUNK_CHARS": "1500",
+                                          "SUMMARY_CHUNK_OVERLAP": "0"}):
+            chunks = chunking.build_chunks(timed, frames, str(txt), timed=True)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            for line in chunk.text.splitlines():
+                self.assertRegex(line, r"^\[\d\d:\d\d\] ")
+        self.assertEqual([f.timestamp_s for f in chunks[0].frames], [5])
+        self.assertEqual([f.timestamp_s for f in chunks[-1].frames], [395])
+
+    def test_model_transcript_is_timed_only_for_reality(self):
+        txt = self._srt([(0, 4, "hello"), (65, 70, "there")])
+        plain = txt.read_text()
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(self.sm.model_transcript(plain, str(txt), "reality"),
+                             "[00:00] hello\n[01:05] there")
+        self.assertEqual(self.sm.model_transcript(plain, str(txt), "video"),
+                         plain)
+
+    def test_no_srt_means_the_plain_text_and_a_warning(self):
+        txt = self.dir / "bare.txt"
+        txt.write_text("words")
+        err = io.StringIO()
+        with mock.patch("sys.stderr", new=err):
+            self.assertEqual(
+                self.sm.model_transcript("words", str(txt), "reality"), "words")
+        self.assertIn("no timestamps", err.getvalue())
+
+    def test_combined_parts_are_timed_per_video(self):
+        a = self._srt([(0, 3, "one"), (20, 23, "two")], "a.srt")
+        b = self._srt([(5, 8, "three")], "b.srt")
+        parts = [chunking.Part(label="video 1 of 2: A", text="one\ntwo",
+                               srt_path=str(a.with_suffix(".srt"))),
+                 chunking.Part(label="video 2 of 2: B", text="three",
+                               srt_path=str(b.with_suffix(".srt")))]
+        self.assertEqual(chunking.part_transcript(parts, timed=True),
+                         "=== video 1 of 2: A ===\n\n[00:00] one\n[00:20] two"
+                         "\n\n=== video 2 of 2: B ===\n\n[00:05] three")
+        # The document still embeds the plain text.
+        self.assertIn("one\ntwo", chunking.part_transcript(parts))
+
+    # --- the links --------------------------------------------------------
+
+    URL = "https://www.youtube.com/watch?v=abcdefghijk"
+
+    def test_youtube_ids(self):
+        for url in ("https://youtu.be/abcdefghijk",
+                    "https://www.youtube.com/watch?v=abcdefghijk&list=PL1",
+                    "https://www.youtube.com/watch?feature=x&v=abcdefghijk",
+                    "https://youtube.com/shorts/abcdefghijk",
+                    "https://www.youtube.com/live/abcdefghijk?si=1"):
+            with self.subTest(url=url):
+                self.assertEqual(document.youtube_id(url), "abcdefghijk")
+        self.assertIsNone(document.youtube_id("/media/ep.mp4"))
+        self.assertIsNone(document.youtube_id(None))
+
+    def test_marks_become_links_to_that_second(self):
+        body = "## 2. Shoot [08:15]\n* [1:02:03] **Bee**: \"ok\""
+        out = document.link_timestamps(body, [(self.URL, 0)])
+        self.assertIn(f"[08:15]({self.URL}&t=495s)", out)
+        self.assertIn(f"[1:02:03]({self.URL}&t=3723s)", out)
+
+    def test_a_clip_offset_is_added_to_the_link_not_the_text(self):
+        out = document.link_timestamps("[00:10]", [(self.URL, 300)])
+        self.assertEqual(out, f"[00:10]({self.URL}&t=310s)")
+
+    def test_video_n_links_into_that_video(self):
+        other = "https://youtu.be/zyxwvutsrqp"
+        out = document.link_timestamps(
+            "[Video 2, 00:05] and [00:07]", [(self.URL, 0), (other, 0)])
+        self.assertIn("[Video 2, 00:05](https://www.youtube.com/watch?v="
+                      "zyxwvutsrqp&t=5s)", out)
+        # A bare mark is ambiguous among several videos: left as text.
+        self.assertTrue(out.endswith("and [00:07]"))
+
+    def test_a_timestamp_dressed_as_code_is_still_linked(self):
+        # Gemini, live: "| `[01:41:22]` | … |" in the Highlights table.
+        out = document.link_timestamps("| `[01:41:22]` | walkout |",
+                                       [(self.URL, 0)])
+        self.assertEqual(out, f"| [01:41:22]({self.URL}&t=6082s) | walkout |")
+
+    def test_what_is_not_linked(self):
+        body = ("`x [00:01]` and\n```\n[00:02]\n```\n[00:03](https://x) "
+                "[Video 9, 00:04]")
+        self.assertEqual(document.link_timestamps(body, [(self.URL, 0)]), body)
+        # No YouTube source: no links at all.
+        self.assertEqual(document.link_timestamps("[00:05]", [("/ep.mp4", 0)]),
+                         "[00:05]")
+        self.assertEqual(document.link_timestamps(
+            "[00:05]", [("https://cdnapisec.kaltura.com/p/1/embed", 0)]),
+            "[00:05]")
+
+    # --- the merge ---------------------------------------------------------
+
+    def test_the_merge_keeps_timestamps_and_puts_results_last(self):
+        from mapreduce import load_merge_template
+        merge = load_merge_template("reality")
+        self.assertIn("Keep every timestamp exactly as written", merge)
+        self.assertIn("ONE `## Results` section, LAST", merge)
+        self.assertNotIn("{language_rule}", merge)
+        self.assertEqual(merge.format(transcript="P").count("P"), 1 +
+                         merge.count("P"))
+        # Every other prompt keeps the shared merge.
+        self.assertEqual(load_merge_template("video"), load_merge_template())
+        self.assertIn("Do not add timestamps", load_merge_template("lecture"))
+
+    def test_summarize_chunked_uses_the_merge_it_is_given(self):
+        seen = []
+
+        def fake(frames, transcript, template, role=None):
+            seen.append((role, template))
+            return "partial"
+        chunks = [Chunk(index=i, text=f"t{i}") for i in range(2)]
+        summarize_chunked(chunks, "P {transcript}", fake, log=lambda *a: None,
+                          merge_template="MERGE {transcript}")
+        self.assertEqual(seen[-1], ("merge", "MERGE {transcript}"))
+
+    # --- end to end through main() ------------------------------------------
+
+    def test_main_sends_timed_lines_and_writes_links(self):
+        txt = self._srt([(0, 4, "สวัสดี"), (125, 130, "ออกจากการแข่งขัน")])
+        manifest = self.dir / "manifest.json"
+        manifest.write_text('{"frames": []}')
+        out_md = self.dir / "out.md"
+        seen = {}
+
+        def fake(frames, transcript, template, role=None):
+            seen["transcript"] = transcript
+            return "# Ep 1\n\n## Results [02:05]\n\n* **A** eliminated [02:05]"
+        argv = ["summarize.py", "https://youtu.be/abcdefghijk", str(txt),
+                str(out_md), "--prompt", "reality", "--frames-manifest",
+                str(manifest), "--no-pdf", "--title", "Ep 1",
+                "--clip", "00:01:00-00:10:00"]
+        env = {k: v for k, v in os.environ.items() if k != "RESOURCES"}
+        with mock.patch.object(self.sm, "summarize", fake), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("sys.stdout", new=io.StringIO()):
+            self.sm.main()
+        self.assertEqual(seen["transcript"],
+                         "[00:00] สวัสดี\n[02:05] ออกจากการแข่งขัน")
+        doc = out_md.read_text()
+        # The clip started at 1:00, so 02:05 in the clip is 185s in the video.
+        self.assertIn("[02:05](https://www.youtube.com/watch?v=abcdefghijk"
+                      "&t=185s)", doc)
+        # The embedded transcript is the plain one.
+        self.assertIn("    สวัสดี", doc)
+        self.assertNotIn("    [00:00]", doc)
+
+    def test_main_leaves_other_prompts_plain(self):
+        txt = self._srt([(0, 4, "hello")])
+        manifest = self.dir / "manifest.json"
+        manifest.write_text('{"frames": []}')
+        seen = {}
+
+        def fake(frames, transcript, template, role=None):
+            seen["transcript"] = transcript
+            return "# T\n\nbody [00:00]"
+        argv = ["summarize.py", "https://youtu.be/abcdefghijk", str(txt),
+                str(self.dir / "o.md"), "--prompt", "video",
+                "--frames-manifest", str(manifest), "--no-pdf", "--title", "T"]
+        with mock.patch.object(self.sm, "summarize", fake), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch("sys.stdout", new=io.StringIO()):
+            self.sm.main()
+        self.assertEqual(seen["transcript"], "hello")
+        self.assertNotIn("&t=", (self.dir / "o.md").read_text())
+
+
+class DramaPromptTest(unittest.TestCase):
+    """The Thai drama (lakorn) recap (2026-11-02): timed like reality, with a
+    characters-and-relationships table, scene-by-scene sections with Thai
+    quotes, a spoiler-free opening and what changed last."""
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+
+    def test_it_is_timed_wrapped_and_labelled(self):
+        from promptnames import wants_timed_transcript
+        import pdf
+        self.assertTrue(wants_timed_transcript("drama"))
+        self.assertTrue(wants_timed_transcript("drama.md"))
+        self.assertTrue(document.wants_wrapper("drama"))
+        self.assertEqual(pdf._doc_kind_label("drama", {}), "Drama episode recap")
+
+    def test_the_prompt_asks_for_the_recap(self):
+        static, dynamic = llm_client.split_static_prompt(
+            (self.PROMPTS_DIR / "drama.md").read_text())
+        for asks in ("titled \"Characters\"", "Relationships",
+                     "never guess a name", "`[mm:ss]`", "[Video N, mm:ss]",
+                     "If the transcript carries no marks, write no timestamps",
+                     "**The opening paragraph reveals nothing**",
+                     "## Highlights", "## What changed", "Cliffhanger",
+                     "ตัวอย่างตอนต่อไป", "Keep each quote in Thai",
+                     "never cite them", "{language_rule}"):
+            with self.subTest(asks=asks):
+                self.assertIn(asks, static)
+        self.assertLess(static.index("5. **`## Highlights`**"),
+                        static.index("6. **`## What changed`**"))
+        for placeholder in ("{transcript}", "{frame_manifest}"):
+            self.assertIn(placeholder, dynamic)
+            self.assertNotIn(placeholder, static)
+
+    def test_the_template_formats(self):
+        template = self.sm.load_prompt_template(self.PROMPTS_DIR / "drama.md")
+        out = template.format(transcript="T", frame_manifest="F")
+        self.assertIn("[mm:ss]", out)
+        self.assertNotIn("{language_rule}", out)
+
+    def test_its_own_merge_keeps_timestamps(self):
+        from mapreduce import load_merge_template
+        merge = load_merge_template("drama")
+        self.assertIn("Keep every timestamp exactly as written", merge)
+        self.assertIn("ONE `## What changed` section", merge)
+        self.assertNotIn("{language_rule}", merge)
+        merge.format(transcript="P")
+
+    def test_timestamps_become_youtube_links(self):
+        doc = document.link_timestamps(
+            "* **พลอย** [02:05]", [("https://youtu.be/abcdefghijk", 0)])
+        self.assertIn("[02:05](https://www.youtube.com/watch?v=abcdefghijk"
+                      "&t=125s)", doc)
+
+
+class InstructionsTest(unittest.TestCase):
+    """--instructions: the operator's own words for one run, after the
+    static half (so the cache holds) and above the reference material."""
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+        self.marked = (f"{llm_client.STATIC_PROMPT_BEGIN}\nRULES\n"
+                       f"{llm_client.STATIC_PROMPT_END}\n\n# Input\n{{transcript}}\n")
+
+    def test_nothing_given_changes_nothing(self):
+        self.assertEqual(self.sm.inject_instructions(self.marked, ""), self.marked)
+        self.assertEqual(self.sm.inject_instructions(self.marked, "  \n"),
+                         self.marked)
+
+    def test_they_go_after_the_static_half(self):
+        out = self.sm.inject_instructions(self.marked, "Focus on exam hints.")
+        static, dynamic = llm_client.split_static_prompt(out)
+        self.assertNotIn("exam hints", static)
+        self.assertIn("<operator_instructions>\nFocus on exam hints.\n"
+                      "</operator_instructions>", dynamic)
+        self.assertLess(dynamic.index("exam hints"), dynamic.index("{transcript}"))
+
+    def test_they_sit_above_the_reference_material(self):
+        out = self.sm.inject_resources(self.marked, None)
+        with_material = out.replace(llm_client.STATIC_PROMPT_END,
+                                    llm_client.STATIC_PROMPT_END + "\nMATERIAL", 1)
+        out = self.sm.inject_instructions(with_material, "Be brief.")
+        self.assertLess(out.index("Be brief."), out.index("MATERIAL"))
+
+    def test_braces_survive_format(self):
+        out = self.sm.inject_instructions(self.marked, "Use {x} and }{")
+        filled = out.format(transcript="T")
+        self.assertIn("Use {x} and }{", filled)
+
+    def test_a_template_without_markers_is_appended_to(self):
+        out = self.sm.inject_instructions("PLAIN {transcript}", "Be brief.")
+        self.assertTrue(out.startswith("PLAIN {transcript}"))
+        self.assertIn("Be brief.", out)
+
+    def test_the_flag_wins_over_the_environment(self):
+        with mock.patch.dict(os.environ, {"SUMMARY_INSTRUCTIONS": "env"}):
+            self.assertEqual(self.sm.run_instructions({"instructions": "flag"}),
+                             "flag")
+            self.assertEqual(self.sm.run_instructions({}), "env")
+
+
+def summarize_main_load(name):
+    import summarize as summarize_main
+    return summarize_main.load_prompt_template(summarize_main.resolve_prompt_path(name))
+
+
+class ChunkFlowTest(unittest.TestCase):
+    """2026-10-14: the merge gets the operator's instructions, every model
+    that wrote part of a document is named, and finished chunks are kept in
+    the run directory and reused."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._env = mock.patch.dict(os.environ, {
+            "MEETING_BOT_RUN_DIR": self._tmp.name, "SUMMARY_MAX_PARALLEL": "1"})
+        self._env.start()
+        self._used = mock.patch.object(llm_client, "USED_MODELS", [])
+        self._used.start()
+        self.calls = []
+
+    def tearDown(self):
+        self._used.stop()
+        self._env.stop()
+        self._tmp.cleanup()
+
+    def _fn(self, frames, text, template, role=None):
+        self.calls.append((text, role))
+        llm_client._record_used("b", "merge" if role == "merge" else
+                                ("m4" if "four" in text else "m1"))
+        return f"sum({text[:5]})"
+
+    def _chunks(self):
+        return [Chunk(index=0, text="one one"), Chunk(index=1, text="four four")]
+
+    def test_finished_chunks_are_reused_with_their_model(self):
+        summarize_chunked(self._chunks(), "{transcript}", self._fn,
+                          log=lambda *a: None)
+        self.assertEqual(len(self.calls), 3)
+        self.calls.clear()
+        llm_client.USED_MODELS.clear()
+        summarize_chunked(self._chunks(), "{transcript}", self._fn,
+                          log=lambda *a: None)
+        self.assertEqual([r for _, r in self.calls], ["merge"])
+        self.assertEqual(llm_client.USED_MODELS, ["b/m1", "b/m4", "b/merge"])
+
+    def test_a_changed_model_misses_the_cache(self):
+        summarize_chunked(self._chunks(), "{transcript}", self._fn,
+                          log=lambda *a: None)
+        self.calls.clear()
+        with mock.patch.dict(os.environ, {"OPENROUTER_MODEL": "other"}):
+            summarize_chunked(self._chunks(), "{transcript}", self._fn,
+                              log=lambda *a: None)
+        self.assertEqual(len(self.calls), 3)
+
+    def test_no_run_dir_keeps_nothing(self):
+        with mock.patch.dict(os.environ, {"MEETING_BOT_RUN_DIR": ""}):
+            summarize_chunked(self._chunks(), "{transcript}", self._fn,
+                              log=lambda *a: None)
+        self.assertFalse((Path(self._tmp.name) / "chunks").exists())
+
+    def test_used_models_label_names_every_model(self):
+        llm_client._record_used("openrouter", "dots")
+        self.assertIsNone(llm_client.used_models_label())
+        llm_client._record_used("claude-cli", "haiku")
+        llm_client._record_used("openrouter", "dots")
+        self.assertEqual(llm_client.used_models_label(),
+                         "openrouter/dots + claude-cli/haiku")
+
+    def test_the_merge_gets_the_instructions_before_the_partials(self):
+        import summarize as summ
+        merge = "Rules.\n\nPartial summaries, in order:\n\n{transcript}\n"
+        out = summ.inject_merge_instructions(merge, "Make a {1-day} plan")
+        self.assertLess(out.index("<operator_instructions>"),
+                        out.index("Partial summaries, in order:"))
+        self.assertIn("Make a {{1-day}} plan", out)
+        self.assertIn("appears once", out)
+        self.assertEqual(summ.inject_merge_instructions(merge, ""), merge)
+
+
+class OpenRouterBackendTest(unittest.TestCase):
+    """summarize_openrouter through a fake `requests`: the payload shape, the
+    key/model walk, the daily cap, errors inside a 200 body."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.calls = []
+        self.script = {}
+        test = self
+
+        class _Resp:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._payload = payload
+                self.headers = {}
+                self.text = json.dumps(payload) if not isinstance(payload, str) else payload
+
+            def json(self):
+                return self._payload
+
+        def post(url, json=None, timeout=None, headers=None):
+            key = headers["Authorization"].split()[-1]
+            test.calls.append((key, json["model"], json, timeout, url))
+            outcome = test.script.get((key, json["model"]), "ok")
+            if isinstance(outcome, tuple):
+                return _Resp(*outcome)
+            content = outcome
+            return _Resp(200, {"choices": [{"message": {"content": content}}],
+                               "usage": {"prompt_tokens": 1,
+                                         "completion_tokens": 2}})
+
+        fake = type(sys)("requests")
+        fake.post = post
+        self._modules = mock.patch.dict(sys.modules, {"requests": fake})
+        self._modules.start()
+        self._env = mock.patch.dict(os.environ, {
+            "MEETING_BOT_ROOT": self._tmp.name,
+            "OPENROUTER_API_KEY_1": "k1", "OPENROUTER_API_KEY_2": "k2",
+            "OPENROUTER_MODEL": "m-a,m-b",
+            "SUMMARY_MAX_RETRIES": "2",
+        })
+        self._env.start()
+        self._sleep = mock.patch.object(retry.time, "sleep", lambda s: None)
+        self._sleep.start()
+
+    def tearDown(self):
+        self._sleep.stop()
+        self._env.stop()
+        self._modules.stop()
+        self._tmp.cleanup()
+
+    def _run(self, frames=()):
+        return llm_client.summarize_openrouter(list(frames), "words",
+                                            "{transcript}")
+
+    def test_registered_in_the_chain(self):
+        self.assertIs(llm_client._BACKENDS["openrouter"],
+                      llm_client.summarize_openrouter)
+
+    def test_no_key_is_unavailable(self):
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY_1": "",
+                                          "OPENROUTER_API_KEY_2": ""}):
+            with self.assertRaises(llm_client.BackendUnavailable):
+                self._run()
+
+    def test_payload_text_then_labelled_data_uri_images(self):
+        path = Path(self._tmp.name) / "f.jpg"
+        path.write_bytes(b"\xff\xd8jpegbytes")
+        frame = llm_client.FrameMeta(path=str(path), timestamp_s=5.0,
+                                     kind="scene_change", number=7)
+        with mock.patch.object(llm_client, "drop_uninformative",
+                               lambda fr: (list(fr), 0, 0)), \
+                mock.patch.object(llm_client, "_downscale_frames",
+                                  lambda fr: (list(fr), 0)):
+            self.assertEqual(self._run([frame]), "ok")
+        body = self.calls[0][2]
+        content = body["messages"][0]["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "words"})
+        self.assertIn("frame 7", content[1]["text"])
+        self.assertEqual(content[2]["type"], "image_url")
+        self.assertTrue(content[2]["image_url"]["url"].startswith(
+            "data:image/jpeg;base64,"))
+        self.assertEqual(llm_client.LAST_BACKEND, "openrouter")
+
+    def test_daily_cap_drops_the_key_for_every_model(self):
+        self.script[("k1", "m-a")] = (429, {"error": {
+            "code": 429, "message": "Rate limit exceeded: free-models-per-day"}})
+        self.script[("k2", "m-a")] = (503, "busy")
+        self.assertEqual(self._run(), "ok")
+        self.assertNotIn(("k1", "m-b"), [c[:2] for c in self.calls])
+        self.assertEqual(sum(1 for c in self.calls if c[0] == "k1"), 1)
+
+    def test_per_minute_429_is_retried(self):
+        seq = [(429, {"error": {"code": 429, "message": "Rate limit exceeded"}}),
+               "ok"]
+        self.script = type("S", (dict,), {
+            "get": lambda s, k, d=None: seq.pop(0) if seq else d})()
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_truncated_answer_is_retried_once_then_moves_on(self):
+        self.script[("k1", "m-a")] = (200, {"choices": [{
+            "message": {"content": "half a guide"}, "finish_reason": "length"}]})
+        with mock.patch.dict(os.environ, {"MEETING_BOT_ROOT": self._tmp.name}):
+            self.assertEqual(self._run(), "ok")
+        self.assertEqual([c[:2] for c in self.calls],
+                         [("k1", "m-a"), ("k1", "m-a"), ("k1", "m-b")])
+        kept = list((Path(self._tmp.name) / "tmp" / "rejected-answers").glob("*.md"))
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(kept[0].read_text(), "half a guide")
+
+    def test_a_retried_runaway_that_then_succeeds_is_kept(self):
+        seq = [(200, {"choices": [{"message": {"content": "x" * 9},
+                                   "finish_reason": "length"}]}), "fine"]
+        self.script = type("S", (dict,), {
+            "get": lambda s, k, d=None: seq.pop(0) if seq else d})()
+        self.assertEqual(self._run(), "fine")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_an_answer_drifting_into_other_scripts_is_rejected(self):
+        # The 2026-10-16 run: Chinese and Arabic inside Thai words.
+        drifted = ("ต้นทุนการซื้อ卖出 การ预测แนวโน้ม ด้าน系统 "
+                   "ไม่ใช่สิ่งที่ضمانว่า")
+        self.script[("k1", "m-a")] = drifted
+        with mock.patch.dict(os.environ, {"SUMMARY_LANGUAGE": "th"}):
+            self.assertEqual(self._run(), "ok")
+        self.assertEqual([c[:2] for c in self.calls],
+                         [("k1", "m-a"), ("k1", "m-a"), ("k1", "m-b")])
+        kept = list((Path(self._tmp.name) / "tmp" / "rejected-answers").glob("*.md"))
+        self.assertEqual(len(kept), 2)
+
+    def test_a_few_foreign_words_or_the_inputs_own_script_pass(self):
+        with mock.patch.dict(os.environ, {"SUMMARY_LANGUAGE": "en"}):
+            self.script[("k1", "m-a")] = "Risk, 危机 in Chinese, is danger (危) and opportunity."
+            self.assertIn("危机", self._run())
+            # Thai quoted from a Thai transcript is the input's own script.
+            for key in ("k1", "k2"):
+                self.script[(key, "m-a")] = "ความเสี่ยง (risk), ผลตอบแทน, หุ้น, ปันผล"
+            self.assertIn("หุ้น", llm_client.summarize_openrouter(
+                [], "ไทย" * 20, "{transcript}"))
+            # Unless asked for none.
+            self.calls.clear()
+            with mock.patch.dict(os.environ, {"OPENROUTER_MAX_FOREIGN_RUNS": "0",
+                                              "OPENROUTER_MODEL": "m-a"}):
+                self.script[("k1", "m-a")] = "Risk (危机)."
+                self.script[("k2", "m-a")] = "Risk (危机)."
+                with self.assertRaises(RuntimeError):
+                    self._run()
+
+    def test_chunks_are_capped_and_the_merge_is_not(self):
+        self._run()
+        self.assertEqual(self.calls[-1][2]["max_tokens"], 32768)
+        llm_client.summarize_openrouter([], "w", "{transcript}", role="merge")
+        self.assertNotIn("max_tokens", self.calls[-1][2])
+
+    def test_an_error_inside_a_200_is_not_an_answer(self):
+        self.script[("k1", "m-a")] = (200, {"error": {
+            "code": 403, "message": "moderation"}})
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(self.calls[-1][0], "k2")
+
+    def test_404_skips_the_model_for_every_key(self):
+        self.script[("k1", "m-a")] = (404, "no such model")
+        self.script[("k2", "m-a")] = (404, "no such model")
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(self.calls[-1][1], "m-b")
+        self.assertEqual(sum(1 for c in self.calls if c[1] == "m-a"), 1)
+
+    def test_the_answering_model_is_recorded(self):
+        self.script[("k1", "m-a")] = (200, {
+            "model": "dots/real:free",
+            "choices": [{"message": {"content": "hi"}}]})
+        self.assertEqual(self._run(), "hi")
+        self.assertEqual(llm_client.LAST_MODEL, "dots/real:free (via m-a)")
+
+    def test_list_content_keeps_only_text_chunks(self):
+        self.script[("k1", "m-a")] = [{"type": "text", "text": "answer"}]
+        self.assertEqual(self._run(), "answer")
+
+    def test_5xx_is_retried(self):
+        seq = [(503, "busy"), "ok"]
+        self.script = type("S", (dict,), {
+            "get": lambda s, k, d=None: seq.pop(0) if seq else d})()
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_everything_failing_raises(self):
+        for k in ("k1", "k2"):
+            for m in ("m-a", "m-b"):
+                self.script[(k, m)] = (401, "bad key")
+        with self.assertRaises(RuntimeError):
+            self._run()
+
 
 class GeminiModelChainTest(unittest.TestCase):
     """GEMINI_MODEL as a chain: every key on a model, then the next model.
@@ -1948,6 +2862,7 @@ class GeminiModelChainTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.calls = []
+        self.http_options = []
         self.script = {}
         test = self
 
@@ -1967,7 +2882,8 @@ class GeminiModelChainTest(unittest.TestCase):
                 return _Resp(outcome)
 
         class Client:
-            def __init__(self, api_key):
+            def __init__(self, api_key, http_options=None):
+                test.http_options.append(http_options)
                 self.models = _Models(api_key)
 
         google = type(sys)("google")
@@ -2040,6 +2956,25 @@ class GeminiModelChainTest(unittest.TestCase):
         self.assertEqual(self.calls, [("k1", "gemini-3.8-flash"),
                                       ("k1", "gemini-3.7-flash")])
 
+    def test_every_client_has_a_timeout(self):
+        # Without one, a request Gemini never answers blocks the run forever
+        # (2026-10-06: 65 minutes on silent sockets, no retry, no rotation).
+        self._run()
+        self.assertEqual(self.http_options, [{"timeout": 600_000}])
+        self.http_options.clear()
+        with mock.patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "90"}):
+            self._run()
+        self.assertEqual(self.http_options, [{"timeout": 90_000}])
+
+    def test_a_timed_out_request_is_retried_then_rotates(self):
+        class ReadTimeout(Exception):   # httpx's name; retry classifies on it
+            pass
+        self.script[("k1", "gemini-3.8-flash")] = ReadTimeout("timed out")
+        self.assertEqual(self._run(), "ok")
+        # Both retries on k1 (it is transient), then the next key.
+        self.assertEqual(self.calls, [("k1", "gemini-3.8-flash")] * 2
+                         + [("k2", "gemini-3.8-flash")])
+
     def test_a_busy_server_still_gets_the_retry_backoff(self):
         busy = self._err(503, "503 UNAVAILABLE: overloaded")
         self.script[("k1", "gemini-3.8-flash")] = busy
@@ -2079,9 +3014,8 @@ class OutputLanguageTest(unittest.TestCase):
     """
 
     PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
-    SHIPPED = ["lecture-claude.md", "lecture-gemini.md",
-               "tutorial-claude.md", "tutorial-gemini.md",
-               "meeting-claude.md", "meeting-gemini.md", "_merge.md"]
+    SHIPPED = ["lecture.md", "tutorial.md", "meeting.md", "video.md",
+               "_merge.md"]
 
     def setUp(self):
         import language
@@ -2167,7 +3101,7 @@ class OutputLanguageTest(unittest.TestCase):
         for code in ("th", "en"):
             os.environ["SUMMARY_LANGUAGE"] = code
             template = summarize_main.load_prompt_template(
-                self.PROMPTS_DIR / "lecture-claude.md")
+                self.PROMPTS_DIR / "lecture.md")
             halves[code] = llm_client.split_static_prompt(template)
         self.assertIn("Thai (ภาษาไทย)", halves["th"][0])
         self.assertIn("in English", halves["en"][0])
