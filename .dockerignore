@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+.git
+.venv
+old_stuff
+spike
+**/__pycache__

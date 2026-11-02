@@ -14,12 +14,30 @@ frames that were on screen while those words were spoken. Without an .srt we
 fall back to splitting the plain text and dividing the frames proportionally,
 which is approximate but still better than sending every frame to every chunk.
 
+A segment is the atom here — chunk boundaries and frame windows are both drawn
+on segment edges — so a transcript whose segments are enormous defeats both.
+That is not hypothetical: AssemblyAI returns almost no sentence boundaries for
+Thai, and a real 2.6-hour lecture came back as **three** cues, the first a
+single 29-minute "sentence". Chunks then came out at 60k and 70k characters
+against a 40k limit (a segment cannot be split), and every frame window was
+half an hour wide, so the model had no way to tell which slide belonged to
+which sentence. `split_long_segments` cuts those back down before chunking.
+
 Env vars:
   SUMMARY_CHUNK_CHARS      default 24000  (0 disables chunking entirely)
+  SUMMARY_SEGMENT_MAX_SECONDS default 120 (0 disables segment splitting)
+  SUMMARY_SEGMENT_MAX_CHARS   default 2000
   SUMMARY_CHUNK_OVERLAP    default 800    (chars of context repeated between
                                            chunks, so a sentence split across a
                                            boundary isn't lost)
   SUMMARY_MAX_PARALLEL     default 3      (concurrent chunk requests)
+  SUMMARY_CHUNK_MAX_FRAMES default 0      (most frames one chunk may carry;
+                                           a chunk with more is cut in time.
+                                           0 = no limit. The Gemini free tier
+                                           counts every image against 250k
+                                           input tokens a minute, so a video
+                                           with hundreds of distinct frames
+                                           has to go in several requests)
 """
 import os
 import re
@@ -48,12 +66,21 @@ class Chunk:
     start_s: Optional[float] = None
     end_s: Optional[float] = None
     frames: List = field(default_factory=list)
+    # Which video the slice came from, when several are summarized as one
+    # ("video 2: <title>"). Empty on a single-recording run. The window in
+    # the header is relative to that video, like every timestamp in it.
+    label: str = ""
 
     def header(self, total):
-        if self.start_s is None:
-            return f"part {self.index + 1} of {total}"
-        return (f"part {self.index + 1} of {total} "
-                f"({_hhmmss(self.start_s)}–{_hhmmss(self.end_s)})")
+        head = f"part {self.index + 1} of {total}"
+        inner = []
+        if self.label:
+            inner.append(self.label)
+        if self.start_s is not None:
+            inner.append(f"{_hhmmss(self.start_s)}–{_hhmmss(self.end_s)}")
+        if inner:
+            head += f" ({', '.join(inner)})"
+        return head
 
 
 def _hhmmss(seconds):
@@ -70,11 +97,61 @@ def chunk_chars():
         return 24000
 
 
+def chunk_max_frames():
+    try:
+        return max(0, int(os.environ.get("SUMMARY_CHUNK_MAX_FRAMES", 0)))
+    except ValueError:
+        return 0
+
+
+def _split_by_frames(groups, frames, cap):
+    """Cut every segment group carrying more than `cap` frames into pieces.
+
+    The cuts fall at frame timestamps, every `cap`-th frame of the group's
+    window, so the pieces carry about `cap` frames each however unevenly the
+    slides are spread through the talk; the segments go to the piece their
+    start falls in. A segment is never split, so a piece can still run over
+    when one segment spans many frames — split_long_segments has already
+    capped segments at two minutes, which keeps that small.
+    """
+    if cap <= 0:
+        return groups
+    ordered = sorted(frames, key=lambda f: f.timestamp_s)
+    out = []
+    for group in groups:
+        start, end = group[0].start_s, group[-1].end_s
+        inside = [f for f in ordered if start <= f.timestamp_s < end]
+        if len(inside) <= cap:
+            out.append(group)
+            continue
+        cuts = [inside[i].timestamp_s for i in range(cap, len(inside), cap)]
+        pieces = [[] for _ in range(len(cuts) + 1)]
+        for seg in group:
+            pieces[sum(1 for c in cuts if seg.start_s >= c)].append(seg)
+        out.extend(piece for piece in pieces if piece)
+    return out
+
+
 def chunk_overlap():
     try:
         return max(0, int(os.environ.get("SUMMARY_CHUNK_OVERLAP", 800)))
     except ValueError:
         return 800
+
+
+def segment_max_seconds():
+    """Longest segment we'll hand the chunker. 0 disables the split."""
+    try:
+        return max(0, int(os.environ.get("SUMMARY_SEGMENT_MAX_SECONDS", 120)))
+    except ValueError:
+        return 120
+
+
+def segment_max_chars():
+    try:
+        return max(1, int(os.environ.get("SUMMARY_SEGMENT_MAX_CHARS", 2000)))
+    except ValueError:
+        return 2000
 
 
 def max_parallel():
@@ -111,6 +188,135 @@ def parse_srt(path):
     return segments
 
 
+# Where a cut is tidy: whitespace, or the punctuation Thai and English
+# transcripts actually contain. Thai doesn't space its words, so on Thai this
+# usually finds a sentence-ish break or nothing at all — hence the hard cut.
+_NICE_BREAK = re.compile(r"[\s。．.!?！？,，、;；:：ฯ]")
+
+
+def split_long_segments(segments, max_seconds=None, max_chars=None):
+    """Cut over-long segments into pieces, interpolating their timestamps.
+
+    Only segments past a limit are touched, so a well-formed transcript (cues
+    of a few seconds each) comes back byte-identical and every existing run
+    behaves exactly as it did. See the module docstring for the transcript
+    that made this necessary.
+
+    Timestamps are interpolated linearly on character offset — it assumes an
+    even speaking rate, which is wrong in detail and enormously closer than
+    "all 1,700 seconds of this belong to one instant". The alternative,
+    leaving a 29-minute atom in place, gives every frame in that half hour an
+    equal claim on every sentence in it.
+    """
+    max_seconds = segment_max_seconds() if max_seconds is None else max_seconds
+    max_chars = segment_max_chars() if max_chars is None else max_chars
+    if max_seconds <= 0:
+        return list(segments)
+
+    out = []
+    for seg in segments:
+        duration = max(0.0, seg.end_s - seg.start_s)
+        text = seg.text
+        pieces = max(_ceil_div(duration, max_seconds),
+                     _ceil_div(len(text), max_chars))
+        if pieces <= 1 or not text:
+            out.append(seg)
+            continue
+        for start_i, end_i in _split_points(text, pieces):
+            # Linear on character offset: the piece covering characters
+            # [start_i, end_i) of the segment gets the same fraction of its
+            # time span.
+            frac_a = start_i / len(text)
+            frac_b = end_i / len(text)
+            out.append(Segment(
+                start_s=seg.start_s + duration * frac_a,
+                end_s=seg.start_s + duration * frac_b,
+                text=text[start_i:end_i],
+            ))
+    return out
+
+
+def _ceil_div(value, limit):
+    """How many pieces of at most `limit` it takes to cover `value`."""
+    if limit <= 0 or value <= 0:
+        return 1
+    return int(value // limit) + (1 if value % limit else 0)
+
+
+def _split_points(text, pieces):
+    """[(start, end)] cutting `text` into `pieces`, preferring tidy breaks."""
+    target = len(text) / pieces
+    bounds = [0]
+    for i in range(1, pieces):
+        ideal = int(round(i * target))
+        # Look for whitespace or punctuation within 10% of the ideal cut, so a
+        # word (or, on Thai, a phrase) isn't sliced through the middle when
+        # there is a break to be had.
+        window = max(1, int(target * 0.1))
+        best = None
+        for offset in range(window):
+            for candidate in (ideal - offset, ideal + offset):
+                if bounds[-1] < candidate < len(text) and \
+                        _NICE_BREAK.match(text[candidate]):
+                    best = candidate + 1
+                    break
+            if best is not None:
+                break
+        cut = best if best is not None else ideal
+        if cut > bounds[-1]:
+            bounds.append(min(cut, len(text)))
+    bounds.append(len(text))
+    return [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
+
+
+# The timed transcript (promptnames.TIMED_TRANSCRIPT_PROMPTS): one line per
+# stretch of about this many seconds, each opening with its [mm:ss]. Caption
+# cues are a few seconds long, and a mark on every one of them would cost ~8
+# characters a cue — a third more input on Thai captions — for precision a
+# highlight doesn't need. Long ASR segments are cut to TIMED_SPLIT_SECONDS
+# first, or an AssemblyAI-Thai transcript would get one mark every two
+# minutes (see split_long_segments).
+TIMED_LINE_SECONDS = 10
+TIMED_SPLIT_SECONDS = 30
+
+
+def timestamp_label(seconds):
+    """[mm:ss] under an hour, [h:mm:ss] from the hour on — the spelling the
+    reality prompt asks for, and the one document.link_timestamps reads."""
+    seconds = int(seconds or 0)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"[{h}:{m:02d}:{s:02d}]" if h else f"[{m:02d}:{s:02d}]"
+
+
+def timed_segments(segments, every=None):
+    """Group segments into lines of ~`every` seconds, each text prefixed with
+    its start time. Returned as Segments, so chunk_by_segments can cut and
+    frame-window them like any other — the marks travel inside the text."""
+    every = TIMED_LINE_SECONDS if every is None else every
+    pieces = split_long_segments(segments, max_seconds=TIMED_SPLIT_SECONDS)
+    lines, group = [], []
+
+    def close():
+        if group:
+            text = " ".join(s.text.strip() for s in group if s.text.strip())
+            lines.append(Segment(group[0].start_s, group[-1].end_s,
+                                 f"{timestamp_label(group[0].start_s)} {text}"))
+
+    for seg in pieces:
+        if group and seg.start_s - group[0].start_s >= every:
+            close()
+            group = []
+        group.append(seg)
+    close()
+    return lines
+
+
+def timed_transcript(segments, every=None):
+    """The whole transcript as [mm:ss]-prefixed lines; "" without segments."""
+    return "\n".join(s.text for s in timed_segments(segments, every))
+
+
 def find_srt_for(transcript_path):
     """The .srt sibling of a .txt transcript, if the pipeline produced one."""
     p = Path(transcript_path)
@@ -118,9 +324,12 @@ def find_srt_for(transcript_path):
     return candidate if candidate.is_file() else None
 
 
-def should_chunk(transcript, limit=None):
+def should_chunk(transcript, limit=None, frames=None):
     limit = chunk_chars() if limit is None else limit
-    return limit > 0 and len(transcript) > limit
+    if limit > 0 and len(transcript) > limit:
+        return True
+    cap = chunk_max_frames()
+    return bool(frames) and cap > 0 and len(frames) > cap
 
 
 def chunk_by_segments(segments, frames, limit=None, overlap=None):
@@ -130,6 +339,8 @@ def chunk_by_segments(segments, frames, limit=None, overlap=None):
     sees the slide that was actually on screen for the words it's reading.
     """
     limit = chunk_chars() if limit is None else limit
+    if limit <= 0:
+        limit = float("inf")   # size chunking off; only the frame cap cuts
     overlap = chunk_overlap() if overlap is None else overlap
 
     chunks = []
@@ -152,17 +363,23 @@ def chunk_by_segments(segments, frames, limit=None, overlap=None):
         current_len += len(seg.text)
     if current:
         chunks.append(current)
+    chunks = _split_by_frames(chunks, frames, chunk_max_frames())
 
     out = []
     for i, group in enumerate(chunks):
         start_s = group[0].start_s
         end_s = group[-1].end_s
-        # The last chunk keeps any frames past its final segment (a trailing
-        # slide after the last spoken word would otherwise be dropped).
+        # The edge chunks keep the frames outside the spoken range: a title
+        # slide that is already up before the first word (real case — the
+        # frame at t=0, when segment 1 starts at 0.3s) and a trailing slide
+        # after the last one would otherwise belong to no chunk at all, and a
+        # frame no chunk carries is a frame the model can never cite.
+        is_first = i == 0
         is_last = i == len(chunks) - 1
         selected = [
             f for f in frames
-            if f.timestamp_s >= start_s and (is_last or f.timestamp_s < end_s)
+            if (is_first or f.timestamp_s >= start_s)
+            and (is_last or f.timestamp_s < end_s)
         ]
         out.append(Chunk(
             index=i,
@@ -203,7 +420,7 @@ def chunk_by_text(transcript, frames, limit=None, overlap=None):
     if not groups:
         groups = [[transcript]]
 
-    ordered = sorted(frames, key=lambda f: f.timestamp_s)
+    ordered = sorted(frames, key=lambda f: getattr(f, "sort_key", f.timestamp_s))
     per = max(1, len(ordered) // max(1, len(groups)))
     out = []
     for i, group in enumerate(groups):
@@ -213,12 +430,16 @@ def chunk_by_text(transcript, frames, limit=None, overlap=None):
     return out
 
 
-def build_chunks(transcript, frames, transcript_path=None):
+def build_chunks(transcript, frames, transcript_path=None, timed=False):
     """Chunk a transcript, preferring the timestamped .srt when available.
 
     Returns [] when the transcript is short enough to summarize in one call.
+    `timed` gives every chunk the [mm:ss]-prefixed lines of timed_segments
+    (pass the timed text as `transcript` too, so the size test counts the
+    marks); without an .srt there are no times to give, and the plain text
+    is chunked as usual.
     """
-    if not should_chunk(transcript):
+    if not should_chunk(transcript, frames=frames):
         return []
 
     if transcript_path:
@@ -226,6 +447,91 @@ def build_chunks(transcript, frames, transcript_path=None):
         if srt:
             segments = parse_srt(srt)
             if segments:
+                segments = (timed_segments(segments) if timed
+                            else split_long_segments(segments))
                 return chunk_by_segments(segments, frames)
 
     return chunk_by_text(transcript, frames)
+
+
+@dataclass
+class Part:
+    """One video of a combined summary (pipeline.sh --combine).
+
+    `label` is what the model is told the video is ("video 2: Week 2 —
+    Requirements"), `frames` are that video's frames already tagged with its
+    part number and numbered globally (see pdf.load_part_manifests), and
+    `srt_path` is the timed transcript when the pipeline produced one.
+    """
+    label: str
+    text: str
+    frames: List = field(default_factory=list)
+    srt_path: Optional[str] = None
+
+
+def _part_text(part, timed):
+    """A video's transcript as the model reads it: [mm:ss] lines when
+    `timed` and the video has an .srt, else its plain text."""
+    if timed and part.srt_path:
+        text = timed_transcript(parse_srt(part.srt_path))
+        if text:
+            return text
+    return part.text.strip()
+
+
+def part_transcript(parts, timed=False):
+    """The transcript of several videos as one labelled text.
+
+    This is what the model reads when the whole set fits in one call, and
+    (untimed) what the document embeds. Each video is fenced with its label
+    so the model can keep them apart — the timestamps inside restart from
+    zero at every fence, and nothing else in the text says so.
+    """
+    blocks = []
+    for part in parts:
+        blocks.append(f"=== {part.label} ===\n\n{_part_text(part, timed)}")
+    return "\n\n".join(blocks)
+
+
+def _chunk_one_part(part, limit, timed=False):
+    """Chunk a single video, always returning at least one chunk."""
+    segments = parse_srt(part.srt_path) if part.srt_path else []
+    if segments:
+        segments = (timed_segments(segments) if timed
+                    else split_long_segments(segments))
+        chunks = chunk_by_segments(segments, part.frames, limit=limit)
+    else:
+        chunks = chunk_by_text(part.text, part.frames, limit=limit)
+    if not chunks:
+        chunks = [Chunk(index=0, text=part.text, frames=list(part.frames))]
+    for chunk in chunks:
+        chunk.label = part.label
+    return chunks
+
+
+def build_part_chunks(parts, limit=None, timed=False):
+    """Chunk several videos for one map-reduce pass.
+
+    Returns [] when everything fits in one call — the caller then sends
+    part_transcript() with every frame, so the model sees the whole set at
+    once and can relate one video to the next. Otherwise every video is
+    chunked on its own (its timestamps and frames are its own; a window
+    spanning two videos would mean nothing) and the chunks are laid end to
+    end in video order, each labelled with the video it came from.
+
+    A video is never merged into a neighbour's chunk even when both are
+    short: the label on a chunk is what the model cites the frames against,
+    and one chunk cannot carry two.
+    """
+    limit = chunk_chars() if limit is None else limit
+    total = sum(len(_part_text(p, timed)) for p in parts)
+    cap = chunk_max_frames()
+    too_many_frames = cap > 0 and sum(len(p.frames) for p in parts) > cap
+    if not (limit > 0 and total > limit) and not too_many_frames:
+        return []
+    chunks = []
+    for part in parts:
+        chunks.extend(_chunk_one_part(part, limit, timed))
+    for index, chunk in enumerate(chunks):
+        chunk.index = index
+    return chunks

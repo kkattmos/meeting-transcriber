@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Unit tests for the parts of the summarize stage that don't need an API key:
-retry classification/backoff, transcript chunking, map-reduce, and the document
-wrapper.
+retry classification/backoff, transcript chunking, map-reduce, the document
+wrapper, and how the claude-cli backend builds and reads its subprocess call.
 
     python3 summarize/test_summarize_units.py
 
@@ -10,20 +10,45 @@ The LLM itself is stubbed, so this exercises our logic (what counts as
 retryable, how chunks are cut, what the final markdown looks like) rather than
 any provider's behaviour.
 """
+import io
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import chunking  # noqa: E402
 import document  # noqa: E402
+import llm_client  # noqa: E402
 import retry  # noqa: E402
 from chunking import Chunk, Segment  # noqa: E402
-from llm_client import FrameMeta  # noqa: E402
+from llm_client import BackendUnavailable, ClaudeCliError, FrameMeta  # noqa: E402
 from mapreduce import summarize_chunked  # noqa: E402
+
+
+def _unpack_stdin(raw):
+    """(text, image blocks) from what summarize_claude_cli piped to the CLI.
+
+    On the inline path stdin is one stream-json user message; on the Read
+    path and with vision off it is the plain prompt. Both come back as the
+    prompt text the model reads, so one assertion style serves every test.
+    """
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw, []
+    texts, images = [], []
+    for block in obj["message"]["content"]:
+        if block["type"] == "text":
+            texts.append(block["text"])
+        else:
+            images.append(block)
+    return "\n".join(texts), images
 
 
 class FakeStatusError(Exception):
@@ -196,6 +221,42 @@ class ChunkingTest(unittest.TestCase):
         assigned = [f.timestamp_s for c in chunks for f in c.frames]
         self.assertIn(500.0, assigned)
 
+    def test_a_frame_heavy_chunk_is_cut_to_the_frame_cap(self):
+        # 10 minutes of talk, a frame every 2s (300), one chunk by size;
+        # SUMMARY_CHUNK_MAX_FRAMES=100 cuts it into pieces of about 100, and
+        # every frame still lands exactly once.
+        segments = [Segment(i * 10.0, i * 10.0 + 10.0, "w" * 10) for i in range(60)]
+        frames = self._frames(*[i * 2.0 for i in range(300)])
+        with mock.patch.dict(os.environ, {"SUMMARY_CHUNK_MAX_FRAMES": "100"}):
+            chunks = chunking.chunk_by_segments(segments, frames,
+                                                limit=100000, overlap=0)
+        self.assertEqual(len(chunks), 3)
+        self.assertTrue(all(len(c.frames) <= 100 for c in chunks))
+        assigned = sorted(f.timestamp_s for c in chunks for f in c.frames)
+        self.assertEqual(assigned, [i * 2.0 for i in range(300)])
+
+    def test_the_frame_cap_alone_starts_chunking(self):
+        # A short transcript with many frames: under SUMMARY_CHUNK_CHARS, so
+        # it would go in one call, but over the frame cap — and with size
+        # chunking switched off the cap still cuts, without one chunk per
+        # segment.
+        srt = self.tmp / "t.srt"
+        srt.write_text("".join(
+            f"{i + 1}\n00:{i // 6:02d}:{i % 6 * 10:02d},000 --> "
+            f"00:{(i + 1) // 6:02d}:{(i + 1) % 6 * 10:02d},000\nline {i}\n\n"
+            for i in range(60)))
+        part = chunking.Part(label="video 1", text="x",
+                             frames=self._frames(*[i * 2.0 for i in range(300)]),
+                             srt_path=str(srt))
+        for chars in ("100000", "0"):
+            with mock.patch.dict(os.environ, {"SUMMARY_CHUNK_CHARS": chars,
+                                              "SUMMARY_CHUNK_MAX_FRAMES": "100"}):
+                chunks = chunking.build_part_chunks([part])
+            self.assertEqual(len(chunks), 3, chars)
+        with mock.patch.dict(os.environ, {"SUMMARY_CHUNK_CHARS": "100000",
+                                          "SUMMARY_CHUNK_MAX_FRAMES": "0"}):
+            self.assertEqual(chunking.build_part_chunks([part]), [])
+
     def test_overlap_repeats_context_between_chunks(self):
         segments = [Segment(i * 5.0, i * 5.0 + 5.0, f"sentence{i} " * 10)
                     for i in range(12)]
@@ -236,7 +297,7 @@ class MapReduceTest(unittest.TestCase):
     def test_chunks_are_summarized_then_merged(self):
         calls = []
 
-        def fake_summarize(frames, transcript, template):
+        def fake_summarize(frames, transcript, template, role=None):
             calls.append(transcript)
             if "Partial summaries" in template or "merging" in template.lower():
                 return "MERGED DOCUMENT"
@@ -249,7 +310,7 @@ class MapReduceTest(unittest.TestCase):
 
     def test_partial_failure_still_produces_a_document(self):
         """Two good chunks cost real API calls; one bad one mustn't waste them."""
-        def fake_summarize(frames, transcript, template):
+        def fake_summarize(frames, transcript, template, role=None):
             if transcript == "body 1":
                 raise RuntimeError("503 overloaded")
             if "merging" in template.lower() or "Partial summaries" in template:
@@ -263,7 +324,7 @@ class MapReduceTest(unittest.TestCase):
         self.assertIn("part(s) 2 of 3", out)
 
     def test_all_chunks_failing_raises(self):
-        def fake_summarize(frames, transcript, template):
+        def fake_summarize(frames, transcript, template, role=None):
             raise RuntimeError("everything is down")
 
         with self.assertRaises(RuntimeError):
@@ -273,7 +334,7 @@ class MapReduceTest(unittest.TestCase):
     def test_chunk_order_is_preserved_despite_parallelism(self):
         import time
 
-        def fake_summarize(frames, transcript, template):
+        def fake_summarize(frames, transcript, template, role=None):
             if "Partial summaries" in template:
                 return transcript  # hand the combined text back for inspection
             # Make the first chunk the slowest, so completion order != index.
@@ -287,11 +348,39 @@ class MapReduceTest(unittest.TestCase):
 
 
 class DocumentTest(unittest.TestCase):
-    def test_wrapper_applies_to_lecture_and_tutorial_only(self):
-        self.assertTrue(document.wants_wrapper("lecture-gemini"))
-        self.assertTrue(document.wants_wrapper("tutorial-claude.md"))
-        self.assertFalse(document.wants_wrapper("meeting-gemini"))
+    def test_wrapper_applies_to_lecture_tutorial_and_video(self):
+        self.assertTrue(document.wants_wrapper("lecture"))
+        self.assertTrue(document.wants_wrapper("tutorial.md"))
+        self.assertTrue(document.wants_wrapper("video"))
+        self.assertFalse(document.wants_wrapper("meeting"))
         self.assertFalse(document.wants_wrapper(None))
+        # Older names still decide the same way.
+        self.assertTrue(document.wants_wrapper("lecture-gemini"))
+        self.assertFalse(document.wants_wrapper("meeting-gemini"))
+
+    def test_a_meeting_link_is_labelled_as_one(self):
+        # The first live guest recording cited its Meet link as "Source File".
+        # A Discord voice channel: the bot's .m4a is a local file, passed
+        # with --source-url so the document cites the channel.
+        for url in ("https://meet.google.com/xbm-ryat-jch",
+                    "https://us02web.zoom.us/j/123456",
+                    "https://discord.com/channels/111111111111111111/222222222222222222"):
+            with self.subTest(url=url):
+                out = document.build_document(
+                    "# T\n\nbody", source=url, source_kind="local_file")
+                self.assertIn(f"Meeting Link: `{url}`", out)
+                self.assertNotIn("Source File", out)
+        out = document.build_document("# T\n\nbody", source="/rec/a.mp4",
+                                      source_kind="local_file")
+        self.assertIn("Source File: `/rec/a.mp4`", out)
+        self.assertTrue(document.looks_like_meeting("https://meet.google.com/abc-defg-hij"))
+        self.assertFalse(document.looks_like_meeting("https://youtu.be/x"))
+        self.assertFalse(document.looks_like_meeting("https://discord.com/invite/abc"))
+
+    def test_the_document_records_its_font(self):
+        out = document.build_document("# T\n\nbody", source="x.mp4",
+                                      source_kind="local_file", font="Sarabun")
+        self.assertIn("     font: Sarabun\n", out)
 
     def test_format_override(self):
         self.assertTrue(document.wants_wrapper("meeting-gemini", "always"))
@@ -311,7 +400,8 @@ class DocumentTest(unittest.TestCase):
         self.assertTrue(out.startswith("<!-- meeting-transcriber"))
         self.assertIn("prompt: lecture-gemini.md", out)
         self.assertIn("model: gemini/gemini-2.5-flash", out)
-        self.assertIn("Chapter N — <topic> (<date>)", out)
+        self.assertNotIn("Chapter N", out)
+        # No H1 in the body, so the video's title heads the document.
         self.assertIn("# Chapter01 SRS n UI 1", out)
         self.assertIn("Youtube Link: `https://www.youtube.com/watch?v=abc123`", out)
         self.assertIn("<details>", out)
@@ -337,7 +427,51 @@ class DocumentTest(unittest.TestCase):
         self.assertNotIn("-->", header)
         self.assertIn("--&gt;", header)
         # Everything after the comment is the document proper.
-        self.assertTrue(rest.lstrip().startswith(document.CHAPTER_PLACEHOLDER))
+        self.assertTrue(rest.lstrip().startswith("# t"))
+
+    def test_the_models_own_title_heads_the_document(self):
+        # The lecture prompts ask for a `# Title`; when the body opens with
+        # one it is lifted above the link lines and the video title is not
+        # used — "Signals and Transformations" names the material where
+        # "2110203 L01" names the file.
+        out = document.build_document(
+            "# Signals and Transformations\n\n## 1. Background\nText.",
+            source="https://www.youtube.com/watch?v=abc123",
+            source_kind="youtube", title="2110203 L01", transcript="x")
+        self.assertEqual(out.count("\n# "), 1)
+        self.assertIn("# Signals and Transformations\n\nYoutube Link:", out)
+        self.assertNotIn("2110203 L01", out)
+        self.assertNotIn("Chapter N", out)
+        # The body keeps everything under the heading.
+        self.assertIn("## 1. Background\nText.", out)
+
+    def test_split_leading_heading(self):
+        self.assertEqual(document.split_leading_heading("# A\n\nb"), ("A", "b"))
+        self.assertEqual(document.split_leading_heading("b\n# A"), (None, "b\n# A"))
+        self.assertEqual(document.split_leading_heading("## A\nb"), (None, "## A\nb"))
+
+    def test_a_clip_is_declared_in_the_document_and_the_provenance(self):
+        # Every timestamp in a clipped summary — the SRT it quotes, the frame
+        # citations, the model's own references — is measured from the start of
+        # the clip, because the media was cut before any of them existed. A
+        # reader who is not told that will scrub to the wrong place in the
+        # source and conclude the summary is wrong, so it is stated visibly and
+        # not only in the greppable comment.
+        out = document.build_document(
+            "body", source="https://www.youtube.com/watch?v=abc123",
+            source_kind="youtube", title="A", transcript="x",
+            clip="00:05:00-01:30:00")
+        header, _, body = out.partition("-->")
+        self.assertIn("clip: 00:05:00-01:30:00", header)
+        self.assertIn("Clip: `00:05:00-01:30:00`", body)
+        self.assertIn("relative to the start of the clip", body)
+
+    def test_an_unclipped_document_says_nothing_about_clips(self):
+        out = document.build_document(
+            "body", source="https://www.youtube.com/watch?v=abc123",
+            source_kind="youtube", title="A", transcript="x")
+        self.assertNotIn("Clip:", out)
+        self.assertNotIn("clip:", out)
 
     def test_local_file_source_label(self):
         out = document.build_document(
@@ -346,23 +480,2642 @@ class DocumentTest(unittest.TestCase):
         self.assertIn("Source File: `/opt/meeting-bot/recordings/a.mp4`", out)
         self.assertNotIn("Youtube Link", out)
 
-    def test_combine_puts_the_chapter_line_once(self):
+    def test_a_combined_document_links_every_video_and_says_so(self):
+        # --combine: one document, one title, one link line per video tagged
+        # with the number the model's citations use, and the one thing the
+        # reader has to be told — that every clock is its own video's.
+        out = document.build_document(
+            "See (Frame 7 @ video 2 30.0s).",
+            source="https://youtu.be/v1", source_kind="youtube",
+            transcript="t",
+            videos=[
+                {"source": "https://youtu.be/v1", "kind": "youtube",
+                 "title": "Week 1"},
+                {"source": "/rec/w2.mp4", "kind": "local_file",
+                 "clip": "00:05:00-end"},
+                {"source": "https://k/p/1/embedPlaykitJs/uiconf_id/0?entry_id=x",
+                 "kind": "kaltura", "title": "Week 3"},
+            ])
+        self.assertEqual(out.count("\n# "), 1)
+        self.assertIn("# Week 1", out)
+        self.assertNotIn("# Week 3", out)
+        self.assertIn("Youtube Link (Video 1): `https://youtu.be/v1`", out)
+        self.assertIn("Source File (Video 2): `/rec/w2.mp4`", out)
+        self.assertIn("Clip (Video 2): `00:05:00-end`", out)
+        self.assertIn("Video Link (Video 3):", out)
+        self.assertIn("Summarized from 3 videos as one", out)
+        self.assertIn("relative to the start of the video", out)
+        # Provenance carries the set too, one line per video.
+        self.assertIn("source_type: combined", out)
+        self.assertIn("videos: 3", out)
+        self.assertIn("video_2: /rec/w2.mp4", out)
+        self.assertIn("video_2_clip: 00:05:00-end", out)
+        # Exactly one transcript block — the text was joined before it got
+        # here — and the body follows it.
+        self.assertEqual(out.count("<details>"), 1)
+        self.assertIn("See (Frame 7 @ video 2 30.0s).", out)
+
+    def test_an_explicit_title_beats_the_first_videos(self):
+        out = document.build_document(
+            "b", source="s", source_kind="youtube", title="Chapter 3",
+            transcript="t",
+            videos=[{"source": "s", "kind": "youtube", "title": "Week 1"}])
+        self.assertIn("# Chapter 3", out)
+        self.assertNotIn("# Week 1", out)
+
+    def test_a_single_video_document_is_untouched_by_the_videos_path(self):
+        out = document.build_document(
+            "b", source="https://youtu.be/v", source_kind="youtube",
+            title="V", transcript="t")
+        self.assertIn("Youtube Link: `https://youtu.be/v`", out)
+        self.assertNotIn("(Video 1)", out)
+        self.assertNotIn("Summarized from", out)
+        self.assertNotIn("combined", out)
+
+
+class CombinedPartsTest(unittest.TestCase):
+    """Several videos summarized as one (pipeline.sh --combine).
+
+    Two invariants matter. Frame numbers are unique across the whole set —
+    the model is shown one number per picture and the PDF resolves the same
+    one — and every timestamp stays relative to its own video, with the
+    video named wherever a timestamp appears, because "410.0s" on its own
+    no longer says which lecture.
+    """
+
+    def frames(self, part, *stamps):
+        return [FrameMeta(timestamp_s=t, kind="periodic",
+                          path=f"/f/{part}/{t}.jpg", part=part)
+                for t in stamps]
+
+    def test_numbers_run_across_videos_in_video_order(self):
+        # Video 2's frames come after video 1's even though their timestamps
+        # are smaller: the clock restarts per video.
+        frames = llm_client.assign_numbers(
+            self.frames(2, 10.0, 20.0) + self.frames(1, 30.0, 40.0))
+        self.assertEqual([(f.part, f.timestamp_s, f.number) for f in frames],
+                         [(1, 30.0, 1), (1, 40.0, 2), (2, 10.0, 3), (2, 20.0, 4)])
+
+    def test_the_manifest_line_names_the_video(self):
+        frames = llm_client.assign_numbers(
+            self.frames(1, 30.0) + self.frames(2, 30.0))
+        _, text = llm_client._render(frames, "t", "{frame_manifest}")
+        self.assertIn("[frame 1 @ video 1 30.0s (periodic)]", text)
+        self.assertIn("[frame 2 @ video 2 30.0s (periodic)]", text)
+        # And the render keeps video order, not timestamp order.
+        self.assertLess(text.index("frame 1 @"), text.index("frame 2 @"))
+
+    def test_a_single_recording_frame_label_is_unchanged(self):
+        frame = FrameMeta(timestamp_s=5.0, kind="scene_change", path="/f.jpg")
+        self.assertEqual(frame.label(3), "[frame 3 @ 5.0s (scene_change)]")
+
+    def test_the_part_transcript_fences_each_video(self):
+        parts = [chunking.Part(label="video 1 of 2: A", text="alpha"),
+                 chunking.Part(label="video 2 of 2: B", text="beta")]
+        text = chunking.part_transcript(parts)
+        self.assertEqual(text, "=== video 1 of 2: A ===\n\nalpha\n\n"
+                               "=== video 2 of 2: B ===\n\nbeta")
+
+    def test_short_videos_go_in_one_call(self):
+        parts = [chunking.Part(label="video 1 of 2: A", text="a" * 100),
+                 chunking.Part(label="video 2 of 2: B", text="b" * 100)]
+        self.assertEqual(chunking.build_part_chunks(parts, limit=1000), [])
+
+    def test_long_sets_are_chunked_per_video_and_labelled(self):
         with tempfile.TemporaryDirectory() as tmp:
-            paths = []
-            for i in range(3):
-                p = Path(tmp) / f"{i}.md"
-                p.write_text(document.build_document(
-                    f"body {i}", source=f"https://youtu.be/v{i}",
-                    source_kind="youtube", title=f"Video {i}", transcript="t"))
-                paths.append(p)
-            combined = document.combine_documents(paths)
-        self.assertEqual(combined.count(document.CHAPTER_PLACEHOLDER), 1)
-        self.assertEqual(combined.count("<!-- meeting-transcriber"), 0)
-        for i in range(3):
-            self.assertIn(f"# Video {i}", combined)
-        # Input order is preserved, which is what makes it drop-in.
-        self.assertLess(combined.index("# Video 0"), combined.index("# Video 1"))
-        self.assertLess(combined.index("# Video 1"), combined.index("# Video 2"))
+            srt = Path(tmp) / "a.srt"
+            srt.write_text(
+                "1\n00:00:00,000 --> 00:00:10,000\n" + "x" * 60 + "\n\n"
+                "2\n00:00:10,000 --> 00:00:20,000\n" + "y" * 60 + "\n\n"
+                "3\n00:00:20,000 --> 00:00:30,000\n" + "z" * 60 + "\n")
+            f1 = llm_client.assign_numbers(
+                self.frames(1, 5.0, 15.0, 25.0) + self.frames(2, 5.0))
+            parts = [
+                chunking.Part(label="video 1 of 2: A",
+                              text="x" * 60 + "\n" + "y" * 60 + "\n" + "z" * 60,
+                              frames=[f for f in f1 if f.part == 1],
+                              srt_path=str(srt)),
+                chunking.Part(label="video 2 of 2: B", text="short",
+                              frames=[f for f in f1 if f.part == 2]),
+            ]
+            with mock.patch.dict(os.environ, {"SUMMARY_CHUNK_OVERLAP": "0"}):
+                chunks = chunking.build_part_chunks(parts, limit=100)
+        # Video 1 split on its own segments (one per 60-char cue under a
+        # 100-char limit), video 2 is one chunk of its own even though it
+        # would have fitted into video 1's last.
+        self.assertEqual(len(chunks), 4)
+        self.assertEqual([c.index for c in chunks], [0, 1, 2, 3])
+        self.assertEqual([c.label for c in chunks],
+                         ["video 1 of 2: A"] * 3 + ["video 2 of 2: B"])
+        # Each chunk carries only its own video's frames, under their global
+        # numbers.
+        self.assertEqual([f.number for c in chunks[:3] for f in c.frames],
+                         [1, 2, 3])
+        self.assertEqual([f.number for f in chunks[3].frames], [4])
+        # The header names the video, and its window is that video's clock.
+        self.assertIn("video 1 of 2: A", chunks[0].header(4))
+        self.assertIn("00:00:00–00:00:10", chunks[0].header(4))
+        self.assertEqual(chunks[3].header(4), "part 4 of 4 (video 2 of 2: B)")
+
+    def test_a_video_with_no_srt_still_gets_one_chunk(self):
+        parts = [chunking.Part(label="video 1 of 1: A", text="a\n" * 200)]
+        chunks = chunking.build_part_chunks(parts, limit=100)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(c.label == "video 1 of 1: A" for c in chunks))
+
+
+# ---------------------------------------------------------------------------
+# The claude-cli backend
+#
+# The summarizer spends a Claude subscription by running `claude -p`, so the
+# things that can break are the command line it builds, the environment it
+# hands the child, and how it reads the CLI's JSON envelope back. None of that
+# needs a network or a login, so all of it is tested here; lib/test_media_e2e.sh
+# covers the same ground against a stub binary in a real run.
+# ---------------------------------------------------------------------------
+
+def _envelope(result, is_error=False, denials=()):
+    """The shape `claude -p --output-format json` prints."""
+    return json.dumps({
+        "type": "result",
+        "subtype": "error" if is_error else "success",
+        "is_error": is_error,
+        "result": result,
+        "permission_denials": list(denials),
+    })
+
+
+class FakeCompleted:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+class ClaudeCliEnvironmentTest(unittest.TestCase):
+    """The subprocess environment decides which account pays."""
+
+    def test_api_key_vars_are_stripped(self):
+        # A set ANTHROPIC_API_KEY silently moves the spend from the
+        # subscription to a metered account, and the summary looks identical —
+        # so this is the only place the mistake is visible.
+        with mock.patch.dict(os.environ, {
+                "ANTHROPIC_API_KEY": "sk-ant-live",
+                "ANTHROPIC_AUTH_TOKEN": "tok",
+                "ANTHROPIC_BASE_URL": "https://proxy.example",
+                "PATH": os.environ.get("PATH", "")}):
+            env = llm_client._claude_cli_env()
+        for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                    "ANTHROPIC_BASE_URL"):
+            self.assertNotIn(var, env)
+
+    def test_unrelated_vars_survive(self):
+        with mock.patch.dict(os.environ, {"HOME": "/root", "LANG": "th_TH.UTF-8"}):
+            env = llm_client._claude_cli_env()
+        self.assertEqual(env["LANG"], "th_TH.UTF-8")
+
+    def test_cwd_is_not_the_repo(self):
+        # The CLI auto-discovers CLAUDE.md from its cwd, and this repo's is
+        # 38KB of architecture notes with nothing to do with the lecture.
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"MEETING_BOT_ROOT": tmp}):
+                cwd = Path(llm_client._claude_cli_cwd())
+        self.assertTrue(str(cwd).startswith(tmp))
+        self.assertNotEqual(cwd.resolve(),
+                            Path(__file__).resolve().parent.parent)
+
+
+class ClaudeCliCommandLineTest(unittest.TestCase):
+    """What ends up in argv, and what ends up in the prompt."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        frame_dir = Path(self.tmp.name) / "frames"
+        frame_dir.mkdir()
+        self.frames = []
+        for i, ts in enumerate((30.0, 5.0), start=1):   # deliberately unsorted
+            fp = frame_dir / f"frame_{i:04d}.jpg"
+            fp.write_bytes(b"\xff\xd8\xff\xe0stub")
+            self.frames.append(FrameMeta(timestamp_s=ts, kind="periodic",
+                                         path=str(fp)))
+        self.frame_dir = frame_dir
+        self.calls = []
+
+    def _run(self, env_overrides=None, frames=None, result=None):
+        """Drive summarize_claude_cli with subprocess.run intercepted."""
+        def fake_run(argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return FakeCompleted(stdout=result or _envelope("SUMMARY BODY"))
+
+        env = {"MEETING_BOT_ROOT": self.tmp.name,
+               "CLAUDE_CLI_BIN": sys.executable}
+        env.update(env_overrides or {})
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            out = llm_client.summarize_claude_cli(
+                self.frames if frames is None else frames,
+                "Dijkstra runs in O(E log V).",
+                "Notes:\n{transcript}\nFrames:\n{frame_manifest}")
+        return out
+
+    def _argv(self):
+        return self.calls[0][0]
+
+    def _prompt(self):
+        return _unpack_stdin(self.calls[0][1]["input"])[0]
+
+    def _images(self):
+        return _unpack_stdin(self.calls[0][1]["input"])[1]
+
+    def test_effort_is_passed_through(self):
+        self._run({"SUMMARY_EFFORT": "xhigh"})
+        argv = self._argv()
+        self.assertIn("--effort", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
+
+    def test_invalid_effort_falls_back_to_high(self):
+        # A typo reaching the CLI comes back as an opaque usage error mid-run.
+        self._run({"SUMMARY_EFFORT": "maximum"})
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+
+    def test_model_defaults_to_the_opus_alias(self):
+        # An alias, not a pinned id: a model rename must not 404 a box nobody
+        # has touched in a year.
+        self._run()
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--model") + 1], "opus")
+
+    def test_anthropic_model_is_accepted_as_an_alias(self):
+        self._run({"ANTHROPIC_MODEL": "claude-opus-5"})
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-5")
+
+    def test_print_mode_and_streaming_json_output(self):
+        # stream-json, not json: it is the only format that carries the
+        # rate_limit_event — the subscription's own meter and, on a hit
+        # window, the reset time. Print mode needs --verbose to allow it.
+        self._run()
+        argv = self._argv()
+        self.assertIn("-p", argv)
+        self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
+        self.assertIn("--verbose", argv)
+
+    def test_frame_cap_thins_what_the_model_is_offered(self):
+        # Ten frames, cap 4: the manifest in the prompt names four, and the
+        # ones it names keep their global numbers.
+        frames = [FrameMeta(timestamp_s=float(i * 30), kind="periodic",
+                            path=self.frames[0].path, number=i + 1)
+                  for i in range(10)]
+        self._run({"CLAUDE_CLI_MAX_FRAMES": "4", "CLAUDE_CLI_FRAME_VISION": "0"},
+                  frames=frames)
+        prompt = self._prompt()
+        cited = [line for line in prompt.splitlines() if line.startswith("[frame ")]
+        self.assertEqual(len(cited), 4)
+        self.assertTrue(cited[0].startswith("[frame 1 @ 0.0s"))
+        self.assertTrue(cited[-1].startswith("[frame 10 @ 270.0s"))
+
+    def test_no_frame_cap_by_default(self):
+        frames = [FrameMeta(timestamp_s=float(i * 30), kind="periodic",
+                            path=self.frames[0].path, number=i + 1)
+                  for i in range(10)]
+        self._run({"CLAUDE_CLI_FRAME_VISION": "0"}, frames=frames)
+        prompt = self._prompt()
+        self.assertEqual(sum(1 for l in prompt.splitlines() if l.startswith("[frame ")), 10)
+
+    def test_context_is_isolated(self):
+        self._run()
+        argv = self._argv()
+        self.assertIn("--safe-mode", argv)
+        self.assertIn("--no-session-persistence", argv)
+
+    def test_no_budget_tokens_anywhere(self):
+        # The parameter current models reject has no CLI spelling at all now.
+        self._run()
+        self.assertNotIn("budget_tokens", " ".join(self._argv()))
+        self.assertNotIn("budget_tokens", self._prompt())
+
+    def test_vision_sends_frames_inline_with_no_tools(self):
+        # The default: the frames ride along as image blocks in a stream-json
+        # user message. One turn, no Read tool, no --add-dir — and so no
+        # per-frame turn that resends the whole context as cache reads.
+        self._run()
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--input-format") + 1], "stream-json")
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertNotIn("--allowedTools", argv)
+        self.assertNotIn("--add-dir", argv)
+        images = self._images()
+        self.assertEqual(len(images), 2)
+        for block in images:
+            self.assertEqual(block["type"], "image")
+            self.assertEqual(block["source"]["type"], "base64")
+            self.assertEqual(block["source"]["media_type"], "image/jpeg")
+
+    def test_inline_frames_are_labelled_with_their_global_numbers(self):
+        # The label beside each picture is the number the model cites, and
+        # the number the PDF resolves — so it is the frame's own, never the
+        # position in this call's list.
+        frames = [FrameMeta(timestamp_s=5.0, kind="periodic", number=7,
+                            path=self.frames[0].path),
+                  FrameMeta(timestamp_s=30.0, kind="scene_change", number=9,
+                            path=self.frames[1].path)]
+        self._run(frames=frames)
+        raw = json.loads(self.calls[0][1]["input"])
+        content = raw["message"]["content"]
+        labels = [b["text"] for b in content[1:] if b["type"] == "text"]
+        self.assertEqual(labels, ["[frame 7 @ 5.0s (periodic)]",
+                                  "[frame 9 @ 30.0s (scene_change)]"])
+        # label, image, label, image — each picture right after its label
+        kinds = [b["type"] for b in content[1:]]
+        self.assertEqual(kinds, ["text", "image", "text", "image"])
+
+    def test_inline_prompt_carries_no_filesystem_paths(self):
+        self._run()
+        prompt = self._prompt()
+        self.assertNotIn(str(self.frame_dir), prompt)
+        self.assertNotIn("Read tool", prompt)
+        self.assertIn("attached after this text", prompt)
+
+    def test_read_path_grants_read_scoped_to_the_frame_dir(self):
+        # CLAUDE_CLI_FRAME_INLINE=0: the older delivery, kept for a CLI too
+        # old to take stream-json input.
+        self._run({"CLAUDE_CLI_FRAME_INLINE": "0"})
+        argv = self._argv()
+        self.assertNotIn("--input-format", argv)
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read")
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "Read")
+        self.assertEqual(argv[argv.index("--add-dir") + 1], str(self.frame_dir))
+        self.assertEqual(self._images(), [])
+
+    def test_read_path_puts_absolute_frame_paths_in_the_prompt(self):
+        self._run({"CLAUDE_CLI_FRAME_INLINE": "0"})
+        prompt = self._prompt()
+        for frame in self.frames:
+            self.assertIn(str(Path(frame.path).resolve()), prompt)
+        self.assertIn("Read tool", prompt)
+
+    def test_merge_role_may_use_a_cheaper_model_and_effort(self):
+        env = {"CLAUDE_CLI_MODEL": "opus", "SUMMARY_EFFORT": "medium",
+               "CLAUDE_CLI_MERGE_MODEL": "sonnet", "SUMMARY_MERGE_EFFORT": "low"}
+        with mock.patch.dict(os.environ, env):
+            self._run(frames=[])
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--model") + 1], "opus")
+        self.assertEqual(argv[argv.index("--effort") + 1], "medium")
+        self.calls.clear()
+
+        def fake_run(argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return FakeCompleted(stdout=_envelope("MERGED"))
+        env.update({"MEETING_BOT_ROOT": self.tmp.name,
+                    "CLAUDE_CLI_BIN": sys.executable})
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            llm_client.summarize_claude_cli([], "partials", "{transcript}{frame_manifest}",
+                                            role="merge")
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
+        self.assertEqual(argv[argv.index("--effort") + 1], "low")
+
+    def test_merge_role_defaults_to_the_chunk_model(self):
+        def fake_run(argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return FakeCompleted(stdout=_envelope("MERGED"))
+        env = {"MEETING_BOT_ROOT": self.tmp.name, "CLAUDE_CLI_BIN": sys.executable,
+               "CLAUDE_CLI_MODEL": "opus", "SUMMARY_EFFORT": "medium"}
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            os.environ.pop("CLAUDE_CLI_MERGE_MODEL", None)
+            os.environ.pop("SUMMARY_MERGE_EFFORT", None)
+            llm_client.summarize_claude_cli([], "partials", "{transcript}{frame_manifest}",
+                                            role="merge")
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--model") + 1], "opus")
+        self.assertEqual(argv[argv.index("--effort") + 1], "medium")
+
+    def test_frames_are_listed_in_timestamp_order(self):
+        # The manifest numbering is what the model cites, and pdf.py matches
+        # those citations back to files — an out-of-order manifest mislabels
+        # every picture in the PDF.
+        prompt = self._prompt() if self.calls else None
+        self._run()
+        prompt = self._prompt()
+        self.assertLess(prompt.index("@ 5.0s"), prompt.index("@ 30.0s"))
+
+    def test_vision_off_offers_no_tools_and_no_paths(self):
+        self._run({"CLAUDE_CLI_FRAME_VISION": "0"})
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertNotIn("--add-dir", argv)
+        self.assertNotIn(str(self.frame_dir), self._prompt())
+
+    def test_no_frames_means_no_tools(self):
+        self._run(frames=[])
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+
+    def test_transcript_reaches_the_prompt_on_stdin(self):
+        # Not argv: an 80KB transcript would blow past ARG_MAX.
+        self._run()
+        self.assertIn("Dijkstra runs in O(E log V).", self._prompt())
+        self.assertNotIn("Dijkstra", " ".join(self._argv()))
+
+    def test_provenance_records_the_backend_that_answered(self):
+        self._run({"CLAUDE_CLI_MODEL": "sonnet"})
+        self.assertEqual(llm_client.LAST_BACKEND, "claude-cli")
+        self.assertEqual(llm_client.LAST_MODEL, "sonnet")
+
+    def test_returns_the_result_text(self):
+        self.assertEqual(self._run(), "SUMMARY BODY")
+
+
+class ClaudeCliResponseTest(unittest.TestCase):
+    """Reading the envelope back — the CLI exits 0 even when it failed."""
+
+    def _run(self, stdout="", stderr="", returncode=0):
+        def fake_run(argv, **kwargs):
+            return FakeCompleted(stdout, stderr, returncode)
+        with mock.patch.object(llm_client.subprocess, "run", fake_run):
+            return llm_client._run_claude_cli(["claude"], "p", {}, ".", 60)
+
+    def test_not_logged_in_is_unavailable_not_a_failure(self):
+        # Exit code 0, is_error true. If this were classified as a transient
+        # failure the chain would burn the whole retry schedule on something
+        # no retry can fix, instead of falling through to Gemini.
+        with self.assertRaises(BackendUnavailable) as ctx:
+            self._run(stdout=_envelope("Not logged in · Please run /login",
+                                       is_error=True))
+        self.assertIn("not logged in", str(ctx.exception).lower())
+
+    def test_not_logged_in_is_never_retried(self):
+        exc = BackendUnavailable("claude CLI is not logged in")
+        self.assertFalse(retry.is_retryable(exc))
+
+    def test_overloaded_is_retryable(self):
+        with self.assertRaises(ClaudeCliError) as ctx:
+            self._run(stdout=_envelope("API Error: 503 upstream is overloaded",
+                                       is_error=True))
+        self.assertTrue(retry.is_retryable(ctx.exception))
+
+    def test_empty_result_is_an_error(self):
+        with self.assertRaises(ClaudeCliError):
+            self._run(stdout=_envelope("   "))
+
+    def test_non_json_output_is_an_error(self):
+        with self.assertRaises(ClaudeCliError):
+            self._run(stdout="Usage: claude [options]")
+
+    def test_non_json_login_message_is_still_unavailable(self):
+        # An older CLI prints this as bare text before it reaches --output-format.
+        with self.assertRaises(BackendUnavailable):
+            self._run(stdout="Not logged in · Please run /login")
+
+    def test_no_output_at_all_is_an_error(self):
+        with self.assertRaises(ClaudeCliError):
+            self._run(stdout="", stderr="segfault", returncode=139)
+
+    def test_permission_denial_warns_but_returns_the_summary(self):
+        # The summary exists; it was just written without the frames. Worth a
+        # warning, not worth discarding.
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            out = self._run(stdout=_envelope(
+                "BODY", denials=[{"tool_name": "Read"}]))
+        self.assertEqual(out, "BODY")
+        self.assertIn("denied", err.getvalue())
+
+    def test_a_timeout_is_retryable(self):
+        def fake_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="claude", timeout=60)
+        with mock.patch.object(llm_client.subprocess, "run", fake_run):
+            with self.assertRaises(ClaudeCliError) as ctx:
+                llm_client._run_claude_cli(["claude"], "p", {}, ".", 60)
+        self.assertTrue(retry.is_retryable(ctx.exception))
+
+    def test_a_missing_binary_is_unavailable(self):
+        def fake_run(argv, **kwargs):
+            raise OSError(2, "No such file or directory")
+        with mock.patch.object(llm_client.subprocess, "run", fake_run):
+            with self.assertRaises(BackendUnavailable):
+                llm_client._run_claude_cli(["claude"], "p", {}, ".", 60)
+
+
+class ClaudeCliUsageWindowTest(unittest.TestCase):
+    """An exhausted subscription window: detected, waited out, never Gemini.
+
+    SUMMARY_MAX_TOKENS was the operator's first guess at a lever here, and it
+    does nothing on this backend; what exists instead is the meter the CLI
+    reports and a wait for the reset. These tests hold that path.
+    """
+
+    def _stream(self, status, resets_at, result="BODY", is_error=False,
+                api_error_status=None, utilization=0.5):
+        event = {"type": "rate_limit_event", "rate_limit_info": {
+            "status": status, "rateLimitType": "five_hour",
+            "unifiedWindows": {"five_hour": {"utilization": utilization,
+                                             "resetsAt": resets_at}}}}
+        if status == "rejected":
+            event["rate_limit_info"]["resetsAt"] = resets_at
+        envelope = json.loads(_envelope(result, is_error=is_error))
+        envelope["api_error_status"] = api_error_status
+        envelope["usage"] = {"input_tokens": 1000, "output_tokens": 50,
+                             "cache_read_input_tokens": 300,
+                             "output_tokens_details": {"thinking_tokens": 7}}
+        envelope["total_cost_usd"] = 0.5
+        return "\n".join(json.dumps(o) for o in (
+            {"type": "system", "subtype": "init"}, event, envelope))
+
+    def setUp(self):
+        llm_client.USAGE.reset()
+        self.slept = []
+        self._orig_sleep = llm_client._sleep
+        llm_client._sleep = lambda s: self.slept.append(s)
+        self._orig_hook = llm_client.WAIT_HOOK
+        llm_client.WAIT_HOOK = None
+
+    def tearDown(self):
+        llm_client._sleep = self._orig_sleep
+        llm_client.WAIT_HOOK = self._orig_hook
+        llm_client.USAGE.reset()
+
+    def _run_once(self, stdout):
+        def fake_run(argv, **kwargs):
+            return FakeCompleted(stdout)
+        with mock.patch.object(llm_client.subprocess, "run", fake_run):
+            return llm_client._run_claude_cli(["claude"], "p", {}, ".", 60)
+
+    def test_stream_output_parses_to_the_result_line(self):
+        self.assertEqual(self._run_once(self._stream("allowed", 1_800_000_000)),
+                         "BODY")
+
+    def test_plain_envelope_still_parses(self):
+        # An older stub, or --output-format json: no event, one object.
+        self.assertEqual(self._run_once(_envelope("BODY")), "BODY")
+
+    def test_usage_is_recorded_with_the_meter(self):
+        self._run_once(self._stream("allowed", 1_800_000_000, utilization=0.42))
+        s = llm_client.USAGE.summary()
+        self.assertEqual(s["calls"], 1)
+        self.assertEqual(s["input_tokens"], 1000)
+        self.assertEqual(s["cache_read_input_tokens"], 300)
+        self.assertEqual(s["thinking_tokens"], 7)
+        self.assertEqual(s["cost_usd"], 0.5)
+        self.assertEqual(s["windows"]["five_hour"]["utilization_after"], 0.42)
+        self.assertEqual(s["windows"]["five_hour"]["resets_at"], 1_800_000_000)
+
+    def test_meter_delta_spans_the_stage(self):
+        self._run_once(self._stream("allowed", 1_800_000_000, utilization=0.10))
+        self._run_once(self._stream("allowed", 1_800_000_000, utilization=0.35))
+        five = llm_client.USAGE.summary()["windows"]["five_hour"]
+        self.assertEqual(five["utilization_before"], 0.10)
+        self.assertEqual(five["utilization_after"], 0.35)
+        self.assertAlmostEqual(five["utilization_delta"], 0.25)
+
+    def test_rejected_event_is_rate_limited_with_the_reset_time(self):
+        with self.assertRaises(llm_client.ClaudeCliRateLimited) as ctx:
+            self._run_once(self._stream("rejected", 1_800_000_000,
+                                        result="API Error: 429", is_error=True,
+                                        api_error_status=429))
+        self.assertEqual(ctx.exception.resets_at, 1_800_000_000)
+        self.assertEqual(ctx.exception.window, "five_hour")
+        # The spent call is still on the ledger — that is the number that
+        # explains the pause.
+        self.assertEqual(llm_client.USAGE.summary()["calls"], 1)
+
+    def test_429_without_an_event_is_rate_limited(self):
+        env = json.loads(_envelope("API Error: 429 rate limit", is_error=True))
+        env["api_error_status"] = 429
+        with self.assertRaises(llm_client.ClaudeCliRateLimited) as ctx:
+            self._run_once(json.dumps(env))
+        self.assertIsNone(ctx.exception.resets_at)
+
+    def test_legacy_wording_carries_the_reset_epoch(self):
+        with self.assertRaises(llm_client.ClaudeCliRateLimited) as ctx:
+            self._run_once(_envelope("Claude AI usage limit reached|1800000000",
+                                     is_error=True))
+        self.assertEqual(ctx.exception.resets_at, 1_800_000_000)
+
+    def test_rate_limited_is_never_retried_on_the_backoff_schedule(self):
+        exc = llm_client.ClaudeCliRateLimited("window", resets_at=1)
+        self.assertFalse(retry.is_retryable(exc))
+
+    def test_rate_limited_is_not_a_login_problem(self):
+        # The CLI's own error classifier files "usage limit reached" next to
+        # "not logged in"; ours must not, or the summary goes to Gemini.
+        with self.assertRaises(llm_client.ClaudeCliRateLimited):
+            self._run_once(_envelope("Claude AI usage limit reached|1800000000",
+                                     is_error=True))
+
+    def _drive(self, outputs, env=None):
+        """summarize_claude_cli against a scripted sequence of CLI outputs."""
+        outputs = list(outputs)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return FakeCompleted(outputs.pop(0))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_vars = {"MEETING_BOT_ROOT": tmp, "CLAUDE_CLI_BIN": sys.executable,
+                        "CLAUDE_CLI_FRAME_VISION": "0"}
+            env_vars.update(env or {})
+            with mock.patch.dict(os.environ, env_vars), \
+                 mock.patch.object(llm_client.subprocess, "run", fake_run):
+                out = llm_client.summarize_claude_cli(
+                    [], "t", "{transcript}{frame_manifest}")
+        return out, calls
+
+    def test_a_hit_window_waits_for_the_reset_then_retries(self):
+        reset = int(llm_client.time.time()) + 900
+        rejected = self._stream("rejected", reset, result="429", is_error=True,
+                                api_error_status=429)
+        ok = self._stream("allowed", reset + 18000, result="AFTER RESET")
+        events = []
+        llm_client.WAIT_HOOK = lambda **kw: events.append(kw)
+        out, calls = self._drive([rejected, ok])
+        self.assertEqual(out, "AFTER RESET")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.slept), 1)
+        # Until the reset plus the margin, give or take the test's own clock.
+        self.assertGreater(self.slept[0], 900)
+        self.assertLess(self.slept[0], 900 + llm_client.RATE_LIMIT_MARGIN_SECONDS + 5)
+        # The hook saw the wait begin and end.
+        self.assertEqual(len(events), 2)
+        self.assertIsNotNone(events[0]["waiting_until"])
+        self.assertEqual(events[0]["window"], "five_hour")
+        self.assertIsNone(events[1]["waiting_until"])
+
+    def test_a_reset_beyond_the_cap_gives_up_with_the_time_attached(self):
+        reset = int(llm_client.time.time()) + 7 * 3600
+        rejected = self._stream("rejected", reset, result="429", is_error=True,
+                                api_error_status=429)
+        with self.assertRaises(llm_client.ClaudeCliRateLimited) as ctx:
+            self._drive([rejected])
+        self.assertEqual(ctx.exception.resets_at, reset)
+        self.assertEqual(self.slept, [])
+
+    def test_the_cap_is_configurable(self):
+        reset = int(llm_client.time.time()) + 900
+        rejected = self._stream("rejected", reset, result="429", is_error=True,
+                                api_error_status=429)
+        with self.assertRaises(llm_client.ClaudeCliRateLimited):
+            self._drive([rejected], env={"CLAUDE_CLI_MAX_WAIT_SECONDS": "60"})
+        self.assertEqual(self.slept, [])
+
+    def test_no_reset_time_polls_until_the_cap(self):
+        env = json.loads(_envelope("API Error: 429", is_error=True))
+        env["api_error_status"] = 429
+        rejected = json.dumps(env)
+        ok = _envelope("EVENTUALLY")
+        out, calls = self._drive([rejected, rejected, ok],
+                                 env={"CLAUDE_CLI_RATE_LIMIT_POLL_SECONDS": "100",
+                                      "CLAUDE_CLI_MAX_WAIT_SECONDS": "250"})
+        self.assertEqual(out, "EVENTUALLY")
+        self.assertEqual(self.slept, [100, 100])
+        # A third refusal would have exceeded the cap and raised.
+
+    def test_the_chain_does_not_advance_to_gemini_on_a_hit_window(self):
+        def limited(*a, **k):
+            raise llm_client.ClaudeCliRateLimited("window", resets_at=1, window="five_hour")
+        with mock.patch.dict(llm_client._BACKENDS,
+                             {"claude-cli": limited,
+                              "gemini": lambda *a, **k: "FROM GEMINI"}), \
+             mock.patch.dict(os.environ,
+                             {"SUMMARY_FALLBACK_CHAIN": "claude-cli,gemini"}):
+            with self.assertRaises(llm_client.ClaudeCliRateLimited):
+                llm_client.summarize_with_fallback([], "t", "{transcript}{frame_manifest}")
+
+    def test_mapreduce_pauses_the_stage_instead_of_merging_around_it(self):
+        # Two chunks succeed, one is out of window: the stage must fail
+        # (resumable) rather than write a document with a hole in it.
+        def fake_summarize(frames, transcript, template, role=None):
+            if transcript == "body 1":
+                raise llm_client.ClaudeCliRateLimited("window", resets_at=1)
+            return "ok"
+        chunks = [Chunk(index=i, text=f"body {i}", start_s=i * 60.0,
+                        end_s=(i + 1) * 60.0, frames=[]) for i in range(3)]
+        with self.assertRaises(llm_client.ClaudeCliRateLimited):
+            summarize_chunked(chunks, "PROMPT {transcript}", fake_summarize,
+                              log=lambda *a: None)
+
+
+class FrameThinningTest(unittest.TestCase):
+    def _frames(self, kinds):
+        return [FrameMeta(timestamp_s=float(i * 10), kind=k, path=f"/f/{i}.jpg",
+                          number=i + 1) for i, k in enumerate(kinds)]
+
+    def test_no_cap_returns_everything(self):
+        frames = self._frames(["periodic"] * 5)
+        self.assertEqual(len(llm_client.thin_frames(frames, 0)), 5)
+        self.assertEqual(len(llm_client.thin_frames(frames, 5)), 5)
+
+    def test_scene_changes_are_kept_first(self):
+        kinds = ["periodic"] * 8
+        kinds[3] = "scene_change"
+        kinds[6] = "scene_change"
+        kept = llm_client.thin_frames(self._frames(kinds), 4)
+        self.assertEqual(len(kept), 4)
+        self.assertEqual([f.number for f in kept if f.kind == "scene_change"], [4, 7])
+
+    def test_periodic_frames_cover_the_whole_window(self):
+        kept = llm_client.thin_frames(self._frames(["periodic"] * 20), 5)
+        self.assertEqual([f.number for f in kept], [1, 6, 11, 15, 20])
+
+    def test_numbers_are_untouched(self):
+        # Thinning is about what is offered, never about renumbering: the
+        # PDF resolves citations against the whole manifest.
+        frames = self._frames(["periodic"] * 9)
+        kept = llm_client.thin_frames(frames, 3)
+        self.assertEqual([f.number for f in kept], [1, 5, 9])
+        self.assertEqual([f.number for f in frames], list(range(1, 10)))
+
+    def test_output_stays_chronological(self):
+        kinds = ["periodic"] * 10
+        kinds[8] = "scene_change"
+        kinds[1] = "scene_change"
+        kept = llm_client.thin_frames(self._frames(kinds), 5)
+        stamps = [f.timestamp_s for f in kept]
+        self.assertEqual(stamps, sorted(stamps))
+
+
+class ClaudeCliDiscoveryTest(unittest.TestCase):
+    def test_missing_cli_is_unavailable_with_install_instructions(self):
+        with mock.patch.object(llm_client, "_claude_cli_bin", lambda: None):
+            with self.assertRaises(BackendUnavailable) as ctx:
+                llm_client.summarize_claude_cli([], "t", "{transcript}{frame_manifest}")
+        self.assertIn("install.sh", str(ctx.exception))
+
+    def test_configured_bin_that_does_not_exist_is_ignored(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CLI_BIN": "/nope/claude"}):
+            self.assertIsNone(llm_client._claude_cli_bin())
+
+
+class BackendChainTest(unittest.TestCase):
+    def test_legacy_anthropic_name_still_resolves(self):
+        # An existing .env whose chain reads `anthropic,gemini` must keep
+        # working — there is just no API-key backend behind the name now.
+        for alias in ("anthropic", "claude", "claude-cli", "fcc"):
+            self.assertIs(llm_client._BACKENDS[alias],
+                          llm_client.summarize_claude_cli)
+
+    def test_default_chain_is_cli_then_gemini(self):
+        self.assertEqual(llm_client.DEFAULT_FALLBACK_CHAIN, "claude-cli,gemini")
+
+    def test_unavailable_backend_advances_the_chain(self):
+        def unavailable(*a, **k):
+            raise BackendUnavailable("not logged in")
+        with mock.patch.dict(llm_client._BACKENDS,
+                             {"claude-cli": unavailable,
+                              "gemini": lambda *a, **k: "FROM GEMINI"}), \
+             mock.patch.dict(os.environ,
+                             {"SUMMARY_FALLBACK_CHAIN": "claude-cli,gemini"}):
+            out = llm_client.summarize_with_fallback([], "t", "{transcript}{frame_manifest}")
+        self.assertEqual(out, "FROM GEMINI")
+
+
+class SegmentGranularityTest(unittest.TestCase):
+    """Over-long transcript segments are cut before they reach the chunker.
+
+    A segment is the atom for both chunk boundaries and frame windows, so an
+    AssemblyAI Thai transcript that comes back as three 30-minute "sentences"
+    blew the chunk limit (60k and 70k chars against 40k) and gave every frame
+    window a half-hour of slack. Real case: Week01, 3 cues for 2.6 hours.
+    """
+
+    def test_a_well_formed_transcript_is_untouched(self):
+        segs = [chunking.Segment(0.0, 3.0, "hello"),
+                chunking.Segment(3.0, 7.0, "there")]
+        self.assertEqual(chunking.split_long_segments(segs), segs)
+
+    def test_a_long_segment_is_split_and_keeps_every_character(self):
+        seg = chunking.Segment(0.0, 1782.0, "ก" * 16000)
+        out = chunking.split_long_segments([seg])
+        self.assertGreater(len(out), 10)
+        self.assertEqual("".join(s.text for s in out), seg.text)
+
+    def test_the_pieces_tile_the_original_time_span(self):
+        seg = chunking.Segment(100.0, 1000.0, "x" * 9000)
+        out = chunking.split_long_segments([seg])
+        self.assertAlmostEqual(out[0].start_s, 100.0, places=6)
+        self.assertAlmostEqual(out[-1].end_s, 1000.0, places=6)
+        for a, b in zip(out, out[1:]):
+            self.assertLessEqual(a.end_s, b.start_s + 1e-9)
+
+    def test_no_piece_exceeds_the_duration_cap(self):
+        seg = chunking.Segment(0.0, 1800.0, "y" * 20000)
+        out = chunking.split_long_segments([seg], max_seconds=120,
+                                           max_chars=100000)
+        for piece in out:
+            self.assertLessEqual(piece.end_s - piece.start_s, 120.5)
+
+    def test_the_char_cap_splits_a_short_but_dense_segment(self):
+        seg = chunking.Segment(0.0, 10.0, "z" * 9000)
+        out = chunking.split_long_segments([seg], max_seconds=120,
+                                           max_chars=2000)
+        self.assertGreaterEqual(len(out), 5)
+
+    def test_splitting_prefers_a_word_boundary(self):
+        words = ("alpha bravo charlie delta echo foxtrot " * 200).strip()
+        out = chunking.split_long_segments([chunking.Segment(0.0, 600.0, words)],
+                                           max_seconds=120, max_chars=100000)
+        self.assertGreater(len(out), 1)
+        # No piece may start or end mid-word.
+        for piece in out[:-1]:
+            self.assertTrue(piece.text.endswith(" ") or
+                            piece.text.rstrip().split()[-1] in words.split())
+
+    def test_zero_disables_the_split(self):
+        seg = chunking.Segment(0.0, 5000.0, "q" * 50000)
+        self.assertEqual(chunking.split_long_segments([seg], max_seconds=0),
+                         [seg])
+
+    def test_chunks_from_giant_segments_respect_the_char_limit(self):
+        # Three 30-minute cues, the shape that started this.
+        segs = [chunking.Segment(0.0, 1800.0, "a" * 20000),
+                chunking.Segment(1800.0, 5400.0, "b" * 60000),
+                chunking.Segment(5400.0, 9000.0, "c" * 40000)]
+        chunks = chunking.chunk_by_segments(
+            chunking.split_long_segments(segs), [], limit=40000, overlap=800)
+        for c in chunks:
+            self.assertLessEqual(len(c.text), 41000)
+
+    def test_frame_windows_stop_overlapping_once_segments_are_fine(self):
+        segs = [chunking.Segment(0.0, 1800.0, "a" * 20000),
+                chunking.Segment(1800.0, 5400.0, "b" * 60000)]
+        chunks = chunking.chunk_by_segments(
+            chunking.split_long_segments(segs), [], limit=40000, overlap=800)
+        # Each chunk may reach back only as far as its carried lead-in, not
+        # over the whole of the previous chunk.
+        for a, b in zip(chunks, chunks[1:]):
+            self.assertGreater(b.start_s, a.start_s)
+
+
+class EdgeFrameTest(unittest.TestCase):
+    """A frame no chunk carries is a frame the model can never cite."""
+
+    def segs(self):
+        return [chunking.Segment(10.0, 100.0, "a" * 100),
+                chunking.Segment(100.0, 200.0, "b" * 100)]
+
+    def frames(self, *stamps):
+        return [llm_client.FrameMeta(timestamp_s=t, kind="periodic",
+                                     path=f"/f/{t}.jpg") for t in stamps]
+
+    def test_a_frame_before_the_first_word_reaches_the_first_chunk(self):
+        # Real case: the frame at t=0 with segment 1 starting at 0.3s.
+        chunks = chunking.chunk_by_segments(self.segs(), self.frames(0.0),
+                                            limit=150, overlap=0)
+        self.assertIn(0.0, [f.timestamp_s for f in chunks[0].frames])
+
+    def test_a_frame_after_the_last_word_reaches_the_last_chunk(self):
+        chunks = chunking.chunk_by_segments(self.segs(), self.frames(999.0),
+                                            limit=150, overlap=0)
+        self.assertIn(999.0, [f.timestamp_s for f in chunks[-1].frames])
+
+    def test_every_frame_lands_in_at_least_one_chunk(self):
+        frames = self.frames(0.0, 50.0, 150.0, 999.0)
+        chunks = chunking.chunk_by_segments(self.segs(), frames,
+                                            limit=150, overlap=0)
+        carried = {f.timestamp_s for c in chunks for f in c.frames}
+        self.assertEqual(carried, {0.0, 50.0, 150.0, 999.0})
+
+
+class FrameNumberingTest(unittest.TestCase):
+    """Frame numbers must mean the same thing to the model and to the PDF.
+
+    Regression: _render numbers whatever list it is given and is called once
+    per chunk, so every chunk announced its own frames as 1..N. The model
+    cited them correctly; the PDF resolved them against the whole recording
+    and printed unrelated pictures. Seen in a real summary as "Frame 4" cited
+    at both 219s and 5484s.
+    """
+
+    def frames(self, *stamps):
+        return [llm_client.FrameMeta(timestamp_s=t, kind="periodic",
+                                     path=f"/f/{t}.jpg") for t in stamps]
+
+    def test_numbers_are_assigned_across_the_whole_manifest(self):
+        frames = llm_client.assign_numbers(self.frames(30.0, 10.0, 20.0))
+        self.assertEqual([f.number for f in frames], [1, 2, 3])
+        self.assertEqual([f.timestamp_s for f in frames], [10.0, 20.0, 30.0])
+
+    def test_a_later_chunk_keeps_the_recordings_numbers(self):
+        all_frames = llm_client.assign_numbers(
+            self.frames(10.0, 20.0, 30.0, 40.0))
+        tail = all_frames[2:]          # what chunk 2 would be handed
+        _, text = llm_client._render(tail, "transcript", "{frame_manifest}")
+        self.assertIn("[frame 3 @ 30.0s", text)
+        self.assertIn("[frame 4 @ 40.0s", text)
+        self.assertNotIn("[frame 1 @", text)
+
+    def test_unnumbered_frames_still_number_from_one(self):
+        # A caller that never called assign_numbers (the older behaviour, and
+        # what the unit tests below rely on) must be unaffected.
+        _, text = llm_client._render(self.frames(5.0), "t", "{frame_manifest}")
+        self.assertIn("[frame 1 @ 5.0s", text)
+
+    def test_no_frames_says_so_instead_of_an_empty_list(self):
+        # Voice only (--no-frames), or an audio file: every prompt says "look
+        # at the frames" under the list, so an empty list must be explained.
+        frames, text = llm_client._render([], "t", "Frames:\n{frame_manifest}")
+        self.assertEqual(frames, [])
+        self.assertIn(llm_client.NO_FRAMES_NOTE, text)
+
+
+# ---------------------------------------------------------------------------
+# The cache-stable prefix
+#
+# Claude caches an exact prefix. The claude-cli backend therefore has to send
+# the unchanging instructions as a system prompt read from a stable file, and
+# keep everything that varies — the chunk label, the reference material, the
+# transcript, the frame paths — in the piped user turn. These tests are what
+# stop something varying from drifting back into the static half, which fails
+# silently: the summary is fine, the cache simply never hits.
+# ---------------------------------------------------------------------------
+
+BEGIN = llm_client.STATIC_PROMPT_BEGIN
+END = llm_client.STATIC_PROMPT_END
+
+MARKED_TEMPLATE = (
+    f"{BEGIN}\n<instructions>\nAlways cite frames.\n</instructions>\n{END}\n\n"
+    "# Input\n\n<transcript>\n{transcript}\n</transcript>\n"
+    "<frames>\n{frame_manifest}\n</frames>\n"
+)
+
+
+class StaticPromptSplitTest(unittest.TestCase):
+    def test_an_unmarked_template_is_returned_untouched(self):
+        # Every prompt file older than summarize-v2.md takes this path, and
+        # must behave exactly as it did before.
+        template = "Do the thing.\n{transcript}\n{frame_manifest}"
+        static, dynamic = llm_client.split_static_prompt(template)
+        self.assertIsNone(static)
+        self.assertEqual(dynamic, template)
+
+    def test_the_marked_block_is_lifted_out(self):
+        static, dynamic = llm_client.split_static_prompt(MARKED_TEMPLATE)
+        self.assertIn("Always cite frames.", static)
+        self.assertNotIn("Always cite frames.", dynamic)
+        self.assertIn("{transcript}", dynamic)
+        self.assertIn("{frame_manifest}", dynamic)
+
+    def test_a_prepended_chunk_label_stays_dynamic(self):
+        # mapreduce prepends the part label to the template. If that landed in
+        # the static half, every chunk would write a different system prompt
+        # file and nothing would ever be cached.
+        template = "You are summarizing PART 2 OF 5.\n\n" + MARKED_TEMPLATE
+        static, dynamic = llm_client.split_static_prompt(template)
+        self.assertNotIn("PART 2 OF 5", static)
+        self.assertIn("PART 2 OF 5", dynamic)
+
+    def test_appended_reference_material_stays_dynamic(self):
+        # summarize.py appends the lecturer's slides to the template; they
+        # differ per run.
+        template = MARKED_TEMPLATE + "\n## Reference material\nWeek 4 slides."
+        static, dynamic = llm_client.split_static_prompt(template)
+        self.assertNotIn("Week 4 slides.", static)
+        self.assertIn("Week 4 slides.", dynamic)
+
+    def test_an_empty_marked_block_falls_back(self):
+        template = f"{BEGIN}\n\n{END}\n{{transcript}}{{frame_manifest}}"
+        static, _ = llm_client.split_static_prompt(template)
+        self.assertIsNone(static)
+
+    def test_markers_never_reach_a_model(self):
+        # gemini renders the template whole; the delimiters are structure for
+        # us and noise for the model.
+        _, text = llm_client._render([], "T", MARKED_TEMPLATE)
+        self.assertNotIn(BEGIN, text)
+        self.assertNotIn(END, text)
+        self.assertIn("Always cite frames.", text)
+
+
+class ShippedMarkedPromptsTest(unittest.TestCase):
+    """The real prompt files that carry the markers, split correctly.
+
+    A placeholder drifting above the `end` marker would put the transcript in
+    the cached prefix — a KeyError at best, a cache that never hits at worst.
+    """
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def _marked(self):
+        found = []
+        for path in sorted(self.PROMPTS_DIR.glob("*.md")):
+            text = path.read_text()
+            if llm_client.STATIC_PROMPT_BEGIN in text:
+                found.append((path, text))
+        return found
+
+    def test_the_expected_files_carry_the_markers(self):
+        names = {path.name for path, _ in self._marked()}
+        self.assertEqual(names, {"lecture.md", "tutorial.md", "meeting.md",
+                                 "video.md", "reality.md", "drama.md"})
+
+    def test_each_splits_cleanly(self):
+        for path, text in self._marked():
+            with self.subTest(prompt=path.name):
+                static, dynamic = llm_client.split_static_prompt(text)
+                self.assertIsNotNone(static, "markers present but split failed")
+                # The placeholders belong to the per-call half, always.
+                for placeholder in ("{transcript}", "{frame_manifest}"):
+                    self.assertNotIn(placeholder, static)
+                    self.assertIn(placeholder, dynamic)
+                # And the static half must survive not being .format()ed: any
+                # other brace in it would have raised before the split existed.
+                self.assertGreater(len(static), 200)
+
+    def test_the_role_line_is_in_the_cached_half(self):
+        # lecture-claude.md used to lose it: load_prompt_template cut at the
+        # first "# Input", which matched the "# Input Data" heading near the
+        # top, so the prompt began with the orphaned word "Data".
+        text = (self.PROMPTS_DIR / "lecture.md").read_text()
+        static, _ = llm_client.split_static_prompt(text)
+        self.assertTrue(static.startswith("You are an expert academic tutor"))
+
+    def test_load_prompt_template_keeps_a_marked_file_whole(self):
+        import summarize as summarize_main
+        template = summarize_main.load_prompt_template(
+            self.PROMPTS_DIR / "lecture.md")
+        self.assertIn("You are an expert academic tutor", template)
+        self.assertIn("# Execution Rules", template)
+        self.assertIn("{transcript}", template)
+
+
+class StaticPromptInvocationTest(unittest.TestCase):
+    """What the CLI is actually handed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.calls = []
+
+    def _run(self, transcript="Dijkstra.", template=MARKED_TEMPLATE, env=None):
+        def fake_run(argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return FakeCompleted(stdout=_envelope("BODY"))
+        environ = {"MEETING_BOT_ROOT": self.tmp.name,
+                   "CLAUDE_CLI_BIN": sys.executable}
+        environ.update(env or {})
+        with mock.patch.dict(os.environ, environ), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            llm_client.summarize_claude_cli([], transcript, template)
+        return self.calls[-1]
+
+    def _flag(self, argv, flag):
+        return argv[argv.index(flag) + 1] if flag in argv else None
+
+    def test_the_static_half_goes_in_as_a_system_prompt_file(self):
+        argv, kwargs = self._run()
+        path = self._flag(argv, "--append-system-prompt-file")
+        self.assertIsNotNone(path)
+        self.assertIn("Always cite frames.", Path(path).read_text())
+        # ...and out of the piped prompt, or it would be sent twice.
+        self.assertNotIn("Always cite frames.", kwargs["input"])
+
+    def test_dynamic_system_prompt_sections_are_excluded(self):
+        # The CLI's own system prompt carries cwd, env info and the date. Left
+        # in front of ours it changes daily and nothing behind it can cache.
+        argv, _ = self._run()
+        self.assertIn("--exclude-dynamic-system-prompt-sections", argv)
+
+    def test_the_path_is_stable_across_calls_that_differ(self):
+        first, _ = self._run(transcript="lecture one")
+        second, _ = self._run(transcript="a completely different lecture")
+        self.assertEqual(self._flag(first, "--append-system-prompt-file"),
+                         self._flag(second, "--append-system-prompt-file"))
+
+    def test_a_different_template_gets_a_different_file(self):
+        first, _ = self._run()
+        other = MARKED_TEMPLATE.replace("Always cite frames.", "Never guess.")
+        second, _ = self._run(template=other)
+        self.assertNotEqual(self._flag(first, "--append-system-prompt-file"),
+                            self._flag(second, "--append-system-prompt-file"))
+
+    def test_the_transcript_still_travels_on_stdin(self):
+        argv, kwargs = self._run(transcript="Dijkstra runs in O(E log V).")
+        self.assertIn("Dijkstra runs in O(E log V).", kwargs["input"])
+        self.assertNotIn("Dijkstra", " ".join(argv))
+
+    def test_the_toggle_reverts_to_the_inline_prompt(self):
+        argv, kwargs = self._run(env={"CLAUDE_CLI_STATIC_PROMPT": "0"})
+        self.assertNotIn("--append-system-prompt-file", argv)
+        self.assertNotIn("--exclude-dynamic-system-prompt-sections", argv)
+        self.assertIn("Always cite frames.", kwargs["input"])
+
+    def test_an_unmarked_template_adds_no_flags(self):
+        argv, kwargs = self._run(template="Old style.\n{transcript}{frame_manifest}")
+        self.assertNotIn("--append-system-prompt-file", argv)
+        self.assertIn("Old style.", kwargs["input"])
+
+
+def _slide_frame(path, size=(1920, 1080), slide=None, seed=0):
+    """A synthetic keyframe: dark UI with a bright slide carrying some marks.
+
+    Not solid white — is_blank() would (correctly) drop that — and with a
+    few dark shapes on the slide so two frames with different `seed`s hash
+    apart while two with the same seed hash together.
+    """
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", size, (20, 20, 20))
+    draw = ImageDraw.Draw(img)
+    if slide is None:
+        slide = (0, 0, size[0], size[1])
+    draw.rectangle(slide, fill=(245, 245, 245))
+    left, top, right, bottom = slide
+    w, h = right - left, bottom - top
+    # A title bar plus "text lines" whose lengths depend on the seed — the
+    # shape a real slide has, and what tells two slides of one deck apart.
+    draw.rectangle((left + w // 20, top + h // 12, right - w // 20, top + h // 5),
+                   fill=(40, 40, 40))
+    for i in range(6):
+        y = top + h // 3 + i * (h // 10)
+        length = w * (3 + (i * 5 + seed * 7) % 6) / 10
+        draw.rectangle((left + w // 20, y, left + w // 20 + int(length), y + h // 24),
+                       fill=(30, 30, 30))
+    img.save(path, "JPEG", quality=90)
+    return path
+
+
+class FrameDownscaleTest(unittest.TestCase):
+    """A 1920x1080 keyframe costs ~1,844 tokens every time the model sees it.
+
+    Driven on the Read path (CLAUDE_CLI_FRAME_INLINE=0) so the path the model
+    is pointed at is visible in the prompt; the copies on disk are the same
+    either way, and the inline test below checks the bytes that ride along.
+    """
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.frame_dir = Path(self.tmp.name) / "frames" / "run_1"
+        self.frame_dir.mkdir(parents=True)
+        self.original = _slide_frame(self.frame_dir / "scene_00001.jpg")
+        self.before = self.original.read_bytes()
+        self.frames = [FrameMeta(timestamp_s=1.0, kind="scene_change",
+                                 path=str(self.original), number=1)]
+        self.calls = []
+
+    def _run(self, env=None):
+        def fake_run(argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return FakeCompleted(stdout=_envelope("BODY"))
+        environ = {"MEETING_BOT_ROOT": self.tmp.name,
+                   "CLAUDE_CLI_BIN": sys.executable,
+                   "CLAUDE_CLI_FRAME_INLINE": "0",
+                   "PDF_FRAME_CROP": "none"}
+        environ.update(env or {})
+        with mock.patch.dict(os.environ, environ), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            llm_client.summarize_claude_cli(
+                self.frames, "t", "{transcript}\n{frame_manifest}")
+        return self.calls[-1]
+
+    def _sent_path(self, kwargs):
+        for token in kwargs["input"].split():
+            if token.endswith(".jpg"):
+                return Path(token)
+        return None
+
+    def test_the_model_is_pointed_at_a_downscaled_copy(self):
+        from PIL import Image
+        _, kwargs = self._run()
+        sent = self._sent_path(kwargs)
+        self.assertNotEqual(sent, self.original)
+        with Image.open(sent) as img:
+            self.assertEqual(max(img.size), 768)
+
+    def test_the_saved_frame_is_left_alone(self):
+        # pdf.py crops and embeds the original; it needs the full resolution.
+        self._run()
+        self.assertEqual(self.original.read_bytes(), self.before)
+
+    def test_the_dimension_is_configurable(self):
+        from PIL import Image
+        _, kwargs = self._run(env={"FRAME_MAX_DIMENSION": "512"})
+        with Image.open(self._sent_path(kwargs)) as img:
+            self.assertEqual(max(img.size), 512)
+
+    def test_zero_disables_the_downscale(self):
+        _, kwargs = self._run(env={"FRAME_MAX_DIMENSION": "0"})
+        self.assertEqual(self._sent_path(kwargs), self.original)
+
+    def test_a_frame_already_small_enough_is_sent_as_is(self):
+        small = _slide_frame(self.frame_dir / "scene_00002.jpg", size=(640, 360))
+        self.frames = [FrameMeta(timestamp_s=1.0, kind="periodic",
+                                 path=str(small), number=1)]
+        _, kwargs = self._run()
+        self.assertEqual(self._sent_path(kwargs), small)
+
+    def test_add_dir_still_covers_the_original_frame_directory(self):
+        argv, _ = self._run()
+        dirs = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
+        self.assertIn(str(self.frame_dir), dirs)
+        for directory in dirs:
+            self.assertTrue(str(directory).startswith(str(self.frame_dir)))
+
+    def test_a_second_run_reuses_the_copy(self):
+        _, first = self._run()
+        sent = self._sent_path(first)
+        stamp = sent.stat().st_mtime_ns
+        _, second = self._run()
+        self.assertEqual(self._sent_path(second), sent)
+        self.assertEqual(sent.stat().st_mtime_ns, stamp)
+
+    def test_inline_delivery_sends_the_downscaled_bytes(self):
+        # Same copy, different transport: the image block carries the small
+        # file, not the 1920x1080 original.
+        import base64
+        from PIL import Image
+        import io
+        _, kwargs = self._run(env={"CLAUDE_CLI_FRAME_INLINE": "1"})
+        _, images = _unpack_stdin(kwargs["input"])
+        self.assertEqual(len(images), 1)
+        data = base64.b64decode(images[0]["source"]["data"])
+        self.assertLess(len(data), len(self.before))
+        with Image.open(io.BytesIO(data)) as img:
+            self.assertEqual(max(img.size), 768)
+
+
+def _bright_fraction(img):
+    gray = img.convert("L").resize((50, 28))
+    values = list(gray.getdata())
+    return sum(1 for v in values if v > 200) / len(values)
+
+
+class FrameCropForLlmTest(unittest.TestCase):
+    """The copy the model sees is cropped to the slide before it is shrunk.
+
+    At 768px a whole 1920x1080 frame gives the slide maybe 500px of width;
+    cropped first, the slide gets all 768. Same detector, same mode
+    (PDF_FRAME_CROP) as the PDF, so the model looks at the picture the PDF
+    prints — and framecrop declines rather than guesses, so a frame with no
+    findable slide is shrunk whole.
+    """
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.frame_dir = Path(self.tmp.name) / "frames" / "run_1"
+        self.frame_dir.mkdir(parents=True)
+        # A 1280x720 slide sitting in dark chrome at (320, 180).
+        self.original = _slide_frame(self.frame_dir / "scene_00001.jpg",
+                                     slide=(320, 180, 1600, 900))
+
+    def test_slide_mode_crops_then_fits(self):
+        import framecrop
+        from PIL import Image
+        dst = self.frame_dir / "llm" / "scene_00001.jpg"
+        out = framecrop.fit_for_llm(self.original, dst, mode="slide", max_dim=768)
+        self.assertEqual(out, dst)
+        with Image.open(dst) as img:
+            self.assertEqual(img.width, 768)
+            # The slide, not the frame: the dark chrome is gone, so the
+            # copy is markedly lighter than the whole-frame version below.
+            self.assertGreater(_bright_fraction(img), 0.6)
+            self.assertLess(abs(img.height - 432), 16)   # still ~16:9
+
+    def test_none_mode_only_downscales(self):
+        import framecrop
+        from PIL import Image
+        dst = self.frame_dir / "llm" / "scene_00001.jpg"
+        framecrop.fit_for_llm(self.original, dst, mode="none", max_dim=768)
+        with Image.open(dst) as img:
+            self.assertEqual(img.size, (768, 432))
+            self.assertLess(_bright_fraction(img), 0.45)   # chrome still there
+
+    def test_nothing_to_do_returns_the_source(self):
+        import framecrop
+        small = _slide_frame(self.frame_dir / "small.jpg", size=(640, 360))
+        dst = self.frame_dir / "llm" / "small.jpg"
+        out = framecrop.fit_for_llm(small, dst, mode="none", max_dim=768)
+        self.assertEqual(out, small)
+        self.assertFalse(dst.exists())
+
+    def test_the_copy_directory_names_the_crop_mode(self):
+        # So flipping PDF_FRAME_CROP doesn't reuse copies cut the old way.
+        src = Path("/x/frames/run/f.jpg")
+        self.assertEqual(llm_client._llm_copy_path(src, 768, "slide"),
+                         Path("/x/frames/run/llm-768-slide/f.jpg"))
+        self.assertEqual(llm_client._llm_copy_path(src, 768, "none"),
+                         Path("/x/frames/run/llm-768/f.jpg"))
+
+    def test_the_backend_uses_pdf_frame_crop(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return FakeCompleted(stdout=_envelope("BODY"))
+        frames = [FrameMeta(timestamp_s=1.0, kind="scene_change",
+                            path=str(self.original), number=1)]
+        env = {"MEETING_BOT_ROOT": self.tmp.name, "CLAUDE_CLI_BIN": sys.executable,
+               "CLAUDE_CLI_FRAME_INLINE": "0", "PDF_FRAME_CROP": "slide"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            llm_client.summarize_claude_cli(frames, "t", "{transcript}\n{frame_manifest}")
+        prompt = calls[0][1]["input"]
+        self.assertIn("/llm-768-slide/scene_00001.jpg", prompt)
+
+
+class DropUninformativeTest(unittest.TestCase):
+    """Blank frames and repeats of the same slide are not offered."""
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def _frame(self, name, ts, seed, kind="periodic", part=0, blank=False):
+        from PIL import Image
+        path = self.dir / f"{name}.jpg"
+        if blank:
+            Image.new("RGB", (640, 360), "black").save(path)
+        else:
+            _slide_frame(path, size=(640, 360), seed=seed)
+        return FrameMeta(timestamp_s=ts, kind=kind, path=str(path), part=part)
+
+    def test_blank_frames_are_dropped(self):
+        frames = [self._frame("a", 0, 1), self._frame("b", 30, 0, blank=True),
+                  self._frame("c", 60, 2)]
+        kept, blanks, dupes = llm_client.drop_uninformative(frames)
+        self.assertEqual([f.timestamp_s for f in kept], [0, 60])
+        self.assertEqual((blanks, dupes), (1, 0))
+
+    def test_consecutive_repeats_of_one_slide_are_dropped(self):
+        frames = [self._frame("a", 0, 1), self._frame("b", 30, 1),
+                  self._frame("c", 60, 1), self._frame("d", 90, 2)]
+        kept, blanks, dupes = llm_client.drop_uninformative(frames)
+        self.assertEqual([f.timestamp_s for f in kept], [0, 90])
+        self.assertEqual((blanks, dupes), (0, 2))
+
+    def test_a_slide_returned_to_later_is_kept(self):
+        # Only *consecutive* repeats go: coming back to a diagram twenty
+        # minutes later is a moment the notes may cite.
+        frames = [self._frame("a", 0, 1), self._frame("b", 30, 2),
+                  self._frame("c", 60, 1)]
+        kept, _, dupes = llm_client.drop_uninformative(frames)
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(dupes, 0)
+
+    def test_numbers_are_untouched(self):
+        frames = llm_client.assign_numbers(
+            [self._frame("a", 0, 1), self._frame("b", 30, 1), self._frame("c", 60, 2)])
+        kept, _, _ = llm_client.drop_uninformative(frames)
+        self.assertEqual([f.number for f in kept], [1, 3])
+
+    def test_frames_of_different_videos_are_never_each_others_repeat(self):
+        frames = [self._frame("a", 0, 1, part=1), self._frame("b", 0, 1, part=2)]
+        kept, _, dupes = llm_client.drop_uninformative(frames)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(dupes, 0)
+
+    def test_dedupe_can_be_turned_off(self):
+        frames = [self._frame("a", 0, 1), self._frame("b", 30, 1)]
+        with mock.patch.dict(os.environ, {"CLAUDE_CLI_FRAME_DEDUPE": "0"}):
+            kept, _, dupes = llm_client.drop_uninformative(frames)
+        self.assertEqual(len(kept), 2)
+
+    def test_dedupe_runs_before_the_cap(self):
+        # Ten periodic samples of one slide, then one new slide, cap 3: the
+        # model sees both slides. Thinning first would have shown it the
+        # first slide three times.
+        frames = [self._frame(f"f{i}", i * 30, 1) for i in range(10)]
+        frames.append(self._frame("new", 300, 2))
+        frames = llm_client.assign_numbers(frames)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(kwargs)
+            return FakeCompleted(stdout=_envelope("BODY"))
+        env = {"MEETING_BOT_ROOT": self.tmp.name, "CLAUDE_CLI_BIN": sys.executable,
+               "CLAUDE_CLI_MAX_FRAMES": "3", "PDF_FRAME_CROP": "none"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(llm_client.subprocess, "run", fake_run):
+            llm_client.summarize_claude_cli(frames, "t", "{transcript}\n{frame_manifest}")
+        text, images = _unpack_stdin(calls[0]["input"])
+        self.assertEqual(len(images), 2)
+        self.assertIn("[frame 1 @ 0.0s", text)
+        self.assertIn("[frame 11 @ 300.0s", text)
+
+    def test_gemini_gets_the_same_filtering_as_the_cli(self):
+        # Blank and repeated frames out, then the cap, then cropped and
+        # downscaled copies — on 2026-10-06 Gemini was still sent every
+        # frame at full size, ~90MB for one 910-frame video, which alone
+        # spent the free tier's per-minute token quota.
+        frames = [self._frame(f"f{i}", i * 30, 1) for i in range(10)]
+        frames.append(self._frame("blank", 300, 0, blank=True))
+        frames.append(self._frame("new", 330, 2))
+        frames.append(self._frame("third", 360, 3))
+        frames = llm_client.assign_numbers(frames)
+        sent = []
+
+        class _Resp:
+            text = "BODY"
+
+        class _Models:
+            def generate_content(self, model, contents):
+                sent.append(contents)
+                return _Resp()
+
+        class Client:
+            def __init__(self, api_key, http_options=None):
+                self.models = _Models()
+
+        google = type(sys)("google")
+        genai = type(sys)("google.genai")
+        genai.Client = Client
+        google.genai = genai
+        env = {"MEETING_BOT_ROOT": self.tmp.name, "GEMINI_API_KEY_1": "k1",
+               "GEMINI_MODEL": "m", "CLAUDE_CLI_MAX_FRAMES": "2",
+               "FRAME_MAX_DIMENSION": "320", "PDF_FRAME_CROP": "none"}
+        before = {f.path: Path(f.path).stat().st_size for f in frames}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            llm_client.summarize_gemini(frames, "t", "{transcript}\n{frame_manifest}")
+        parts = sent[0][0]["parts"]
+        images = [p for p in parts if "inline_data" in p]
+        self.assertEqual(len(images), 2)          # 3 distinct slides, cap 2
+        self.assertNotIn("[frame 11 @", parts[0]["text"])   # the blank one
+        from PIL import Image
+        import io
+        for img in images:
+            self.assertLessEqual(max(Image.open(io.BytesIO(
+                img["inline_data"]["data"])).size), 320)
+        self.assertEqual(before, {f.path: Path(f.path).stat().st_size
+                                  for f in frames})   # originals untouched
+
+    def test_gemini_resolution_and_its_own_cap(self):
+        # GEMINI_MAX_FRAMES=0 sends every distinct frame even with the CLI's
+        # cap at 2, and GEMINI_MEDIA_RESOLUTION lands on every image part —
+        # it is the only thing that changes what an image costs Gemini.
+        frames = [self._frame("a", 0, 1), self._frame("b", 30, 2),
+                  self._frame("c", 60, 3)]
+        frames = llm_client.assign_numbers(frames)
+        sent = []
+
+        class _Resp:
+            text = "BODY"
+
+        class _Models:
+            def generate_content(self, model, contents):
+                sent.append(contents)
+                return _Resp()
+
+        class Client:
+            def __init__(self, api_key, http_options=None):
+                self.models = _Models()
+
+        google = type(sys)("google")
+        genai = type(sys)("google.genai")
+        genai.Client = Client
+        google.genai = genai
+        env = {"MEETING_BOT_ROOT": self.tmp.name, "GEMINI_API_KEY_1": "k1",
+               "GEMINI_MODEL": "m", "CLAUDE_CLI_MAX_FRAMES": "2",
+               "GEMINI_MAX_FRAMES": "0", "GEMINI_MEDIA_RESOLUTION": "low",
+               "PDF_FRAME_CROP": "none"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            llm_client.summarize_gemini(frames, "t", "{transcript}\n{frame_manifest}")
+        images = [p for p in sent[0][0]["parts"] if "inline_data" in p]
+        self.assertEqual(len(images), 3)
+        self.assertTrue(all(p["media_resolution"] == {"level": "MEDIA_RESOLUTION_LOW"}
+                            for p in images))
+        with mock.patch.dict(os.environ, {"GEMINI_MEDIA_RESOLUTION": "tiny"}):
+            self.assertEqual(llm_client._gemini_media_resolution(), "")
+
+    def test_frame_hash_tells_slides_apart(self):
+        import framecrop
+        a = framecrop.frame_hash(self._frame("a", 0, 1).path)
+        b = framecrop.frame_hash(self._frame("b", 0, 1).path)
+        c = framecrop.frame_hash(self._frame("c", 0, 2).path)
+        self.assertEqual(framecrop.hamming(a, b), 0)
+        self.assertGreater(framecrop.hamming(a, c), llm_client.FRAME_DEDUPE_MAX_DISTANCE)
+
+    def _text_slide(self, name, title, cursor=None, tile=False):
+        # Real rendered text in dark chrome, the way a Meet recording of a
+        # shared slide looks: this is the case the hash exists for.
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (1920, 1080), (20, 20, 20))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((320, 180, 1600, 900), fill="white")
+        draw.text((400, 300), title, fill="black", font_size=60)
+        if cursor:
+            draw.ellipse((cursor[0], cursor[1], cursor[0] + 18, cursor[1] + 18), fill="black")
+        if tile:
+            draw.rectangle((1650, 200, 1900, 340), fill=(90, 120, 200))
+        path = self.dir / f"{name}.jpg"
+        img.save(path, "JPEG", quality=90)
+        return path
+
+    def test_a_changed_title_is_a_different_slide(self):
+        # The false positive seen live 2026-09-12: same template, different
+        # title, deduped by an average hash. Texture bits tell them apart.
+        import framecrop
+        a = framecrop.frame_hash(self._text_slide("t1", "Dijkstra: relax edges"))
+        b = framecrop.frame_hash(self._text_slide("t2", "Bellman-Ford: V-1 passes"))
+        self.assertGreater(framecrop.hamming(a, b), llm_client.FRAME_DEDUPE_MAX_DISTANCE)
+
+    def test_a_cursor_or_a_filmstrip_change_is_the_same_slide(self):
+        import framecrop
+        a = framecrop.frame_hash(self._text_slide("s1", "Dijkstra: relax edges"))
+        cursor = framecrop.frame_hash(self._text_slide("s2", "Dijkstra: relax edges", cursor=(900, 600)))
+        tile = framecrop.frame_hash(self._text_slide("s3", "Dijkstra: relax edges", tile=True))
+        self.assertLessEqual(framecrop.hamming(a, cursor), llm_client.FRAME_DEDUPE_MAX_DISTANCE)
+        self.assertLessEqual(framecrop.hamming(a, tile), llm_client.FRAME_DEDUPE_MAX_DISTANCE)
+
+
+class PromptOrderForCachingTest(unittest.TestCase):
+    """What varies per chunk goes last; what is the same for a run goes first."""
+
+    def test_the_chunk_label_is_appended_not_prepended(self):
+        seen = []
+
+        def fake_summarize(frames, transcript, template, role=None):
+            seen.append(template)
+            return "x"
+        chunks = [Chunk(index=i, text=f"body {i}", start_s=i * 60.0,
+                        end_s=(i + 1) * 60.0, frames=[]) for i in range(2)]
+        summarize_chunked(chunks, "INSTRUCTIONS\n{transcript}\n{frame_manifest}",
+                          fake_summarize, log=lambda *a: None)
+        chunk_templates = [t for t in seen if "ONE PART" in t]
+        self.assertEqual(len(chunk_templates), 2)
+        for template in chunk_templates:
+            self.assertTrue(template.startswith("INSTRUCTIONS"))
+            self.assertGreater(template.index("ONE PART"), template.index("{frame_manifest}"))
+
+    def test_the_merge_is_called_with_the_merge_role(self):
+        roles = []
+
+        def fake_summarize(frames, transcript, template, role=None):
+            roles.append(role)
+            return "x"
+        chunks = [Chunk(index=i, text=f"body {i}", start_s=i * 60.0,
+                        end_s=(i + 1) * 60.0, frames=[]) for i in range(2)]
+        summarize_chunked(chunks, "P {transcript}", fake_summarize, log=lambda *a: None)
+        self.assertEqual(roles, [None, None, "merge"])
+
+    def test_reference_material_goes_to_the_top_of_the_dynamic_half(self):
+        import summarize as summarize_main
+
+        class Bundle:
+            def text_block(self):
+                return "Week 4 slides {x}"
+
+            def provenance(self):
+                return "repo"
+        template = (f"{BEGIN}\nRULES\n{END}\n# Input\n{{transcript}}\n{{frame_manifest}}\n")
+        out = summarize_main.inject_resources(template, Bundle())
+        static, dynamic = llm_client.split_static_prompt(out)
+        self.assertNotIn("Week 4", static)
+        self.assertLess(dynamic.index("Week 4 slides {{x}}"), dynamic.index("# Input"))
+
+    def test_reference_material_is_appended_to_an_unmarked_template(self):
+        import summarize as summarize_main
+
+        class Bundle:
+            def text_block(self):
+                return "Week 4 slides"
+
+            def provenance(self):
+                return "repo"
+        out = summarize_main.inject_resources("RULES\n{transcript}", Bundle())
+        self.assertTrue(out.startswith("RULES"))
+        self.assertGreater(out.index("Week 4"), out.index("{transcript}"))
+
+    def test_frontmatter_reference_is_tagged_and_keeps_its_braces_safe(self):
+        import summarize as summarize_main
+        import resources as botresources
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "kurose.md"
+            ref.write_text("---\ncourse: Networks\nsource: Kurose & Ross\n"
+                           "citation_label: Kurose\n---\n# 2.4 DNS\nuses {x}\n")
+            bundle = botresources.collect([str(ref)], cache_root=tmp, want_images=False)
+            template = f"{BEGIN}\nRULES\n{END}\n# Input\n{{transcript}}\n"
+            with mock.patch.dict(os.environ, {"MEETING_BOT_LANGUAGE": "th"}):
+                out = summarize_main.inject_resources(template, bundle)
+        static, dynamic = llm_client.split_static_prompt(out)
+        self.assertNotIn("Networks", static, "per-course metadata must stay dynamic")
+        self.assertIn('<course_reference course="Networks" source="Kurose &amp; Ross" '
+                      'citation_label="Kurose" lecture_language="th">', dynamic)
+        self.assertNotIn("---", dynamic.split("<course_reference")[1],
+                         "the frontmatter itself is stripped")
+        self.assertEqual(dynamic.format(transcript="T").count("uses {x}"), 1)
+
+    def test_a_reference_without_frontmatter_is_unchanged(self):
+        import summarize as summarize_main
+        import resources as botresources
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "notes.md"
+            ref.write_text("# Notes\nplain\n")
+            bundle = botresources.collect([str(ref)], cache_root=tmp, want_images=False)
+            with mock.patch.dict(os.environ, {"MEETING_BOT_LANGUAGE": "th"}):
+                out = summarize_main.inject_resources("RULES\n{transcript}", bundle)
+        self.assertNotIn("course_reference", out)
+        self.assertNotIn("lecture_language", out)
+        self.assertIn("### notes.md\n\n# Notes\nplain", out)
+
+    def test_lecture_reference_prompt_keeps_its_rules_static(self):
+        template = summarize_main_load("lecture-reference")
+        static, dynamic = llm_client.split_static_prompt(template)
+        self.assertIn("Cite only what is in the excerpt", static)
+        self.assertIn("{transcript}", dynamic)
+        self.assertNotIn("{", static.replace("{{", ""), "no format slots in the static half")
+
+
+class PromptSetTest(unittest.TestCase):
+    """The prompts (four on 2026-09-29, `reality` the fifth on 09-30): one
+    file per kind of recording, shared by every backend, none but the timed
+    ones asking for timestamps, none asking for frame citations, all
+    speaking the callout vocabulary the PDF styles (DESIGN.md)."""
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+
+    def test_exactly_six_selectable_prompts(self):
+        names = sorted(p.stem for p in self.PROMPTS_DIR.glob("*.md")
+                       if not p.stem.startswith("_"))
+        self.assertEqual(names, ["drama", "lecture", "meeting", "reality",
+                                 "tutorial", "video"])
+
+    def test_old_names_resolve_to_their_replacements(self):
+        for old, new in (("lecture-claude", "lecture"),
+                         ("lecture-gemini.md", "lecture"),
+                         ("lecture-reference", "lecture"),
+                         ("tutorial-gemini", "tutorial"),
+                         ("meeting-claude", "meeting"),
+                         ("summarize-v2", "meeting"), ("summarize", "meeting"),
+                         (None, "video"), ("", "video"), ("tutorial", "tutorial")):
+            with self.subTest(name=old):
+                self.assertEqual(self.sm.resolve_prompt_path(old).name,
+                                 f"{new}.md")
+
+    def test_an_unknown_prompt_lists_them(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.sm.resolve_prompt_path("nope")
+        self.assertIn("drama, lecture, meeting, reality, tutorial, video",
+                      str(cm.exception))
+
+    def test_no_prompt_asks_for_timestamps_or_frame_citations(self):
+        from promptnames import TIMED_TRANSCRIPT_PROMPTS
+        timed = {f"{n}.md" for n in TIMED_TRANSCRIPT_PROMPTS} | {
+            f"_merge-{n}.md" for n in TIMED_TRANSCRIPT_PROMPTS}
+        for path in sorted(self.PROMPTS_DIR.glob("*.md")):
+            if path.name in timed:
+                continue  # RealityPromptTest holds what those ask for
+            text = path.read_text()
+            with self.subTest(prompt=path.name):
+                for asks in ("Timestamp Format", "[mm:ss]`", "Visual Index",
+                             "Frame / Index", "Context Timestamp",
+                             "Preserve timestamp citations"):
+                    self.assertNotIn(asks, text)
+                if not path.name.startswith("_"):
+                    self.assertIn("never cite them", text)
+                    self.assertIn("no timestamps", text)
+
+    def test_every_prompt_speaks_the_callout_vocabulary(self):
+        for name in ("lecture", "tutorial", "meeting", "video", "reality",
+                     "drama"):
+            text = (self.PROMPTS_DIR / f"{name}.md").read_text()
+            with self.subTest(prompt=name):
+                for tag in ("[!CONCEPT]", "[!EXAMPLE]", "[!WARNING]",
+                            "[!IMPORTANT]", "[!NOTE]"):
+                    self.assertIn(tag, text)
+                static, _ = llm_client.split_static_prompt(text)
+                self.assertIn("[!CONCEPT]", static)
+
+    def test_the_lecture_prompt_carries_the_course_reference_rules(self):
+        static, _ = llm_client.split_static_prompt(
+            (self.PROMPTS_DIR / "lecture.md").read_text())
+        self.assertIn("Cite only what is in the excerpt", static)
+        self.assertIn("If there is none, ignore this section entirely", static)
+
+
+class RealityPromptTest(unittest.TestCase):
+    """The reality-show recap (2026-09-30): the one prompt that reads a timed
+    transcript and cites [mm:ss], which the code — not the model — links
+    into the video; quotes credited from on-screen name captions; the
+    results last."""
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def _srt(self, cues, name="ep.srt"):
+        """cues: [(start_s, end_s, text)] -> the .txt path beside an .srt."""
+        def ts(sec):
+            ms = int(round(sec * 1000))
+            h, rem = divmod(ms, 3600_000)
+            m, rem = divmod(rem, 60_000)
+            s_, ms = divmod(rem, 1000)
+            return f"{h:02d}:{m:02d}:{s_:02d},{ms:03d}"
+        blocks = [f"{i}\n{ts(a)} --> {ts(b)}\n{t}\n"
+                  for i, (a, b, t) in enumerate(cues, start=1)]
+        srt = self.dir / name
+        srt.write_text("\n".join(blocks))
+        txt = srt.with_suffix(".txt")
+        txt.write_text("\n".join(t for _, _, t in cues))
+        return txt
+
+    # --- which prompts read the timed transcript -------------------------
+
+    def test_only_reality_and_drama_read_timed_lines(self):
+        from promptnames import wants_timed_transcript
+        self.assertTrue(wants_timed_transcript("reality"))
+        self.assertTrue(wants_timed_transcript("reality.md"))
+        self.assertTrue(wants_timed_transcript("drama"))
+        for name in (None, "", "video", "lecture", "meeting", "tutorial",
+                     "lecture-claude", "summarize"):
+            with self.subTest(prompt=name):
+                self.assertFalse(wants_timed_transcript(name))
+
+    def test_it_is_wrapped_with_the_link_and_transcript(self):
+        self.assertTrue(document.wants_wrapper("reality"))
+
+    # --- what the prompt asks for ----------------------------------------
+
+    def test_the_prompt_asks_for_the_recap(self):
+        text = (self.PROMPTS_DIR / "reality.md").read_text()
+        static, dynamic = llm_client.split_static_prompt(text)
+        for asks in ("## Highlights", "## Results", "eliminated",
+                     "[!EXAMPLE]` box titled \"Quotes\"",
+                     "On-screen name captions", "never guess a name",
+                     "The Face", "`[mm:ss]`", "[Video N, mm:ss]",
+                     "If the transcript carries no marks, write no timestamps",
+                     "{language_rule}"):
+            with self.subTest(asks=asks):
+                self.assertIn(asks, static)
+        # Results last, and no spoiler in the opening.
+        self.assertIn("**End with the Results section.**", static)
+        self.assertIn("Do not reveal any result here", static)
+        self.assertLess(static.index("## Highlights"),
+                        static.index("`## Results`"))
+        # Frames are still never cited.
+        self.assertIn("never cite them", static)
+        for placeholder in ("{transcript}", "{frame_manifest}"):
+            self.assertIn(placeholder, dynamic)
+            self.assertNotIn(placeholder, static)
+
+    def test_the_template_formats(self):
+        # Every brace in the file is a placeholder: .format() must not choke.
+        template = self.sm.load_prompt_template(self.PROMPTS_DIR / "reality.md")
+        out = template.format(transcript="T", frame_manifest="F")
+        self.assertIn("[mm:ss]", out)
+
+    # --- the timed transcript --------------------------------------------
+
+    def test_lines_group_cues_and_open_with_their_time(self):
+        segs = [Segment(t, t + 3, f"c{t}") for t in range(0, 30, 3)]
+        lines = chunking.timed_transcript(segs).splitlines()
+        self.assertEqual(lines, ["[00:00] c0 c3 c6 c9",
+                                 "[00:12] c12 c15 c18 c21",
+                                 "[00:24] c24 c27"])
+
+    def test_past_the_hour_the_mark_carries_hours(self):
+        self.assertEqual(chunking.timestamp_label(3599), "[59:59]")
+        self.assertEqual(chunking.timestamp_label(3723.9), "[1:02:03]")
+
+    def test_a_long_asr_segment_is_cut_so_marks_stay_dense(self):
+        # AssemblyAI on Thai: one "sentence" for two minutes.
+        segs = [Segment(0, 120, "ก" * 1200)]
+        lines = chunking.timed_transcript(segs).splitlines()
+        self.assertEqual([ln.split("]")[0] + "]" for ln in lines],
+                         ["[00:00]", "[00:30]", "[01:00]", "[01:30]"])
+
+    def test_chunks_carry_the_marks_and_their_frames(self):
+        txt = self._srt([(t, t + 4, "x" * 50) for t in range(0, 400, 4)])
+        frames = [FrameMeta(timestamp_s=t, kind="motion", path=f"/f{t}.jpg")
+                  for t in (5, 395)]
+        timed = self.sm.model_transcript(txt.read_text(), str(txt), "reality")
+        with mock.patch.dict(os.environ, {"SUMMARY_CHUNK_CHARS": "1500",
+                                          "SUMMARY_CHUNK_OVERLAP": "0"}):
+            chunks = chunking.build_chunks(timed, frames, str(txt), timed=True)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            for line in chunk.text.splitlines():
+                self.assertRegex(line, r"^\[\d\d:\d\d\] ")
+        self.assertEqual([f.timestamp_s for f in chunks[0].frames], [5])
+        self.assertEqual([f.timestamp_s for f in chunks[-1].frames], [395])
+
+    def test_model_transcript_is_timed_only_for_reality(self):
+        txt = self._srt([(0, 4, "hello"), (65, 70, "there")])
+        plain = txt.read_text()
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(self.sm.model_transcript(plain, str(txt), "reality"),
+                             "[00:00] hello\n[01:05] there")
+        self.assertEqual(self.sm.model_transcript(plain, str(txt), "video"),
+                         plain)
+
+    def test_no_srt_means_the_plain_text_and_a_warning(self):
+        txt = self.dir / "bare.txt"
+        txt.write_text("words")
+        err = io.StringIO()
+        with mock.patch("sys.stderr", new=err):
+            self.assertEqual(
+                self.sm.model_transcript("words", str(txt), "reality"), "words")
+        self.assertIn("no timestamps", err.getvalue())
+
+    def test_combined_parts_are_timed_per_video(self):
+        a = self._srt([(0, 3, "one"), (20, 23, "two")], "a.srt")
+        b = self._srt([(5, 8, "three")], "b.srt")
+        parts = [chunking.Part(label="video 1 of 2: A", text="one\ntwo",
+                               srt_path=str(a.with_suffix(".srt"))),
+                 chunking.Part(label="video 2 of 2: B", text="three",
+                               srt_path=str(b.with_suffix(".srt")))]
+        self.assertEqual(chunking.part_transcript(parts, timed=True),
+                         "=== video 1 of 2: A ===\n\n[00:00] one\n[00:20] two"
+                         "\n\n=== video 2 of 2: B ===\n\n[00:05] three")
+        # The document still embeds the plain text.
+        self.assertIn("one\ntwo", chunking.part_transcript(parts))
+
+    # --- the links --------------------------------------------------------
+
+    URL = "https://www.youtube.com/watch?v=abcdefghijk"
+
+    def test_youtube_ids(self):
+        for url in ("https://youtu.be/abcdefghijk",
+                    "https://www.youtube.com/watch?v=abcdefghijk&list=PL1",
+                    "https://www.youtube.com/watch?feature=x&v=abcdefghijk",
+                    "https://youtube.com/shorts/abcdefghijk",
+                    "https://www.youtube.com/live/abcdefghijk?si=1"):
+            with self.subTest(url=url):
+                self.assertEqual(document.youtube_id(url), "abcdefghijk")
+        self.assertIsNone(document.youtube_id("/media/ep.mp4"))
+        self.assertIsNone(document.youtube_id(None))
+
+    def test_marks_become_links_to_that_second(self):
+        body = "## 2. Shoot [08:15]\n* [1:02:03] **Bee**: \"ok\""
+        out = document.link_timestamps(body, [(self.URL, 0)])
+        self.assertIn(f"[08:15]({self.URL}&t=495s)", out)
+        self.assertIn(f"[1:02:03]({self.URL}&t=3723s)", out)
+
+    def test_a_clip_offset_is_added_to_the_link_not_the_text(self):
+        out = document.link_timestamps("[00:10]", [(self.URL, 300)])
+        self.assertEqual(out, f"[00:10]({self.URL}&t=310s)")
+
+    def test_video_n_links_into_that_video(self):
+        other = "https://youtu.be/zyxwvutsrqp"
+        out = document.link_timestamps(
+            "[Video 2, 00:05] and [00:07]", [(self.URL, 0), (other, 0)])
+        self.assertIn("[Video 2, 00:05](https://www.youtube.com/watch?v="
+                      "zyxwvutsrqp&t=5s)", out)
+        # A bare mark is ambiguous among several videos: left as text.
+        self.assertTrue(out.endswith("and [00:07]"))
+
+    def test_a_timestamp_dressed_as_code_is_still_linked(self):
+        # Gemini, live: "| `[01:41:22]` | … |" in the Highlights table.
+        out = document.link_timestamps("| `[01:41:22]` | walkout |",
+                                       [(self.URL, 0)])
+        self.assertEqual(out, f"| [01:41:22]({self.URL}&t=6082s) | walkout |")
+
+    def test_what_is_not_linked(self):
+        body = ("`x [00:01]` and\n```\n[00:02]\n```\n[00:03](https://x) "
+                "[Video 9, 00:04]")
+        self.assertEqual(document.link_timestamps(body, [(self.URL, 0)]), body)
+        # No YouTube source: no links at all.
+        self.assertEqual(document.link_timestamps("[00:05]", [("/ep.mp4", 0)]),
+                         "[00:05]")
+        self.assertEqual(document.link_timestamps(
+            "[00:05]", [("https://cdnapisec.kaltura.com/p/1/embed", 0)]),
+            "[00:05]")
+
+    # --- the merge ---------------------------------------------------------
+
+    def test_the_merge_keeps_timestamps_and_puts_results_last(self):
+        from mapreduce import load_merge_template
+        merge = load_merge_template("reality")
+        self.assertIn("Keep every timestamp exactly as written", merge)
+        self.assertIn("ONE `## Results` section, LAST", merge)
+        self.assertNotIn("{language_rule}", merge)
+        self.assertEqual(merge.format(transcript="P").count("P"), 1 +
+                         merge.count("P"))
+        # Every other prompt keeps the shared merge.
+        self.assertEqual(load_merge_template("video"), load_merge_template())
+        self.assertIn("Do not add timestamps", load_merge_template("lecture"))
+
+    def test_summarize_chunked_uses_the_merge_it_is_given(self):
+        seen = []
+
+        def fake(frames, transcript, template, role=None):
+            seen.append((role, template))
+            return "partial"
+        chunks = [Chunk(index=i, text=f"t{i}") for i in range(2)]
+        summarize_chunked(chunks, "P {transcript}", fake, log=lambda *a: None,
+                          merge_template="MERGE {transcript}")
+        self.assertEqual(seen[-1], ("merge", "MERGE {transcript}"))
+
+    # --- end to end through main() ------------------------------------------
+
+    def test_main_sends_timed_lines_and_writes_links(self):
+        txt = self._srt([(0, 4, "สวัสดี"), (125, 130, "ออกจากการแข่งขัน")])
+        manifest = self.dir / "manifest.json"
+        manifest.write_text('{"frames": []}')
+        out_md = self.dir / "out.md"
+        seen = {}
+
+        def fake(frames, transcript, template, role=None):
+            seen["transcript"] = transcript
+            return "# Ep 1\n\n## Results [02:05]\n\n* **A** eliminated [02:05]"
+        argv = ["summarize.py", "https://youtu.be/abcdefghijk", str(txt),
+                str(out_md), "--prompt", "reality", "--frames-manifest",
+                str(manifest), "--no-pdf", "--title", "Ep 1",
+                "--clip", "00:01:00-00:10:00"]
+        env = {k: v for k, v in os.environ.items() if k != "RESOURCES"}
+        with mock.patch.object(self.sm, "summarize", fake), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("sys.stdout", new=io.StringIO()):
+            self.sm.main()
+        self.assertEqual(seen["transcript"],
+                         "[00:00] สวัสดี\n[02:05] ออกจากการแข่งขัน")
+        doc = out_md.read_text()
+        # The clip started at 1:00, so 02:05 in the clip is 185s in the video.
+        self.assertIn("[02:05](https://www.youtube.com/watch?v=abcdefghijk"
+                      "&t=185s)", doc)
+        # The embedded transcript is the plain one.
+        self.assertIn("    สวัสดี", doc)
+        self.assertNotIn("    [00:00]", doc)
+
+    def test_main_leaves_other_prompts_plain(self):
+        txt = self._srt([(0, 4, "hello")])
+        manifest = self.dir / "manifest.json"
+        manifest.write_text('{"frames": []}')
+        seen = {}
+
+        def fake(frames, transcript, template, role=None):
+            seen["transcript"] = transcript
+            return "# T\n\nbody [00:00]"
+        argv = ["summarize.py", "https://youtu.be/abcdefghijk", str(txt),
+                str(self.dir / "o.md"), "--prompt", "video",
+                "--frames-manifest", str(manifest), "--no-pdf", "--title", "T"]
+        with mock.patch.object(self.sm, "summarize", fake), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch("sys.stdout", new=io.StringIO()):
+            self.sm.main()
+        self.assertEqual(seen["transcript"], "hello")
+        self.assertNotIn("&t=", (self.dir / "o.md").read_text())
+
+
+class DramaPromptTest(unittest.TestCase):
+    """The Thai drama (lakorn) recap (2026-11-02): timed like reality, with a
+    characters-and-relationships table, scene-by-scene sections with Thai
+    quotes, a spoiler-free opening and what changed last."""
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+
+    def test_it_is_timed_wrapped_and_labelled(self):
+        from promptnames import wants_timed_transcript
+        import pdf
+        self.assertTrue(wants_timed_transcript("drama"))
+        self.assertTrue(wants_timed_transcript("drama.md"))
+        self.assertTrue(document.wants_wrapper("drama"))
+        self.assertEqual(pdf._doc_kind_label("drama", {}), "Drama episode recap")
+
+    def test_the_prompt_asks_for_the_recap(self):
+        static, dynamic = llm_client.split_static_prompt(
+            (self.PROMPTS_DIR / "drama.md").read_text())
+        for asks in ("titled \"Characters\"", "Relationships",
+                     "never guess a name", "`[mm:ss]`", "[Video N, mm:ss]",
+                     "If the transcript carries no marks, write no timestamps",
+                     "**The opening paragraph reveals nothing**",
+                     "## Highlights", "## What changed", "Cliffhanger",
+                     "ตัวอย่างตอนต่อไป", "Keep each quote in Thai",
+                     "never cite them", "{language_rule}"):
+            with self.subTest(asks=asks):
+                self.assertIn(asks, static)
+        self.assertLess(static.index("5. **`## Highlights`**"),
+                        static.index("6. **`## What changed`**"))
+        for placeholder in ("{transcript}", "{frame_manifest}"):
+            self.assertIn(placeholder, dynamic)
+            self.assertNotIn(placeholder, static)
+
+    def test_the_template_formats(self):
+        template = self.sm.load_prompt_template(self.PROMPTS_DIR / "drama.md")
+        out = template.format(transcript="T", frame_manifest="F")
+        self.assertIn("[mm:ss]", out)
+        self.assertNotIn("{language_rule}", out)
+
+    def test_its_own_merge_keeps_timestamps(self):
+        from mapreduce import load_merge_template
+        merge = load_merge_template("drama")
+        self.assertIn("Keep every timestamp exactly as written", merge)
+        self.assertIn("ONE `## What changed` section", merge)
+        self.assertNotIn("{language_rule}", merge)
+        merge.format(transcript="P")
+
+    def test_timestamps_become_youtube_links(self):
+        doc = document.link_timestamps(
+            "* **พลอย** [02:05]", [("https://youtu.be/abcdefghijk", 0)])
+        self.assertIn("[02:05](https://www.youtube.com/watch?v=abcdefghijk"
+                      "&t=125s)", doc)
+
+
+class InstructionsTest(unittest.TestCase):
+    """--instructions: the operator's own words for one run, after the
+    static half (so the cache holds) and above the reference material."""
+
+    def setUp(self):
+        import summarize as summarize_main
+        self.sm = summarize_main
+        self.marked = (f"{llm_client.STATIC_PROMPT_BEGIN}\nRULES\n"
+                       f"{llm_client.STATIC_PROMPT_END}\n\n# Input\n{{transcript}}\n")
+
+    def test_nothing_given_changes_nothing(self):
+        self.assertEqual(self.sm.inject_instructions(self.marked, ""), self.marked)
+        self.assertEqual(self.sm.inject_instructions(self.marked, "  \n"),
+                         self.marked)
+
+    def test_they_go_after_the_static_half(self):
+        out = self.sm.inject_instructions(self.marked, "Focus on exam hints.")
+        static, dynamic = llm_client.split_static_prompt(out)
+        self.assertNotIn("exam hints", static)
+        self.assertIn("<operator_instructions>\nFocus on exam hints.\n"
+                      "</operator_instructions>", dynamic)
+        self.assertLess(dynamic.index("exam hints"), dynamic.index("{transcript}"))
+
+    def test_they_sit_above_the_reference_material(self):
+        out = self.sm.inject_resources(self.marked, None)
+        with_material = out.replace(llm_client.STATIC_PROMPT_END,
+                                    llm_client.STATIC_PROMPT_END + "\nMATERIAL", 1)
+        out = self.sm.inject_instructions(with_material, "Be brief.")
+        self.assertLess(out.index("Be brief."), out.index("MATERIAL"))
+
+    def test_braces_survive_format(self):
+        out = self.sm.inject_instructions(self.marked, "Use {x} and }{")
+        filled = out.format(transcript="T")
+        self.assertIn("Use {x} and }{", filled)
+
+    def test_a_template_without_markers_is_appended_to(self):
+        out = self.sm.inject_instructions("PLAIN {transcript}", "Be brief.")
+        self.assertTrue(out.startswith("PLAIN {transcript}"))
+        self.assertIn("Be brief.", out)
+
+    def test_the_flag_wins_over_the_environment(self):
+        with mock.patch.dict(os.environ, {"SUMMARY_INSTRUCTIONS": "env"}):
+            self.assertEqual(self.sm.run_instructions({"instructions": "flag"}),
+                             "flag")
+            self.assertEqual(self.sm.run_instructions({}), "env")
+
+
+def summarize_main_load(name):
+    import summarize as summarize_main
+    return summarize_main.load_prompt_template(summarize_main.resolve_prompt_path(name))
+
+
+class ChunkFlowTest(unittest.TestCase):
+    """2026-10-14: the merge gets the operator's instructions, every model
+    that wrote part of a document is named, and finished chunks are kept in
+    the run directory and reused."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._env = mock.patch.dict(os.environ, {
+            "MEETING_BOT_RUN_DIR": self._tmp.name, "SUMMARY_MAX_PARALLEL": "1"})
+        self._env.start()
+        self._used = mock.patch.object(llm_client, "USED_MODELS", [])
+        self._used.start()
+        self.calls = []
+
+    def tearDown(self):
+        self._used.stop()
+        self._env.stop()
+        self._tmp.cleanup()
+
+    def _fn(self, frames, text, template, role=None):
+        self.calls.append((text, role))
+        llm_client._record_used("b", "merge" if role == "merge" else
+                                ("m4" if "four" in text else "m1"))
+        return f"sum({text[:5]})"
+
+    def _chunks(self):
+        return [Chunk(index=0, text="one one"), Chunk(index=1, text="four four")]
+
+    def test_finished_chunks_are_reused_with_their_model(self):
+        summarize_chunked(self._chunks(), "{transcript}", self._fn,
+                          log=lambda *a: None)
+        self.assertEqual(len(self.calls), 3)
+        self.calls.clear()
+        llm_client.USED_MODELS.clear()
+        summarize_chunked(self._chunks(), "{transcript}", self._fn,
+                          log=lambda *a: None)
+        self.assertEqual([r for _, r in self.calls], ["merge"])
+        self.assertEqual(llm_client.USED_MODELS, ["b/m1", "b/m4", "b/merge"])
+
+    def test_a_changed_model_misses_the_cache(self):
+        summarize_chunked(self._chunks(), "{transcript}", self._fn,
+                          log=lambda *a: None)
+        self.calls.clear()
+        with mock.patch.dict(os.environ, {"OPENROUTER_MODEL": "other"}):
+            summarize_chunked(self._chunks(), "{transcript}", self._fn,
+                              log=lambda *a: None)
+        self.assertEqual(len(self.calls), 3)
+
+    def test_no_run_dir_keeps_nothing(self):
+        with mock.patch.dict(os.environ, {"MEETING_BOT_RUN_DIR": ""}):
+            summarize_chunked(self._chunks(), "{transcript}", self._fn,
+                              log=lambda *a: None)
+        self.assertFalse((Path(self._tmp.name) / "chunks").exists())
+
+    def test_used_models_label_names_every_model(self):
+        llm_client._record_used("openrouter", "dots")
+        self.assertIsNone(llm_client.used_models_label())
+        llm_client._record_used("claude-cli", "haiku")
+        llm_client._record_used("openrouter", "dots")
+        self.assertEqual(llm_client.used_models_label(),
+                         "openrouter/dots + claude-cli/haiku")
+
+    def test_the_merge_gets_the_instructions_before_the_partials(self):
+        import summarize as summ
+        merge = "Rules.\n\nPartial summaries, in order:\n\n{transcript}\n"
+        out = summ.inject_merge_instructions(merge, "Make a {1-day} plan")
+        self.assertLess(out.index("<operator_instructions>"),
+                        out.index("Partial summaries, in order:"))
+        self.assertIn("Make a {{1-day}} plan", out)
+        self.assertIn("appears once", out)
+        self.assertEqual(summ.inject_merge_instructions(merge, ""), merge)
+
+
+class OpenRouterBackendTest(unittest.TestCase):
+    """summarize_openrouter through a fake `requests`: the payload shape, the
+    key/model walk, the daily cap, errors inside a 200 body."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.calls = []
+        self.script = {}
+        test = self
+
+        class _Resp:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._payload = payload
+                self.headers = {}
+                self.text = json.dumps(payload) if not isinstance(payload, str) else payload
+
+            def json(self):
+                return self._payload
+
+        def post(url, json=None, timeout=None, headers=None):
+            key = headers["Authorization"].split()[-1]
+            test.calls.append((key, json["model"], json, timeout, url))
+            outcome = test.script.get((key, json["model"]), "ok")
+            if isinstance(outcome, tuple):
+                return _Resp(*outcome)
+            content = outcome
+            return _Resp(200, {"choices": [{"message": {"content": content}}],
+                               "usage": {"prompt_tokens": 1,
+                                         "completion_tokens": 2}})
+
+        fake = type(sys)("requests")
+        fake.post = post
+        self._modules = mock.patch.dict(sys.modules, {"requests": fake})
+        self._modules.start()
+        self._env = mock.patch.dict(os.environ, {
+            "MEETING_BOT_ROOT": self._tmp.name,
+            "OPENROUTER_API_KEY_1": "k1", "OPENROUTER_API_KEY_2": "k2",
+            "OPENROUTER_MODEL": "m-a,m-b",
+            "SUMMARY_MAX_RETRIES": "2",
+        })
+        self._env.start()
+        self._sleep = mock.patch.object(retry.time, "sleep", lambda s: None)
+        self._sleep.start()
+
+    def tearDown(self):
+        self._sleep.stop()
+        self._env.stop()
+        self._modules.stop()
+        self._tmp.cleanup()
+
+    def _run(self, frames=()):
+        return llm_client.summarize_openrouter(list(frames), "words",
+                                            "{transcript}")
+
+    def test_registered_in_the_chain(self):
+        self.assertIs(llm_client._BACKENDS["openrouter"],
+                      llm_client.summarize_openrouter)
+
+    def test_no_key_is_unavailable(self):
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY_1": "",
+                                          "OPENROUTER_API_KEY_2": ""}):
+            with self.assertRaises(llm_client.BackendUnavailable):
+                self._run()
+
+    def test_payload_text_then_labelled_data_uri_images(self):
+        path = Path(self._tmp.name) / "f.jpg"
+        path.write_bytes(b"\xff\xd8jpegbytes")
+        frame = llm_client.FrameMeta(path=str(path), timestamp_s=5.0,
+                                     kind="scene_change", number=7)
+        with mock.patch.object(llm_client, "drop_uninformative",
+                               lambda fr: (list(fr), 0, 0)), \
+                mock.patch.object(llm_client, "_downscale_frames",
+                                  lambda fr: (list(fr), 0)):
+            self.assertEqual(self._run([frame]), "ok")
+        body = self.calls[0][2]
+        content = body["messages"][0]["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "words"})
+        self.assertIn("frame 7", content[1]["text"])
+        self.assertEqual(content[2]["type"], "image_url")
+        self.assertTrue(content[2]["image_url"]["url"].startswith(
+            "data:image/jpeg;base64,"))
+        self.assertEqual(llm_client.LAST_BACKEND, "openrouter")
+
+    def test_daily_cap_drops_the_key_for_every_model(self):
+        self.script[("k1", "m-a")] = (429, {"error": {
+            "code": 429, "message": "Rate limit exceeded: free-models-per-day"}})
+        self.script[("k2", "m-a")] = (503, "busy")
+        self.assertEqual(self._run(), "ok")
+        self.assertNotIn(("k1", "m-b"), [c[:2] for c in self.calls])
+        self.assertEqual(sum(1 for c in self.calls if c[0] == "k1"), 1)
+
+    def test_per_minute_429_is_retried(self):
+        seq = [(429, {"error": {"code": 429, "message": "Rate limit exceeded"}}),
+               "ok"]
+        self.script = type("S", (dict,), {
+            "get": lambda s, k, d=None: seq.pop(0) if seq else d})()
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_truncated_answer_is_retried_once_then_moves_on(self):
+        self.script[("k1", "m-a")] = (200, {"choices": [{
+            "message": {"content": "half a guide"}, "finish_reason": "length"}]})
+        with mock.patch.dict(os.environ, {"MEETING_BOT_ROOT": self._tmp.name}):
+            self.assertEqual(self._run(), "ok")
+        self.assertEqual([c[:2] for c in self.calls],
+                         [("k1", "m-a"), ("k1", "m-a"), ("k1", "m-b")])
+        kept = list((Path(self._tmp.name) / "tmp" / "rejected-answers").glob("*.md"))
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(kept[0].read_text(), "half a guide")
+
+    def test_a_retried_runaway_that_then_succeeds_is_kept(self):
+        seq = [(200, {"choices": [{"message": {"content": "x" * 9},
+                                   "finish_reason": "length"}]}), "fine"]
+        self.script = type("S", (dict,), {
+            "get": lambda s, k, d=None: seq.pop(0) if seq else d})()
+        self.assertEqual(self._run(), "fine")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_an_answer_drifting_into_other_scripts_is_rejected(self):
+        # The 2026-10-16 run: Chinese and Arabic inside Thai words.
+        drifted = ("ต้นทุนการซื้อ卖出 การ预测แนวโน้ม ด้าน系统 "
+                   "ไม่ใช่สิ่งที่ضمانว่า")
+        self.script[("k1", "m-a")] = drifted
+        with mock.patch.dict(os.environ, {"SUMMARY_LANGUAGE": "th"}):
+            self.assertEqual(self._run(), "ok")
+        self.assertEqual([c[:2] for c in self.calls],
+                         [("k1", "m-a"), ("k1", "m-a"), ("k1", "m-b")])
+        kept = list((Path(self._tmp.name) / "tmp" / "rejected-answers").glob("*.md"))
+        self.assertEqual(len(kept), 2)
+
+    def test_a_few_foreign_words_or_the_inputs_own_script_pass(self):
+        with mock.patch.dict(os.environ, {"SUMMARY_LANGUAGE": "en"}):
+            self.script[("k1", "m-a")] = "Risk, 危机 in Chinese, is danger (危) and opportunity."
+            self.assertIn("危机", self._run())
+            # Thai quoted from a Thai transcript is the input's own script.
+            for key in ("k1", "k2"):
+                self.script[(key, "m-a")] = "ความเสี่ยง (risk), ผลตอบแทน, หุ้น, ปันผล"
+            self.assertIn("หุ้น", llm_client.summarize_openrouter(
+                [], "ไทย" * 20, "{transcript}"))
+            # Unless asked for none.
+            self.calls.clear()
+            with mock.patch.dict(os.environ, {"OPENROUTER_MAX_FOREIGN_RUNS": "0",
+                                              "OPENROUTER_MODEL": "m-a"}):
+                self.script[("k1", "m-a")] = "Risk (危机)."
+                self.script[("k2", "m-a")] = "Risk (危机)."
+                with self.assertRaises(RuntimeError):
+                    self._run()
+
+    def test_chunks_are_capped_and_the_merge_is_not(self):
+        self._run()
+        self.assertEqual(self.calls[-1][2]["max_tokens"], 32768)
+        llm_client.summarize_openrouter([], "w", "{transcript}", role="merge")
+        self.assertNotIn("max_tokens", self.calls[-1][2])
+
+    def test_an_error_inside_a_200_is_not_an_answer(self):
+        self.script[("k1", "m-a")] = (200, {"error": {
+            "code": 403, "message": "moderation"}})
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(self.calls[-1][0], "k2")
+
+    def test_404_skips_the_model_for_every_key(self):
+        self.script[("k1", "m-a")] = (404, "no such model")
+        self.script[("k2", "m-a")] = (404, "no such model")
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(self.calls[-1][1], "m-b")
+        self.assertEqual(sum(1 for c in self.calls if c[1] == "m-a"), 1)
+
+    def test_the_answering_model_is_recorded(self):
+        self.script[("k1", "m-a")] = (200, {
+            "model": "dots/real:free",
+            "choices": [{"message": {"content": "hi"}}]})
+        self.assertEqual(self._run(), "hi")
+        self.assertEqual(llm_client.LAST_MODEL, "dots/real:free (via m-a)")
+
+    def test_list_content_keeps_only_text_chunks(self):
+        self.script[("k1", "m-a")] = [{"type": "text", "text": "answer"}]
+        self.assertEqual(self._run(), "answer")
+
+    def test_5xx_is_retried(self):
+        seq = [(503, "busy"), "ok"]
+        self.script = type("S", (dict,), {
+            "get": lambda s, k, d=None: seq.pop(0) if seq else d})()
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_everything_failing_raises(self):
+        for k in ("k1", "k2"):
+            for m in ("m-a", "m-b"):
+                self.script[(k, m)] = (401, "bad key")
+        with self.assertRaises(RuntimeError):
+            self._run()
+
+
+class GeminiModelChainTest(unittest.TestCase):
+    """GEMINI_MODEL as a chain: every key on a model, then the next model.
+
+    Driven through a fake `google.genai` so the real rotation loop, the real
+    retry wrapper and the real classification run; the script says what each
+    (key, model) pair answers.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.calls = []
+        self.http_options = []
+        self.script = {}
+        test = self
+
+        class _Resp:
+            def __init__(self, text):
+                self.text = text
+
+        class _Models:
+            def __init__(self, key):
+                self.key = key
+
+            def generate_content(self, model, contents):
+                test.calls.append((self.key, model))
+                outcome = test.script.get((self.key, model), "ok")
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return _Resp(outcome)
+
+        class Client:
+            def __init__(self, api_key, http_options=None):
+                test.http_options.append(http_options)
+                self.models = _Models(api_key)
+
+        google = type(sys)("google")
+        genai = type(sys)("google.genai")
+        genai.Client = Client
+        google.genai = genai
+        self._modules = mock.patch.dict(sys.modules,
+                                        {"google": google, "google.genai": genai})
+        self._modules.start()
+        self._env = mock.patch.dict(os.environ, {
+            "MEETING_BOT_ROOT": self._tmp.name,
+            "GEMINI_API_KEY_1": "k1", "GEMINI_API_KEY_2": "k2",
+            "GEMINI_API_KEY_3": "k3",
+            "GEMINI_MODEL": "gemini-3.8-flash, gemini-3.7-flash,gemini-3.6-flash",
+            "SUMMARY_MAX_RETRIES": "2",
+        })
+        self._env.start()
+        self._sleep = mock.patch.object(retry.time, "sleep", lambda s: None)
+        self._sleep.start()
+
+    def tearDown(self):
+        self._sleep.stop()
+        self._env.stop()
+        self._modules.stop()
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _err(code, text):
+        exc = RuntimeError(text)
+        exc.code = code
+        return exc
+
+    def _run(self):
+        return llm_client.summarize_gemini([], "words", "{transcript}")
+
+    def test_the_variable_is_a_chain(self):
+        self.assertEqual(llm_client._gemini_models(),
+                         ["gemini-3.8-flash", "gemini-3.7-flash",
+                          "gemini-3.6-flash"])
+        with mock.patch.dict(os.environ, {"GEMINI_MODEL": "one-model"}):
+            self.assertEqual(llm_client._gemini_models(), ["one-model"])
+
+    def test_the_first_model_answers_on_the_first_key(self):
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(self.calls, [("k1", "gemini-3.8-flash")])
+        self.assertEqual(llm_client.LAST_MODEL, "gemini-3.8-flash")
+
+    def test_a_rate_limited_key_hands_to_the_next_key_without_backoff(self):
+        quota = self._err(429, "429 RESOURCE_EXHAUSTED: quota exceeded")
+        self.script[("k1", "gemini-3.8-flash")] = quota
+        self.assertEqual(self._run(), "ok")
+        # One call on k1 — not the two the retry schedule allows — then k2.
+        self.assertEqual(self.calls, [("k1", "gemini-3.8-flash"),
+                                      ("k2", "gemini-3.8-flash")])
+
+    def test_every_key_rate_limited_moves_to_the_next_model(self):
+        quota = self._err(429, "429 RESOURCE_EXHAUSTED")
+        for key in ("k1", "k2", "k3"):
+            self.script[(key, "gemini-3.8-flash")] = quota
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual([m for _k, m in self.calls],
+                         ["gemini-3.8-flash"] * 3 + ["gemini-3.7-flash"])
+        self.assertEqual(llm_client.LAST_MODEL, "gemini-3.7-flash")
+
+    def test_an_unknown_model_is_abandoned_on_the_first_key(self):
+        gone = self._err(404, "404 NOT_FOUND: models/gemini-3.8-flash is not "
+                              "found for API version v1beta")
+        self.script[("k1", "gemini-3.8-flash")] = gone
+        self.assertEqual(self._run(), "ok")
+        self.assertEqual(self.calls, [("k1", "gemini-3.8-flash"),
+                                      ("k1", "gemini-3.7-flash")])
+
+    def test_every_client_has_a_timeout(self):
+        # Without one, a request Gemini never answers blocks the run forever
+        # (2026-10-06: 65 minutes on silent sockets, no retry, no rotation).
+        self._run()
+        self.assertEqual(self.http_options, [{"timeout": 600_000}])
+        self.http_options.clear()
+        with mock.patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "90"}):
+            self._run()
+        self.assertEqual(self.http_options, [{"timeout": 90_000}])
+
+    def test_a_timed_out_request_is_retried_then_rotates(self):
+        class ReadTimeout(Exception):   # httpx's name; retry classifies on it
+            pass
+        self.script[("k1", "gemini-3.8-flash")] = ReadTimeout("timed out")
+        self.assertEqual(self._run(), "ok")
+        # Both retries on k1 (it is transient), then the next key.
+        self.assertEqual(self.calls, [("k1", "gemini-3.8-flash")] * 2
+                         + [("k2", "gemini-3.8-flash")])
+
+    def test_a_busy_server_still_gets_the_retry_backoff(self):
+        busy = self._err(503, "503 UNAVAILABLE: overloaded")
+        self.script[("k1", "gemini-3.8-flash")] = busy
+        self.assertEqual(self._run(), "ok")
+        # Two attempts on k1 (the schedule), then k2.
+        self.assertEqual(self.calls, [("k1", "gemini-3.8-flash"),
+                                      ("k1", "gemini-3.8-flash"),
+                                      ("k2", "gemini-3.8-flash")])
+
+    def test_everything_out_names_the_whole_chain(self):
+        quota = self._err(429, "429 RESOURCE_EXHAUSTED")
+        for key in ("k1", "k2", "k3"):
+            for model in ("gemini-3.8-flash", "gemini-3.7-flash",
+                          "gemini-3.6-flash"):
+                self.script[(key, model)] = quota
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run()
+        self.assertIn("3 Gemini model(s) x 3 key(s)", str(ctx.exception))
+        self.assertEqual(len(self.calls), 9)
+
+    def test_an_unsupported_request_is_not_mistaken_for_a_dead_model(self):
+        self.assertIsNone(llm_client._classify_gemini_error(
+            self._err(400, "400 INVALID_ARGUMENT: Unsupported MIME type")))
+        self.assertEqual(llm_client._classify_gemini_error(
+            self._err(None, "models/x is not supported for generateContent")),
+            "model")
+
+
+class OutputLanguageTest(unittest.TestCase):
+    """SUMMARY_LANGUAGE decides what the prompts tell the model to write in.
+
+    Every shipped template carries a {language_rule} placeholder that
+    load_prompt_template (and the merge loader) fills before the template is
+    sent anywhere. The placeholder sits in the cacheable static half on
+    purpose: the setting is per box, so the content-addressed system prompt
+    file changes once when it is flipped and then stays put.
+    """
+
+    PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+    SHIPPED = ["lecture.md", "tutorial.md", "meeting.md", "video.md",
+               "_merge.md"]
+
+    def setUp(self):
+        import language
+        self.language = language
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop("SUMMARY_LANGUAGE", None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_the_default_is_thai(self):
+        self.assertEqual(self.language.output_language(), "th")
+        self.assertEqual(self.language.language_name(), "Thai")
+
+    def test_english_is_the_switch(self):
+        os.environ["SUMMARY_LANGUAGE"] = "en"
+        self.assertEqual(self.language.output_language(), "en")
+        self.assertIn("in English", self.language.language_rule())
+
+    def test_reasonable_spellings_are_accepted(self):
+        for raw, code in (("Thai", "th"), ("th-TH", "th"), (" EN ", "en"),
+                          ("english", "en"), ("", "th"), ("ไทย", "th")):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.language.normalize(raw), code)
+
+    def test_an_unknown_language_is_an_error_not_a_guess(self):
+        os.environ["SUMMARY_LANGUAGE"] = "fr"
+        with self.assertRaises(self.language.UnknownLanguage) as cm:
+            self.language.output_language()
+        self.assertIn("SUMMARY_LANGUAGE='fr'", str(cm.exception))
+
+    def test_the_thai_rule_asks_for_terms_in_parentheses(self):
+        rule = self.language.language_rule("th")
+        self.assertIn("Thai", rule)
+        self.assertIn("English term in parentheses", rule)
+        # Code and maths are never translated, whatever the language.
+        for code in ("th", "en"):
+            self.assertIn("mathematical notation", self.language.language_rule(code))
+
+    def test_apply_fills_the_placeholder_and_leaves_other_templates_alone(self):
+        self.assertEqual(self.language.apply("a {language_rule} b", "en"),
+                         "a " + self.language.language_rule("en") + " b")
+        untouched = "No placeholder here {transcript}"
+        self.assertEqual(self.language.apply(untouched), untouched)
+
+    def test_every_shipped_template_carries_the_placeholder(self):
+        for name in self.SHIPPED:
+            with self.subTest(prompt=name):
+                text = (self.PROMPTS_DIR / name).read_text()
+                self.assertEqual(text.count(self.language.PLACEHOLDER), 1)
+
+    def test_load_prompt_template_fills_it_for_every_template(self):
+        import summarize as summarize_main
+        for name in self.SHIPPED:
+            if name.startswith("_"):
+                continue
+            for code, needle in (("th", "Thai (ภาษาไทย)"), ("en", "in English")):
+                os.environ["SUMMARY_LANGUAGE"] = code
+                with self.subTest(prompt=name, language=code):
+                    template = summarize_main.load_prompt_template(
+                        self.PROMPTS_DIR / name)
+                    self.assertNotIn("{language_rule}", template)
+                    self.assertIn(needle, template)
+                    # The template still has to survive .format(); a stray
+                    # brace in the rule text would raise here.
+                    template.format(transcript="t", frame_manifest="m")
+
+    def test_the_merge_prompt_is_told_the_language_too(self):
+        os.environ["SUMMARY_LANGUAGE"] = "en"
+        from mapreduce import load_merge_template, _default_merge_template
+        self.assertIn("in English", load_merge_template())
+        self.assertNotIn("{language_rule}", load_merge_template())
+        # The in-code fallback for a missing _merge.md carries it as well.
+        self.assertIn("{language_rule}", _default_merge_template())
+
+    def test_the_rule_lands_in_the_cacheable_half(self):
+        # Two runs on the same setting must produce the same static prompt
+        # (same bytes, same content-addressed file); flipping the setting
+        # produces a different one; and the dynamic half never changes.
+        import summarize as summarize_main
+        halves = {}
+        for code in ("th", "en"):
+            os.environ["SUMMARY_LANGUAGE"] = code
+            template = summarize_main.load_prompt_template(
+                self.PROMPTS_DIR / "lecture.md")
+            halves[code] = llm_client.split_static_prompt(template)
+        self.assertIn("Thai (ภาษาไทย)", halves["th"][0])
+        self.assertIn("in English", halves["en"][0])
+        self.assertNotEqual(halves["th"][0], halves["en"][0])
+        self.assertEqual(halves["th"][1], halves["en"][1])
+
+    def test_the_document_records_its_language(self):
+        doc = document.build_document(
+            "# T\n\nbody", source="https://youtu.be/x", source_kind="youtube",
+            language="th")
+        self.assertIn("     language: th\n", doc)
+        # The wrapper's own labels stay in English whatever the language.
+        self.assertIn("Youtube Link:", doc)
+        self.assertIn("View Transcript", doc)
 
 
 if __name__ == "__main__":

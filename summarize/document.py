@@ -11,9 +11,7 @@ The shape matches the course-note template — see
 `2_Transcripts/_template_lecture_summary.md` and the chapter files next to it:
 
     <!-- meeting-transcriber provenance ... -->
-    Chapter N — <topic> (<date>)
-
-    # <video title>
+    # <the model's own title>
 
     Youtube Link: `https://www.youtube.com/watch?v=...`
 
@@ -24,15 +22,20 @@ The shape matches the course-note template — see
     </details>
     <br>
 
-    ...the model's structured summary...
+    ...the rest of the model's structured summary...
 
     <br><br>
 
-The `Chapter N — <topic> (<date>)` line is emitted as a literal placeholder, on
-purpose: the chapter number isn't derivable from the video and a guess that
-looks right but isn't would be worse than an obvious blank to fill in.
+The heading is the model's: the lecture prompts ask for a title, and the
+one it writes ("Computer Engineering Mathematics II — Signal Processing
+Module") names the material where the video's own title ("2110203 L01")
+names the file. So a body that opens with an H1 has that H1 lifted to the
+top, above the link lines, and only a body without one falls back to the
+video title. Until 2026-09-13 the wrapper put a `Chapter N — <topic>
+(<date>)` placeholder and the video title above the body; both went at the
+operator's request, and pdf.py drops them from the older files it meets.
 
-The four-space indent inside <details> is deliberate too. It makes most
+The four-space indent inside <details> is deliberate. It makes most
 renderers show the transcript as a code block, which is what the existing
 chapter files already do — reproducing them beats "fixing" them.
 """
@@ -42,12 +45,14 @@ import subprocess
 from datetime import date
 from pathlib import Path
 
-CHAPTER_PLACEHOLDER = "Chapter N — <topic> (<date>)"
 SECTION_SEPARATOR = "<br><br>"
 
-# Prompts whose output is course-note shaped. meeting-* keeps the plain
-# executive summary — those don't go into the course files.
-WRAPPED_PROMPT_PREFIXES = ("lecture", "tutorial")
+# Prompts whose output gets the link line and the transcript: the course-note
+# shaped ones, and `video`, `reality` and `drama`, whose reader wants the link back to
+# what was summarized. `meeting` keeps the plain executive summary — those
+# don't go into the course files, and a meeting has no link worth printing.
+WRAPPED_PROMPT_PREFIXES = ("lecture", "tutorial", "video", "reality",
+                           "drama")
 
 
 def wants_wrapper(prompt_name, mode="auto"):
@@ -114,31 +119,214 @@ def provenance_comment(**fields):
     return "\n".join(lines)
 
 
+# A recorded call's link. Not "Source File": the first live guest recording
+# (2026-09-29) cited its Meet link as a local file, because anything that was
+# neither YouTube nor Kaltura fell through to that label. A Discord voice
+# channel's link is one too: the bot's recording is a local file, passed with
+# --source-url so the document cites the channel.
+MEETING_URL_RE = re.compile(
+    r"^https?://(meet\.google\.com|([\w-]+\.)?zoom\.us|teams\.(microsoft|live)\.com|meet\.new"
+    r"|(ptb\.|canary\.)?discord(app)?\.com/channels/)",
+    re.IGNORECASE)
+
+
+def looks_like_meeting(source):
+    return bool(MEETING_URL_RE.match(str(source or "").strip()))
+
+
+def _source_line(source, source_kind, tag=""):
+    """The clickable (or at least copyable) line naming where a video came from."""
+    if source_kind == "youtube":
+        return f"Youtube Link{tag}: `{source}`"
+    if source_kind == "meeting" or looks_like_meeting(source):
+        return f"Meeting Link{tag}: `{source}`"
+    if source_kind == "kaltura":
+        # Not "Source File" — a Kaltura lecture is a link like the YouTube one,
+        # and the reader needs to be able to click it.
+        return f"Video Link{tag}: `{source}`"
+    if source:
+        return f"Source File{tag}: `{source}`"
+    return None
+
+
+def _clip_line(clip, tag=""):
+    # Visible, not just in the provenance comment. Every timestamp below this
+    # line — the SRT the transcript came from, "Frame 4 @ 0:02:11", the model's
+    # own references — is measured from the START OF THE CLIP, because the
+    # media was cut before any of them were produced. A reader who doesn't know
+    # that will scrub to the wrong place in the source video and conclude the
+    # summary is wrong.
+    if tag:
+        # A combined document says once, below the links, that every clock is
+        # its own video's; repeating it per line would just bury that.
+        return f"Clip{tag}: `{clip}` of that video."
+    return (f"Clip: `{clip}` of the source. "
+            "Timestamps below are relative to the start of the clip.")
+
+
+YOUTUBE_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:[^#\s]*&)?v=|shorts/|live/|embed/)"
+    r"|youtu\.be/)([A-Za-z0-9_-]{11})")
+
+# A timestamp the reality prompt writes: [12:34], [1:02:03], or, in a
+# combined document, [Video 2, 12:34]. Not one already followed by "(" — that
+# is a link already, from an earlier pass or from the model.
+TIMESTAMP_RE = re.compile(
+    r"\[(?:video\s*(\d+)\s*,\s*)?(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\](?!\()",
+    re.IGNORECASE)
+# A code span holding nothing but a timestamp (`[01:41:22]`) is a timestamp
+# the model dressed as code — seen on the first live run, in a table.
+_CODED_TIMESTAMP_RE = re.compile(
+    r"`(\[(?:video\s*\d+\s*,\s*)?(?:\d{1,2}:)?\d{1,2}:\d{2}\])`", re.IGNORECASE)
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_INLINE_CODE_RE = re.compile(r"(`+)(?:(?!\1).)+\1")
+
+
+def youtube_id(url):
+    """The 11-character video id of a YouTube URL, or None."""
+    m = YOUTUBE_ID_RE.search(str(url or ""))
+    return m.group(1) if m else None
+
+
+def link_timestamps(body, videos):
+    """Turn the model's [mm:ss] marks into links to that moment of the video.
+
+    `videos` is [(source, clip_start_seconds)], video 1 first. A plain
+    [mm:ss] links into the only video — with several it would be ambiguous,
+    so it stays text — and [Video N, mm:ss] into video N. Only YouTube
+    sources get links (a Kaltura embed and a recording have no URL that
+    seeks); the rest stay text. The times the model read are clip-relative
+    (see --clip), so the clip's start is added back for the link, while the
+    visible text keeps the time the document's own transcript uses.
+
+    Code spans and fenced blocks are left alone. The model never writes the
+    URL: it could not know the clip offset, and a link it made up would
+    look exactly as right as one it didn't.
+    """
+    targets = {}
+    for n, (source, offset) in enumerate(videos or [], start=1):
+        vid = youtube_id(source)
+        if vid:
+            targets[n] = (vid, float(offset or 0))
+    if not targets:
+        return body
+
+    def link(m):
+        video, hours, minutes, seconds = m.groups()
+        n = int(video) if video else (1 if len(videos) == 1 else None)
+        if n not in targets:
+            return m.group(0)
+        vid, offset = targets[n]
+        at = int(hours or 0) * 3600 + int(minutes) * 60 + int(seconds)
+        return (f"{m.group(0)}(https://www.youtube.com/watch?v={vid}"
+                f"&t={int(at + offset)}s)")
+
+    out, in_fence = [], False
+    for line in body.split("\n"):
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        # Link only outside inline code: split on the code spans and rewrite
+        # the gaps between them.
+        line = _CODED_TIMESTAMP_RE.sub(r"\1", line)
+        pieces, last = [], 0
+        for code in _INLINE_CODE_RE.finditer(line):
+            pieces.append(TIMESTAMP_RE.sub(link, line[last:code.start()]))
+            pieces.append(code.group(0))
+            last = code.end()
+        pieces.append(TIMESTAMP_RE.sub(link, line[last:]))
+        out.append("".join(pieces))
+    return "\n".join(out)
+
+
+def split_leading_heading(body):
+    """(heading text, rest) when the body opens with an H1; else (None, body)."""
+    lines = body.strip().splitlines()
+    if lines and re.match(r"^#\s+\S", lines[0]):
+        return lines[0][1:].strip(), "\n".join(lines[1:]).strip()
+    return None, body.strip()
+
+
 def build_document(body, *, source, source_kind, title=None, transcript="",
                    backend=None, model=None, prompt_name=None, run_id=None,
-                   generated=None, include_chapter_line=True,
-                   include_transcript=True):
-    """Wrap a model-written summary body in the course-note template."""
+                   generated=None, include_transcript=True, clip=None,
+                   videos=None, language=None, font=None):
+    """Wrap a model-written summary body in the course-note template.
+
+    `videos`, when given, is the list of sources a --combine summary was made
+    from — dicts with `source`, `kind`, and optionally `title` and `clip`, in
+    the order the model saw them — and the wrapper then lists one link line
+    per video, tagged "(Video N)" so the model's "video 2" references and the
+    "Frame 12 @ video 2 ..." citations can be followed back to a link. The
+    document keeps a single title, because it is one document about one
+    topic, not a stack of sections.
+
+    `title` is the video's, and is used only when the body has no H1 of its
+    own — see the module docstring.
+
+    `language` is the SUMMARY_LANGUAGE code the body was written in. It goes
+    into the provenance comment so pdf.py can pick the matching body face
+    when the document is re-rendered later, whatever the box is set to by
+    then. The wrapper's own labels stay in English regardless: the .md has
+    to drop into the operator's existing course files. `font` is the PDF
+    body face the run chose (fontchoice.py), recorded for the same reason.
+    """
     generated = generated or date.today().isoformat()
 
-    parts = [provenance_comment(
+    provenance = dict(
         source=source,
         source_type=source_kind,
         model=f"{backend}/{model}" if backend and model else (model or backend),
-        prompt=prompt_name or "summarize.md",
+        prompt=prompt_name or "video.md",
         run_id=run_id,
+        clip=clip,
+        language=language,
+        font=font,
         generated=generated,
-    )]
+    )
+    if videos:
+        # One line per video in the comment too, so the raw file says which
+        # sources went into it without anyone parsing the link lines.
+        provenance["source_type"] = "combined"
+        provenance["videos"] = len(videos)
+        for n, video in enumerate(videos, start=1):
+            provenance[f"video_{n}"] = video.get("source")
+            if video.get("clip"):
+                provenance[f"video_{n}_clip"] = video["clip"]
+    parts = [provenance_comment(**provenance)]
 
-    if include_chapter_line:
-        parts.append(CHAPTER_PLACEHOLDER)
+    heading, body = split_leading_heading(body)
+    if not heading:
+        heading = title
+    if videos and not heading:
+        heading = next((v.get("title") for v in videos if v.get("title")), None)
+    parts.append(f"# {heading or run_id or 'Untitled'}")
 
-    parts.append(f"# {title or run_id or 'Untitled'}")
-
-    if source_kind == "youtube":
-        parts.append(f"Youtube Link: `{source}`")
-    elif source:
-        parts.append(f"Source File: `{source}`")
+    if videos:
+        lines = []
+        for n, video in enumerate(videos, start=1):
+            line = _source_line(video.get("source"), video.get("kind"),
+                                tag=f" (Video {n})")
+            if line:
+                lines.append(line)
+            if video.get("clip"):
+                lines.append(_clip_line(video["clip"], tag=f" (Video {n})"))
+        # The one fact a reader of a combined summary has to be told: the
+        # clock restarts at every video. "0:12:30" alone does not say which.
+        lines.append(f"Summarized from {len(videos)} videos as one. "
+                     "Every timestamp is relative to the start of the video "
+                     "(or clip) it cites.")
+        parts.append("\n".join(lines))
+    else:
+        line = _source_line(source, source_kind)
+        if line:
+            parts.append(line)
+        if clip:
+            parts.append(_clip_line(clip))
 
     if include_transcript:
         transcript_block = _indent_transcript(transcript.strip()) if transcript.strip() \
@@ -155,61 +343,3 @@ def build_document(body, *, source, source_kind, title=None, transcript="",
     parts.append(SECTION_SEPARATOR)
 
     return "\n\n".join(parts) + "\n"
-
-
-def strip_provenance_and_chapter(text):
-    """Remove the header comment and the Chapter placeholder from a document.
-
-    Used when concatenating several documents into one chapter file, where the
-    Chapter line belongs once at the top rather than above every video.
-    """
-    text = re.sub(r"<!--\s*meeting-transcriber.*?-->\s*", "", text,
-                  count=1, flags=re.DOTALL)
-    text = text.replace(CHAPTER_PLACEHOLDER + "\n", "", 1)
-    return text.lstrip("\n")
-
-
-def _main():
-    """CLI used by pipeline.sh --combine.
-
-        document.py combine --output chapter3.md a.md b.md c.md
-    """
-    import argparse
-
-    ap = argparse.ArgumentParser(description="Combine per-run summaries")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("combine")
-    p.add_argument("--output", required=True)
-    p.add_argument("--no-chapter-line", action="store_true")
-    p.add_argument("summaries", nargs="+")
-    args = ap.parse_args()
-
-    text = combine_documents(args.summaries,
-                             chapter_line=not args.no_chapter_line)
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(text)
-    print(f"==> Combined {len(args.summaries)} summary/summaries -> {out}")
-    return 0
-
-
-def combine_documents(paths, chapter_line=True):
-    """Concatenate per-run documents into one chapter-file-shaped markdown.
-
-    Each document already ends with the <br><br> separator, so sections just
-    follow one another the way chapter2.md lays them out.
-    """
-    chunks = []
-    if chapter_line:
-        chunks.append(CHAPTER_PLACEHOLDER + "\n")
-    for path in paths:
-        try:
-            text = Path(path).read_text()
-        except OSError:
-            continue
-        chunks.append(strip_provenance_and_chapter(text).rstrip() + "\n")
-    return "\n".join(chunks)
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main())

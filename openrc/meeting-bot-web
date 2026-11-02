@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+# The web UI / trigger server on the Alpine host. Installed by ./webui.sh on
+# (with @REPO_ROOT@ substituted) into /etc/init.d/. web/serve.sh loads .env
+# afresh on every start, so this file carries no keys.
+name="meeting-bot-web"
+description="Meeting bot web UI and trigger server"
+supervisor=supervise-daemon
+command="/bin/bash"
+command_args="@REPO_ROOT@/web/serve.sh"
+directory="@REPO_ROOT@"
+output_log="/var/log/meeting-bot-web.log"
+error_log="/var/log/meeting-bot-web.log"
+respawn_delay=5
+
+depend() {
+  need net
+  after docker tailscale
+}

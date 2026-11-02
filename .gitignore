@@ -1,12 +1,15 @@
-# Secrets — API keys / tokens. Never commit these.
-# Populated by `setup.sh` (creates the directory) and used by
-# transcribe/yt_transcript_client.py for the youtube-transcript.io key ring.
-# File shape: {"keys": ["acct1-token", ...], "next_index": 0}
-# Edit with sudo if /opt/meeting-bot is owned by root.
-/opt/meeting-bot/secrets/
-
-# Local .env file (real keys). The .env.example template IS committed.
+# Local .env file (real keys and the operator's own output paths).
+# The .env.example template IS committed.
+#
+# Every credential lives here now: the Anthropic key, the numbered Gemini,
+# AssemblyAI and youtube-transcript.io keys. The separate
+# /opt/meeting-bot/secrets/youtube_transcript_keys.json of the Alpine branch
+# is gone — see CLAUDE.md.
 .env
+
+# Left over from the Alpine layout; ignored so an upgraded box doesn't
+# accidentally commit an old key file that's still sitting on disk.
+/opt/meeting-bot/secrets/
 
 # Python bytecode. These were committed once by accident; because the VM
 # regenerates them on every run, the tracked copies show up as local changes
@@ -14,3 +17,38 @@
 # which silently leaves the deployment on old code.
 __pycache__/
 *.py[cod]
+
+.bash_history
+.bashrc
+.cache/
+.claude.json
+.claude/
+.config/
+.gitconfig
+.local
+.profile
+.seadrive-cli/
+.ssh/
+seadrive-cli/
+scripts/
+.env*
+!.env.example
+runs/
+.log
+.save
+
+# shell junk that lands in the repo root (the repo IS $HOME)
+.bash_history-*.tmp
+.bashrc.bak-*
+
+# The uv-built project venv (setup.sh). Delete it to remove every Python dep.
+/.venv/
+
+# A copy of the Proxmox VM's .env, kept for its keys. Never commit it.
+/t.env
+
+# The Discord spikes' own throwaway dependencies (README "Discord voice bot").
+/spike/discord/py/.venv/
+/spike/discord/node/node_modules/
+/spike/discord/node/node-v22/
+/spike/discord/node/package-lock.json

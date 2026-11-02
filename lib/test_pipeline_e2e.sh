@@ -20,14 +20,29 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TESTROOT="$(mktemp -d)"
+# A path with a space in it, on purpose: the five output directories are
+# operator-configured and one of them WILL eventually live under
+# "/mnt/Course Material". Every quoting mistake in the pipeline shows up here.
+TESTROOT="$(mktemp -d)/test root"
+mkdir -p "$TESTROOT"
 export MEETING_BOT_ROOT="$TESTROOT/opt"
+# The five media directories are independent env vars now, with no defaults —
+# an unset one is an error, which section 8 checks.
+export RECORDINGS_DIR="$TESTROOT/opt/recordings"
+export TRANSCRIPTS_DIR="$TESTROOT/opt/transcripts"
+export FRAMES_DIR="$TESTROOT/opt/frames"
+export SUMMARIES_DIR="$TESTROOT/opt/summaries"
+export PDF_DIR="$TESTROOT/opt/pdf"
+# A meeting input detaches into the background by default; these tests assert
+# on its outcome right after the call returns, so they stay attached. The
+# detach itself has its own section at the end.
+export MEETING_BOT_FOREGROUND=1
 FAKE_BIN="$TESTROOT/bin"
 STAGING="$TESTROOT/repo"
 PASS=0
 FAIL=0
 
-cleanup() { rm -rf "$TESTROOT"; }
+cleanup() { rm -rf "$(dirname "$TESTROOT")"; }
 trap cleanup EXIT
 
 ok()   { PASS=$((PASS + 1)); echo "  ok   — $1"; }
@@ -36,16 +51,52 @@ check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2
 
 # --- Build a staging copy of the repo with the four stages stubbed -----------
 mkdir -p "$STAGING" "$FAKE_BIN"
-cp -r "$REPO"/{pipeline.sh,source_env.sh,lib,summarize,transcribe,screen} "$STAGING/"
+cp -r "$REPO"/{pipeline.sh,kill_meeting.sh,source_env.sh,lib,summarize,transcribe,screen} "$STAGING/"
 # No .env in the test tree: source_env.sh must not pick up the developer's real
 # keys and start making live API calls from a test run.
 : > "$STAGING/.env"
+
+# Google Drive (lib/gdrive.py): `parse` is the real module's, the rest a stub
+# that records every upload. STUB_GDRIVE_OUT=0 plays "not signed in".
+mv "$STAGING/lib/gdrive.py" "$STAGING/lib/gdrive_real.py"
+cat > "$STAGING/lib/gdrive.py" <<'STUB'
+#!/usr/bin/env python3
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gdrive_real
+cmd = sys.argv[1]
+if cmd == "parse":
+    sys.exit(gdrive_real.main(sys.argv[1:]))
+if cmd == "status":
+    on = os.environ.get("STUB_GDRIVE_OUT", "1") == "1"
+    print(json.dumps({"configured": on, "logged_in": on, "account_ok": True}))
+    sys.exit(0)
+if cmd == "upload":
+    a = dict(zip(sys.argv[2::2], sys.argv[3::2]))
+    with open(os.environ["STUB_GDRIVE_CALLS"], "a") as fh:
+        fh.write(json.dumps(a) + "\n")
+    if os.path.exists(os.environ.get("STUB_FAIL_UPLOAD", "/nonexistent")):
+        sys.stderr.write("ERROR: uploading the file: HTTP 403: stub refusal\n"); sys.exit(1)
+    assert open(a["--file"], "rb").read(4) == b"%PDF", "not a PDF"
+    print(json.dumps({"id": "FILE1", "name": a["--name"] + ".pdf",
+                      "webViewLink": "https://drive.google.com/file/d/FILE1/view",
+                      "replaced": False}))
+    sys.exit(0)
+sys.exit(2)
+STUB
 
 cat > "$STAGING/screen/record_screen.sh" <<'STUB'
 #!/bin/bash
 # stub recorder: writes an "MP4" at the path the orchestrator chose
 [ -f "$STUB_FAIL_RECORD" ] && { echo "stub: record failing on purpose" >&2; exit 1; }
+[ -n "${STUB_RECORD_ENV:-}" ] && echo "RECORD_MEDIA=${RECORD_MEDIA:-}" > "$STUB_RECORD_ENV"
 mkdir -p "$(dirname "$4")"; echo "fake mp4 for $1" > "$4"
+# A meeting the bot created: capture.py stores the real link in state.json the
+# moment meet.new redirects. Do the same, so the orchestration around it runs.
+if [ "$1" = "https://meet.new" ]; then
+  python3 "$STUB_RUNSTATE" init --run-dir "$MEETING_BOT_RUN_DIR" \
+    --meet-url "https://meet.google.com/stb-hostd-mtg"
+fi
 echo "stub: recorded $4"
 STUB
 
@@ -58,6 +109,10 @@ cat > "$STAGING/transcribe/transcribe.sh" <<'STUB'
 # condition and so always 0), and run_one.sh recorded artifacts that were
 # never created.
 [ -f "$STUB_LIE_TRANSCRIBE" ] && { echo "stub: transcribe claiming success without output"; exit 0; }
+# Record what the orchestrator handed us, before the loop below shifts it
+# away, so a test can assert on the routing (--media on the Kaltura path, the
+# input itself on the YouTube one).
+[ -n "${STUB_TRANSCRIBE_ARGS:-}" ] && printf '%s\n' "$@" > "$STUB_TRANSCRIBE_ARGS"
 out=""
 while [ "$#" -gt 0 ]; do
   case "$1" in --out-base) out="$2"; shift 2 ;; *) args+=("$1"); shift ;; esac
@@ -82,6 +137,8 @@ import json, os, sys
 if os.path.exists(os.environ.get("STUB_FAIL_FRAMES", "/nonexistent")):
     sys.stderr.write("stub: frames failing on purpose\n"); sys.exit(1)
 video, out_dir = sys.argv[1], sys.argv[2]
+if os.environ.get("STUB_FRAMES_CALLS"):
+    open(os.environ["STUB_FRAMES_CALLS"], "a").write(video + "\n")
 os.makedirs(out_dir, exist_ok=True)
 json.dump({"video": video, "frame_count": 2, "frames": [
     {"timestamp_s": 1.0, "kind": "scene_change", "path": f"{out_dir}/a.jpg"},
@@ -95,16 +152,122 @@ cat > "$STAGING/summarize/summarize.py" <<'STUB'
 import os, sys
 if os.path.exists(os.environ.get("STUB_FAIL_SUMMARIZE", "/nonexistent")):
     sys.stderr.write("stub: summarize failing on purpose\n"); sys.exit(1)
-args = [a for a in sys.argv[1:] if not a.startswith("--")]
+if os.path.exists(os.environ.get("STUB_HANG_SUMMARIZE", "/nonexistent")):
+    # A summary that never finishes (a backend looping on errors), for Stop.
+    import time
+    open(os.environ["STUB_HANG_SUMMARIZE"] + ".pid", "w").write(str(os.getpid()))
+    while os.path.exists(os.environ["STUB_HANG_SUMMARIZE"]):
+        time.sleep(0.2)
+if os.path.exists(os.environ.get("STUB_PAUSE_SUMMARIZE", "/nonexistent")):
+    # What the real summarize.py does when the Claude usage window is
+    # exhausted and the wait gave up: record the reset time on the stage
+    # (the file holds the unix time) and exit 75.
+    import subprocess
+    resets_at = open(os.environ["STUB_PAUSE_SUMMARIZE"]).read().strip() or "0"
+    subprocess.run([sys.executable, os.environ["STUB_RUNSTATE"], "annotate",
+                    "--run-dir", os.environ["MEETING_BOT_RUN_DIR"], "--stage", "summarize",
+                    "--set", 'rate_limited={"window": "five_hour", "resets_at": %s, '
+                             '"resets_at_iso": "later"}' % resets_at], check=True)
+    sys.stderr.write("stub: PAUSED on the usage window\n"); sys.exit(75)
+argv = sys.argv[1:]
+flags = {}
+args = []
+i = 0
+while i < len(argv):
+    if argv[i].startswith("--") and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+        flags.setdefault(argv[i], []).append(argv[i + 1]); i += 2
+    elif argv[i].startswith("--"):
+        flags.setdefault(argv[i], []); i += 1
+    else:
+        args.append(argv[i]); i += 1
+# Record what we were handed so the tests can assert on it.
+with open(os.environ["STUB_SUMMARIZE_ARGS"], "w") as fh:
+    fh.write("\n".join(argv))
+# The per-run summary settings reach summarize.py as the variables it reads.
+with open(os.environ["STUB_SUMMARIZE_ARGS"] + ".env", "w") as fh:
+    for key in ("SUMMARY_LANGUAGE", "PDF_FONT"):
+        fh.write(f"{key}={os.environ.get(key, '')}\n")
+if "--parts" in flags:
+    # The --combine path: one call over every member's transcript + frames.
+    # The parts file is what the tests inspect; the "summary" it writes
+    # names each part so the document proves it saw all of them.
+    import json
+    parts = json.load(open(flags["--parts"][0]))["parts"]
+    for i, part in enumerate(parts, start=1):
+        assert os.path.isfile(part["transcript"]), f"part {i}: no transcript"
+        if "--no-frames" in flags:
+            assert not part["frames_manifest"], f"part {i}: voice only, yet a manifest"
+        else:
+            assert os.path.isfile(part["frames_manifest"]), f"part {i}: no manifest"
+    out = args[0]
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    body = "\n".join(f"video {i}: {p['source']}" for i, p in enumerate(parts, start=1))
+    open(out, "w").write(f"<!-- meeting-transcriber\n     source_type: combined\n-->\n\n"
+                         f"# Stub combined\n\n{body}\n\n"
+                         f"See (Frame 3 @ video 2 9.0s).\n\n<br><br>\n")
+    print(f"stub: combined summary of {len(parts)} parts -> {out}")
+    if "--pdf-out" in flags and os.environ.get("STUB_SUMMARIZE_NO_PDF") != "1":
+        pdf = flags["--pdf-out"][0]
+        os.makedirs(os.path.dirname(pdf), exist_ok=True)
+        open(pdf, "wb").write(b"%PDF-1.4 stub\n")
+        print(f"stub: pdf -> {pdf}")
+    sys.exit(0)
 # Assert the orchestrator handed us a pre-extracted manifest rather than making
-# us re-run frame extraction.
-assert "--frames-manifest" in sys.argv, "pipeline must pass --frames-manifest"
+# us re-run frame extraction, and told us where the PDF goes (PDF_DIR is not
+# derivable from the .md path — the two directories are configured separately).
+if "--no-frames" in flags:
+    assert "--frames-manifest" not in flags, "voice only, yet a --frames-manifest"
+else:
+    assert "--frames-manifest" in flags, "pipeline must pass --frames-manifest"
+assert "--pdf-out" in flags, "pipeline must pass --pdf-out"
 out = args[2]
 os.makedirs(os.path.dirname(out), exist_ok=True)
-open(out, "w").write(f"<!-- meeting-transcriber\n     source: x\n-->\n\n"
-                     f"Chapter N — <topic> (<date>)\n\n# Stub\n\nsummary of {args[0]}\n\n<br><br>\n")
-print(f"stub: summary -> {out}")
+if os.environ.get("STUB_SUMMARIZE_NO_MARKDOWN") != "1":
+    open(out, "w").write(f"<!-- meeting-transcriber\n     source: x\n-->\n\n"
+                         f"# Stub\n\nsummary of {args[0]}\n\n"
+                         f"See (Frame 1 @ 0:00:01).\n\n<br><br>\n")
+    print(f"stub: summary -> {out}")
+pdf = flags["--pdf-out"][0]
+if os.environ.get("STUB_SUMMARIZE_NO_PDF") != "1":
+    os.makedirs(os.path.dirname(pdf), exist_ok=True)
+    open(pdf, "wb").write(b"%PDF-1.4 stub\n")
+    print(f"stub: pdf -> {pdf}")
 STUB
+
+# Kaltura: only the network half is stubbed. `parse` is delegated to the real
+# module, because the orchestration under test depends on what it returns —
+# the run id (kal_<entry>) and the canonical URL that replaces a pasted
+# <iframe> in the summary's source line. lib/test_kaltura.py covers the parser
+# itself; this covers the wiring around it.
+cp "$STAGING/lib/kaltura.py" "$STAGING/lib/kaltura_real.py"
+cat > "$STAGING/lib/kaltura.py" <<'STUB'
+#!/usr/bin/env python3
+import json, os, subprocess, sys
+REAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kaltura_real.py")
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+if cmd == "parse":
+    sys.exit(subprocess.call([sys.executable, REAL] + sys.argv[1:]))
+if os.path.exists(os.environ.get("STUB_FAIL_KALTURA", "/nonexistent")):
+    sys.stderr.write("stub: kaltura failing on purpose\n"); sys.exit(1)
+if cmd == "info":
+    print(json.dumps({"partner_id": "2910381", "entry_id": "1_y9jay9sw",
+                      "title": os.environ.get("STUB_KALTURA_TITLE", "Stub Kaltura Lecture"),
+                      "duration": 60, "captions": []}))
+    sys.exit(0)
+if cmd == "download":
+    path = sys.argv[3]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").write("fake kaltura video\n")
+    print(path); sys.exit(0)
+if cmd == "captions":
+    if os.environ.get("STUB_KALTURA_CAPTIONS") == "1":
+        json.dump([{"text": "stub caption", "offset_ms": 0, "duration_ms": 1000}],
+                  sys.stdout)
+        sys.exit(0)
+    sys.stderr.write("stub: no usable caption track\n"); sys.exit(3)
+sys.stderr.write(f"stub: unknown command {cmd}\n"); sys.exit(1)
+STUB
+chmod +x "$STAGING/lib/kaltura.py"
 
 chmod +x "$STAGING/screen/record_screen.sh" "$STAGING/transcribe/transcribe.sh" \
          "$STAGING/screen/extract_frames.py" "$STAGING/summarize/summarize.py"
@@ -113,6 +276,12 @@ chmod +x "$STAGING/screen/record_screen.sh" "$STAGING/transcribe/transcribe.sh" 
 cat > "$FAKE_BIN/yt-dlp" <<'STUB'
 #!/bin/bash
 [ -f "$STUB_FAIL_FETCH" ] && { echo "stub: yt-dlp failing on purpose" >&2; exit 1; }
+# A refusal that a fresh attempt gets past, as YouTube's media URLs do.
+if [ -f "$STUB_403_FETCH" ]; then
+  n=$(cat "$STUB_403_FETCH"); echo "$((n - 1))" > "$STUB_403_FETCH"
+  [ "$n" -le 1 ] && rm -f "$STUB_403_FETCH"
+  echo "ERROR: unable to download video data: HTTP Error 403: Forbidden" >&2; exit 1
+fi
 out=""; while [ "$#" -gt 0 ]; do
   case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
 done
@@ -121,6 +290,21 @@ mkdir -p "$(dirname "$path")"; echo "fake youtube video" > "$path"
 echo "stub: downloaded $path"
 STUB
 chmod +x "$FAKE_BIN/yt-dlp"
+
+# ffmpeg, for the clip stage. lib/clip.py is NOT stubbed — the window parsing,
+# the flag order and the .part rename are the parts worth exercising against
+# the real orchestrator — so only the encoder underneath it is faked. It
+# records its argv, which is how the clip tests assert that the window that
+# reached ffmpeg is the one the operator typed.
+cat > "$FAKE_BIN/ffmpeg" <<'STUB'
+#!/bin/bash
+[ -f "$STUB_FAIL_CLIP" ] && { echo "stub ffmpeg: failing on purpose" >&2; exit 1; }
+[ -n "${STUB_FFMPEG_ARGS:-}" ] && printf '%s\n' "$@" > "$STUB_FFMPEG_ARGS"
+# The output path is always the last argument.
+for out in "$@"; do :; done
+mkdir -p "$(dirname "$out")"; echo "fake clipped video" > "$out"
+STUB
+chmod +x "$FAKE_BIN/ffmpeg"
 export PATH="$FAKE_BIN:$PATH"
 
 export STUB_FAIL_RECORD="$TESTROOT/fail_record"
@@ -128,7 +312,19 @@ export STUB_FAIL_TRANSCRIBE="$TESTROOT/fail_transcribe"
 export STUB_LIE_TRANSCRIBE="$TESTROOT/lie_transcribe"
 export STUB_FAIL_FRAMES="$TESTROOT/fail_frames"
 export STUB_FAIL_SUMMARIZE="$TESTROOT/fail_summarize"
+export STUB_PAUSE_SUMMARIZE="$TESTROOT/pause_summarize"
+export STUB_HANG_SUMMARIZE="$TESTROOT/hang_summarize"
+export STUB_RUNSTATE="$STAGING/lib/runstate.py"
 export STUB_FAIL_FETCH="$TESTROOT/fail_fetch"
+export STUB_403_FETCH="$TESTROOT/403_fetch"
+export YT_DOWNLOAD_RETRY_SECONDS=0
+export STUB_SUMMARIZE_ARGS="$TESTROOT/summarize_args.txt"
+export STUB_TRANSCRIBE_ARGS="$TESTROOT/transcribe_args.txt"
+export STUB_FAIL_KALTURA="$TESTROOT/fail_kaltura"
+export STUB_FAIL_CLIP="$TESTROOT/fail_clip"
+export STUB_FFMPEG_ARGS="$TESTROOT/ffmpeg_args.txt"
+export STUB_RECORD_ENV="$TESTROOT/record_env.txt"
+export STUB_FRAMES_CALLS="$TESTROOT/frames_calls.txt"
 
 RUNS="$MEETING_BOT_ROOT/runs"
 pipeline() { ( cd "$STAGING" && bash ./pipeline.sh "$@" ) ; }
@@ -137,7 +333,7 @@ latest_run() { python3 "$STAGING/lib/runstate.py" latest --root "$RUNS"; }
 
 echo ""
 echo "=================================================================="
-echo "1. Input routing — all four input types"
+echo "1. Input routing — all five input types"
 echo "=================================================================="
 
 echo "--- Google Meet URL"
@@ -150,7 +346,13 @@ for stage in record transcribe frames summarize; do
   check "meet: $stage done" "$(state status --run-dir "$RUNS/$run" --stage $stage)" "done"
 done
 check "meet: fetch_video skipped" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "pending"
-[ -f "$MEETING_BOT_ROOT/recordings/$run.mp4" ] && ok "meet: mp4 written" || bad "meet: no mp4"
+[ -f "$RECORDINGS_DIR/$run.mp4" ] && ok "meet: mp4 written" || bad "meet: no mp4"
+# The recording is the one irreplaceable artifact; the post-summary media
+# sweep only ever touches downloads inside the run dir.
+[ -f "$RECORDINGS_DIR/$run.mp4" ] && ok "meet: recording kept after the summary" \
+  || bad "meet: the recording was swept"
+[ -f "$SUMMARIES_DIR/$run.md" ] && ok "meet: summary written" || bad "meet: no summary"
+[ -f "$PDF_DIR/$run.pdf" ] && ok "meet: pdf written to PDF_DIR" || bad "meet: no pdf"
 
 echo "--- Zoom URL"
 out=$(pipeline "https://zoom.us/j/1234567890" --name "Client Call" 2>&1)
@@ -168,6 +370,8 @@ check "local: name derived from filename" "${run%_*_*}" "my_lecture"
 check "local: record skipped" "$(state status --run-dir "$RUNS/$run" --stage record)" "pending"
 check "local: transcribed" "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "done"
 check "local: summarized" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+[ -f "$TESTROOT/my_lecture.mp4" ] && ok "local: the input file is untouched by the sweep" \
+  || bad "local: the sweep deleted the operator's own file"
 
 echo "--- YouTube URL (the one from the request, with its &list= parameter)"
 YT="https://www.youtube.com/watch?v=5GAfjAjLKYk&list=PLMvKqhmt0Lp8"
@@ -178,7 +382,129 @@ check "youtube: run id is the video id" "${run%_*_*}" "yt_5GAfjAjLKYk"
 check "youtube: record skipped" "$(state status --run-dir "$RUNS/$run" --stage record)" "pending"
 check "youtube: video fetched" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
 check "youtube: summarized" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+# The download is swept once the summary exists — it was only ever there for
+# the frames — and the stage stays done (cleaned) rather than sliding back
+# to pending.
+[ -e "$RUNS/$run/video.mp4" ] && bad "youtube: video.mp4 kept after the summary" \
+  || ok "youtube: video.mp4 swept after the summary"
+check "youtube: fetch_video still done after the sweep" \
+  "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
+check "youtube: fetch_video marked cleaned" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.fetch_video.cleaned)" "True"
+echo "$out" | grep -q "\[video\] removed the downloaded media" \
+  && ok "youtube: the sweep is reported" || bad "youtube: sweep not reported"
 echo "$out" | grep -q -- "--no-playlist" && ok "youtube: &list= did not expand" || ok "youtube: &list= did not expand (single run)"
+
+echo "--- YouTube download refused with a 403, then served (lib/ytdownload.py)"
+echo 2 > "$STUB_403_FETCH"
+out=$(pipeline "https://www.youtube.com/watch?v=403retry0aa" 2>&1); rc=$?
+check "yt 403: exits 0 after two refusals" "$rc" "0"
+run=$(latest_run)
+check "yt 403: video fetched" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
+echo "$out" | grep -q "fresh attempt in 0s (2 of 4)" \
+  && ok "yt 403: the retry is reported" || bad "yt 403: retry not reported"
+echo "$out" | grep -q "downloaded on attempt 3 of 4" \
+  && ok "yt 403: the attempt that worked is named" || bad "yt 403: success attempt not named"
+echo 9 > "$STUB_403_FETCH"
+out=$(YT_DOWNLOAD_ATTEMPTS=2 pipeline "https://www.youtube.com/watch?v=403retry0bb" 2>&1); rc=$?
+rm -f "$STUB_403_FETCH"
+[ "$rc" -ne 0 ] && ok "yt 403: fails once the attempts run out" || bad "yt 403: succeeded with every attempt refused"
+echo "$out" | grep -q "still failing after 2 attempts" \
+  && ok "yt 403: giving up is reported" || bad "yt 403: give-up not reported"
+touch "$STUB_FAIL_FETCH"
+out=$(pipeline "https://www.youtube.com/watch?v=403retry0cc" 2>&1)
+rm -f "$STUB_FAIL_FETCH"
+echo "$out" | grep -q "fresh attempt" \
+  && bad "yt 403: a non-transient failure was retried" || ok "yt 403: a non-transient failure is not retried"
+# Finish both failed runs, so a later --resume-all has nothing of ours to pick up.
+pipeline "https://www.youtube.com/watch?v=403retry0bb" >/dev/null 2>&1
+check "yt 403: the given-up run resumes once YouTube serves it" "$?" "0"
+pipeline "https://www.youtube.com/watch?v=403retry0cc" >/dev/null 2>&1
+
+echo "--- Kaltura embed, pasted as the whole <iframe> tag"
+KAL_IFRAME='<iframe id="kaltura_player" src='"'"'https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/52668182?iframeembed=true&amp;entry_id=1_y9jay9sw&amp;config%5Bplayback%5D=%7B%22startTime%22%3A0%7D'"'"' style="width: 608px;height: 402px;border: 0;" allowfullscreen title="2110322 Online Session"></iframe>'
+out=$(pipeline "$KAL_IFRAME" 2>&1); rc=$?
+check "kaltura: exits 0" "$rc" "0"
+run=$(latest_run)
+check "kaltura: run id is the entry id" "${run%_*_*}" "kal_1_y9jay9sw"
+check "kaltura: record skipped" "$(state status --run-dir "$RUNS/$run" --stage record)" "pending"
+check "kaltura: video fetched" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
+check "kaltura: transcribed" "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "done"
+check "kaltura: frames extracted" "$(state status --run-dir "$RUNS/$run" --stage frames)" "done"
+check "kaltura: summarized" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+[ -f "$SUMMARIES_DIR/$run.md" ] && ok "kaltura: summary written" || bad "kaltura: no summary"
+# The download is on the critical path for transcribe here, unlike YouTube:
+# without captions AssemblyAI needs the media file.
+grep -q -- "--media" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "kaltura: transcribe was given the downloaded media" \
+  || bad "kaltura: transcribe got no --media"
+grep -q "video.mp4" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "kaltura: --media points at the run's download" \
+  || bad "kaltura: --media is not the download"
+# The <iframe> blob must not end up in the document's source line.
+grep -q -- "--source-url" "$STUB_SUMMARIZE_ARGS" \
+  && ok "kaltura: summarize got a source url" || bad "kaltura: no --source-url"
+grep -q "<iframe" "$STUB_SUMMARIZE_ARGS" \
+  && bad "kaltura: the raw iframe blob reached summarize" \
+  || ok "kaltura: the iframe blob was normalised to a URL"
+grep -q "entry_id=1_y9jay9sw" "$STUB_SUMMARIZE_ARGS" \
+  && ok "kaltura: the source url names the entry" || bad "kaltura: source url lost the entry id"
+# The entry's own name, read at fetch time — there is no yt-dlp to ask.
+grep -q -- "--title" "$STUB_SUMMARIZE_ARGS" \
+  && ok "kaltura: summarize got the entry title" || bad "kaltura: no --title"
+grep -q "Stub Kaltura Lecture" "$STUB_SUMMARIZE_ARGS" \
+  && ok "kaltura: the title is the entry's own name" || bad "kaltura: wrong title"
+[ -f "$RUNS/$run/kaltura.json" ] \
+  && ok "kaltura: entry facts cached in the run dir" || bad "kaltura: no kaltura.json"
+[ -e "$RUNS/$run/video.mp4" ] && bad "kaltura: video.mp4 kept after the summary" \
+  || ok "kaltura: video.mp4 swept after the summary"
+check "kaltura: fetch_video still done after the sweep" \
+  "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
+
+echo "--- Kaltura embed, given as just the src URL"
+KAL_URL="https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/52668182?iframeembed=true&entry_id=1_y9jay9sw"
+out=$(pipeline "$KAL_URL" --force 2>&1)
+check "kaltura url: exits 0" "$?" "0"
+run=$(latest_run)
+check "kaltura url: same run id as the iframe form" "${run%_*_*}" "kal_1_y9jay9sw"
+check "kaltura url: summarized" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+
+echo "--- Kaltura entry that has its own captions"
+STUB_KALTURA_CAPTIONS=1 out=$(STUB_KALTURA_CAPTIONS=1 pipeline "$KAL_URL" --force 2>&1)
+check "kaltura captions: exits 0" "$?" "0"
+run=$(latest_run)
+check "kaltura captions: transcribed" "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "done"
+# The video is still fetched — frames need it either way.
+check "kaltura captions: video still fetched" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
+
+echo "--- Kaltura entry that cannot be reached (needs an LMS login)"
+touch "$STUB_FAIL_KALTURA"
+out=$(pipeline "$KAL_URL" --force 2>&1); rc=$?
+rm -f "$STUB_FAIL_KALTURA"
+check "kaltura unreachable: exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+run=$(latest_run)
+check "kaltura unreachable: fetch_video failed" "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "failed"
+# Fail before anything expensive: no transcript was paid for.
+check "kaltura unreachable: transcribe never ran" "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "pending"
+check "kaltura unreachable: summarize never ran" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "pending"
+echo "$out" | grep -q "Resume with" && ok "kaltura unreachable: says how to resume" || bad "kaltura unreachable: no resume hint"
+
+echo "--- Kaltura resume picks up the finished download"
+rm -f "$STUB_FAIL_KALTURA"
+out=$(pipeline --run-id "$run" 2>&1)
+check "kaltura resume: exits 0" "$?" "0"
+check "kaltura resume: completes" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+
+echo "--- A finished Kaltura run re-invoked by --run-id does not download again"
+# The ahead-of-branches fetch used to run unconditionally; with the download
+# swept after the summary that would pull 446MB back for a run with nothing
+# left to do.
+out=$(pipeline --run-id "$run" 2>&1)
+check "kaltura finished: exits 0" "$?" "0"
+echo "$out" | grep -q "downloading again" && bad "kaltura finished: re-downloaded the entry" \
+  || ok "kaltura finished: no re-download"
+[ -e "$RUNS/$run/video.mp4" ] && bad "kaltura finished: a video.mp4 reappeared" \
+  || ok "kaltura finished: run dir still has no video"
 
 echo "--- Unrecognized input"
 out=$(pipeline "not-a-real-thing" 2>&1); rc=$?
@@ -196,14 +522,227 @@ out=$(pipeline "https://www.youtube.com/watch?v=aaaaaaaaaaa" \
                --jobs 3 --combine "$TESTROOT/chapter.md" 2>&1)
 check "multi: exits 0" "$?" "0"
 after=$(ls -1 "$RUNS" | wc -l)
-check "multi: created 3 runs" "$((after - before))" "3"
+# Three members plus the combine run.
+check "multi: created 3 member runs and 1 combine run" "$((after - before))" "4"
 for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
   ls -d "$RUNS/yt_${vid}_"* >/dev/null 2>&1 && ok "multi: run for $vid" || bad "multi: no run for $vid"
 done
 [ -f "$TESTROOT/chapter.md" ] && ok "multi: combined file written" || bad "multi: no combined file"
-check "multi: one Chapter line in combined file" \
-  "$(grep -c 'Chapter N' "$TESTROOT/chapter.md")" "1"
+check "multi: one title in combined file" \
+  "$(grep -c '^# Stub combined' "$TESTROOT/chapter.md")" "1"
 echo "$out" | grep -q "3 run(s), up to 3 at a time" && ok "multi: honored --jobs 3" || bad "multi: --jobs not honored"
+
+# --- The combined summary is ONE summarize call over every member ----------
+# --combine no longer staples three summaries together: the members stop after
+# transcribe + frames (their summarize stage stays pending, on purpose), and a
+# fourth run — the combine run — hands every transcript and manifest to
+# summarize.py --parts in input order.
+for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
+  for d in "$RUNS"/yt_${vid}_*; do
+    check "multi: $vid transcribed" "$(state status --run-dir "$d" --stage transcribe)" "done"
+    check "multi: $vid summarize left pending (combine run owns it)" \
+      "$(state status --run-dir "$d" --stage summarize)" "pending"
+    [ -f "$SUMMARIES_DIR/$(basename "$d").md" ] \
+      && bad "multi: $vid got an individual summary anyway" \
+      || ok "multi: $vid has no individual summary"
+  done
+done
+combine_run="$(ls -d "$RUNS"/combine_3x_* 2>/dev/null | head -n 1)"
+[ -n "$combine_run" ] && ok "multi: combine run created ($(basename "$combine_run"))" \
+  || bad "multi: no combine run directory"
+check "multi: combine run summarize done" \
+  "$(state status --run-dir "$combine_run" --stage summarize)" "done"
+check "multi: combine run records the markdown" \
+  "$(state get --run-dir "$combine_run" --key stages.summarize.artifacts.md)" "$TESTROOT/chapter.md"
+# Members point back at the combine run, so --resume-all leaves them alone.
+for d in "$RUNS"/yt_aaaaaaaaaaa_*; do
+  check "multi: member records its combine run" \
+    "$(state get --run-dir "$d" --key combined_into)" "$(basename "$combine_run")"
+done
+# The parts file is the whole contract with summarize.py: every member, in
+# INPUT order (runs finish out of order at --jobs 3), each with its own
+# transcript and manifest.
+parts="$combine_run/parts.json"
+[ -f "$parts" ] && ok "multi: parts.json written" || bad "multi: no parts.json"
+check "multi: parts.json lists 3 videos" \
+  "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["parts"]))' "$parts")" "3"
+check "multi: parts in input order" \
+  "$(python3 -c 'import json,sys; print(" ".join(p["source"].split("=")[-1].split("/")[-1] for p in json.load(open(sys.argv[1]))["parts"]))' "$parts")" \
+  "aaaaaaaaaaa bbbbbbbbbbb ccccccccccc"
+check "multi: each part has its own manifest" \
+  "$(python3 -c 'import json,sys; ps=json.load(open(sys.argv[1]))["parts"]; print(len({p["frames_manifest"] for p in ps}))' "$parts")" "3"
+grep -q "^--parts$" "$STUB_SUMMARIZE_ARGS" && ok "multi: summarize.py called with --parts" \
+  || bad "multi: summarize.py not called with --parts"
+grep -q "^--pdf-out$" "$STUB_SUMMARIZE_ARGS" && ok "multi: combined pdf requested" \
+  || bad "multi: no --pdf-out for the combined pdf"
+check "multi: combined document names all three videos" \
+  "$(grep -c '^video [0-9]: ' "$TESTROOT/chapter.md")" "3"
+[ -f "$TESTROOT/chapter.pdf" ] && ok "multi: combined pdf written" || bad "multi: no combined pdf"
+echo "$out" | grep -q "(combined summary)" && ok "multi: report names the combined summary" \
+  || bad "multi: report silent about the combined summary"
+# The members' frames are swept by the combine run once the PDF exists.
+leftover=0
+for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
+  for d in "$FRAMES_DIR/yt_${vid}_"*; do
+    [ -d "$d" ] && leftover=$((leftover + 1))
+  done
+done
+check "multi: members' frames swept after the combined render" "$leftover" "0"
+leftover=0
+for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
+  for f in "$RUNS/yt_${vid}_"*/video.mp4; do
+    [ -e "$f" ] && leftover=$((leftover + 1))
+  done
+done
+check "multi: members' downloads swept after the combined render" "$leftover" "0"
+
+echo "--- --combine without a path writes to SUMMARIES_DIR / PDF_DIR, named for the run"
+out=$(pipeline "https://youtu.be/dfltcomb001" "https://youtu.be/dfltcomb002" \
+               --combine --jobs 2 2>&1)
+check "combine default: exits 0" "$?" "0"
+dflt_id="$(printf '%s\n' "$out" | sed -n 's/^ *run id: *//p' | head -n 1)"
+dflt_run="$RUNS/$dflt_id"
+[ -n "$dflt_id" ] || dflt_run=""
+[ -n "$dflt_run" ] && ok "combine default: combine run created" || bad "combine default: no combine run: $out"
+[ -f "$SUMMARIES_DIR/$dflt_id.md" ] && ok "combine default: markdown in SUMMARIES_DIR" \
+  || bad "combine default: no $SUMMARIES_DIR/$dflt_id.md"
+[ -f "$PDF_DIR/$dflt_id.pdf" ] && ok "combine default: pdf in PDF_DIR" \
+  || bad "combine default: no $PDF_DIR/$dflt_id.pdf"
+check "combine default: state records the markdown" \
+  "$(state get --run-dir "$dflt_run" --key output_md)" "$SUMMARIES_DIR/$dflt_id.md"
+out=$(pipeline "https://youtu.be/dfltcomb001" "https://youtu.be/dfltcomb002" --combine 2>&1)
+echo "$out" | grep -q "Resuming combined summary: $dflt_id" \
+  && ok "combine default resume: same run, same files" || bad "combine default resume: not resumed: $out"
+out=$(pipeline "https://youtu.be/dfltcomb001" "https://youtu.be/dfltcomb002" --combine --no-combine-pdf --force 2>&1)
+check "combine default --no-combine-pdf: exits 0" "$?" "0"
+
+echo "--- Re-running the same command resumes the combined summary, not a new one"
+: > "$STUB_SUMMARIZE_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=aaaaaaaaaaa" \
+               "https://youtu.be/bbbbbbbbbbb" \
+               "https://www.youtube.com/watch?v=ccccccccccc" \
+               --jobs 3 --combine "$TESTROOT/chapter.md" 2>&1)
+check "multi resume: exits 0" "$?" "0"
+check "multi resume: no new combine run" "$(ls -d "$RUNS"/combine_3x_* | wc -l)" "1"
+[ -s "$STUB_SUMMARIZE_ARGS" ] && bad "multi resume: summarize ran again" \
+  || ok "multi resume: summarize not re-run (already done)"
+echo "$out" | grep -q "already done" && ok "multi resume: says summarize was done" \
+  || bad "multi resume: no 'already done'"
+
+echo "--- --run-id on the combine run after --force re-extracts swept frames"
+: > "$STUB_SUMMARIZE_ARGS"
+out=$(pipeline --run-id "$(basename "$combine_run")" --force 2>&1)
+check "combine --force: exits 0" "$?" "0"
+grep -q "^--parts$" "$STUB_SUMMARIZE_ARGS" && ok "combine --force: summarized again" \
+  || bad "combine --force: summarize did not run"
+echo "$out" | grep -q "frames were swept" && ok "combine --force: re-extracted the swept frames" \
+  || bad "combine --force: did not notice the swept frames"
+echo "$out" | grep -q "\[fetch_video\] swept after the last summary" \
+  && ok "combine --force: fetched the swept downloads again" \
+  || bad "combine --force: did not re-download for the re-extraction"
+leftover=0
+for vid in aaaaaaaaaaa bbbbbbbbbbb ccccccccccc; do
+  for f in "$RUNS/yt_${vid}_"*/video.mp4; do
+    [ -e "$f" ] && leftover=$((leftover + 1))
+  done
+done
+check "combine --force: the re-fetched downloads are swept again" "$leftover" "0"
+
+echo "--- A failed member blocks the combined summary, and the same command resumes both"
+touch "$STUB_FAIL_TRANSCRIBE"
+: > "$STUB_SUMMARIZE_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=hhhhhhhhhhh" \
+               "https://youtu.be/iiiiiiiiiii" \
+               --combine "$TESTROOT/partial.md" 2>&1)
+check "member fail: exits 1" "$?" "1"
+[ -s "$STUB_SUMMARIZE_ARGS" ] && bad "member fail: summarize ran on an incomplete set" \
+  || ok "member fail: summarize not attempted"
+echo "$out" | grep -q "Combined summary not attempted" && ok "member fail: says why" \
+  || bad "member fail: no explanation"
+[ -f "$TESTROOT/partial.md" ] && bad "member fail: wrote a combined file anyway" \
+  || ok "member fail: no combined file"
+rm -f "$STUB_FAIL_TRANSCRIBE"
+before=$(ls -1 "$RUNS" | wc -l)
+out=$(pipeline "https://www.youtube.com/watch?v=hhhhhhhhhhh" \
+               "https://youtu.be/iiiiiiiiiii" \
+               --combine "$TESTROOT/partial.md" 2>&1)
+check "member fail resume: exits 0" "$?" "0"
+after=$(ls -1 "$RUNS" | wc -l)
+check "member fail resume: no new runs (members and combine run resumed)" "$((after - before))" "0"
+[ -f "$TESTROOT/partial.md" ] && ok "member fail resume: combined file written" \
+  || bad "member fail resume: no combined file"
+
+echo "--- --resume-all leaves combine members to their combine run"
+# Make a fresh set whose combine summarize fails, then --resume-all.
+touch "$STUB_FAIL_SUMMARIZE"
+out=$(pipeline "https://www.youtube.com/watch?v=jjjjjjjjjjj" \
+               --combine "$TESTROOT/ra.md" 2>&1)
+check "resume-all setup: combine summarize failed" "$?" "1"
+rm -f "$STUB_FAIL_SUMMARIZE"
+: > "$STUB_SUMMARIZE_ARGS"
+out=$(pipeline --resume-all 2>&1)
+check "resume-all: exits 0" "$?" "0"
+echo "$out" | grep -q "resumed through it" && ok "resume-all: skipped the member" \
+  || bad "resume-all: did not skip the member"
+grep -q "^--parts$" "$STUB_SUMMARIZE_ARGS" && ok "resume-all: ran the combine run" \
+  || bad "resume-all: combine run not resumed"
+for d in "$RUNS"/yt_jjjjjjjjjjj_*; do
+  check "resume-all: member still has no individual summary" \
+    "$(state status --run-dir "$d" --stage summarize)" "pending"
+done
+[ -f "$TESTROOT/ra.md" ] && ok "resume-all: combined file written" || bad "resume-all: no combined file"
+
+echo "--- --no-combine-pdf writes only the markdown"
+: > "$STUB_SUMMARIZE_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=ddddddddddd" \
+               "https://youtu.be/eeeeeeeeeee" \
+               --combine "$TESTROOT/nopdf.md" --no-combine-pdf 2>&1)
+check "no-combine-pdf: exits 0" "$?" "0"
+[ -f "$TESTROOT/nopdf.md" ] && ok "no-combine-pdf: markdown written" \
+  || bad "no-combine-pdf: no markdown"
+[ -f "$TESTROOT/nopdf.pdf" ] && bad "no-combine-pdf: wrote a pdf anyway" \
+  || ok "no-combine-pdf: no pdf written"
+grep -q "^--no-pdf$" "$STUB_SUMMARIZE_ARGS" && ok "no-combine-pdf: summarize told --no-pdf" \
+  || bad "no-combine-pdf: summarize not told --no-pdf"
+# No PDF to wait for, so the frames go straight away.
+leftover=0
+for d in "$FRAMES_DIR"/yt_ddddddddddd_* "$FRAMES_DIR"/yt_eeeeeeeeeee_*; do
+  [ -d "$d" ] && leftover=$((leftover + 1))
+done
+check "no-combine-pdf: members' frames swept" "$leftover" "0"
+
+echo "--- --combine-pdf names the file"
+out=$(pipeline "https://www.youtube.com/watch?v=fffffffffff" \
+               --combine "$TESTROOT/named.md" \
+               --combine-pdf "$TESTROOT/somewhere else.pdf" 2>&1)
+check "combine-pdf: exits 0" "$?" "0"
+[ -f "$TESTROOT/somewhere else.pdf" ] \
+  && ok "combine-pdf: honored the path (with a space in it)" \
+  || bad "combine-pdf: path not used"
+
+echo "--- KEEP_FRAMES=1 survives a combined render"
+out=$(KEEP_FRAMES=1 pipeline "https://youtu.be/ggggggggggg" \
+               --combine "$TESTROOT/keep.md" 2>&1)
+check "keep-frames: exits 0" "$?" "0"
+kept=0
+for d in "$FRAMES_DIR/yt_ggggggggggg_"*; do [ -d "$d" ] && kept=1; done
+check "keep-frames: frames kept" "$kept" "1"
+kept=0
+for f in "$RUNS/yt_ggggggggggg_"*/video.mp4; do [ -e "$f" ] && kept=1; done
+check "keep-frames: the download is kept too" "$kept" "1"
+
+echo "--- KEEP_FRAMES=1 keeps a single run's download as well"
+out=$(KEEP_FRAMES=1 pipeline "https://youtu.be/keepvideo01" 2>&1)
+check "keep-video: exits 0" "$?" "0"
+run=$(latest_run)
+[ -f "$RUNS/$run/video.mp4" ] && ok "keep-video: video.mp4 kept" || bad "keep-video: video.mp4 swept"
+[ -d "$FRAMES_DIR/$run" ] && ok "keep-video: frames kept" || bad "keep-video: frames swept"
+
+echo "--- --combine refuses the resume-only forms"
+out=$(pipeline --resume-last --combine "$TESTROOT/x.md" 2>&1)
+check "combine + --resume-last: exits 1" "$?" "1"
+echo "$out" | grep -q "takes inputs" && ok "combine + --resume-last: clear error" \
+  || bad "combine + --resume-last: no clear error"
 
 echo "--- --from-file"
 cat > "$TESTROOT/links.txt" <<EOF
@@ -245,6 +784,8 @@ run=$(latest_run)
 check "resume: transcribe survived" "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "done"
 check "resume: frames survived" "$(state status --run-dir "$RUNS/$run" --stage frames)" "done"
 check "resume: summarize marked failed" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "failed"
+[ -f "$RUNS/$run/video.mp4" ] && ok "resume: the download survived the failure" \
+  || bad "resume: the download was swept before the summary existed"
 state show --run-dir "$RUNS/$run" | grep -q "error:" && ok "resume: error recorded in state" || bad "resume: no error recorded"
 
 echo "--- Re-running the same command resumes instead of starting over"
@@ -258,9 +799,20 @@ echo "$out" | grep -q "\[frames\] already done" && ok "resume: skipped frames" |
 check "resume: summarize now done" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
 check "resume: transcribe attempted once only" \
   "$(state get --run-dir "$RUNS/$run" --key stages.transcribe.attempts)" "1"
+[ -e "$RUNS/$run/video.mp4" ] && bad "resume: the download outlived the summary" \
+  || ok "resume: the download swept once the summary existed"
+
+echo "--- A finished run re-invoked by --run-id neither downloads nor extracts again"
+out=$(pipeline --run-id "$run" 2>&1)
+check "finished: exits 0" "$?" "0"
+echo "$out" | grep -q "downloading again" && bad "finished: re-downloaded" || ok "finished: no re-download"
+echo "$out" | grep -q "extracting them again" && bad "finished: re-extracted frames" \
+  || ok "finished: no re-extraction"
+check "finished: fetch_video attempted once only" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.fetch_video.attempts)" "1"
 
 echo "--- Deleting an artifact makes that stage run again"
-rm -f "$MEETING_BOT_ROOT/transcripts/$run.txt"
+rm -f "$TRANSCRIPTS_DIR/$run.txt"
 check "stale: transcribe reports pending again" \
   "$(state status --run-dir "$RUNS/$run" --stage transcribe)" "pending"
 
@@ -270,6 +822,10 @@ check "force: exits 0" "$?" "0"
 check "force: transcribe re-run (attempts reset to 1)" \
   "$(state get --run-dir "$RUNS/$run" --key stages.transcribe.attempts)" "1"
 echo "$out" | grep -q "discarding previous stage results" && ok "force: announced" || bad "force: not announced"
+check "force: the swept download was fetched again" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.fetch_video.attempts)" "1"
+[ -e "$RUNS/$run/video.mp4" ] && bad "force: the re-fetched download was not swept" \
+  || ok "force: the re-fetched download was swept after the summary"
 
 echo "--- A completed run is not resumed; a fresh one starts"
 out=$(pipeline "$LECTURE" 2>&1)
@@ -288,6 +844,96 @@ for vid in broken00001 broken00002; do
   d=$(ls -d "$RUNS/yt_${vid}_"* | head -1)
   check "resume-all: $vid completed" "$(state status --run-dir "$d" --stage summarize)" "done"
 done
+
+echo "--- A summarize stage paused on the Claude usage window"
+# The stub records a reset time an hour away and exits 75, the way
+# summarize.py does when the in-process wait gives up.
+echo $(( $(date +%s) + 3600 )) > "$STUB_PAUSE_SUMMARIZE"
+LECTURE="https://www.youtube.com/watch?v=paused00001"
+out=$(pipeline "$LECTURE" 2>&1); rc=$?
+check "pause: pipeline exits 75, not 1" "$rc" "75"
+prun=$(latest_run)
+check "pause: summarize is failed (so a resume re-runs it)" \
+  "$(state status --run-dir "$RUNS/$prun" --stage summarize)" "failed"
+check "pause: frames survived" "$(state status --run-dir "$RUNS/$prun" --stage frames)" "done"
+[ -n "$(state get --run-dir "$RUNS/$prun" --key stages.summarize.rate_limited.resets_at 2>/dev/null)" ] \
+  && ok "pause: reset time recorded in state.json" || bad "pause: no reset time in state"
+echo "$out" | grep -q "PAUSED $prun" && ok "pause: reported as PAUSED, not FAIL" || bad "pause: not reported as PAUSED"
+echo "$out" | grep -q "  FAIL  $prun" && bad "pause: also reported as FAIL" || ok "pause: not reported as FAIL"
+echo "$out" | grep -q "waiting for the Claude usage window" && ok "pause: the footer explains" || bad "pause: no explanation"
+state show --run-dir "$RUNS/$prun" | grep -q "paused: Claude usage window" \
+  && ok "pause: --status explains the pause" || bad "pause: --status does not mention it"
+
+echo "--- --resume-all leaves a paused run alone until its reset"
+out=$(pipeline --resume-all 2>&1); rc=$?
+check "pause: --resume-all exits 0 with nothing to do" "$rc" "0"
+echo "$out" | grep -q "$prun: paused until" && ok "pause: --resume-all names the paused run and the time" \
+  || bad "pause: --resume-all did not mention the pause"
+echo "$out" | grep -q "waiting for the Claude usage window" && ok "pause: 'nothing to resume yet'" \
+  || bad "pause: wrong summary line"
+check "pause: summarize not attempted again" \
+  "$(state get --run-dir "$RUNS/$prun" --key stages.summarize.attempts)" "1"
+
+echo "--- Once the reset has passed, --resume-all finishes it"
+# Rewrite the recorded reset into the past and let the stub succeed.
+state annotate --run-dir "$RUNS/$prun" --stage summarize \
+  --set 'rate_limited={"window": "five_hour", "resets_at": 1000000000}'
+rm -f "$STUB_PAUSE_SUMMARIZE"
+out=$(pipeline --resume-all 2>&1); rc=$?
+check "pause: --resume-all exits 0" "$rc" "0"
+check "pause: summarize now done" "$(state status --run-dir "$RUNS/$prun" --stage summarize)" "done"
+[ -z "$(state get --run-dir "$RUNS/$prun" --key stages.summarize.rate_limited 2>/dev/null)" ] \
+  && ok "pause: the pause is cleared on completion" || bad "pause: rate_limited left behind"
+echo "$out" | grep -q "\[transcribe\] already done" && ok "pause: transcribe not re-run" || bad "pause: transcribe re-ran"
+
+echo "--- The same command resumes a paused run too"
+echo $(( $(date +%s) + 3600 )) > "$STUB_PAUSE_SUMMARIZE"
+pipeline "https://www.youtube.com/watch?v=paused00002" >/dev/null 2>&1
+prun2=$(latest_run)
+rm -f "$STUB_PAUSE_SUMMARIZE"
+out=$(pipeline "https://www.youtube.com/watch?v=paused00002" 2>&1); rc=$?
+check "pause: explicit re-run exits 0" "$rc" "0"
+check "pause: same run id" "$(latest_run)" "$prun2"
+check "pause: done" "$(state status --run-dir "$RUNS/$prun2" --stage summarize)" "done"
+
+echo "--- Stop on a run that is not recording terminates it (kill_meeting.sh --run-id)"
+# Found 2026-10-12: the web UI's Stop only touched the kill sentinel, which
+# nothing past the recording reads, and a local file's summary ran on.
+touch "$STUB_HANG_SUMMARIZE"; rm -f "$STUB_HANG_SUMMARIZE.pid"
+STOP_OUT="$TESTROOT/stop_pipeline.out"
+pipeline "https://www.youtube.com/watch?v=stopme00001" >"$STOP_OUT" 2>&1 &
+stop_pipe=$!
+for _ in $(seq 1 100); do [ -s "$STUB_HANG_SUMMARIZE.pid" ] && break; sleep 0.1; done
+srun=$(latest_run)
+check "stop: summarize is running" "$(state status --run-dir "$RUNS/$srun" --stage summarize)" "running"
+hang_pid=$(cat "$STUB_HANG_SUMMARIZE.pid")
+out=$( cd "$STAGING" && bash ./kill_meeting.sh --run-id "$srun" 2>&1 ); rc=$?
+check "stop: kill_meeting.sh exits 0" "$rc" "0"
+wait "$stop_pipe"; rc=$?
+check "stop: pipeline exits 1" "$rc" "1"
+kill -0 "$hang_pid" 2>/dev/null && bad "stop: summarize still alive" || ok "stop: summarize terminated"
+rm -f "$STUB_HANG_SUMMARIZE"
+check "stop: summarize marked failed" "$(state status --run-dir "$RUNS/$srun" --stage summarize)" "failed"
+check "stop: transcribe kept" "$(state status --run-dir "$RUNS/$srun" --stage transcribe)" "done"
+[ -n "$(state get --run-dir "$RUNS/$srun" --key stopped.at 2>/dev/null)" ] \
+  && ok "stop: run marked stopped" || bad "stop: no stopped mark"
+[ -d "$RUNS/$srun/run.lock" ] && bad "stop: run.lock left behind" || ok "stop: run.lock released"
+grep -q "STOPPED $srun" "$STOP_OUT" && ok "stop: reported as STOPPED" || bad "stop: not reported as STOPPED"
+out=$(pipeline --resume-all 2>&1)
+echo "$out" | grep -q "$srun: stopped by hand" && ok "stop: --resume-all leaves it alone" \
+  || bad "stop: --resume-all did not skip it"
+check "stop: summarize not attempted again" \
+  "$(state get --run-dir "$RUNS/$srun" --key stages.summarize.attempts)" "1"
+out=$(pipeline --run-id "$srun" 2>&1); rc=$?
+check "stop: --run-id resumes it" "$rc" "0"
+check "stop: summarize done" "$(state status --run-dir "$RUNS/$srun" --stage summarize)" "done"
+[ -z "$(state get --run-dir "$RUNS/$srun" --key stopped 2>/dev/null)" ] \
+  && ok "stop: the stopped mark is cleared" || bad "stop: stopped mark left behind"
+echo "$out" | grep -q "\[transcribe\] already done" && ok "stop: transcribe not re-run" || bad "stop: transcribe re-ran"
+out=$( cd "$STAGING" && bash ./kill_meeting.sh --run-id "$srun" 2>&1 ); rc=$?
+check "stop: stopping a finished run is a no-op" "$rc" "0"
+[ -z "$(state get --run-dir "$RUNS/$srun" --key stopped 2>/dev/null)" ] \
+  && ok "stop: a finished run is not marked stopped" || bad "stop: finished run marked stopped"
 
 echo "--- A failing mid-stage still reports the other branch"
 touch "$STUB_FAIL_TRANSCRIBE"
@@ -417,6 +1063,876 @@ held=$(python3 "$STAGING/lib/slotqueue.py" status --component transcribe 2>&1 | 
 check "queue: no slot left held" "$held" "0"
 
 unset QUEUE_SLOTS_TRANSCRIBE QUEUE_POLL_SECONDS
+
+echo ""
+echo "=================================================================="
+echo "8. Output directories, PDF and reference material"
+echo "=================================================================="
+
+echo "--- Every output directory is independent, and required"
+out=$( cd "$STAGING" && env -u SUMMARIES_DIR bash ./pipeline.sh \
+       "https://www.youtube.com/watch?v=nopath00001" 2>&1 )
+rc=$?
+check "paths: a missing SUMMARIES_DIR fails the run" "$rc" "1"
+echo "$out" | grep -q "SUMMARIES_DIR" \
+  && ok "paths: the error names the missing variable" \
+  || bad "paths: error does not name the variable"
+
+echo "--- Artifacts land in the configured directories, spaces and all"
+run=$(ls -1t "$RUNS" | head -1)
+prev=$(ls -1t "$RUNS" | head -1)
+out=$(pipeline "https://www.youtube.com/watch?v=paths0000001" 2>&1)
+check "paths: exits 0" "$?" "0"
+run=$(latest_run)
+check "paths: md artifact recorded" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.summarize.artifacts.md)" \
+  "$SUMMARIES_DIR/$run.md"
+check "paths: pdf artifact recorded" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.summarize.artifacts.pdf)" \
+  "$PDF_DIR/$run.pdf"
+case "$SUMMARIES_DIR" in *" "*) ok "paths: output path contains a space" ;;
+  *) bad "paths: test root has no space in it" ;; esac
+
+echo "--- --no-pdf: markdown only, and the stage still succeeds"
+export STUB_SUMMARIZE_NO_PDF=1
+out=$(pipeline "https://www.youtube.com/watch?v=nopdf0000001" 2>&1)
+check "nopdf: exits 0" "$?" "0"
+run=$(latest_run)
+check "nopdf: summarize done" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+check "nopdf: md still recorded" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.summarize.artifacts.md)" \
+  "$SUMMARIES_DIR/$run.md"
+state get --run-dir "$RUNS/$run" --key stages.summarize.artifacts.pdf >/dev/null 2>&1 \
+  && bad "nopdf: recorded a pdf that was never written" \
+  || ok "nopdf: no pdf artifact recorded"
+unset STUB_SUMMARIZE_NO_PDF
+
+echo "--- --no-markdown: PDF only"
+export STUB_SUMMARIZE_NO_MARKDOWN=1
+out=$(pipeline "https://www.youtube.com/watch?v=nomd00000001" 2>&1)
+check "nomd: exits 0" "$?" "0"
+run=$(latest_run)
+check "nomd: pdf recorded" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.summarize.artifacts.pdf)" \
+  "$PDF_DIR/$run.pdf"
+state get --run-dir "$RUNS/$run" --key stages.summarize.artifacts.md >/dev/null 2>&1 \
+  && bad "nomd: recorded a markdown file that was never written" \
+  || ok "nomd: no md artifact recorded"
+unset STUB_SUMMARIZE_NO_MARKDOWN
+
+echo "--- Neither output written is a failed stage, not a silent success"
+export STUB_SUMMARIZE_NO_PDF=1
+export STUB_SUMMARIZE_NO_MARKDOWN=1
+out=$(pipeline "https://www.youtube.com/watch?v=nothing00001" 2>&1); rc=$?
+check "empty: run exits 1" "$rc" "1"
+run=$(latest_run)
+check "empty: summarize marked failed" \
+  "$(state status --run-dir "$RUNS/$run" --stage summarize)" "failed"
+echo "$out" | grep -q "produced no output files" \
+  && ok "empty: says what went wrong" || bad "empty: unclear error"
+unset STUB_SUMMARIZE_NO_PDF STUB_SUMMARIZE_NO_MARKDOWN
+
+echo "--- --resources reaches summarize and survives a resume"
+mkdir -p "$TESTROOT/slides deck"
+echo "# Week 4 slides" > "$TESTROOT/slides deck/week4.md"
+touch "$STUB_FAIL_SUMMARIZE"
+pipeline "https://www.youtube.com/watch?v=res000000001" \
+         --resources "$TESTROOT/slides deck" >/dev/null 2>&1
+run=$(latest_run)
+check "resources: recorded in state.json" \
+  "$(state get --run-dir "$RUNS/$run" --key resources)" "$TESTROOT/slides deck"
+rm -f "$STUB_FAIL_SUMMARIZE"
+out=$(pipeline --run-id "$run" 2>&1)
+check "resources: resumed run exits 0" "$?" "0"
+grep -qx -- "--resources" "$STUB_SUMMARIZE_ARGS" \
+  && ok "resources: passed to summarize on the resume" \
+  || bad "resources: not passed to summarize"
+grep -qx -- "$TESTROOT/slides deck" "$STUB_SUMMARIZE_ARGS" \
+  && ok "resources: spec with a space passed intact" \
+  || bad "resources: spec was mangled"
+
+echo "--- Two --resources are both threaded through"
+out=$(pipeline "https://www.youtube.com/watch?v=res000000002" \
+      --resources "$TESTROOT/slides deck" \
+      --resources "https://github.com/acme/course@wk4" 2>&1)
+check "resources: exits 0" "$?" "0"
+check "resources: both specs recorded" \
+  "$(state get --run-dir "$RUNS/$(latest_run)" --key resources | wc -l)" "2"
+check "resources: both passed to summarize" \
+  "$(grep -cx -- "--resources" "$STUB_SUMMARIZE_ARGS")" "2"
+
+
+echo ""
+echo "=================================================================="
+echo "N. --clip: summarize only part of a video"
+echo "=================================================================="
+
+echo "--- YouTube: the window is cut after the download, before frames"
+rm -f "$STUB_FFMPEG_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=clip000000001" \
+      --clip 00:05:00-01:30:00 2>&1)
+check "clip/yt: exits 0" "$?" "0"
+run=$(latest_run)
+check "clip/yt: clip stage done" "$(state status --run-dir "$RUNS/$run" --stage clip)" "done"
+check "clip/yt: window recorded in state.json" \
+  "$(state get --run-dir "$RUNS/$run" --key clip)" "00:05:00-01:30:00"
+# The run id is what every artifact path derives from, so this is what keeps a
+# clipped run's transcript and summary away from a full run's.
+case "$run" in
+  *_c000500-013000_*) ok "clip/yt: window is in the run id" ;;
+  *) bad "clip/yt: run id carries no window: $run" ;;
+esac
+# The clip is derived data with the download's lifetime: written (mark_done
+# refuses a missing artifact, so `clip done` proves it existed) and then swept
+# with the download once the summary is out.
+[ -f "$RUNS/$run/clip.mp4" ] && bad "clip/yt: clip.mp4 kept after the summary" \
+  || ok "clip/yt: clip.mp4 swept after the summary"
+check "clip/yt: clip stage marked cleaned" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.clip.cleaned)" "True"
+[ -f "$RUNS/$run/clip.part.mp4" ] && bad "clip/yt: left a .part behind" \
+  || ok "clip/yt: no .part left behind"
+grep -qx -- "-ss" "$STUB_FFMPEG_ARGS" && ok "clip/yt: ffmpeg seeked" \
+  || bad "clip/yt: ffmpeg got no -ss"
+grep -qx -- "300.000" "$STUB_FFMPEG_ARGS" && ok "clip/yt: seeked to the start" \
+  || bad "clip/yt: wrong start"
+grep -qx -- "5100.000" "$STUB_FFMPEG_ARGS" && ok "clip/yt: cut the right duration" \
+  || bad "clip/yt: wrong duration"
+
+echo "--- The clip, not the source, is what the later stages are given"
+grep -qx -- "$RUNS/$run/clip.mp4" "$STUB_SUMMARIZE_ARGS" \
+  && ok "clip: summarize got the clip" || bad "clip: summarize got the source"
+grep -qx -- "--clip" "$STUB_SUMMARIZE_ARGS" \
+  && ok "clip: window reaches the document provenance" \
+  || bad "clip: window never reached summarize"
+
+echo "--- YouTube captions are windowed by transcribe.sh, not by ffmpeg"
+# There is no media to cut on the caption path: the transcript comes back whole
+# and free, so the same window is applied to the segments instead.
+grep -qx -- "--clip-captions" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "clip/yt: transcribe told to window the captions" \
+  || bad "clip/yt: transcribe never told about the window"
+
+echo "--- A second window on the same input is a second run, not a resume"
+out=$(pipeline "https://www.youtube.com/watch?v=clip000000001" \
+      --clip 01:30:00-02:00:00 2>&1)
+check "clip: exits 0" "$?" "0"
+run2=$(latest_run)
+[ "$run2" != "$run" ] && ok "clip: a different window makes a different run" \
+  || bad "clip: the second window resumed the first window's run"
+[ -f "$SUMMARIES_DIR/$run.md" ] && [ -f "$SUMMARIES_DIR/$run2.md" ] \
+  && ok "clip: both windows kept their own summary" \
+  || bad "clip: one window overwrote the other's summary"
+
+echo "--- The same window, spelled differently, resumes rather than duplicating"
+touch "$STUB_FAIL_SUMMARIZE"
+pipeline "https://www.youtube.com/watch?v=clip000000002" --clip 00:05:00-01:30:00 \
+  >/dev/null 2>&1
+first=$(latest_run)
+rm -f "$STUB_FAIL_SUMMARIZE"
+out=$(pipeline "https://www.youtube.com/watch?v=clip000000002" --clip 5:00-90:00 2>&1)
+check "clip: exits 0" "$?" "0"
+check "clip: 5:00-90:00 resumed 00:05:00-01:30:00" "$(latest_run)" "$first"
+
+echo "--- An unclipped run of the same input is untouched by a clipped one"
+out=$(pipeline "https://www.youtube.com/watch?v=clip000000003" 2>&1)
+rc=$?
+full=$(latest_run)
+check "clip: full run exits 0" "$rc" "0"
+out=$(pipeline "https://www.youtube.com/watch?v=clip000000003" --clip 00:05:00- 2>&1)
+rc=$?
+check "clip: clipped run exits 0" "$rc" "0"
+clipped=$(latest_run)
+[ "$clipped" != "$full" ] && ok "clip: clipped run is separate from the full run" \
+  || bad "clip: the clip resumed the finished full run"
+[ -f "$SUMMARIES_DIR/$full.md" ] && ok "clip: the full summary survived" \
+  || bad "clip: the full summary was overwritten"
+case "$clipped" in
+  *_c000500-end_*) ok "clip: an open end is named in the run id" ;;
+  *) bad "clip: open-end run id is wrong: $clipped" ;;
+esac
+
+echo "--- Kaltura: the cut happens before BOTH branches"
+# Kaltura's transcribe branch reads the media (the entry usually has no
+# captions), so a cut that ran inside the frames branch would race it and
+# AssemblyAI would be billed for the whole lecture.
+rm -f "$STUB_FFMPEG_ARGS"
+out=$(pipeline "https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/1?entry_id=1_clipclip" \
+      --clip 00:10:00-00:20:00 2>&1)
+check "clip/kal: exits 0" "$?" "0"
+run=$(latest_run)
+check "clip/kal: clip stage done" "$(state status --run-dir "$RUNS/$run" --stage clip)" "done"
+grep -qx -- "$RUNS/$run/clip.mp4" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "clip/kal: transcribe got the clip, not the full download" \
+  || bad "clip/kal: transcribe got the uncut media"
+
+echo "--- A local file is cut before it is transcribed"
+rm -f "$STUB_FFMPEG_ARGS"
+echo "fake recording" > "$TESTROOT/lecture clip.mp4"
+out=$(pipeline "$TESTROOT/lecture clip.mp4" --clip 00:01:00-00:02:00 2>&1)
+check "clip/local: exits 0" "$?" "0"
+run=$(latest_run)
+grep -qx -- "$RUNS/$run/clip.mp4" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "clip/local: transcribe got the clip" \
+  || bad "clip/local: transcribe got the whole file"
+
+echo "--- A bad window fails before anything is downloaded"
+before=$(latest_run)
+out=$(pipeline "https://www.youtube.com/watch?v=clipbad000001" --clip 01:30:00-00:05:00 2>&1)
+check "clip: a backwards window exits 1" "$?" "1"
+echo "$out" | grep -q "ends at or before it starts" \
+  && ok "clip: says what is wrong with the window" || bad "clip: unclear error"
+check "clip: no run was created" "$(latest_run)" "$before"
+
+echo "--- --clip is refused for a live meeting"
+before=$(latest_run)
+out=$(pipeline "https://meet.google.com/abc-defg-hij" --clip 00:05:00-01:30:00 2>&1)
+check "clip/meet: exits 1" "$?" "1"
+echo "$out" | grep -q "does not apply to a live meeting" \
+  && ok "clip/meet: says why" || bad "clip/meet: unclear error"
+check "clip/meet: no run was created" "$(latest_run)" "$before"
+
+echo "--- A failed cut is resumable, and the resume re-cuts"
+touch "$STUB_FAIL_CLIP"
+pipeline "https://www.youtube.com/watch?v=clipfail00001" --clip 00:05:00-01:30:00 \
+  >/dev/null 2>&1
+run=$(latest_run)
+check "clip: the run failed" "$(state status --run-dir "$RUNS/$run" --stage clip)" "failed"
+check "clip: the download was kept" \
+  "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "done"
+rm -f "$STUB_FAIL_CLIP"
+out=$(pipeline --run-id "$run" 2>&1)
+check "clip: the resume exits 0" "$?" "0"
+check "clip: the cut succeeded on the resume" \
+  "$(state status --run-dir "$RUNS/$run" --stage clip)" "done"
+
+echo "--- A swept clip is cut again when a resume needs the frames back"
+# Simulates a summary that has to be redone after the sweep: reset summarize
+# and frames, keep fetch_video and clip at their swept `done`.
+state reset --run-dir "$RUNS/$run" --stage summarize
+state reset --run-dir "$RUNS/$run" --stage frames
+out=$(pipeline --run-id "$run" 2>&1)
+check "clip re-cut: exits 0" "$?" "0"
+echo "$out" | grep -q "\[fetch_video\] swept after the last summary" \
+  && ok "clip re-cut: download fetched again" || bad "clip re-cut: no re-download"
+echo "$out" | grep -q "\[clip\] swept after the last summary" \
+  && ok "clip re-cut: window cut again" || bad "clip re-cut: clip not re-cut"
+grep -qx -- "-ss" "$STUB_FFMPEG_ARGS" && ok "clip re-cut: ffmpeg ran" || bad "clip re-cut: ffmpeg did not run"
+check "clip re-cut: summarized again" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+[ -e "$RUNS/$run/clip.mp4" ] && bad "clip re-cut: clip kept afterwards" || ok "clip re-cut: clip swept again"
+
+echo "--- Without --clip nothing changes"
+rm -f "$STUB_FFMPEG_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=noclip0000001" 2>&1)
+check "noclip: exits 0" "$?" "0"
+run=$(latest_run)
+check "noclip: clip stage never runs" \
+  "$(state status --run-dir "$RUNS/$run" --stage clip)" "pending"
+[ -f "$RUNS/$run/clip.mp4" ] && bad "noclip: wrote a clip anyway" \
+  || ok "noclip: no clip.mp4"
+[ -f "$STUB_FFMPEG_ARGS" ] && bad "noclip: ran ffmpeg anyway" \
+  || ok "noclip: ffmpeg never invoked"
+grep -qx -- "--clip" "$STUB_SUMMARIZE_ARGS" \
+  && bad "noclip: passed --clip to summarize" \
+  || ok "noclip: summarize got no --clip"
+grep -qx -- "--clip-captions" "$STUB_TRANSCRIBE_ARGS" \
+  && bad "noclip: passed --clip-captions to transcribe" \
+  || ok "noclip: transcribe got no window"
+
+
+echo ""
+echo "=================================================================="
+echo "N+1. #t= — a window on ONE input, in a multi-input invocation"
+echo "=================================================================="
+
+echo "--- Only the input carrying #t= is clipped"
+# The case this exists for: several lectures summarized together, some of them
+# needing trimming, and one --combine document over the lot. A global --clip
+# cannot express it, and splitting into one invocation per window would split
+# the combined document too.
+rm -f "$STUB_FFMPEG_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=tsuffix00001" \
+               "https://www.youtube.com/watch?v=tsuffix00002#t=00:00:00-01:16:04" \
+               "https://www.youtube.com/watch?v=tsuffix00003" --jobs 1 2>&1)
+check "t=: exits 0" "$?" "0"
+clipped_run=$(ls -1d "$RUNS"/yt_tsuffix00002_* | head -n 1)
+plain_run=$(ls -1d "$RUNS"/yt_tsuffix00001_* | head -n 1)
+check "t=: the marked input is clipped" \
+  "$(state get --run-dir "$clipped_run" --key clip)" "00:00:00-01:16:04"
+state get --run-dir "$plain_run" --key clip >/dev/null 2>&1 \
+  && bad "t=: the window leaked onto a neighbouring input" \
+  || ok "t=: its neighbours are untouched"
+case "$(basename "$clipped_run")" in
+  yt_tsuffix00002_c000000-011604_*) ok "t=: window is in that run's id" ;;
+  *) bad "t=: run id is wrong: $(basename "$clipped_run")" ;;
+esac
+
+echo "--- The suffix does not reach the input, the run id, or the document"
+# The input string is the auto-resume key and the provenance link. A window
+# left inside it would make the link wrong and every resume miss.
+check "t=: the suffix is stripped from the stored input" \
+  "$(state get --run-dir "$clipped_run" --key input)" \
+  "https://www.youtube.com/watch?v=tsuffix00002"
+case "$(basename "$clipped_run")" in
+  *"#t="*) bad "t=: the suffix leaked into the run id" ;;
+  *) ok "t=: no suffix in the run id" ;;
+esac
+
+echo "--- #t= overrides --clip for its own input only"
+rm -f "$STUB_FFMPEG_ARGS"
+out=$(pipeline "https://www.youtube.com/watch?v=tsuffix00004" \
+               "https://www.youtube.com/watch?v=tsuffix00005#t=00:10:00-00:20:00" \
+               --clip 00:05:00-01:30:00 --jobs 1 2>&1)
+check "t=: exits 0" "$?" "0"
+check "t=: the unmarked input took --clip" \
+  "$(state get --run-dir "$(ls -1d "$RUNS"/yt_tsuffix00004_* | head -n 1)" --key clip)" \
+  "00:05:00-01:30:00"
+check "t=: the marked input overrode it" \
+  "$(state get --run-dir "$(ls -1d "$RUNS"/yt_tsuffix00005_* | head -n 1)" --key clip)" \
+  "00:10:00-00:20:00"
+
+echo "--- A Kaltura <iframe> takes the suffix after the closing tag"
+# The blob is what gets pasted out of the LMS, so the suffix has to survive
+# sitting on the end of 900 characters of HTML with a quoted src in the middle.
+IFRAME='<iframe id="kaltura_player" src="https://cdnapisec.kaltura.com/p/2910381/embedPlaykitJs/uiconf_id/52668182?iframeembed=true&amp;entry_id=1_tsuffix1" style="width: 400px;height: 285px;border: 0;" allowfullscreen title="2110423 Online Lecture Sessions"></iframe>'
+out=$(pipeline "${IFRAME}#t=00:00:00-00:23:00" 2>&1)
+check "t=/kaltura: exits 0" "$?" "0"
+run=$(latest_run)
+check "t=/kaltura: window recorded" \
+  "$(state get --run-dir "$RUNS/$run" --key clip)" "00:00:00-00:23:00"
+case "$run" in
+  kal_1_tsuffix1_c000000-002300_*) ok "t=/kaltura: entry id and window in the run id" ;;
+  *) bad "t=/kaltura: run id is wrong: $run" ;;
+esac
+# The blob is normalised to a canonical embed URL before summarize sees it;
+# what matters here is that no fragment rode along with it.
+grep -q -- "#t=" "$STUB_SUMMARIZE_ARGS" \
+  && bad "t=/kaltura: the suffix reached summarize" \
+  || ok "t=/kaltura: no suffix downstream"
+
+echo "--- A local file takes it too"
+echo "fake recording" > "$TESTROOT/suffix lecture.mp4"
+out=$(pipeline "$TESTROOT/suffix lecture.mp4#t=00:01:00-00:02:00" 2>&1)
+check "t=/local: exits 0" "$?" "0"
+run=$(latest_run)
+check "t=/local: window recorded" \
+  "$(state get --run-dir "$RUNS/$run" --key clip)" "00:01:00-00:02:00"
+check "t=/local: the path is intact, suffix and space and all" \
+  "$(state get --run-dir "$RUNS/$run" --key input)" "$TESTROOT/suffix lecture.mp4"
+
+echo "--- The same window resumes whether it came from #t= or --clip"
+touch "$STUB_FAIL_SUMMARIZE"
+pipeline "https://www.youtube.com/watch?v=tsuffix00006#t=00:05:00-01:30:00" \
+  >/dev/null 2>&1
+first=$(latest_run)
+rm -f "$STUB_FAIL_SUMMARIZE"
+out=$(pipeline "https://www.youtube.com/watch?v=tsuffix00006" --clip 5:00-90:00 2>&1)
+check "t=: exits 0" "$?" "0"
+check "t=: the two spellings are one run" "$(latest_run)" "$first"
+
+echo "--- An unparseable window is refused before anything is created"
+before=$(latest_run)
+out=$(pipeline "https://www.youtube.com/watch?v=tsuffix00007#t=90:00-5:00" 2>&1)
+check "t=: exits 1" "$?" "1"
+echo "$out" | grep -q "ends at or before it starts" \
+  && ok "t=: names the problem" || bad "t=: unclear error"
+check "t=: no run created" "$(latest_run)" "$before"
+
+echo "--- A fragment that is not a window is left on the URL"
+# "#t=" only becomes a window when what is left of it still looks like an
+# input AND the remainder parses. Anything else stays part of the URL rather
+# than being silently truncated.
+out=$(pipeline "https://www.youtube.com/watch?v=tsuffix00008" 2>&1)
+check "t=: a plain URL is unaffected" "$?" "0"
+state get --run-dir "$RUNS/$(latest_run)" --key clip >/dev/null 2>&1 \
+  && bad "t=: invented a window" || ok "t=: no window on a plain URL"
+
+echo "--- --from-file carries #t=, and still honours real comments"
+cat > "$TESTROOT/links.txt" <<'LINKS'
+# a comment line
+https://www.youtube.com/watch?v=tsuffix00009#t=00:05:00-01:30:00
+https://www.youtube.com/watch?v=tsuffix00010   # trailing comment
+LINKS
+out=$(pipeline --from-file "$TESTROOT/links.txt" --jobs 1 2>&1)
+check "t=/from-file: exits 0" "$?" "0"
+check "t=/from-file: the window survived the comment stripper" \
+  "$(state get --run-dir "$(ls -1d "$RUNS"/yt_tsuffix00009_* | head -n 1)" --key clip)" \
+  "00:05:00-01:30:00"
+check "t=/from-file: a trailing comment is still stripped" \
+  "$(state get --run-dir "$(ls -1d "$RUNS"/yt_tsuffix00010_* | head -n 1)" --key input)" \
+  "https://www.youtube.com/watch?v=tsuffix00010"
+
+echo "--- Several windows in one invocation still make one combined document"
+COMBINED="$TESTROOT/combined clips.md"
+out=$(pipeline "https://www.youtube.com/watch?v=tcomb00000001#t=00:00:00-01:16:04" \
+               "https://www.youtube.com/watch?v=tcomb00000002" \
+               "https://www.youtube.com/watch?v=tcomb00000003#t=00:00:00-00:23:00" \
+               --jobs 1 --combine "$COMBINED" 2>&1)
+check "t=/combine: exits 0" "$?" "0"
+[ -f "$COMBINED" ] && ok "t=/combine: one document for three windows" \
+  || bad "t=/combine: no combined document"
+check "t=/combine: all three videos in the one summary" \
+  "$(grep -c "^video [0-9]: " "$COMBINED")" "3"
+# The clip label travels into parts.json, so the document can say which
+# video was a window and summarize.py can label it.
+tparts="$(ls -d "$RUNS"/combine_3x_* | while read -r d; do
+  [ "$(state get --run-dir "$d" --key output_md)" = "$COMBINED" ] && echo "$d/parts.json"; done | head -n 1)"
+check "t=/combine: clip labels reach parts.json" \
+  "$(python3 -c 'import json,sys; print(" ".join(str(p["clip"]) for p in json.load(open(sys.argv[1]))["parts"]))' "$tparts")" \
+  "00:00:00-01:16:04 None 00:00:00-00:23:00"
+
+echo ""
+echo "--- An option left without its value errors instead of hanging"
+# Found 2026-09-23: "... --combine" as the last argument made `shift 2` a
+# no-op and the parse loop spun forever, silently, on one core.
+for opt in --jobs --name --display-name --language --prompt --clip \
+           --from-file --combine-pdf --run-id --resources; do
+  out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" "$2"' _ "$STAGING" "$opt" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 124 ]; then
+    bad "$opt with no value: still hangs"
+  else
+    check "$opt with no value: exits 1" "$rc" "1"
+  fi
+done
+out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" --name --jobs 1' _ "$STAGING" 2>&1)
+check "an option taken as another option's value is refused" "$?" "1"
+echo "$out" | grep -q -- "--name needs a value" \
+  && ok "the error names the option" || bad "the error does not name --name: $out"
+# --combine's path is optional since 2026-11-02: last on the line it means
+# the default paths, and must neither hang nor take the next option.
+out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" "https://youtu.be/hangtest002" --dry-run --combine' _ "$STAGING" 2>&1)
+check "--combine last on the line: a dry run exits 0" "$?" "0"
+echo "$out" | grep -q "^combine.*<combine run id>.md" \
+  && ok "--combine with no path: the plan names the default place" \
+  || bad "--combine with no path: no default plan line: $out"
+out=$(timeout 10 bash -c 'cd "$1" && bash ./pipeline.sh "https://youtu.be/hangtest001" --jobs abc' _ "$STAGING" 2>&1)
+check "--jobs that is not a number is refused" "$?" "1"
+ls -d "$RUNS"/yt_hangtest001_* >/dev/null 2>&1 \
+  && bad "a refused command still created a run" || ok "a refused command creates no run"
+help="$(pipeline --help)"
+echo "$help" | grep -q -- "--no-combine-pdf" \
+  && ok "--help is not cut short" || bad "--help stops before --no-combine-pdf"
+
+echo ""
+echo "--- Binary files are refused before anything is paid for"
+printf '%%PDF-1.4\n\000binary' > "$TESTROOT/kurose.md"
+out=$(pipeline "https://youtu.be/binarytest01" --resources "$TESTROOT/kurose.md" 2>&1)
+check "--resources with a PDF named .md: exits 1" "$?" "1"
+echo "$out" | grep -q "convert it to Markdown first" \
+  && ok "--resources: says to convert it" || bad "--resources: unhelpful error: $out"
+out=$(pipeline "https://youtu.be/binarytest01" --resources "$TESTROOT/no such notes.md" 2>&1)
+check "--resources with a missing file: exits 1 at once" "$?" "1"
+ls -d "$RUNS"/yt_binarytest01_* >/dev/null 2>&1 \
+  && bad "a refused --resources still created a run" || ok "a refused --resources creates no run"
+out=$(pipeline --from-file "$TESTROOT/kurose.md" 2>&1)
+check "--from-file with a binary file: exits 1" "$?" "1"
+echo "$out" | grep -q "Slides and course notes go in --resources" \
+  && ok "--from-file: points at --resources" || bad "--from-file: unhelpful error: $out"
+printf -- '---\ncourse: Networks\nsource: Kurose\n---\n# 2.4 DNS\n' > "$TESTROOT/ref.md"
+out=$(pipeline "https://youtu.be/fmtest00001" --resources "$TESTROOT/ref.md" --prompt lecture 2>&1)
+check "a frontmatter reference runs end to end" "$?" "0"
+
+echo ""
+echo "--- --dry-run: what the web UI's Check runs"
+out=$(pipeline "https://youtu.be/dryrun00001#t=5:00-90:00" meet.new --dry-run 2>&1)
+check "dry-run: exits 0" "$?" "0"
+echo "$out" | grep -qP '^ok\tyoutube\t00:05:00-01:30:00\tnew\thttps://youtu.be/dryrun00001$' \
+  && ok "dry-run: the window is canonical and the input split off" \
+  || bad "dry-run: unexpected plan line: $out"
+echo "$out" | grep -qP '^ok\tmeeting\t-\tnew\thttps://meet.new$' \
+  && ok "dry-run: meet.new canonicalised" || bad "dry-run: meet.new line missing: $out"
+ls -d "$RUNS"/yt_dryrun00001_* >/dev/null 2>&1 \
+  && bad "dry-run created a run" || ok "dry-run creates nothing"
+out=$(pipeline "https://youtu.be/dryrun00001" --combine "$TESTROOT/no such dir/x.md" --dry-run 2>&1)
+check "dry-run: a --combine into a missing directory is refused" "$?" "1"
+# Every unusable input is reported (the web UI marks each line), not just the
+# first; the good ones are still planned.
+out=$(pipeline "https://youtu.be/dryrun00002" "https://youtu.be/dryrun00003#t=zz" \
+      "https://not-a-source.example/x" "https://meet.google.com/abc-defg-hij#t=1:00-2:00" \
+      "$TESTROOT/no such file.mp4" --dry-run 2>/dev/null)
+check "dry-run: unusable inputs exit 1" "$?" "1"
+echo "$out" | grep -qP '^ok\tyoutube\t-\tnew\thttps://youtu.be/dryrun00002$' \
+  && ok "dry-run: a good input is still planned beside bad ones" || bad "dry-run: $out"
+echo "$out" | grep -qP '^badarg\tunusable #t= window: .*\thttps://youtu.be/dryrun00003#t=zz$' \
+  && ok "dry-run: a bad #t= window is a badarg line, as typed" || bad "dry-run: $out"
+echo "$out" | grep -qP '^bad\tnot recognised.*\thttps://not-a-source.example/x$' \
+  && ok "dry-run: an unrecognised URL is a bad line" || bad "dry-run: $out"
+echo "$out" | grep -qP '^bad\ta clip window does not apply to a live meeting\thttps://meet.google.com/abc-defg-hij$' \
+  && ok "dry-run: a clipped meeting is a bad line" || bad "dry-run: $out"
+echo "$out" | grep -qP "^extra\t$TESTROOT/no such file.mp4\$" \
+  && ok "dry-run: a missing file is an extra line" || bad "dry-run: $out"
+out=$(pipeline "https://youtu.be/dryrun00002" "$TESTROOT/no such file.mp4" --dry-run 2>/dev/null)
+check "dry-run: one input + a legacy name still passes on the command line" "$?" "0"
+echo "$out" | grep -qP "^extra\t" && ok "dry-run: ... and the name is reported as extra" \
+  || bad "dry-run: $out"
+out=$(pipeline "https://youtu.be/dryrun00003#t=zz" --dry-run 2>&1)
+check "dry-run: only a bad window exits 1" "$?" "1"
+echo "$out" | grep -q "The orchestrator:" && bad "dry-run: printed the usage for a bad window" \
+  || ok "dry-run: a bad window alone is reported, not the usage"
+
+echo "--- Summary language, PDF font and extra instructions, per run"
+out=$(pipeline "https://youtu.be/sumset00001" --summary-language fr --dry-run 2>&1)
+check "summary: an unknown output language is refused" "$?" "1"
+out=$(pipeline "https://youtu.be/sumset00001" --summary-language th \
+      --pdf-font "CMU Serif" --dry-run 2>&1)
+check "summary: Computer Modern is refused for a Thai summary" "$?" "1"
+echo "$out" | grep -q "Bai Jamjuree, Sarabun" \
+  && ok "summary: the refusal names the Thai choices" \
+  || bad "summary: refusal without the choices: $out"
+out=$(pipeline "https://youtu.be/sumset00001" --summary-language English \
+      --pdf-font cm --dry-run 2>&1)
+check "summary: aliases are accepted" "$?" "0"
+echo "$out" | grep -q "written in en, PDF font CMU Serif" \
+  && ok "summary: dry-run reports the canonical language and font" \
+  || bad "summary: dry-run line missing: $out"
+out=$(pipeline "https://youtu.be/sumset00001" --instructions 2>&1)
+check "summary: --instructions without a value is refused" "$?" "1"
+out=$(pipeline "https://youtu.be/sumset00001" --summary-language en \
+      --pdf-font sarabun --instructions "Focus on the exam." 2>&1)
+check "summary: run exits 0" "$?" "0"
+run=$(latest_run)
+check "summary: language stored" \
+  "$(state get --run-dir "$RUNS/$run" --key summary_language)" "en"
+check "summary: font stored canonically" \
+  "$(state get --run-dir "$RUNS/$run" --key pdf_font)" "Sarabun"
+check "summary: instructions stored" \
+  "$(state get --run-dir "$RUNS/$run" --key instructions)" "Focus on the exam."
+grep -qx -- "--instructions" "$STUB_SUMMARIZE_ARGS" \
+  && grep -qx -- "Focus on the exam." "$STUB_SUMMARIZE_ARGS" \
+  && ok "summary: instructions passed to summarize.py" \
+  || bad "summary: instructions not passed: $(cat "$STUB_SUMMARIZE_ARGS")"
+grep -qx "SUMMARY_LANGUAGE=en" "$STUB_SUMMARIZE_ARGS.env" \
+  && grep -qx "PDF_FONT=Sarabun" "$STUB_SUMMARIZE_ARGS.env" \
+  && ok "summary: language and font exported to summarize.py" \
+  || bad "summary: env not exported: $(cat "$STUB_SUMMARIZE_ARGS.env")"
+
+echo "--- New summary settings on a resume replace the old ones, nothing else"
+touch "$STUB_FAIL_SUMMARIZE"
+pipeline "https://youtu.be/sumset00002" --instructions "old words" \
+         --resources "$TESTROOT/slides deck" >/dev/null 2>&1
+run=$(latest_run)
+rm -f "$STUB_FAIL_SUMMARIZE"
+out=$(pipeline "https://youtu.be/sumset00002" --instructions "new words" 2>&1)
+check "summary: the resume exits 0" "$?" "0"
+check "summary: the same run was resumed" "$(latest_run)" "$run"
+check "summary: the new instructions replaced the old" \
+  "$(state get --run-dir "$RUNS/$run" --key instructions)" "new words"
+check "summary: the run's resources survived the update" \
+  "$(state get --run-dir "$RUNS/$run" --key resources)" "$TESTROOT/slides deck"
+grep -qx -- "new words" "$STUB_SUMMARIZE_ARGS" \
+  && ok "summary: the resume summarized with the new instructions" \
+  || bad "summary: resume used stale instructions"
+
+echo ""
+echo "--- --new-meet: the bot creates the meeting, records it, cites the real link"
+out=$(pipeline --new-meet --name "Project sync" 2>&1)
+check "new-meet: exits 0" "$?" "0"
+nm_dir="$(ls -1d "$RUNS"/Project_sync_* | head -n 1)"
+[ -n "$nm_dir" ] && ok "new-meet: run named after --name" || bad "new-meet: no Project_sync run: $out"
+check "new-meet: canonical input" "$(state get --run-dir "$nm_dir" --key input)" "https://meet.new"
+check "new-meet: classified as a meeting" "$(state get --run-dir "$nm_dir" --key input_type)" "meeting"
+check "new-meet: record ran" "$(state status --run-dir "$nm_dir" --stage record)" "done"
+check "new-meet: the created link is stored" \
+  "$(state get --run-dir "$nm_dir" --key meet_url)" "https://meet.google.com/stb-hostd-mtg"
+grep -A1 -- "--source-url" "$STUB_SUMMARIZE_ARGS" | grep -q "stb-hostd-mtg" \
+  && ok "new-meet: the document cites the real meeting, not meet.new" \
+  || bad "new-meet: summarize got the wrong --source-url"
+state show --run-dir "$nm_dir" | grep -q "meeting:    https://meet.google.com/stb-hostd-mtg" \
+  && ok "new-meet: --status shows the link" || bad "new-meet: --status has no link"
+
+echo "--- meet.new as an input is the same thing, and is never auto-resumed"
+touch "$STUB_FAIL_TRANSCRIBE"
+out=$(pipeline meet.new 2>&1)
+rm -f "$STUB_FAIL_TRANSCRIBE"
+first="$(ls -1d "$RUNS"/new_meet_* | head -n 1)"
+[ -n "$first" ] && ok "meet.new: default run name new_meet" || bad "meet.new: no new_meet run: $out"
+sleep 1
+out=$(pipeline "https://meet.new/" 2>&1)
+check "meet.new: second call exits 0" "$?" "0"
+check "meet.new: an unfinished earlier call is not resumed — a new run instead" \
+  "$(ls -1d "$RUNS"/new_meet_* | wc -l | tr -d ' ')" "2"
+out=$(pipeline meet.new --clip 00:01:00-00:02:00 2>&1)
+check "meet.new: a clip window is refused (no source to cut)" "$?" "1"
+
+echo "--- A meeting runs in the background by default"
+bg_before="$(ls -1d "$RUNS"/bg_meeting_* 2>/dev/null | wc -l | tr -d ' ')"
+t0=$(date +%s)
+out=$(MEETING_BOT_FOREGROUND=0 pipeline "https://meet.google.com/bgr-ound-tst" --name "BG Meeting" 2>&1)
+rc=$?
+check "background: the command returns 0" "$rc" "0"
+[ $(( $(date +%s) - t0 )) -lt 15 ] && ok "background: it returns without waiting for the run" \
+  || bad "background: took $(( $(date +%s) - t0 ))s to return"
+echo "$out" | grep -q "Recording in the background" \
+  && ok "background: says so" || bad "background: no notice: $out"
+bg_log="$(echo "$out" | sed -nE "s/.*tail -f '([^']+)'.*/\1/p")"
+[ -n "$bg_log" ] && [ -f "$bg_log" ] && ok "background: the log it names exists" \
+  || bad "background: no log file: $out"
+echo "$out" | grep -qE 'Run: +BG_Meeting_' \
+  && ok "background: prints the run id" || bad "background: no run id: $out"
+bg_dir=""
+for _ in $(seq 1 60); do
+  bg_dir="$(ls -1d "$RUNS"/BG_Meeting_* 2>/dev/null | head -n 1)"
+  [ -n "$bg_dir" ] && [ "$(state status --run-dir "$bg_dir" --stage summarize)" = "done" ] && break
+  sleep 0.5
+done
+check "background: the detached run finishes on its own" \
+  "$(state status --run-dir "$bg_dir" --stage summarize 2>/dev/null)" "done"
+grep -q "^Run: " "$bg_log" 2>/dev/null && ok "background: the run's output is in the log" \
+  || bad "background: log has no run output"
+out=$(MEETING_BOT_FOREGROUND=0 pipeline "https://meet.google.com/fgr-ound-tst" --foreground 2>&1)
+check "--foreground: exits 0" "$?" "0"
+echo "$out" | grep -q "Recording in the background" \
+  && bad "--foreground: detached anyway" || ok "--foreground: stays attached"
+echo "$out" | grep -q "^Run: " && ok "--foreground: the run's output is inline" \
+  || bad "--foreground: no run output inline: $out"
+out=$(MEETING_BOT_FOREGROUND=0 pipeline "https://meet.google.com/dry-ound-tst" --dry-run 2>&1)
+echo "$out" | grep -qP '^ok\tmeeting\t' && ok "--dry-run: never detaches" \
+  || bad "--dry-run: $out"
+out=$(MEETING_BOT_FOREGROUND=0 pipeline "https://youtu.be/bgnotmeet01" 2>&1)
+echo "$out" | grep -q "Recording in the background" \
+  && bad "background: a YouTube input detached" || ok "background: only meetings detach"
+
+echo ""
+echo "=================================================================="
+echo "Voice only (--summary-source voice) and audio recordings (--record-media audio)"
+echo "=================================================================="
+
+voice_checks() {  # <label> <run dir>: frames never ran, summarize got --no-frames
+  check "$1: summary_source stored" "$(state get --run-dir "$2" --key summary_source)" "voice"
+  check "$1: frames stage never ran" "$(state status --run-dir "$2" --stage frames)" "pending"
+  [ -d "$FRAMES_DIR/$(basename "$2")" ] && bad "$1: a frames dir was made" \
+    || ok "$1: no frames dir"
+  grep -qx -- "--no-frames" "$STUB_SUMMARIZE_ARGS" \
+    && ! grep -qx -- "--frames-manifest" "$STUB_SUMMARIZE_ARGS" \
+    && ok "$1: summarize.py got --no-frames and no manifest" \
+    || bad "$1: summarize args: $(tr '\n' ' ' < "$STUB_SUMMARIZE_ARGS")"
+}
+
+echo "--- YouTube, voice only: no download, no frames"
+: > "$STUB_FRAMES_CALLS"
+out=$(pipeline "https://youtu.be/voiceonly01" --voice-only 2>&1)
+check "voice/youtube: exits 0" "$?" "0"
+run=$(latest_run)
+voice_checks "voice/youtube" "$RUNS/$run"
+check "voice/youtube: the video is never downloaded" \
+  "$(state status --run-dir "$RUNS/$run" --stage fetch_video)" "pending"
+check "voice/youtube: summarize done" "$(state status --run-dir "$RUNS/$run" --stage summarize)" "done"
+check "voice/youtube: extract_frames.py never called" "$(wc -l < "$STUB_FRAMES_CALLS" | tr -d ' ')" "0"
+
+echo "--- A local file, voice only"
+mkdir -p "$TESTROOT/media"; echo "fake lecture" > "$TESTROOT/media/voice lecture.mp4"
+out=$(pipeline "$TESTROOT/media/voice lecture.mp4" --summary-source voice 2>&1)
+check "voice/local: exits 0" "$?" "0"
+voice_checks "voice/local" "$RUNS/$(latest_run)"
+
+echo "--- Kaltura, voice only: fetched for AssemblyAI, but no frames"
+out=$(pipeline "$KAL_URL" --force --voice-only 2>&1)
+check "voice/kaltura: exits 0" "$?" "0"
+run=$(latest_run)
+voice_checks "voice/kaltura" "$RUNS/$run"
+grep -qx -- "--media" "$STUB_TRANSCRIBE_ARGS" \
+  && ok "voice/kaltura: transcribe still got the media for AssemblyAI" \
+  || bad "voice/kaltura: transcribe args: $(tr '\n' ' ' < "$STUB_TRANSCRIBE_ARGS")"
+
+echo "--- A meeting recorded as audio only"
+out=$(pipeline "https://meet.google.com/aud-ioon-lyy" --name "Audio Call" --audio-only 2>&1)
+check "audio/meet: exits 0" "$?" "0"
+run=$(latest_run)
+grep -qx "RECORD_MEDIA=audio" "$STUB_RECORD_ENV" \
+  && ok "audio/meet: the recorder was asked for audio" \
+  || bad "audio/meet: recorder env: $(cat "$STUB_RECORD_ENV")"
+[ -f "$RECORDINGS_DIR/$run.m4a" ] && ok "audio/meet: the recording is an .m4a" \
+  || bad "audio/meet: no $run.m4a: $(ls "$RECORDINGS_DIR")"
+check "audio/meet: record_media stored" "$(state get --run-dir "$RUNS/$run" --key record_media)" "audio"
+voice_checks "audio/meet" "$RUNS/$run"
+state show --run-dir "$RUNS/$run" | grep -q "summary from voice   recording: audio" \
+  && ok "audio/meet: --status shows both" || bad "audio/meet: --status: $(state show --run-dir "$RUNS/$run")"
+
+echo "--- A meeting by default still records video and uses frames"
+out=$(pipeline "https://meet.google.com/vid-eoon-lyy" --name "Video Call" 2>&1)
+run=$(latest_run)
+grep -qx "RECORD_MEDIA=video" "$STUB_RECORD_ENV" \
+  && ok "default/meet: the recorder was asked for video" || bad "default/meet: $(cat "$STUB_RECORD_ENV")"
+[ -f "$RECORDINGS_DIR/$run.mp4" ] && ok "default/meet: an .mp4" || bad "default/meet: no mp4"
+check "default/meet: frames ran" "$(state status --run-dir "$RUNS/$run" --stage frames)" "done"
+check "default/meet: summary_source both" "$(state get --run-dir "$RUNS/$run" --key summary_source)" "both"
+
+echo "--- Refusals, before anything is created"
+before="$(ls -1 "$RUNS" | wc -l)"
+out=$(pipeline "https://meet.google.com/con-flic-tss" --audio-only --summary-source both 2>&1)
+check "refuse: audio recording + frames for a meeting" "$?" "1"
+echo "$out" | grep -q "needs a video recording" && ok "refuse: says why" || bad "refuse: $out"
+out=$(pipeline "https://youtu.be/voiceonly02" --audio-only --summary-source both --dry-run 2>&1)
+check "refuse: not for a non-meeting input (audio does not apply to it)" "$?" "0"
+out=$(pipeline "https://youtu.be/voiceonly02" --summary-source pictures 2>&1)
+check "refuse: an unknown --summary-source" "$?" "1"
+out=$(RECORD_MEDIA=tape pipeline "https://youtu.be/voiceonly02" 2>&1)
+check "refuse: an unknown RECORD_MEDIA in .env" "$?" "1"
+echo "$out" | grep -q "RECORD_MEDIA must be one of: video audio" \
+  && ok "refuse: names the variable and the choices" || bad "refuse: $out"
+out=$(pipeline "https://youtu.be/voiceonly02" --summary-source 2>&1)
+check "refuse: --summary-source without a value" "$?" "1"
+check "refuse: nothing was created" "$(ls -1 "$RUNS" | wc -l)" "$before"
+
+echo "--- .env defaults, and the flag over them"
+out=$(SUMMARY_SOURCE=voice pipeline "https://youtu.be/voiceonly03" 2>&1)
+check "env: exits 0" "$?" "0"
+check "env: SUMMARY_SOURCE=voice is the default" \
+  "$(state get --run-dir "$RUNS/$(latest_run)" --key summary_source)" "voice"
+out=$(SUMMARY_SOURCE=voice pipeline "https://youtu.be/voiceonly04" --summary-source both 2>&1)
+check "env: the flag wins" "$(state get --run-dir "$RUNS/$(latest_run)" --key summary_source)" "both"
+out=$(RECORD_MEDIA=audio pipeline "https://meet.google.com/env-audi-ooo" 2>&1)
+check "env: RECORD_MEDIA=audio records audio" \
+  "$(state get --run-dir "$RUNS/$(latest_run)" --key record_media)" "audio"
+out=$(pipeline "https://youtu.be/voiceonly05" "https://meet.google.com/dry-medi-aaa" \
+      --audio-only --dry-run 2>&1)
+echo "$out" | grep -q "Media: summary from both; a meeting records audio" \
+  && ok "dry-run: reports the media choice" || bad "dry-run: no Media line: $out"
+
+echo "--- A resume may switch voice only off, and then extracts the frames"
+touch "$STUB_FAIL_SUMMARIZE"
+pipeline "https://youtu.be/voiceonly06" --voice-only >/dev/null 2>&1
+run=$(latest_run)
+rm -f "$STUB_FAIL_SUMMARIZE"
+out=$(pipeline "https://youtu.be/voiceonly06" --summary-source both 2>&1)
+check "resume: exits 0" "$?" "0"
+check "resume: the same run" "$(latest_run)" "$run"
+check "resume: stored both" "$(state get --run-dir "$RUNS/$run" --key summary_source)" "both"
+check "resume: frames now done" "$(state status --run-dir "$RUNS/$run" --stage frames)" "done"
+grep -qx -- "--frames-manifest" "$STUB_SUMMARIZE_ARGS" \
+  && ok "resume: summarize got the manifest" || bad "resume: no manifest passed"
+
+echo "--- A combined summary, voice only"
+out=$(pipeline "https://youtu.be/voicecomb01" "https://youtu.be/voicecomb02" --voice-only \
+      --combine "$TESTROOT/voice-combined.md" 2>&1)
+check "voice/combine: exits 0" "$?" "0"
+[ -f "$TESTROOT/voice-combined.md" ] && ok "voice/combine: the document is written" \
+  || bad "voice/combine: no document: $out"
+grep -qx -- "--no-frames" "$STUB_SUMMARIZE_ARGS" && grep -qx -- "--parts" "$STUB_SUMMARIZE_ARGS" \
+  && ok "voice/combine: summarize --parts got --no-frames" \
+  || bad "voice/combine: args: $(tr '\n' ' ' < "$STUB_SUMMARIZE_ARGS")"
+for m in "$RUNS"/yt_voicecomb0*; do
+  check "voice/combine: $(basename "$m" | cut -c1-15) never cut frames" \
+    "$(state status --run-dir "$m" --stage frames)" "pending"
+done
+
+echo ""
+echo "=================================================================="
+echo "--source-url: a local recording of a call made elsewhere (the Discord bot)"
+echo "=================================================================="
+DISCORD_LINK="https://discord.com/channels/111111111111111111/222222222222222222"
+mkdir -p "$TESTROOT/media"; echo "fake mix" > "$TESTROOT/media/discord call.m4a"
+out=$(pipeline "$TESTROOT/media/discord call.m4a" --source-url "$DISCORD_LINK" \
+      --voice-only --prompt meeting --name "Discord Standup" 2>&1)
+check "source-url: exits 0" "$?" "0"
+run=$(latest_run)
+check "source-url: classified as a local file" \
+  "$(state get --run-dir "$RUNS/$run" --key input_type)" "local_file"
+check "source-url: stored with the run" \
+  "$(state get --run-dir "$RUNS/$run" --key source_url)" "$DISCORD_LINK"
+grep -A1 -x -- "--source-url" "$STUB_SUMMARIZE_ARGS" | grep -qxF "$DISCORD_LINK" \
+  && ok "source-url: the document cites the channel, not the file" \
+  || bad "source-url: summarize args: $(tr '\n' ' ' < "$STUB_SUMMARIZE_ARGS")"
+check "source-url: the recording is never swept" \
+  "$(ls "$TESTROOT/media/discord call.m4a" 2>/dev/null)" "$TESTROOT/media/discord call.m4a"
+
+echo "--- --source-url refusals, before anything is created"
+before="$(ls -1 "$RUNS" | wc -l)"
+out=$(pipeline "$TESTROOT/media/discord call.m4a" --source-url "http://discord.com/x" --force 2>&1)
+check "source-url: http:// is refused" "$?" "1"
+out=$(pipeline "https://youtu.be/srcurlyt01" --source-url "$DISCORD_LINK" 2>&1)
+check "source-url: refused for a non-file input" "$?" "1"
+echo "$out" | grep -q "cannot go with a youtube input" && ok "source-url: says why" \
+  || bad "source-url: $out"
+out=$(pipeline "$TESTROOT/media/discord call.m4a" "$TESTROOT/media/voice lecture.mp4" \
+      --source-url "$DISCORD_LINK" --force 2>&1)
+check "source-url: refused with two inputs" "$?" "1"
+out=$(pipeline "$TESTROOT/media/discord call.m4a" --source-url 2>&1)
+check "source-url: refused without a value" "$?" "1"
+out=$(pipeline "https://youtu.be/srcurlyt01" --source-url "$DISCORD_LINK" --dry-run 2>&1)
+echo "$out" | grep -qP '^bad\t--source-url applies to a single local file only\t' \
+  && ok "source-url: --dry-run reports it as a bad line" || bad "source-url dry-run: $out"
+check "source-url: nothing was created" "$(ls -1 "$RUNS" | wc -l)" "$before"
+
+echo ""
+echo "=================================================================="
+echo "Google Drive upload and run tags (2026-11-02)"
+echo "=================================================================="
+export STUB_GDRIVE_CALLS="$TESTROOT/gdrive_calls.jsonl"
+export STUB_FAIL_UPLOAD="$TESTROOT/fail_upload"
+: > "$STUB_GDRIVE_CALLS"
+DRIVE_LINK_IN="https://drive.google.com/drive/u/0/folders/1DriveFolderAbc?usp=sharing"
+out=$(pipeline "https://youtu.be/drivetest01" --drive-folder "$DRIVE_LINK_IN" \
+      --drive-folder-name "Course notes" --tag "Signals" --tag "week 1, midterm" 2>&1)
+check "drive: exits 0" "$?" "0"
+run="$(ls -1 "$RUNS" | grep '^yt_drivetest01_' | head -n 1)"
+check "drive: the folder id is stored, not the link" \
+  "$(state get --run-dir "$RUNS/$run" --key drive_folder)" "1DriveFolderAbc"
+check "drive: the upload stage is done" \
+  "$(state status --run-dir "$RUNS/$run" --stage upload)" "done"
+check "drive: one upload" "$(wc -l < "$STUB_GDRIVE_CALLS")" "1"
+grep -q "\"--name\": \"Stub\"" "$STUB_GDRIVE_CALLS" \
+  && ok "drive: the name defaults to the summary's title" || bad "drive: $(cat "$STUB_GDRIVE_CALLS")"
+grep -qF "\"--file\": \"$PDF_DIR/$run.pdf\"" "$STUB_GDRIVE_CALLS" \
+  && ok "drive: the run's own PDF is sent" || bad "drive: wrong file: $(cat "$STUB_GDRIVE_CALLS")"
+check "drive: the link is in state.json" \
+  "$(state get --run-dir "$RUNS/$run" --key stages.upload.drive_link)" \
+  "https://drive.google.com/file/d/FILE1/view"
+check "tags: stored, split and trimmed" \
+  "$(state get --run-dir "$RUNS/$run" --key tags | tr '\n' '|')" "Signals|week 1|midterm|"
+
+echo "--- re-running the finished run uploads nothing again"
+: > "$STUB_GDRIVE_CALLS"
+pipeline --run-id "$run" >/dev/null 2>&1
+check "drive: no second upload" "$(wc -l < "$STUB_GDRIVE_CALLS" | tr -d ' ')" "0"
+
+echo "--- a new name on --run-id uploads the finished run's PDF again, only that"
+: > "$STUB_SUMMARIZE_ARGS"
+out=$(pipeline --run-id "$run" --drive-name "Week 1 notes" 2>&1)
+check "drive rename: exits 0" "$?" "0"
+grep -q '"--name": "Week 1 notes"' "$STUB_GDRIVE_CALLS" && ok "drive rename: uploaded under the new name" \
+  || bad "drive rename: $(cat "$STUB_GDRIVE_CALLS")"
+[ -s "$STUB_SUMMARIZE_ARGS" ] && bad "drive rename: summarize ran again" || ok "drive rename: no new summary"
+
+echo "--- a failed upload fails only that stage, and a resume retries it"
+: > "$STUB_GDRIVE_CALLS"
+touch "$STUB_FAIL_UPLOAD"
+out=$(pipeline "https://youtu.be/drivetest02" --drive-folder "1DriveFolderAbc" 2>&1)
+check "drive fail: exits 1" "$?" "1"
+run2="$(ls -1 "$RUNS" | grep '^yt_drivetest02_' | head -n 1)"
+check "drive fail: summarize is done" "$(state status --run-dir "$RUNS/$run2" --stage summarize)" "done"
+check "drive fail: upload failed" "$(state status --run-dir "$RUNS/$run2" --stage upload)" "failed"
+echo "$out" | grep -q "only the Drive upload failed" && ok "drive fail: says what to do" \
+  || bad "drive fail: $out"
+rm -f "$STUB_FAIL_UPLOAD"
+pipeline --run-id "$run2" >/dev/null 2>&1
+check "drive fail resume: uploaded" "$(state status --run-dir "$RUNS/$run2" --stage upload)" "done"
+
+echo "--- refusals before anything is created"
+before="$(ls -1 "$RUNS" | wc -l)"
+out=$(pipeline "https://youtu.be/drivetest03" --drive-folder "not a folder" 2>&1)
+check "drive: a bad folder is refused" "$?" "1"
+out=$(STUB_GDRIVE_OUT=0 pipeline "https://youtu.be/drivetest03" --drive-folder "1DriveFolderAbc" 2>&1)
+check "drive: not signed in is refused" "$?" "1"
+echo "$out" | grep -q "gdrive.py login" && ok "drive: says how to sign in" || bad "drive: $out"
+out=$(pipeline "https://youtu.be/drivetest03" "https://youtu.be/drivetest04" --combine \
+      --no-combine-pdf --drive-folder "1DriveFolderAbc" 2>&1)
+check "drive: refused with no combined PDF" "$?" "1"
+check "drive: nothing was created" "$(ls -1 "$RUNS" | wc -l)" "$before"
+
+echo "--- with --combine, only the combined PDF goes to Drive"
+: > "$STUB_GDRIVE_CALLS"
+out=$(pipeline "https://youtu.be/drivecmb01" "https://youtu.be/drivecmb02" --combine \
+      --drive-folder "1DriveFolderAbc" --drive-name "Both" --tag "pair" 2>&1)
+check "drive combine: exits 0" "$?" "0"
+cid="$(printf '%s\n' "$out" | sed -n 's/^ *run id: *//p' | head -n 1)"
+check "drive combine: one upload" "$(wc -l < "$STUB_GDRIVE_CALLS" | tr -d ' ')" "1"
+grep -qF "\"--file\": \"$PDF_DIR/$cid.pdf\"" "$STUB_GDRIVE_CALLS" \
+  && ok "drive combine: the combined PDF" || bad "drive combine: $(cat "$STUB_GDRIVE_CALLS")"
+m1="$(ls -1 "$RUNS" | grep '^yt_drivecmb01_' | head -n 1)"
+check "drive combine: members carry no Drive folder" \
+  "$(state get --run-dir "$RUNS/$m1" --key drive_folder)" ""
+check "drive combine: members carry the tags" "$(state get --run-dir "$RUNS/$m1" --key tags)" "pair"
 
 echo ""
 echo "=================================================================="

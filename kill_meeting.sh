@@ -9,24 +9,34 @@
 #   1. Touches the kill sentinel in every active run directory. capture.py
 #      polls for it and clicks "Leave" in the meeting UI, so other participants
 #      see the bot go rather than it vanishing mid-call. This is the whole
-#      point — do not "optimize" it into a docker kill.
+#      point — do not "optimize" it into a SIGKILL.
 #   2. SIGTERMs the host-side orchestrator + stage scripts.
-#   3. Only if a recorder container is still alive after the grace period,
-#      forcibly removes it.
+#   3. Only if a recorder is still alive after the grace period, stops that
+#      run's browser driver (from $RUN_DIR/record.pid) and waits up to
+#      KILL_FINALISE_SECONDS (120) for record_screen.sh to finalise the MP4.
+#      ffmpeg is never SIGKILLed, and never gets a second SIGINT — see the
+#      comment at the escalation below.
 #
-# Recordings run one container per run, so this can target a single run instead
-# of taking down every meeting at once:
+# Each recording writes its own pid file, so this can target a single run
+# instead of taking down every meeting at once:
 #
 #   ./kill_meeting.sh                  # every active run
-#   ./kill_meeting.sh --run-id <id>    # just that one
+#   ./kill_meeting.sh --run-id <id>    # just that one (a run past its
+#                                      # recording: terminate its processing)
 #   ./kill_meeting.sh --list           # show what's running, kill nothing
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-/opt/meeting-bot}"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/source_env.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/platform.sh"
+
+MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-$HOME/.local/share/meeting-bot}"
 RUNS_DIR="$MEETING_BOT_ROOT/runs"
 LEGACY_SENTINEL="/tmp/meeting_bot_kill"
 GRACE_SECONDS="${KILL_GRACE_SECONDS:-25}"
+FINALISE_SECONDS="${KILL_FINALISE_SECONDS:-120}"
 
 TARGET_RUN_ID=""
 LIST_ONLY=0
@@ -41,16 +51,58 @@ while [ "$#" -gt 0 ]; do
 done
 
 # --- What's actually running? -----------------------------------------------
-mapfile -t REC_CONTAINERS < <(
-  docker ps --format '{{.Names}}' 2>/dev/null | grep '^meeting-bot-rec-' || true
-)
+# A run is "recording" if its record.pid names a live process. The pid file is
+# written by screen/record_screen.sh and removed by its EXIT trap, so a stale
+# one only survives a SIGKILL — and the liveness check covers that.
+read_pid_field() {
+  local file="$1" field="$2"
+  [ -f "$file" ] || return 1
+  awk -F= -v k="$field" '$1==k {print $2; exit}' "$file"
+}
+
+# --- Alpine (`main`): a recording runs in the Debian recorder container ------
+# Its record.pid holds the CONTAINER's pids, which mean nothing (or something
+# else) here, so the stop is done in there, by this same script, and such
+# runs are skipped below. screen/record_in_container.sh writes the name.
+if [ -z "${MEETING_BOT_IN_RECORDER:-}" ] && [ "$LIST_ONLY" -eq 0 ]; then
+  for cfile in "$RUNS_DIR"/*/record.container; do
+    [ -f "$cfile" ] || continue
+    crun="$(basename "$(dirname "$cfile")")"
+    [ -n "$TARGET_RUN_ID" ] && [ "$crun" != "$TARGET_RUN_ID" ] && continue
+    cname="$(cat "$cfile")"
+    if [ "$(docker inspect -f '{{.State.Running}}' "$cname" 2>/dev/null)" = "true" ]; then
+      echo "==> $crun is recording in container $cname — stopping it there"
+      docker exec "$cname" bash /app/kill_meeting.sh --run-id "$crun" || true
+      [ -n "$TARGET_RUN_ID" ] && exit 0
+    fi
+  done
+fi
+
+declare -a ACTIVE_RUNS=()
+if [ -d "$RUNS_DIR" ]; then
+  for run_dir in "$RUNS_DIR"/*/; do
+    [ -d "$run_dir" ] || continue
+    pid_file="${run_dir}record.pid"
+    [ -f "$pid_file" ] || continue
+    # Recording in the container: handled above, never by host pids.
+    [ -z "${MEETING_BOT_IN_RECORDER:-}" ] && [ -f "${run_dir}record.container" ] && continue
+    rec_pid="$(read_pid_field "$pid_file" record || true)"
+    if [ -n "$rec_pid" ] && mb_alive "$rec_pid"; then
+      ACTIVE_RUNS+=("${run_dir%/}")
+    fi
+  done
+fi
 
 if [ "$LIST_ONLY" -eq 1 ]; then
-  echo "Recorder containers:"
-  if [ "${#REC_CONTAINERS[@]}" -eq 0 ]; then
+  echo "Active recordings:"
+  if [ "${#ACTIVE_RUNS[@]}" -eq 0 ]; then
     echo "  (none)"
   else
-    printf '  %s\n' "${REC_CONTAINERS[@]}"
+    for run_dir in "${ACTIVE_RUNS[@]}"; do
+      pid_file="$run_dir/record.pid"
+      echo "  $(basename "$run_dir")  (pid $(read_pid_field "$pid_file" record), \
+display :$(read_pid_field "$pid_file" display || echo '?'))"
+    done
   fi
   echo ""
   echo "Recent runs:"
@@ -59,9 +111,8 @@ if [ "$LIST_ONLY" -eq 1 ]; then
 fi
 
 # --- 1) Set the kill sentinels ----------------------------------------------
-# A sentinel in a run dir that has no live recording is harmless: pipeline.sh
+# A sentinel in a run dir that has no live recording is harmless: run_one.sh
 # clears it at the start of every run.
-SENTINELS_SET=0
 if [ -n "$TARGET_RUN_ID" ]; then
   if [ ! -d "$RUNS_DIR/$TARGET_RUN_ID" ]; then
     echo "ERROR: no such run: $RUNS_DIR/$TARGET_RUN_ID" >&2
@@ -70,8 +121,8 @@ if [ -n "$TARGET_RUN_ID" ]; then
   fi
   echo "==> Setting kill sentinel for run: $TARGET_RUN_ID"
   touch "$RUNS_DIR/$TARGET_RUN_ID/kill"
-  SENTINELS_SET=1
 else
+  SENTINELS_SET=0
   if [ -d "$RUNS_DIR" ]; then
     for run_dir in "$RUNS_DIR"/*/; do
       [ -d "$run_dir" ] || continue
@@ -86,8 +137,8 @@ else
 fi
 
 # --- 2) SIGTERM the host-side processes --------------------------------------
-# Only when killing everything: with --run-id we let the sentinel do the work,
-# since the host processes aren't labelled per-run.
+# Only when killing everything: with --run-id we let the sentinel do the work
+# and escalate through that run's own pid file below.
 if [ -z "$TARGET_RUN_ID" ]; then
   ORCH_PIDS=$(pgrep -f "pipeline\.sh|screen/record_screen\.sh" || true)
   STAGE_PIDS=$(pgrep -f "transcribe/transcribe\.sh|summarize/summarize\.py" || true)
@@ -105,8 +156,92 @@ if [ -z "$TARGET_RUN_ID" ]; then
 fi
 
 # --- 3) Give the bot time to click Leave, then escalate ----------------------
-if [ "${#REC_CONTAINERS[@]}" -eq 0 ]; then
-  echo "==> No recorder containers running. Sentinels are set, so anything that"
+declare -a TARGETS=()
+for run_dir in "${ACTIVE_RUNS[@]:-}"; do
+  [ -n "$run_dir" ] || continue
+  if [ -n "$TARGET_RUN_ID" ] && [ "$(basename "$run_dir")" != "$TARGET_RUN_ID" ]; then
+    continue
+  fi
+  TARGETS+=("$run_dir")
+done
+
+# --- 2b) A run that is not recording: terminate its processing ---------------
+# The sentinel is read only by capture.py, so on its own it stops nothing once
+# the recording is over — a transcribe, frames or summarize in progress ran on
+# (found 2026-10-12: Stop in the web UI on a local file's summary). With
+# --run-id and no live recorder, terminate that run's own process tree —
+# run_one.sh (the run.lock owner) and everything under it — never its
+# pipeline.sh, which may be running other inputs and reports this one FAILED.
+# The run is marked `stopped` so --resume-all leaves it alone; --run-id (the
+# UI's Resume) clears the mark and carries on from the stages already done.
+# A record stage that is running without a live record.pid (still joining) is
+# left to the sentinel: capture.py checks it while it waits.
+descendants() {
+  local child
+  for child in $(ps -o pid= --ppid "$1" 2>/dev/null); do
+    descendants "$child"
+    echo "$child"
+  done
+}
+
+stop_processing() {
+  local run_dir="$1" run_id owner pids
+  run_id="$(basename "$run_dir")"
+  if [ "$(python3 "$SCRIPT_DIR/lib/runstate.py" status --run-dir "$run_dir" \
+          --stage record --no-verify 2>/dev/null)" = "running" ]; then
+    echo "==> $run_id is still joining its meeting; the sentinel will make it leave."
+    return 0
+  fi
+  # Nothing past the recording reads the sentinel; don't leave it behind.
+  rm -f "$run_dir/kill"
+  owner="$(cat "$run_dir/run.lock/pid" 2>/dev/null || true)"
+  if [ -z "$owner" ] || ! mb_alive "$owner"; then
+    echo "==> $run_id is not running; nothing to stop."
+    return 0
+  fi
+  # Mark first, so pipeline.sh already sees `stopped` when run_one.sh dies.
+  python3 "$SCRIPT_DIR/lib/runstate.py" stop --run-dir "$run_dir" || true
+  if mb_is_windows; then
+    # A Windows pid (lib/platform.sh): no TERM to send, so the tree goes at
+    # once with taskkill /T /F. Finished stages are in state.json already.
+    echo "==> Stopping $run_id (PID $owner and its children)"
+    mb_kill_tree TERM "$owner"
+    mb_alive "$owner" || rm -rf "$run_dir/run.lock"
+    python3 "$SCRIPT_DIR/lib/runstate.py" stop --run-dir "$run_dir" || true
+    echo "==> Stopped. Finished stages are kept; resume with: ./pipeline.sh --run-id $run_id"
+    return 0
+  fi
+  pids="$(descendants "$owner") $owner"
+  echo "==> Stopping $run_id (PIDs: $(echo $pids))"
+  # shellcheck disable=SC2086
+  kill -TERM $pids 2>/dev/null || true
+  local alive p
+  for _ in $(seq 1 10); do
+    alive=""
+    for p in $pids; do mb_alive "$p" && alive="$alive $p"; done
+    [ -z "$alive" ] && break
+    sleep 1
+  done
+  if [ -n "$alive" ]; then
+    echo "==> Still alive after 10s, killing:$alive"
+    # shellcheck disable=SC2086
+    kill -KILL $alive 2>/dev/null || true
+  fi
+  # A run_one.sh killed by a signal skips its EXIT trap; the lock would be
+  # taken over as stale anyway, but leave nothing that looks in progress.
+  mb_alive "$owner" || rm -rf "$run_dir/run.lock"
+  # Again: a stage run_one.sh marked running between the two calls ends failed.
+  python3 "$SCRIPT_DIR/lib/runstate.py" stop --run-dir "$run_dir" || true
+  echo "==> Stopped. Finished stages are kept; resume with: ./pipeline.sh --run-id $run_id"
+}
+
+if [ -n "$TARGET_RUN_ID" ] && [ "${#TARGETS[@]}" -eq 0 ]; then
+  stop_processing "$RUNS_DIR/$TARGET_RUN_ID"
+  exit 0
+fi
+
+if [ "${#TARGETS[@]}" -eq 0 ]; then
+  echo "==> No recordings are running. Sentinels are set, so anything that"
   echo "    starts in the next few seconds will leave immediately too."
   exit 0
 fi
@@ -114,16 +249,14 @@ fi
 echo "==> Waiting up to ${GRACE_SECONDS}s for the bot to leave the meeting cleanly..."
 for _ in $(seq 1 "$GRACE_SECONDS"); do
   still_up=0
-  for name in "${REC_CONTAINERS[@]}"; do
-    if [ -n "$TARGET_RUN_ID" ] && [ "$name" != "meeting-bot-rec-$TARGET_RUN_ID" ]; then
-      continue
-    fi
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"; then
+  for run_dir in "${TARGETS[@]}"; do
+    rec_pid="$(read_pid_field "$run_dir/record.pid" record || true)"
+    if [ -n "$rec_pid" ] && mb_alive "$rec_pid"; then
       still_up=1
     fi
   done
   if [ "$still_up" -eq 0 ]; then
-    echo "==> All recorder containers exited cleanly."
+    echo "==> All recordings exited cleanly."
     exit 0
   fi
   sleep 1
@@ -131,14 +264,56 @@ done
 
 # capture.py polls every POLL_SECONDS (15s), so anything still alive after the
 # grace period is genuinely stuck rather than just slow to notice.
-for name in "${REC_CONTAINERS[@]}"; do
-  if [ -n "$TARGET_RUN_ID" ] && [ "$name" != "meeting-bot-rec-$TARGET_RUN_ID" ]; then
-    continue
+for run_dir in "${TARGETS[@]}"; do
+  pid_file="$run_dir/record.pid"
+  run_id="$(basename "$run_dir")"
+  rec_pid="$(read_pid_field "$pid_file" record || true)"
+  [ -n "$rec_pid" ] && mb_alive "$rec_pid" || continue
+  echo "==> $run_id didn't exit in time — forcing it down."
+  # The browser driver only. record_screen.sh notices it has gone, stops
+  # ffmpeg itself with exactly ONE SIGINT and waits for the file to be
+  # finalised. This script used to SIGINT ffmpeg as well: two signals while
+  # ffmpeg closed the file made it abandon the final write ("Error closing
+  # file: Immediate exit requested") and two recordings were unplayable on
+  # 2026-09-29. ffmpeg is signalled from here only if its parent is gone.
+  join_pid="$(read_pid_field "$pid_file" join || true)"
+  ff_pid="$(read_pid_field "$pid_file" ffmpeg || true)"
+  # TERM lets capture.py quit its browser (geckodriver + Firefox); a KILL
+  # straight away orphaned both, still holding the profile.
+  if mb_is_windows; then
+    # No TERM on Windows: taskkill the driver and its browser. The recorder
+    # (screen/record_windows.py) sees capture.py gone and stops ffmpeg itself
+    # with its "q" command, which finalises the file.
+    [ -n "$join_pid" ] && mb_kill_tree TERM "$join_pid"
+  else
+    [ -n "$join_pid" ] && kill -TERM "$join_pid" 2>/dev/null || true
   fi
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"; then
-    echo "==> $name didn't exit in time — forcing it down."
-    docker rm -f "$name" >/dev/null 2>&1 || true
+  for _ in $(seq 1 15); do
+    [ -n "$join_pid" ] && mb_alive "$join_pid" || break
+    sleep 1
+  done
+  [ -n "$join_pid" ] && mb_alive "$join_pid" && kill -KILL "$join_pid" 2>/dev/null || true
+  # Finalising writes the index at the end of the file; on a network drive
+  # that takes a while. Never SIGKILL ffmpeg.
+  echo "==> Waiting up to ${FINALISE_SECONDS}s for the recording to be finalised..."
+  for _ in $(seq 1 "$FINALISE_SECONDS"); do
+    rec_alive=0; ff_alive=0
+    mb_alive "$rec_pid" && rec_alive=1
+    [ -n "$ff_pid" ] && mb_alive "$ff_pid" && ff_alive=1
+    if [ "$rec_alive" -eq 0 ] && [ "$ff_alive" -eq 1 ] && [ -z "${ff_signalled:-}" ]; then
+      # orphaned: nobody else will. (Windows has no SIGINT for another
+      # process; an orphaned ffmpeg there is left to finish or be closed.)
+      mb_is_windows || kill -INT "$ff_pid" 2>/dev/null || true
+      ff_signalled=1
+    fi
+    [ "$rec_alive" -eq 0 ] && [ "$ff_alive" -eq 0 ] && break
+    sleep 1
+  done
+  if mb_alive "$rec_pid" || { [ -n "$ff_pid" ] && mb_alive "$ff_pid"; }; then
+    echo "WARNING: $run_id is still finalising its recording (pids $rec_pid ${ff_pid:-}) —"
+    echo "         left alone; it will finish on its own."
   fi
+  unset ff_signalled
 done
 
 echo "==> Done."

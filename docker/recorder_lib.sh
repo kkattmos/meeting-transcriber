@@ -1,143 +1,79 @@
 #!/bin/bash
-# Shared helper for launching the Debian "recorder" container from the Alpine
-# host. Sourced by first_time_login.sh and screen/record_screen.sh — the two
-# scripts that need real Google Chrome, which cannot run on musl.
+# The Alpine host's launcher for the Debian "recorder" container (the `main`
+# branch). Sourced by screen/record_in_container.sh, first_time_login.sh,
+# kill_meeting.sh and recorder.sh — the scripts that need real Google Chrome,
+# which has no musl build.
 #
-# bash, not ash: setup.sh installs bash, and arrays are the only way to pass
-# docker arguments through without word-splitting/globbing a URL or a path.
+#   recorder_require                  docker usable and the image built, or fail loudly
+#   recorder_build                    build (or rebuild) the image
+#   recorder_run NAME [docker args...] -- CMD...
+#                                     run CMD in a fresh container, attached
+#   recorder_running NAME             is that container up
 #
-# Provides:
-#   recorder_require_docker      fail loudly if docker isn't usable
-#   recorder_require_image       fail loudly if the image isn't built
-#   recorder_build <docker_dir>  build (or rebuild) the image
-#   recorder_run <name> <detach|attach> [docker args...] -- <command...>
-#   recorder_tailscale_ip        this host's Tailscale IPv4, or empty
+# Mounts, each at the SAME path inside as outside, so every path in
+# state.json, record.pid and the logs means the same thing on both sides:
+#   the repo                 -> /app, read-only (code only; edits need no rebuild)
+#   MEETING_BOT_ROOT         -> itself (runs/, the sentinels, logs)
+#   RECORDINGS_DIR           -> itself (the MP4 / .m4a is written straight there)
+#   CHROME_PROFILE_DIR       -> itself (the persistent Google/Zoom sign-in)
 #
-# Everything the container needs is bind-mounted, so editing a .py/.sh file in
-# the repo takes effect on the next run with no rebuild.
+# The environment the recorder reads (capture.py's timeouts, BOT_GOOGLE_ACCOUNT,
+# RECORD_*, MEETING_BOT_RUN_DIR, …) is handed over by name (RECORDER_ENV_RE).
 
 RECORDER_IMAGE="${RECORDER_IMAGE:-meeting-bot-recorder:latest}"
-MEETING_BOT_ROOT="${MEETING_BOT_ROOT:-/opt/meeting-bot}"
-# The Chrome profile lives on the host under the output root (NOT under a
-# user's $HOME) so it survives container restarts and is shared between the
-# login script and the recorder. Inside the container it is mounted at
-# ~/.meeting-bot/chrome-profile, the path capture.py already expects.
-CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-$MEETING_BOT_ROOT/chrome-profile}"
+# Everything the browser stage reads; anything else (API keys!) stays on the host.
+RECORDER_ENV_RE='^(MEETING_BOT_(ROOT|RUN_DIR|LANGUAGE|KIOSK_MONITOR)|RECORD(INGS)?_[A-Z_]*|RECORD_MEDIA|BOT_GOOGLE_ACCOUNT|CHROME_PROFILE_DIR|FIREFOX_PROFILE_DIR|MAX_MEETING_MINUTES|IDLE_LEAVE_MINUTES|AUTO_LEAVE_[A-Z_]*|NEW_MEET_[A-Z_]*|HOST_ADMIT_[A-Z_]*|ADMIT_[A-Z_]*|AUDIO_SILENCE_[A-Z_]*|KILL_[A-Z_]*|POLL_SECONDS|DISPLAY_MIN|DISPLAY_MAX|TZ)='
 
-recorder_require_docker() {
+recorder_require() {
   if ! command -v docker >/dev/null 2>&1; then
-    cat >&2 <<EOF
-ERROR: docker is not installed.
-  The browser stages need real Google Chrome, which has no musl build, so they
-  run in a Debian container. Install it with:
-    apk add docker docker-cli-compose && rc-update add docker default && service docker start
-  (or just re-run ./setup.sh)
-EOF
+    echo "ERROR: docker is not installed. The browser stage needs real Google Chrome," >&2
+    echo "  which has no musl build, so it runs in a Debian container. ./setup.sh installs it." >&2
     return 1
   fi
   if ! docker info >/dev/null 2>&1; then
-    cat >&2 <<EOF
-ERROR: docker is installed but the daemon isn't reachable.
-  Start it with:  service docker start
-  In a Proxmox LXC container the daemon also needs nesting=1
-  (Options -> Features -> Nesting) and a usable storage driver.
-EOF
+    echo "ERROR: the docker daemon isn't reachable. Start it with:  rc-service docker start" >&2
+    echo "  (In a Proxmox LXC container the daemon also needs nesting=1.)" >&2
     return 1
   fi
-  return 0
-}
-
-recorder_image_exists() {
-  docker image inspect "$RECORDER_IMAGE" >/dev/null 2>&1
-}
-
-recorder_require_image() {
-  if ! recorder_image_exists; then
-    cat >&2 <<EOF
-ERROR: recorder image '$RECORDER_IMAGE' is not built.
-  Build it with:  ./setup.sh --build-recorder
-  (or directly:   docker build -t $RECORDER_IMAGE -f docker/Dockerfile.recorder docker/)
-EOF
+  if ! docker image inspect "$RECORDER_IMAGE" >/dev/null 2>&1; then
+    echo "ERROR: the recorder image '$RECORDER_IMAGE' is not built. Build it with:" >&2
+    echo "    ./setup.sh --build-recorder" >&2
     return 1
   fi
-  return 0
 }
 
 recorder_build() {
-  local docker_dir="$1"
-  echo "==> Building recorder image: $RECORDER_IMAGE"
-  echo "    (Debian + real google-chrome-stable; a few minutes the first time)"
-  docker build -t "$RECORDER_IMAGE" -f "$docker_dir/Dockerfile.recorder" "$docker_dir"
+  local repo="${REPO_ROOT:?REPO_ROOT not set}"
+  echo "==> Building the recorder image $RECORDER_IMAGE (Debian + real Chrome)"
+  docker build -t "$RECORDER_IMAGE" -f "$repo/docker/Dockerfile.recorder" "$repo"
 }
 
-# recorder_run <container_name> <detach|attach> [docker args...] -- <cmd...>
-#
-# Mounts:
-#   $REPO_ROOT          -> /app (read-only: code only, never written to)
-#   $MEETING_BOT_ROOT   -> same path (recordings, transcripts, runs/, ...)
-#   $CHROME_PROFILE_DIR -> /root/.meeting-bot/chrome-profile (persistent login)
-#
-# --shm-size=1g: Chrome crashes on Docker's default 64MB /dev/shm as soon as a
-# page gets non-trivial. --init reaps the zombies Chrome leaves behind.
+recorder_running() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]
+}
+
 recorder_run() {
   local name="$1"; shift
-  local mode="$1"; shift
-
   local -a extra=()
-  while [ "$#" -gt 0 ]; do
-    if [ "$1" = "--" ]; then
-      shift
-      break
-    fi
-    extra+=("$1")
-    shift
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do extra+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  local repo="${REPO_ROOT:?REPO_ROOT not set}"
+  local envfile
+  envfile="$(mktemp)"
+  env | grep -E "$RECORDER_ENV_RE" > "$envfile" || true
+  local -a mounts=(-v "$repo:/app:ro")
+  local dir
+  for dir in "${MEETING_BOT_ROOT:-}" "${RECORDINGS_DIR:-}" "${CHROME_PROFILE_DIR:-}"; do
+    [ -n "$dir" ] || continue
+    mkdir -p "$dir"
+    mounts+=(-v "$dir:$dir")
   done
-  # Whatever is left in "$@" is the command to run inside the container.
-
-  if [ -z "${REPO_ROOT:-}" ]; then
-    echo "ERROR: recorder_run needs REPO_ROOT set by the caller." >&2
-    return 1
-  fi
-
-  mkdir -p "$CHROME_PROFILE_DIR" "$MEETING_BOT_ROOT"
-
-  local -a detach=()
-  [ "$mode" = "detach" ] && detach=(-d)
-
-  # Bare `-e VAR` forwards the host's current value and is a no-op when the var
-  # is unset, so values source_env.sh loaded from .env reach capture.py intact.
-  docker run --rm "${detach[@]}" --init \
-    --name "$name" \
-    --shm-size=1g \
-    -e PYTHONDONTWRITEBYTECODE=1 \
-    -e MAX_MEETING_MINUTES \
-    -e IDLE_LEAVE_MINUTES \
-    -e MEETING_BOT_RUN_DIR \
-    -e TZ \
-    -v "$REPO_ROOT:/app:ro" \
-    -v "$MEETING_BOT_ROOT:$MEETING_BOT_ROOT" \
-    -v "$CHROME_PROFILE_DIR:/root/.meeting-bot/chrome-profile" \
-    "${extra[@]}" \
-    "$RECORDER_IMAGE" \
-    "$@"
-}
-
-# Best-effort: this host's Tailscale IPv4, empty if Tailscale isn't up. Used to
-# print a URL the operator can actually reach, since they can't see the console.
-recorder_tailscale_ip() {
-  if command -v tailscale >/dev/null 2>&1; then
-    tailscale ip -4 2>/dev/null | head -n 1
-  fi
-}
-
-# Best-effort: this host's primary routable IPv4. Used when the bind mode is
-# 0.0.0.0 (a wildcard, not a destination) so we can print a URL the operator
-# can actually open. Empty on hosts with no non-loopback IPv4 — the caller
-# falls back to `hostname -i` in that case.
-recorder_host_ipv4() {
-  # `ip -4 route get 1.1.1.1` returns the source address the kernel would use
-  # to reach the public internet. That is the canonical "this host's primary
-  # routable IPv4" on every modern Linux, including musl/Alpine.
-  ip -4 route get 1.1.1.1 2>/dev/null \
-    | awk '/src/ {for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}'
+  # --shm-size: Chrome crashes on Docker's 64MB /dev/shm. --init reaps the
+  # zombies Chrome leaves (tini is also the image's entrypoint).
+  local rc=0
+  docker run --rm --init --name "$name" --shm-size=1g \
+    --env-file "$envfile" -e MEETING_BOT_IN_RECORDER=1 \
+    "${mounts[@]}" "${extra[@]}" "$RECORDER_IMAGE" "$@" || rc=$?
+  rm -f "$envfile"
+  return "$rc"
 }
