@@ -87,6 +87,8 @@ FIREFOX_PREFS = {
     "permissions.default.microphone": 2,
     "permissions.default.camera": 2,
     "media.navigator.video.enabled": False,
+    # Reset here so a Zoom run's value in prefs.js can't outlive that run.
+    "media.audio_loopback_dev": "",
     # Layer 1 of the screen-share defense.
     "media.getdisplaymedia.enabled": False,
     "permissions.default.screen": 2,
@@ -117,6 +119,26 @@ FIREFOX_PREFS = {
     # body, and the JSON viewer would hand it a UI instead.
     "devtools.jsonview.enabled": False,
 }
+
+
+def silent_mic_prefs(device=None):
+    """Prefs that allow a microphone only when it can be nothing but silence.
+
+    With media.audio_loopback_dev Firefox offers that one device and no other
+    (the real mic is not even listed), and a missing device is NotFoundError,
+    never a fallback: both verified 2026-11-06 on ESR. Empty = stays blocked.
+    """
+    device = os.environ.get("MEETING_SILENT_MIC", "") if device is None else device
+    if not device:
+        return {}
+    return {"media.audio_loopback_dev": device,
+            "permissions.default.microphone": 1,
+            # With a working mic Zoom picks a speaker itself (setSinkId), past
+            # PULSE_SINK: the call played on the PC's speakers, silent in the
+            # recording. Without the API it plays on PULSE_SINK like Meet.
+            "media.setsinkid.enabled": False}
+
+
 FIREFOX_ARGS = ["--kiosk", "--width", str(_W), "--height", str(_H)]
 # Windows (the `windows` branch) records a visible window, so the kiosk goes
 # to the monitor the operator gives up for it (Firefox's --kiosk-monitor,
@@ -528,7 +550,7 @@ def _open_firefox(profile, headless):
     else:
         for a in FIREFOX_ARGS:
             opts.add_argument(a)
-    for k, v in FIREFOX_PREFS.items():
+    for k, v in {**FIREFOX_PREFS, **silent_mic_prefs()}.items():
         opts.set_preference(k, v)
     gd = os.environ.get("GECKODRIVER_BIN") or shutil.which("geckodriver")
     # No geckodriver on PATH: Selenium Manager fetches a matching one into

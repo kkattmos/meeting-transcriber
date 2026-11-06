@@ -184,6 +184,7 @@ cleanup() {
   [ -n "$JOIN_PID" ] && kill "$JOIN_PID" 2>/dev/null || true
   # Before the sink and the display go away: ffmpeg is still reading them.
   stop_ffmpeg || true
+  xsession_audio_stop "${SINK_NAME}_mic" || true
   xsession_audio_stop "$SINK_NAME" || true
   xsession_stop_xvfb || true
   rm -f "$PID_FILE" || true
@@ -222,7 +223,22 @@ export PULSE_SINK="$SINK_NAME"
 # stream the operator moved in pavucontrol was restored onto the bot's, which
 # then played the meeting into the wrong device and recorded silence
 # (2026-09-29). audio_watch below also pins the streams (lib/pinaudio.py).
-# The microphone needs no dummy device any more: the browser blocks it.
+# The browser blocks the microphone, and that is enough on Meet. Zoom lists a
+# blocked mic as unmuted and its Mute can't act, so a Zoom call on Firefox gets
+# one silent device to mute (browser.silent_mic_prefs). No device, no grant.
+case "$MEETING_URL" in
+  *zoom.us*)
+    if [ "$BROWSER_KIND" != chrome ]; then
+      if SILENT_MIC="$(xsession_silent_mic_start "$SINK_NAME")"; then
+        export MEETING_SILENT_MIC="$SILENT_MIC"
+        export PULSE_SOURCE="${SINK_NAME}_mic"
+        echo "==> Silent microphone for Zoom: $SILENT_MIC"
+      else
+        echo "WARNING: no silent microphone; the mic stays blocked and Zoom will show it as on." >&2
+      fi
+    fi
+    ;;
+esac
 export PULSE_PROP_OVERRIDE='application.name="Meeting Bot" application.id="meeting-bot"'
 # On a Wayland desktop session the browser would otherwise pick Wayland over
 # DISPLAY — putting the kiosk window on the operator's screen, or (Firefox's

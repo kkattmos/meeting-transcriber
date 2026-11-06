@@ -145,5 +145,19 @@ class CaptureAccountGateTest(unittest.TestCase):
         self.assertTrue(self._run(None, None))
 
 
+class SilentMicTest(unittest.TestCase):
+    def test_no_device_means_the_mic_stays_blocked(self):
+        self.assertEqual(browser.silent_mic_prefs(""), {})
+        self.assertEqual(browser.FIREFOX_PREFS["permissions.default.microphone"], 2)
+
+    def test_the_mic_is_only_allowed_with_the_one_device_named(self):
+        p = browser.silent_mic_prefs("Monitor of x_mic")
+        self.assertEqual(p["media.audio_loopback_dev"], "Monitor of x_mic")
+        self.assertEqual(p["permissions.default.microphone"], 1)
+        self.assertFalse(p["media.setsinkid.enabled"])
+        self.assertNotIn("media.navigator.permission.disabled", p)
+        self.assertNotIn("permissions.default.camera", p)
+
+
 if __name__ == "__main__":
     unittest.main()

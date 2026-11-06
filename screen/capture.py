@@ -268,19 +268,49 @@ def join_google_meet(page, url, display_name, navigate=True):
     )
 
 
+# Zoom's pre-join form: set the name field (always overwriting what Zoom
+# remembered) and, when the link carries no usable pwd, report the passcode
+# box. Fields are found by their label text, not by ids Zoom may rename.
+_ZOOM_FORM_JS = r"""(name) => {
+  const set = (el, v) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+  };
+  const labelOf = el => {
+    const l = el.id && document.querySelector(`label[for="${el.id}"]`);
+    return ((l && l.innerText) || el.getAttribute('aria-label') ||
+            el.getAttribute('placeholder') || '').toLowerCase();
+  };
+  const inputs = Array.from(document.querySelectorAll('input'))
+    .filter(i => i.getBoundingClientRect().width > 0);
+  const nameEl = inputs.find(i => /name/.test(labelOf(i)) && i.type !== 'password')
+    || inputs.find(i => i.type === 'text');
+  if (nameEl) set(nameEl, name);
+  const pw = inputs.find(i => /passcode|password/.test(labelOf(i)) || i.type === 'password');
+  return {name: nameEl ? nameEl.value : null, passcode_empty: pw ? !pw.value : null};
+}"""
+
+
 def join_zoom(page, url, display_name):
     if "zoom.us/wc/" not in url and "/j/" in url:
-        url = url.replace("/j/", "/wc/join/")
+        url = url.replace("/j/", "/wc/join/")  # keeps ?pwd=, which prefills the passcode
     page.goto(url, wait_until="domcontentloaded")
     page.wait_for_timeout(3000)
     click_first_match(page, ["I Agree", "Accept Cookies", "OK"], timeout=1500)
     try:
-        name_field = page.locator("#inputname, input[type='text']").first
-        if name_field.is_visible(timeout=4000):
-            name_field.fill(display_name)
-    except PWTimeout:
-        pass
-    return click_first_match(page, ["Join", "Join from Your Browser"], timeout=4000)
+        form = page.evaluate("() => (" + _ZOOM_FORM_JS + ")(" + json.dumps(display_name) + ")")
+    except Exception as e:
+        form = None
+        print(f"Zoom form fill failed: {e}")
+    print(f"Zoom form: {form}")
+    if form and form.get("passcode_empty"):
+        print("Zoom asks for a passcode and the link carries none.")
+        return False
+    # Join muted. Exact: "Mute" is inside "Unmute". Does nothing on a blocked mic.
+    if click_first_match(page, ["Mute"], timeout=1500, exact=True):
+        page.wait_for_timeout(800)
+    return click_first_match(page, ["Join", "Join from Your Browser"], timeout=4000, exact=True)
 
 
 # --- Hosting a meeting the bot created (meet.new) ----------------------------
@@ -505,12 +535,13 @@ def is_admitted(page):
     """True once we're actually inside the call (not a waiting/lobby screen)."""
     # English + Thai: see join_google_meet() for why both.
     admitted_markers = [
-        "Leave call", "Leave meeting", "Leave", "End",  # English
+        "Leave call", "Leave meeting", "Leave",  # English
         "ออกจากการโทร", "ออกจากการประชุม",                  # Thai
     ]
     for label in admitted_markers:
         try:
-            if page.get_by_role("button", name=label).is_visible(timeout=1000):
+            # exact: "End" matched Zoom's footer "Send Report" on the pre-join page
+            if page.get_by_role("button", name=label, exact=True).is_visible(timeout=1000):
                 return True
         except PWTimeout:
             continue
@@ -565,6 +596,15 @@ def join_rejection_reason(page):
          "Nobody admitted the bot from the waiting room (Thai UI)."),
         ("you can't join this meeting",
          "The meeting refused the join."),
+        # Only on Zoom's pre-join form; a link with a pwd never shows the box.
+        ("meeting passcode",
+         "Zoom asks for a passcode: use the invite link that carries ?pwd=."),
+        ("automated bots aren't allowed",
+         "Zoom's bot check refused this browser (it wants a signed-in user)."),
+        ("incorrect password",
+         "Zoom rejected the meeting passcode."),
+        ("incorrect passcode",
+         "Zoom rejected the meeting passcode."),
         ("invalid meeting id",
          "Zoom rejected the meeting ID."),
         ("this meeting has been locked",
@@ -639,26 +679,32 @@ def get_participant_count(page):
     return None
 
 
+LEAVE_VERIFY_SECONDS = 10
+
 def leave_meeting(page):
     print("Leaving the meeting.")
     click_first_match(
         page,
         [
-            "Leave call", "Leave meeting", "Leave", "End",  # English
+            "Leave call", "Leave meeting", "Leave",  # English
             "ออกจากการโทร", "ออกจากการประชุม",                 # Thai
         ],
         timeout=3000,
     )
-    # Confirm dialogs sometimes follow (e.g. "Leave meeting" -> confirm "Leave")
+    # Zoom's Leave only opens a popup; its red "Leave Meeting" does the leaving.
+    # Exact, or this matches the toolbar's "Leave" again and shuts the popup.
     time.sleep(1)
-    click_first_match(
-        page,
-        [
-            "Leave meeting", "Leave",        # English
-            "ออกจากการประชุม", "ออกจากการโทร",  # Thai
-        ],
-        timeout=2000,
-    )
+    click_first_match(page, ["Leave Meeting", "ออกจากการประชุม", "ออกจากการโทร"],
+                      timeout=1000, exact=True)
+    # Bounded well under kill_meeting.sh's 25s grace, or the SIGTERM eats this
+    # verdict: is_admitted alone can take 5s when the bot is still in the call.
+    deadline = time.time() + LEAVE_VERIFY_SECONDS
+    while time.time() < deadline:
+        if not is_admitted(page):
+            print("Left the meeting (in-call controls are gone).")
+            return
+        time.sleep(1)
+    print("WARNING: still in the call after Leave - check the recording.")
 
 
 def click_now(page, labels, exact=True):
@@ -906,6 +952,25 @@ def _any_visible(page, labels, exact=False):
     return None
 
 
+_BUTTON_NAMES_JS = r"""() => Array.from(document.querySelectorAll('button,[role=button]'))
+  .filter(b => b.getBoundingClientRect().width > 0)
+  .map(b => (b.getAttribute('aria-label') || b.innerText || '').replace(/\s+/g, ' ').trim())
+  .filter(Boolean).slice(0, 40)"""
+_logged_buttons = False
+
+
+def _log_button_names(page):
+    """Once per call: what buttons exist, so a label miss can be fixed from the log."""
+    global _logged_buttons
+    if _logged_buttons:
+        return
+    _logged_buttons = True
+    try:
+        print(f"  visible buttons: {page.evaluate(_BUTTON_NAMES_JS)}")
+    except Exception:
+        pass
+
+
 def mute_av(page, platform):
     """Make sure the bot's camera and microphone are off.
 
@@ -955,6 +1020,7 @@ def mute_av(page, platform):
             print(f"  {kind}: was ON - turned it off.")
             continue
         print(f"  WARNING: could not tell whether the {kind} is off - check the recording.")
+        _log_button_names(page)
 
 
 def block_screen_share_dialog(page):
@@ -1150,6 +1216,9 @@ def wait_until_meeting_ends(page, poll_seconds=POLL_SECONDS, host=False):
 
             # Anything Meet has put over the call since the last poll (a
             # notice, the People panel) comes off the recording.
+            if "zoom.us" in (getattr(page, "url", "") or ""):
+                # Lower-case "close" is the x on Zoom's notification banner.
+                click_now(page, ["Got it", "close"])
             if "meet.google.com" in (getattr(page, "url", "") or ""):
                 dismiss_notices(page)
                 # An unreadable count (Meet renamed the chip) must not stop

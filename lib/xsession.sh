@@ -193,6 +193,27 @@ xsession_audio_stop() {
   true
 }
 
+# xsession_silent_mic_start <sink>
+# Loads <sink>_mic, a PipeWire source with no sink side, and prints its
+# description: the only input Firefox will then offer (media.audio_loopback_dev).
+# NOT a plain null sink: that is also a speaker, and the bot's call audio went
+# into it instead of the recording (2026-11-06: 1s of sound in 38s).
+# On plain PulseAudio media.class means nothing and a sink appears, so nothing
+# named exactly <sink>_mic is a source: unload, return 1, the mic stays blocked.
+xsession_silent_mic_start() {
+  local mic="${1}_mic" desc
+  pactl load-module module-null-sink media.class=Audio/Source/Virtual \
+    sink_name="$mic" channel_map=mono \
+    sink_properties=device.description="$mic" >/dev/null 2>&1 || return 1
+  desc="$(pactl list sources 2>/dev/null \
+          | sed -n "/Name: ${mic}\$/,/Description:/s/^[[:space:]]*Description: //p")"
+  if [ -z "$desc" ]; then
+    xsession_audio_stop "$mic"
+    return 1
+  fi
+  printf '%s\n' "$desc"
+}
+
 # Turn a run id into something pactl accepts as a sink name.
 xsession_sink_name() {
   local raw="$1"

@@ -1105,6 +1105,59 @@ first participant, then end the call for everyone when it empties**.
   Workaround meanwhile: join as the bot account from another browser and set
   Host controls → Meeting access → Open (per meeting; only the host can).
 
+### Zoom on the web client (2026-11-06, live on Firefox ESR)
+
+First live Zoom calls, with the operator hosting. Selectors and labels below
+were read from Zoom's real page.
+
+- **The form:** `/j/<id>` → `app.zoom.us/wc/<id>/join`. `#input-for-pwd` is a
+  plain text input *before* `#input-for-name`, so "first text input" typed the
+  bot's name into the passcode box ("Incorrect Password"). `_ZOOM_FORM_JS` finds
+  each by its label and overwrites the remembered name. A `?pwd=` link shows no
+  passcode box. There is no passcode option (the operator's choice: the link
+  carries it); a box left empty is a refusal, so a bare link fails at once.
+- **`is_admitted` matches exactly.** "End" as a substring matched the form's
+  footer "Send Report", and the bot filmed the form as the meeting.
+- **Leaving takes two clicks:** toolbar "Leave", then the popup's exact
+  "Leave Meeting" (a substring match hits the toolbar and shuts the popup).
+  Verified live. `LEAVE_VERIFY_SECONDS` stays under kill_meeting.sh's 25s grace.
+- **Zoom gets a silent microphone; Meet stays blocked.** With the browser
+  blocking the mic, Zoom lists the bot as "computer audio unmuted", draws
+  `SvgAudioMuteDisallowed`, names the button just `audio`, and its Mute does
+  nothing. The operator chose (2026-11-06) to give it something to mute:
+  `xsession_silent_mic_start` loads a PipeWire source (`media.class=
+  Audio/Source/Virtual`) and `browser.silent_mic_prefs` allows the mic with
+  `media.audio_loopback_dev` naming that one device. Verified: the real mic
+  is not even listed, peak 0, camera still denied, and a missing device is
+  `NotFoundError`, never a fallback. Without a confirmed device the env var is
+  unset and the mic stays blocked. `join_zoom` clicks the preview's exact
+  "Mute" before Join; in the call the button reads "unmute my microphone".
+  A plain null sink would also be a speaker, so it is a pure source.
+  (`module-null-source` does not exist on pipewire-pulse.)
+  **`media.setsinkid.enabled=false` goes with it.** With a working mic Zoom
+  chose a speaker itself: one of its two streams carried `target.object =
+  alsa_output…`, so the call played on the PC's speakers, the recording sink sat
+  at -91 dB, and pinaudio moved it back every 10s to no effect.
+  **The black share came from the blocked mic too** (seen live 2026-11-06: with
+  the silent mic the "Oops" banner went and a shared video rendered sharp), so
+  the block can't simply come back on Zoom.
+  Firefox's prefs.js can keep `permissions.default.microphone=1` for the
+  undriven sign-in window after a Zoom run; the loopback pref is reset each run.
+- **Chrome is refused by Zoom** on the same link: "Automated bots aren't allowed
+  to join this meeting" + reCAPTCHA + "Sign in to join". The bot reports it as a
+  refusal; do not try to get past it. The bot's Firefox profile carries a
+  remembered Zoom name and avatar, which may be why it passes.
+- A browser closed without "Leave Meeting" stays in the host's list until Zoom
+  times it out.
+- **Notices** ("Got it", the banner's lower-case "close") are clicked on every
+  poll (`click_now`). Not yet seen working live; the camera banner may return.
+- **Live result, 2026-11-06** (`zoom_e2e_audio_*`, 245s, a shared video with
+  sound): joined by `?pwd=` under the given name, muted in the host's list,
+  share rendered and moving, left cleanly, then transcribe, frames, summary and
+  PDF all done. One earlier leave, with a shared video playing, clicked "Leave"
+  but not "Leave Meeting" and was forced down; cause unknown, not repeated.
+  The stored source and the document's link line keep `?pwd=`.
+
 ### Stage 2 — Transcribe (`transcribe/transcribe.sh`)
 
 - Local files → AssemblyAI (`assemblyai_client.py`). MP3/MP4/M4A/WAV go
@@ -2701,8 +2754,8 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **Firefox gets its profile as `-profile <dir>`**, never `Options.profile`
   (which copies it and loses every sign-in).
 - **The PC's real camera and microphone never reach the browser.** Camera
-  refused / fake black device; microphone = the run's silent `<sink>_mic`
-  monitor (`PULSE_SOURCE`) or a silent fake file. Dropping this on a PC
+  refused; microphone blocked, or on a Zoom call the one silent source named by
+  `media.audio_loopback_dev` (see "Zoom on the web client"). Dropping this on a PC
   broadcasts the operator's room when a mute click misses.
 - **`GDK_BACKEND=x11` and no `WAYLAND_DISPLAY` wherever the browser goes to
   Xvfb.** On a Wayland session the browser otherwise fails to open the
@@ -2737,8 +2790,9 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
   run use `.env` as it was when the UI started, silently.
 - **pm2 never starts anything at boot.** No `pm2 startup`, no `pm2 save` in
   any script. The operator asked for the web UI to be off by default.
-- **The bot's mic and camera stay blocked at the browser**, and mute_av
-  never clicks an "already off" label. See "What the recording shows".
+- **The bot's mic and camera stay blocked at the browser**, except Zoom's one
+  silent source (the operator's decision, 2026-11-06), and mute_av never clicks
+  an "already off" label. See "What the recording shows".
 - **Silence is measured by duration, not peak**, before any AssemblyAI upload.
 - **The bot's audio client is never called "Firefox"** (PULSE_PROP_OVERRIDE
   in record_screen.sh), and lib/pinaudio.py keeps it on the recording sink.
@@ -3157,7 +3211,8 @@ without API keys or network, against temp directories
 | `transcribe/test_yt_autocaptions.py` | yt-dlp captions: track choice (never a translation; `auto` prefers an upload in the spoken language), json3, the CLI against a stub yt-dlp, an auto-dubbed video's original audio over the dub | 15 |
 | `screen/test_extract_frames.py` | frames on change: settle, a transient change, blanks, the motion cap, the safety net, the last sample, the shared distance; the PPM reader; real ffmpeg (black lead-in skipped, audio-only empty, retired settings named) | 19 |
 | `screen/test_capture_host.py` | hosting a created Meet: the wait for the first participant, ending when empty, an unreadable count, 1:1 not idle, the guest path unchanged; which tile menu is the bot's own, minimising only with company | 19 |
-| `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate | 16 |
+| `screen/test_capture_zoom.py` | Zoom on a fake page: a `?pwd=` link kept, joining muted, an empty passcode box never joined, the passcode form and the bot check as refusals, the form's footer not a call, the two-click leave and its verdict | 12 |
+| `screen/test_browser.py` | browser choice and aliases, per-browser profiles, no real camera/mic, sandbox only as root, Firefox stale locks, ListAccounts parsing (signed out vs unknown), verdicts, gmail normalisation, `authuser`, the account not hardcoded, capture's account gate, the silent microphone only with a named device | 19 |
 | `test_trigger_server.py` | the web UI's API against a stub pipeline: body → argv, token, `/api/check` = `--dry-run`, every refused line reported (`bad`/`badarg`/`extra`, an `extra` failing the form), run/log path refusal, summary language/font/instructions, the options, record media / summary source, an `.env` edit reaching the next run and the form without a restart, the `.env` parser, no pm2 Node IPC variables in a child, the combine switch / tags / Drive arguments, run history (sizes, tags, cache removal marking stages `cleaned`, clear; a busy run and a live set's member refused; bulk clear with members), the tmp cache, Drive status, a resume naming a Drive folder | 20 |
 | `lib/test_pipeline_e2e.sh` | full orchestration with stubbed stages, output dirs, PDF/markdown toggles, `--resources`, the combine run (members skip summarize, parts.json in input order, resume, `--force` re-extraction, failed member, `--resume-all`, the frame sweep), the Kaltura DAG, the `--clip` DAG and run-id separation, the per-input `#t=` suffix, a summarize paused on the usage window (exit 75, `PAUSED`, `--resume-all` skipping until the reset, then finishing), the post-summary media sweep (download and clip gone, recording and local input kept, `cleaned` stages, `KEEP_FRAMES=1`, re-download on `--force` / combine `--force` / a swept clip, no re-download on a finished `--run-id`), options without values, `--help` complete, binary `--resources`/`--from-file` refused, a frontmatter reference, `--dry-run` (plan lines, creates nothing, every unusable input reported as `bad`/`badarg`/`extra` and exit 1, a legacy name still passing), `--new-meet` / `meet.new` (link stored and cited, never auto-resumed, clip refused), a meeting detached into the background (returns at once, names its log and run, finishes on its own; `--foreground`, `--dry-run` and non-meeting inputs stay attached), per-run summary language/font/instructions (refusals, storage, export to summarize, replaced on a resume without touching resources), voice only per source (no frames stage, no YouTube download, Kaltura still fetched, `--no-frames`), audio-only meetings (.m4a, RECORD_MEDIA to the recorder, stored voice), refusals, `.env` defaults, a resume switching frames back on, a voice-only `--combine`, `--source-url` (stored, cited, refused for http / non-files / several inputs, a dry-run `bad` line), Stop on a summarizing run (`kill_meeting.sh --run-id` terminates it, `STOPPED`, `--resume-all` skips it, `--run-id` finishes it and clears the mark), a YouTube download refused with a 403 and re-run (served, given up, a non-transient failure not retried), `--combine` without a path (default places, resumed onto the same files, last on the line in a dry run), the Drive upload (folder id from a link, the title as the name, the link stored, not repeated, renamed on `--run-id` without re-summarizing, a failure failing only `upload` and retried, refusals, only the combined PDF), tags (stored, split, on members too) | 520 |
 | `lib/test_media_e2e.sh` | real MP4 + real SDKs against local stub servers, the real llm_client against a stub `claude` binary (single run and `--parts`), the usage ledger landing in state.json, a hit window waited out then retried against the stub (`rate-limited-once`), a pause past the cap (exit 75, reset time recorded, Gemini untouched), and a real ffmpeg clip probed for duration and rebased timestamps, YouTube captions through a stub yt-dlp first (the API never asked when it succeeds), youtube-transcript.io when yt-dlp fails or finds no track, the other-language-labelled track as last resort, `YT_AUTOCAPTIONS=0`, both down = exit 1, `--no-frames` sending no image and the no-frames note, an audio file's empty manifest summarized | 141 |
@@ -3219,8 +3274,8 @@ three to one image block; that is the fixture, not a bug — real slides carry
 text, which is what the texture hash keys on.
 
 **What no test here covers:** the browser actually joining a live Meet/Zoom
-call (Firefox has reached Meet's pre-join page and its refusal page, not a
-call), a
+call in CI (Zoom was checked by hand on 2026-11-06, see "Zoom on the web
+client"; Firefox has reached Meet's pre-join page and its refusal page), a
 real Kaltura tenant's access-control (`./verify_e2e.sh --kaltura` is the live
 check, and needs no key), and
 real AssemblyAI/Claude/Gemini/youtube-transcript.io round-trips — including
@@ -3296,6 +3351,7 @@ own flags, which is everything about stage 1 except the call itself.
 │   ├── browser_smoke.py          <- the same browser, without a meeting
 │   ├── test_browser.py
 │   ├── test_capture_host.py
+│   ├── test_capture_zoom.py
 │   ├── test_extract_frames.py
 │   └── extract_frames.py         <- one decode; a frame when the picture changes
 ├── transcribe/
