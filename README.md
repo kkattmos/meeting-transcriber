@@ -667,6 +667,10 @@ Every `--new-meet` is a new call: it is never auto-resumed into an earlier run
 (re-running the command creates another meeting). A run whose *recording*
 finished but whose summary failed resumes with `--run-id` as usual.
 
+A Meet or Zoom link always joins too, even when an older run on that link was
+stopped or failed: finish that one with `--run-id` or the UI's Resume. A link
+being recorded right now is refused, so a second click can't send a second bot.
+
 If the profile isn't signed in as `BOT_GOOGLE_ACCOUNT`, the run fails in
 seconds and says so — run `first_time_login.sh`.
 

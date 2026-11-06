@@ -451,6 +451,11 @@
           <div class="fb" id="fb-name"></div>
         </div>
         <div class="field">
+          <label class="lbl" for="displayName">Bot's name in the meeting <span class="opt">(optional)</span></label>
+          <input type="text" id="displayName" placeholder="Meeting Bot">
+          <div class="help">What other people see on a Zoom or Meet link you join.</div>
+        </div>
+        <div class="field">
           <label class="lbl" for="tags">Tags <span class="opt">(optional, comma-separated)</span></label>
           <input type="text" id="tags" list="tagList" placeholder="e.g. Signals 2110203, midterm">
           <div class="fb" id="fb-tags"></div>
@@ -1048,6 +1053,7 @@
       summary_source: seg("sSource"), record_media: seg("sRecord"),
       instructions: $("instructions").value.trim() || undefined,
       jobs: $("jobs").value || undefined, name: $("name").value.trim() || undefined,
+      display_name: $("displayName").value.trim() || undefined,
       combine: $("combine").checked || undefined,
       no_combine_pdf: $("noCombinePdf").checked && $("combine").checked,
       tags: tagList($("tags").value),

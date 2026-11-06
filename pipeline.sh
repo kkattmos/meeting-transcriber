@@ -931,9 +931,24 @@ else
     # and "resuming" an older one would transcribe last week's meeting in
     # place of recording this one. Its link is in that run's state; resume it
     # explicitly with --run-id.
+    # Nor for any meeting link: a personal room's link is the same every week,
+    # and a stopped or failed run would otherwise stop the bot joining the next
+    # call. --run-id, --resume-all and the UI's Resume finish the old one.
     existing=""
     if [ "$FORCE" -eq 0 ] && [ "$input" != "$NEW_MEET_INPUT" ]; then
       existing="$(rs find --root "$RUNS_DIR" --input "$input" --clip "$this_clip_label" --incomplete 2>/dev/null || true)"
+    fi
+    if [ "$kind" = "meeting" ] && [ -n "$existing" ]; then
+      # Only the old run's lock used to stop a second bot entering a live call.
+      owner="$(cat "$RUNS_DIR/$existing/run.lock/pid" 2>/dev/null || true)"
+      if [ -f "$RUNS_DIR/$existing/record.pid" ] && [ -n "$owner" ] && mb_alive "$owner"; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+          dry_bad "already being recorded by run $existing" "$input"; continue
+        fi
+        echo "ERROR: $input is already being recorded by run $existing." >&2
+        exit 1
+      fi
+      existing=""
     fi
 
     if [ "$DRY_RUN" -eq 1 ]; then

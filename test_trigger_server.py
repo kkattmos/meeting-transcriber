@@ -100,6 +100,9 @@ echo "inherited chain: ${SUMMARY_FALLBACK_CHAIN:-unset}"
             "--resources", "https://github.com/me/c"])
 
     def test_new_meet_takes_the_name(self):
+        args, _ = self.ts.build_args({"url": "https://x.zoom.us/j/1",
+                                      "display_name": "A Name"})
+        self.assertEqual(args[args.index("--display-name") + 1], "A Name")
         args, _ = self.ts.build_args({"new_meet": True, "name": "Sync"})
         self.assertEqual(args, ["--new-meet", "--name", "Sync"])
         self.assertIsNotNone(self.ts.build_args({})[1])

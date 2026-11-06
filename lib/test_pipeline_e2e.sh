@@ -1654,6 +1654,44 @@ check "meet.new: an unfinished earlier call is not resumed — a new run instead
 out=$(pipeline meet.new --clip 00:01:00-00:02:00 2>&1)
 check "meet.new: a clip window is refused (no source to cut)" "$?" "1"
 
+echo "--- A meeting link always joins, unless it is being recorded right now"
+ROOM="https://us05web.zoom.us/j/1112223334?pwd=abc"
+touch "$STUB_FAIL_TRANSCRIBE"
+out=$(pipeline "$ROOM" --name "Room" 2>&1)
+rm -f "$STUB_FAIL_TRANSCRIBE"
+check "room: an unfinished run exists" "$(ls -1d "$RUNS"/Room_* | wc -l | tr -d ' ')" "1"
+room_dir="$(ls -1d "$RUNS"/Room_* | head -n 1)"
+out=$(pipeline "$ROOM" --dry-run 2>&1 || true)
+echo "$out" | grep -qP '^ok\tmeeting\t-\tnew\t' \
+  && ok "room: Check says new, not resume" || bad "room: the dry run offers to resume: $out"
+sleep 1
+out=$(pipeline "$ROOM" --name "Room" 2>&1)
+check "room: the second call exits 0" "$?" "0"
+check "room: a stopped or failed run does not stop the next call" \
+  "$(ls -1d "$RUNS"/Room_* | wc -l | tr -d ' ')" "2"
+echo "$out" | grep -q "Resuming unfinished" && bad "room: it resumed" || ok "room: no resume"
+pipeline --run-id "$(basename "$room_dir")" >/dev/null 2>&1
+check "room: --run-id still finishes the old run" "$?" "0"
+touch "$STUB_FAIL_TRANSCRIBE"
+out=$(pipeline "$ROOM" --name "Live" 2>&1)
+rm -f "$STUB_FAIL_TRANSCRIBE"
+live_dir="$(ls -1td "$RUNS"/Live_* | head -n 1)"
+mkdir -p "$live_dir/run.lock"; echo "$$" > "$live_dir/run.lock/pid"
+touch "$live_dir/record.pid"
+out=$(pipeline "$ROOM" --dry-run 2>&1 || true)
+echo "$out" | grep -q "already being recorded by run" \
+  && ok "room: Check refuses a link being recorded" || bad "room: no refusal in the dry run"
+before="$(ls -1d "$RUNS"/* | wc -l)"
+out=$(pipeline "$ROOM" 2>&1)
+check "room: a second bot is refused" "$?" "1"
+check "room: the refusal creates no run" "$(ls -1d "$RUNS"/* | wc -l)" "$before"
+rm -f "$live_dir/record.pid"
+out=$(pipeline "$ROOM" --dry-run 2>&1 || true)
+echo "$out" | grep -qP '^ok\tmeeting\t-\tnew\t' \
+  && ok "room: a run past its recording does not block the next call" \
+  || bad "room: a summarizing run blocked the next call"
+rm -rf "$live_dir/run.lock"
+
 echo "--- A meeting runs in the background by default"
 bg_before="$(ls -1d "$RUNS"/bg_meeting_* 2>/dev/null | wc -l | tr -d ' ')"
 t0=$(date +%s)

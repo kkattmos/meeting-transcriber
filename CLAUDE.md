@@ -1008,7 +1008,8 @@ Non-obvious details:
 ### Resume semantics
 
 - Re-running the same command **resumes by default**: `runstate.py find` looks
-  for a run with the same `input` whose `summarize` isn't done.
+  for a run with the same `input` whose `summarize` isn't done Meeting links
+  are the exception: they always join (see "Zoom on the web client").
 - A stage counts as done only if **every artifact it recorded still exists**.
   A state file that disagrees with the filesystem is worse than none. The
   one exception is a stage marked `cleaned` (frames after a sweep): it stays
@@ -1149,6 +1150,14 @@ were read from Zoom's real page.
   remembered Zoom name and avatar, which may be why it passes.
 - A browser closed without "Leave Meeting" stays in the host's list until Zoom
   times it out.
+- **A meeting link is never auto-resumed** (2026-11-06, the operator's choice;
+  Meet and Zoom alike, the rule `meet.new` already had). A personal room's link
+  repeats, and an unfinished run on it made the next Start transcribe the old
+  recording instead of joining. `--run-id`, `--resume-all` and the UI's Resume
+  still finish the old run. A link being recorded right now (live `run.lock`
+  owner and a `record.pid`) is refused, `bad` in the dry run, because that lock
+  was the only thing stopping a second bot; a run past its recording blocks
+  nothing. The web page has a "Bot's name in the meeting" field (`display_name`).
 - **Notices** ("Got it", the banner's lower-case "close") are clicked on every
   poll (`click_now`). Not yet seen working live; the camera banner may return.
 - **Live result, 2026-11-06** (`zoom_e2e_audio_*`, 245s, a shared video with
@@ -3164,8 +3173,9 @@ and confirm with the user first — they're deliberate trade-offs, not laziness.
 - **Features go to `debian13` first, then are merged into the deployment
   branches**, which keep only their layer. Don't develop a feature on a
   deployment branch.
-- **A meet.new run is never auto-resumed**, and a hosted call is never ended
-  on an unreadable participant count.
+- **No meeting link is ever auto-resumed** (meet.new or a Meet/Zoom URL), a
+  link being recorded is refused, and a hosted call is never ended on an
+  unreadable participant count.
 - **Captions are never taken from a YouTube machine translation.** Spoken
   language first; another language only as the announced last resort.
 - **Of several `-orig` tracks, the original audio's wins** — never the
